@@ -1,0 +1,27 @@
+[package]
+edition = '2021'
+name = "ocpp_charger"
+version = "0.1.0"
+description = "OCPP Charge Point Implementation. Use this library to implement an OCPP charge point"
+repository = "https://github.com/flowionab/ocpp-charge-point"
+license = "MIT OR Apache-2.0"
+authors = ["Joatin Granlund <joatin@granlund.io>"]
+keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
+
+[features]
+default = ["ocpp_1_6", "ocpp_2_0_1"]
+ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
+ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
+
+[dependencies]
+tokio = { version = "1", features = ["time"] }
+serde = { version = "1.0", features = ["derive"] }
+ocpp-client = { version = "0.1.7", default-features = false }
+futures = "0.3"
+log = "0.4"
+chrono = "0.4"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.39", features = ["full"]}
+simplelog = "0.12"
