@@ -1,6 +1,6 @@
 [package]
-edition = '2021'
-name = "ocpp_charger"
+edition = '2024'
+name = "ocpp-charge-point"
 version = "0.1.0"
 description = "OCPP Charge Point Implementation. Use this library to implement an OCPP charge point"
 repository = "https://github.com/flowionab/ocpp-charge-point"
