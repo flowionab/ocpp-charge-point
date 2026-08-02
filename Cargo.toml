@@ -9,19 +9,17 @@ authors = ["Joatin Granlund <joatin@granlund.io>"]
 keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
 
 [features]
+std = []
 default = ["ocpp_1_6", "ocpp_2_0_1"]
 ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
 ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
 
 [dependencies]
-tokio = { version = "1", features = ["time"] }
-serde = { version = "1.0", features = ["derive"] }
-ocpp-client = { version = "0.1.7", default-features = false }
-futures = "0.3"
-log = "0.4"
-chrono = "0.4"
-async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+ocpp-client = { git = "https://github.com/flowionab/ocpp-client" }
+async-trait = "^0.1"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"]}
-simplelog = "0.12"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

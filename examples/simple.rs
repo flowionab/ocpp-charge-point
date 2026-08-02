@@ -1,53 +1,94 @@
-use std::sync::Arc;
-use log::LevelFilter;
-use simplelog::{SimpleLogger};
-use tokio::signal;
-use tokio::time::sleep;
-use ocpp_charger::{Charger, Config, OcppNetworkBridge, OutletConfig, State};
+use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
+use ocpp_charge_point::setup;
+
+struct SampleChargePoint {
+    evses: [SampleEvse; 2],
+}
+
+struct SampleEvse {
+    connectors: [SampleConnector; 2],
+}
+
+struct SampleConnector;
+
+impl SampleEvse {
+    pub fn new() -> Self {
+        Self {
+            connectors: [SampleConnector, SampleConnector],
+        }
+    }
+}
+
+impl SampleChargePoint {
+    pub fn new() -> Self {
+        Self {
+            evses: [SampleEvse::new(), SampleEvse::new()],
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ChargePoint<SampleEvse, SampleConnector> for SampleChargePoint {
+    type StartError = core::convert::Infallible;
+
+    async fn vendor_name(&self) -> &str {
+        "Test Vendor"
+    }
+    async fn model_name(&self) -> &str {
+        "Test Model"
+    }
+
+    async fn evses(&self) -> &[SampleEvse] {
+        return &self.evses;
+    }
+
+    async fn start(
+        &self,
+        _events: ocpp_charge_point::hardware::HardwareEventSender,
+        _commands: ocpp_charge_point::hardware::HardwareCommandReceiver,
+    ) -> Result<(), Self::StartError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Evse<SampleConnector> for SampleEvse {
+    async fn connectors(&self) -> &[SampleConnector] {
+        return &self.connectors;
+    }
+}
+
+#[async_trait::async_trait]
+impl Connector for SampleConnector {
+    type Error = core::convert::Infallible;
+
+    async fn lock(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn unlock(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn close_contactor(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn open_contactor(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = SimpleLogger::init(LevelFilter::Info, simplelog::Config::default());
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
-    let config = Arc::new(Config {
-        ocpp_endpoint: "wss://ocpp.flowion.app/easee".to_string(),
-        ocpp_identity: "EHP2MQ3l".to_string(),
-        serial_number: Some("EHP2MQ3l".to_string()),
-        model: "Home".to_string(),
-        vendor: "Easee".to_string(),
-        outlets: vec![
-            OutletConfig {
-                id: 1,
-                max_current: 32.0,
-            },
-            OutletConfig {
-                id: 2,
-                max_current: 32.0,
-            }
-        ],
-        ..Default::default()
-    });
-
-    let state = State::new();
-
-    let network = OcppNetworkBridge::connect(Arc::clone(&config), state.clone()).await?;
-
-    let charger = Charger::new(config, state, network);
-
-    charger.startup();
-
-    sleep(std::time::Duration::from_secs(1)).await;
-
-    charger.car_connected(1)?;
-
-    sleep(std::time::Duration::from_secs(1)).await;
-
-    charger.blip_rfid_tag("1234567890")?;
-
-
-    signal::ctrl_c().await?;
-
-    charger.disconnect().await?;
+    let _runtime = setup(SampleChargePoint::new()).await?;
 
     Ok(())
 }

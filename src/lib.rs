@@ -1,12 +1,12 @@
-mod config;
-mod state;
-mod charger;
-mod network_bridge;
-mod ocpp_network_bridge;
+#![cfg_attr(not(feature = "std"), no_std)]
 
-pub use self::charger::Charger;
-pub use self::config::Config;
-pub use self::config::OutletConfig;
-pub use self::state::State;
-pub use self::network_bridge::NetworkBridge;
-pub use self::ocpp_network_bridge::OcppNetworkBridge;
+extern crate alloc;
+
+pub mod actor;
+pub mod hardware;
+mod runtime;
+mod setup;
+pub mod state;
+
+pub use self::runtime::ChargePointRuntime;
+pub use self::setup::setup;
