@@ -128,20 +128,15 @@ mod tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    use super::TransactionNotifier;
     use crate::state::{StopReason, Transaction, TransactionChargingState, TransactionEventKind};
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use alloc::vec::Vec;
-    use chrono::Utc;
-    use ocpp_client::ClientError;
-    use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::rust_ocpp::v2_1::datatypes::{EVSEType, TransactionType};
     use ocpp_client::rust_ocpp::v2_1::enumerations::{
         ChargingStateEnumType, ReasonEnumType, TransactionEventEnumType, TriggerReasonEnumType,
     };
-    use ocpp_client::rust_ocpp::v2_1::messages::transaction_event::TransactionEventRequest;
 
+    // The four functions below are only consumed by `with_system_clock` (`std`-gated) and by
+    // this module's own tests; without either, they're legitimately unused.
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_event_type(kind: TransactionEventKind) -> TransactionEventEnumType {
         match kind {
             TransactionEventKind::Started => TransactionEventEnumType::Started,
@@ -150,6 +145,7 @@ mod ocpp_2_1 {
         }
     }
 
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_charging_state(state: TransactionChargingState) -> ChargingStateEnumType {
         match state {
             TransactionChargingState::EvConnected => ChargingStateEnumType::EVConnected,
@@ -160,6 +156,7 @@ mod ocpp_2_1 {
         }
     }
 
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_stop_reason(reason: StopReason) -> ReasonEnumType {
         match reason {
             StopReason::Local => ReasonEnumType::Local,
@@ -172,6 +169,7 @@ mod ocpp_2_1 {
     /// The OCPP `triggerReason` a TransactionEvent carries isn't part of our internal
     /// `Transaction`/`TransactionEventKind` model (see CLAUDE.md's version-adapter principle) -
     /// it's derived here from the event kind and, for `Ended`, the transaction's stop reason.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn trigger_reason_for(
         kind: TransactionEventKind,
         transaction: &Transaction,
@@ -188,45 +186,63 @@ mod ocpp_2_1 {
         }
     }
 
-    #[async_trait::async_trait]
-    impl TransactionNotifier for OCPP2_1Client {
-        type Error = ClientError<OCPP2_1Error>;
+    // `TransactionEventRequest` needs a timestamp; producing one without a caller-supplied
+    // `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so this impl - unlike
+    // the rest of this file - needs both `ocpp_2_1` and `std`.
+    #[cfg(feature = "std")]
+    mod with_system_clock {
+        use super::{map_charging_state, map_event_type, map_stop_reason, trigger_reason_for};
+        use crate::clock::{Clock, SystemClock};
+        use crate::state::{Transaction, TransactionEventKind};
+        use crate::transactions::TransactionNotifier;
+        use alloc::boxed::Box;
+        use alloc::string::ToString;
+        use alloc::vec::Vec;
+        use ocpp_client::ClientError;
+        use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
+        use ocpp_client::rust_ocpp::v2_1::datatypes::{EVSEType, TransactionType};
+        use ocpp_client::rust_ocpp::v2_1::messages::transaction_event::TransactionEventRequest;
 
-        async fn notify_transaction_event(
-            &self,
-            evse_id: usize,
-            connector_id: usize,
-            kind: TransactionEventKind,
-            transaction: Transaction,
-        ) -> Result<(), Self::Error> {
-            self.send_transaction_event(TransactionEventRequest {
-                custom_data: None,
-                event_type: map_event_type(kind),
-                meter_value: Vec::new(),
-                timestamp: Utc::now(),
-                trigger_reason: trigger_reason_for(kind, &transaction),
-                seq_no: transaction.seq_no as i32,
-                transaction_info: TransactionType {
-                    transaction_id: transaction.id.0.to_string(),
-                    charging_state: Some(map_charging_state(transaction.charging_state)),
-                    time_spent_charging: None,
-                    stopped_reason: transaction.stop_reason.map(map_stop_reason),
-                    remote_start_id: None,
+        #[async_trait::async_trait]
+        impl TransactionNotifier for OCPP2_1Client {
+            type Error = ClientError<OCPP2_1Error>;
+
+            async fn notify_transaction_event(
+                &self,
+                evse_id: usize,
+                connector_id: usize,
+                kind: TransactionEventKind,
+                transaction: Transaction,
+            ) -> Result<(), Self::Error> {
+                self.send_transaction_event(TransactionEventRequest {
                     custom_data: None,
-                },
-                offline: None,
-                number_of_phases_used: None,
-                cable_max_current: None,
-                reservation_id: None,
-                evse: Some(EVSEType {
-                    id: evse_id as i32,
-                    connector_id: Some(connector_id as i32),
-                    custom_data: None,
-                }),
-                id_token: None,
-            })
-            .await?;
-            Ok(())
+                    event_type: map_event_type(kind),
+                    meter_value: Vec::new(),
+                    timestamp: SystemClock.now(),
+                    trigger_reason: trigger_reason_for(kind, &transaction),
+                    seq_no: transaction.seq_no as i32,
+                    transaction_info: TransactionType {
+                        transaction_id: transaction.id.0.to_string(),
+                        charging_state: Some(map_charging_state(transaction.charging_state)),
+                        time_spent_charging: None,
+                        stopped_reason: transaction.stop_reason.map(map_stop_reason),
+                        remote_start_id: None,
+                        custom_data: None,
+                    },
+                    offline: None,
+                    number_of_phases_used: None,
+                    cable_max_current: None,
+                    reservation_id: None,
+                    evse: Some(EVSEType {
+                        id: evse_id as i32,
+                        connector_id: Some(connector_id as i32),
+                        custom_data: None,
+                    }),
+                    id_token: None,
+                })
+                .await?;
+                Ok(())
+            }
         }
     }
 

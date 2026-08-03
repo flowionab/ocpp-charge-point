@@ -121,16 +121,12 @@ mod tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    use super::StatusNotifier;
     use crate::state::ConnectorStatus;
-    use alloc::boxed::Box;
-    use chrono::Utc;
-    use ocpp_client::ClientError;
-    use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::rust_ocpp::v2_1::messages::status_notification::{
-        ConnectorStatusEnumType, StatusNotificationRequest,
-    };
+    use ocpp_client::rust_ocpp::v2_1::messages::status_notification::ConnectorStatusEnumType;
 
+    // Only consumed by `with_system_clock` below (`std`-gated) and by this module's own tests;
+    // without either, it's legitimately unused.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_status(status: ConnectorStatus) -> ConnectorStatusEnumType {
         match status {
             ConnectorStatus::Available => ConnectorStatusEnumType::Available,
@@ -141,25 +137,40 @@ mod ocpp_2_1 {
         }
     }
 
-    #[async_trait::async_trait]
-    impl StatusNotifier for OCPP2_1Client {
-        type Error = ClientError<OCPP2_1Error>;
+    // `StatusNotificationRequest` needs a timestamp; producing one without a caller-supplied
+    // `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so this impl - unlike
+    // the rest of this file - needs both `ocpp_2_1` and `std`.
+    #[cfg(feature = "std")]
+    mod with_system_clock {
+        use super::map_status;
+        use crate::availability::StatusNotifier;
+        use crate::clock::{Clock, SystemClock};
+        use crate::state::ConnectorStatus;
+        use alloc::boxed::Box;
+        use ocpp_client::ClientError;
+        use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
+        use ocpp_client::rust_ocpp::v2_1::messages::status_notification::StatusNotificationRequest;
 
-        async fn notify_status(
-            &self,
-            evse_id: usize,
-            connector_id: usize,
-            status: ConnectorStatus,
-        ) -> Result<(), Self::Error> {
-            self.send_status_notification(StatusNotificationRequest {
-                custom_data: None,
-                timestamp: Utc::now(),
-                connector_status: map_status(status),
-                evse_id: evse_id as i32,
-                connector_id: connector_id as i32,
-            })
-            .await?;
-            Ok(())
+        #[async_trait::async_trait]
+        impl StatusNotifier for OCPP2_1Client {
+            type Error = ClientError<OCPP2_1Error>;
+
+            async fn notify_status(
+                &self,
+                evse_id: usize,
+                connector_id: usize,
+                status: ConnectorStatus,
+            ) -> Result<(), Self::Error> {
+                self.send_status_notification(StatusNotificationRequest {
+                    custom_data: None,
+                    timestamp: SystemClock.now(),
+                    connector_status: map_status(status),
+                    evse_id: evse_id as i32,
+                    connector_id: connector_id as i32,
+                })
+                .await?;
+                Ok(())
+            }
         }
     }
 

@@ -5,6 +5,8 @@ extern crate alloc;
 pub mod actor;
 pub mod authorization;
 pub mod availability;
+pub mod clock;
+pub mod executor;
 pub mod hardware;
 pub mod provisioning;
 mod runtime;

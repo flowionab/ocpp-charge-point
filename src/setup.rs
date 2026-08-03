@@ -1,23 +1,32 @@
 use crate::ChargePointRuntime;
 use crate::authorization::{Authorizer, run_authorization_requests};
 use crate::availability::{StatusNotifier, run_status_notifications};
+use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
-use crate::provisioning::{BootNotifier, HeartbeatSender, TokioBackoff, run_heartbeat};
+use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
 use crate::transactions::{TransactionNotifier, run_transaction_events};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 /// Starts the hardware, then runs the Provisioning functional block's BootNotification
-/// exchange (retrying with backoff on `Pending`/`Rejected` or a transport failure - see
-/// [`ChargePointRuntime::register_until_accepted`]). Once accepted, spawns background tasks
-/// that send a Heartbeat at the interval the CSMS returned, forward every connector status
-/// change to the CSMS via StatusNotification, forward every transaction lifecycle event via
-/// TransactionEvent, and answer every presented-id-token authorization request via Authorize,
-/// for as long as the process runs.
-pub async fn setup<T, E, C, N>(
+/// exchange (retrying with `backoff` on `Pending`/`Rejected` or a transport failure - see
+/// [`ChargePointRuntime::register_until_accepted`]). Once accepted, uses `executor` to spawn
+/// background tasks that send a Heartbeat at the interval the CSMS returned, forward every
+/// connector status change to the CSMS via StatusNotification, forward every transaction
+/// lifecycle event via TransactionEvent, and answer every presented-id-token authorization
+/// request via Authorize, for as long as the process runs.
+///
+/// `executor`/`backoff` are caller-supplied (rather than defaulting to tokio) so this function
+/// doesn't hard-depend on an async runtime - std/tokio users can pass
+/// [`crate::executor::TokioExecutor`]/[`crate::provisioning::TokioBackoff`]; embedded targets
+/// supply their own.
+pub async fn setup<T, E, C, N, X, B>(
     charge_point: T,
     csms: N,
+    executor: X,
+    backoff: B,
 ) -> Result<ChargePointRuntime<T>, T::StartError>
 where
     T: ChargePoint<E, C>,
@@ -32,6 +41,8 @@ where
         + Send
         + Sync
         + 'static,
+    X: Executor,
+    B: Backoff + Clone + Send + Sync + 'static,
 {
     tracing::info!(
         vendor = charge_point.vendor_name().await,
@@ -60,29 +71,30 @@ where
     let vendor_name = hardware.vendor_name().await;
     let model_name = hardware.model_name().await;
     let outcome = runtime
-        .register_until_accepted(&csms, &TokioBackoff, vendor_name, model_name)
+        .register_until_accepted(&csms, &backoff, vendor_name, model_name)
         .await;
 
     let heartbeat_sender = csms.clone();
-    tokio::spawn(async move {
-        run_heartbeat(&heartbeat_sender, &TokioBackoff, outcome.interval_secs).await;
-    });
+    let heartbeat_backoff = backoff.clone();
+    executor.spawn(Box::pin(async move {
+        run_heartbeat(&heartbeat_sender, &heartbeat_backoff, outcome.interval_secs).await;
+    }));
 
     let status_notifier = csms.clone();
-    tokio::spawn(async move {
+    executor.spawn(Box::pin(async move {
         run_status_notifications(status_changes, &status_notifier).await;
-    });
+    }));
 
     let transaction_notifier = csms.clone();
-    tokio::spawn(async move {
+    executor.spawn(Box::pin(async move {
         run_transaction_events(transaction_events, &transaction_notifier).await;
-    });
+    }));
 
     let authorizer = csms.clone();
     let actor = runtime.actor();
-    tokio::spawn(async move {
+    executor.spawn(Box::pin(async move {
         run_authorization_requests(authorization_requests, &authorizer, actor).await;
-    });
+    }));
 
     Ok(runtime)
 }
@@ -90,11 +102,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::setup;
+    use crate::executor::TokioExecutor;
     use crate::hardware::{
         ChargePoint, Connector, Evse, HardwareCommandReceiver, HardwareEventSender,
         execute_hardware_command,
     };
     use crate::provisioning::BootNotificationOutcome;
+    use crate::provisioning::TokioBackoff;
     use crate::provisioning::test_support::FixedBootNotifier;
     use crate::state::{
         ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, RegistrationStatus,
@@ -217,6 +231,8 @@ mod tests {
                 }],
             },
             accepted_boot_notifier(),
+            TokioExecutor,
+            TokioBackoff,
         )
         .await
         .unwrap();
@@ -241,6 +257,8 @@ mod tests {
                 }],
             },
             accepted_boot_notifier(),
+            TokioExecutor,
+            TokioBackoff,
         )
         .await
         .unwrap();

@@ -41,7 +41,10 @@ pub trait Backoff {
     async fn wait(&self, seconds: u32);
 }
 
-/// A [`Backoff`] backed by `tokio::time::sleep`.
+/// A [`Backoff`] backed by `tokio::time::sleep`. Not gated behind the `std` feature: tokio is
+/// still a mandatory dependency of this crate regardless (see `docs/ROADMAP.md` §0) - that will
+/// change once the channel abstraction lands, at which point this impl will move behind a real
+/// `tokio-runtime` feature.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokioBackoff;
 

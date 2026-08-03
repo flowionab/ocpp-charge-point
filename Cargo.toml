@@ -9,7 +9,11 @@ authors = ["Joatin Granlund <joatin@granlund.io>"]
 keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
 
 [features]
-std = []
+# Forwards to ocpp-client's own `std` feature (validator/regex-based payload validation) and
+# to chrono's `clock` feature (`Utc::now()`, used by `clock::SystemClock`). Everything else in
+# this crate still hard-depends on tokio for now (see docs/ROADMAP.md §0) - disabling this
+# feature alone does not yet produce a no_std build.
+std = ["ocpp-client/std", "chrono/clock"]
 default = ["ocpp_1_6", "ocpp_2_0_1", "ocpp_2_1"]
 ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
 ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
@@ -17,10 +21,10 @@ ocpp_2_1 = ["ocpp-client/ocpp_2_1"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"] }
-ocpp-client = { git = "https://github.com/flowionab/ocpp-client" }
+ocpp-client = { git = "https://github.com/flowionab/ocpp-client", default-features = false }
 async-trait = "^0.1"
 tracing = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"]}

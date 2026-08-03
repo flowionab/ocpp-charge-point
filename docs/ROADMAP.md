@@ -45,22 +45,49 @@ Not a functional block, but a prerequisite for all of them.
   injection tests yet.
 - ⬜ Rustdoc coverage pass on all public APIs (see `CLAUDE.md` documentation
   standard).
-- ⬜ Real `no_std` support. `lib.rs` already gates on `#![cfg_attr(not(feature
-  = "std"), no_std)]`, but this is aspirational today: `tokio`'s
-  mpsc/broadcast/oneshot/watch/time are hard, unconditional dependencies in
-  `actor.rs`, `runtime.rs`, `provisioning.rs` (`TokioBackoff`), and
-  `availability.rs` (its status-change broadcast channel); `chrono`'s
-  `clock` feature (used in `availability.rs` to timestamp
-  StatusNotification) is a hard std dependency too; and our `ocpp-client`
-  dependency isn't `default-features = false` - its own `std` and
-  `tokio-runtime` features are always on regardless of our `std` feature.
-  Closing this gap needs: an `Executor`/`Timer` abstraction (`ocpp-client`
-  already has one - see its `Executor`/`Timer` traits and
-  `TokioExecutor`/`TokioTimer`) so the actor and any `Backoff` impl don't
-  hard-depend on tokio, a non-`clock` way to obtain the current time (an
-  injected clock trait, mirroring `Backoff`), and gating `ocpp-client`'s
-  features behind our own `std` feature so embedded targets don't pull in
-  std/tokio transitively.
+- 🚧 Real `no_std` support. `lib.rs` gates on `#![cfg_attr(not(feature =
+  "std"), no_std)]`; two pieces of dependency/clock hygiene are done, the
+  big one (an executor/channel abstraction) is not:
+  - ✅ `ocpp-client = { ..., default-features = false }`, with our own
+    features forwarding only what's needed (`ocpp_1_6`/`ocpp_2_0_1`/
+    `ocpp_2_1` map to its same-named features; our `std` feature forwards
+    to its `std`). `ocpp-client`'s own `std`/`tokio-runtime` are no longer
+    pulled in transitively regardless of our feature flags.
+  - ✅ `chrono`'s `clock` feature (needed for `Utc::now()`, itself a hard
+    std dependency) is now gated behind our own `std` feature rather than
+    unconditional. A new `clock::Clock` trait (mirroring `Backoff`) plus a
+    `std`-gated `clock::SystemClock` impl replace direct `Utc::now()`
+    calls. The two OCPP2_1Client adapters that need a timestamp
+    (`StatusNotifier`, `TransactionNotifier`) now live in a
+    `with_system_clock` submodule requiring both `ocpp_2_1` **and** `std`;
+    `BootNotifier`/`HeartbeatSender`/`Authorizer` needed no timestamp and
+    were already std-independent. `cargo build`/`cargo test` with default
+    features (`std` off) now succeed cleanly (42 tests), as does
+    `--no-default-features` (32 tests) and `--features std` /
+    `--all-features`.
+  - 🚧 `setup()`'s four `tokio::spawn` calls (heartbeat, status,
+    transaction, authorization loops) now go through a new `executor::
+    Executor` trait (mirroring `ocpp-client`'s own `Executor`) instead of
+    calling `tokio::spawn` directly - `setup()` takes an `executor: X`
+    parameter (plus a `backoff: B` parameter, replacing the previously
+    hardcoded `TokioBackoff`), so std/tokio users pass
+    `executor::TokioExecutor`/`provisioning::TokioBackoff` explicitly and
+    embedded targets can supply their own. `TokioExecutor`/`TokioBackoff`
+    are deliberately **not** gated behind `std`, unlike `SystemClock`:
+    tokio is still a mandatory, unconditional Cargo dependency of this
+    crate regardless of feature flags (see below), so gating them would
+    only break the default build without reflecting any real constraint;
+    they'll move behind a real `tokio-runtime` feature once tokio itself
+    becomes optional.
+  - ⬜ `tokio`'s mpsc/broadcast/oneshot/watch are still hard, unconditional
+    dependencies in `actor.rs` and `runtime.rs` (the mailbox and the three
+    broadcast fanouts: status, transaction, authorization; plus the
+    state-watch mechanism). This is the remaining, larger piece:
+    `embassy-sync`-backed (or trait-based) replacements for all of these,
+    mirroring `ocpp-client`'s own `src/sync.rs`. Until this lands, the
+    `tokio` dependency itself can't become `optional`, so disabling `std`
+    narrows what ocpp-client/chrono pull in but does not yet produce an
+    actual no_std build of this crate.
 
 ---
 

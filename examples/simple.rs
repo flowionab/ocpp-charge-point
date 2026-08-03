@@ -1,7 +1,10 @@
 use ocpp_charge_point::authorization::Authorizer;
 use ocpp_charge_point::availability::StatusNotifier;
+use ocpp_charge_point::executor::TokioExecutor;
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
-use ocpp_charge_point::provisioning::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
+use ocpp_charge_point::provisioning::{
+    BootNotificationOutcome, BootNotifier, HeartbeatSender, TokioBackoff,
+};
 use ocpp_charge_point::setup;
 use ocpp_charge_point::state::{
     AuthorizationStatus, ChargePointEvent, ConnectorEvent, ConnectorStatus, EvseEvent, IdToken,
@@ -165,7 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let runtime = setup(SampleChargePoint::new(), AlwaysAcceptBootNotifier).await?;
+    let runtime = setup(
+        SampleChargePoint::new(),
+        AlwaysAcceptBootNotifier,
+        TokioExecutor,
+        TokioBackoff,
+    )
+    .await?;
     runtime
         .send(ChargePointEvent::Evse {
             evse_id: 1,
