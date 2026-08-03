@@ -1,4 +1,4 @@
-use crate::state::ConnectorEvent;
+use crate::state::{ConnectorEvent, ConnectorStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectorState {
@@ -26,6 +26,22 @@ pub(crate) struct ConnectorTransition {
 }
 
 impl ConnectorState {
+    /// The status reported to the CSMS via StatusNotification for this connector state.
+    ///
+    /// Several internal states map to the same OCPP-visible status (e.g. `Locked` and
+    /// `Charging` are both `Occupied`) - only an actual change in this mapped value should
+    /// trigger a StatusNotification, not every internal transition.
+    pub fn availability_status(&self) -> ConnectorStatus {
+        match self {
+            Self::Available => ConnectorStatus::Available,
+            Self::Connected | Self::Locked | Self::Starting | Self::Charging | Self::Unlocking => {
+                ConnectorStatus::Occupied
+            }
+            Self::Unavailable => ConnectorStatus::Unavailable,
+            Self::Faulted | Self::FaultedSafe => ConnectorStatus::Faulted,
+        }
+    }
+
     pub(crate) fn apply(&mut self, event: ConnectorEvent) -> ConnectorTransition {
         let (next, command) = match (*self, event) {
             (Self::Available, ConnectorEvent::CableConnected) => {

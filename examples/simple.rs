@@ -1,6 +1,55 @@
+use ocpp_charge_point::availability::StatusNotifier;
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
+use ocpp_charge_point::provisioning::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
 use ocpp_charge_point::setup;
-use ocpp_charge_point::state::{ChargePointEvent, EvseEvent, ConnectorEvent};
+use ocpp_charge_point::state::{
+    ChargePointEvent, ConnectorEvent, ConnectorStatus, EvseEvent, RegistrationStatus,
+};
+
+/// A stand-in for a real CSMS connection. Real deployments pass an `ocpp-client` version
+/// client (e.g. `ocpp_client::connect_2_1`) instead, which already implements `BootNotifier`,
+/// `HeartbeatSender`, and `StatusNotifier`.
+#[derive(Clone)]
+struct AlwaysAcceptBootNotifier;
+
+#[async_trait::async_trait]
+impl BootNotifier for AlwaysAcceptBootNotifier {
+    type Error = core::convert::Infallible;
+
+    async fn notify_boot(
+        &self,
+        _vendor_name: &str,
+        _model_name: &str,
+    ) -> Result<BootNotificationOutcome, Self::Error> {
+        Ok(BootNotificationOutcome {
+            status: RegistrationStatus::Accepted,
+            interval_secs: 300,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl HeartbeatSender for AlwaysAcceptBootNotifier {
+    type Error = core::convert::Infallible;
+
+    async fn send_heartbeat(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl StatusNotifier for AlwaysAcceptBootNotifier {
+    type Error = core::convert::Infallible;
+
+    async fn notify_status(
+        &self,
+        _evse_id: usize,
+        _connector_id: usize,
+        _status: ConnectorStatus,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 struct SampleChargePoint {
     evses: [SampleEvse; 2],
@@ -89,8 +138,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let runtime = setup(SampleChargePoint::new()).await?;
-    runtime.send(ChargePointEvent::Evse{ evse_id: 1, event: EvseEvent::Connector { connector_id: 1, event: ConnectorEvent::CableConnected }}).await.unwrap();
+    let runtime = setup(SampleChargePoint::new(), AlwaysAcceptBootNotifier).await?;
+    runtime
+        .send(ChargePointEvent::Evse {
+            evse_id: 1,
+            event: EvseEvent::Connector {
+                connector_id: 1,
+                event: ConnectorEvent::CableConnected,
+            },
+        })
+        .await
+        .unwrap();
 
     Ok(())
 }

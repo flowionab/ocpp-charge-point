@@ -1,12 +1,26 @@
 use crate::ChargePointRuntime;
+use crate::availability::{StatusNotifier, run_status_notifications};
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
+use crate::provisioning::{BootNotifier, HeartbeatSender, TokioBackoff, run_heartbeat};
 use alloc::vec::Vec;
 
-pub async fn setup<T: ChargePoint<E, C>, E: Evse<C>, C: Connector>(
+/// Starts the hardware, then runs the Provisioning functional block's BootNotification
+/// exchange (retrying with backoff on `Pending`/`Rejected` or a transport failure - see
+/// [`ChargePointRuntime::register_until_accepted`]). Once accepted, spawns background tasks
+/// that send a Heartbeat at the interval the CSMS returned, and forward every connector status
+/// change to the CSMS via StatusNotification, for as long as the process runs.
+pub async fn setup<T, E, C, N>(
     charge_point: T,
-) -> Result<ChargePointRuntime<T>, T::StartError> {
+    csms: N,
+) -> Result<ChargePointRuntime<T>, T::StartError>
+where
+    T: ChargePoint<E, C>,
+    E: Evse<C>,
+    C: Connector,
+    N: BootNotifier + HeartbeatSender + StatusNotifier + Clone + Send + Sync + 'static,
+{
     tracing::info!(
         vendor = charge_point.vendor_name().await,
         model = charge_point.model_name().await,
@@ -19,10 +33,30 @@ pub async fn setup<T: ChargePoint<E, C>, E: Evse<C>, C: Connector>(
     }
 
     let runtime = ChargePointRuntime::new(charge_point, connector_counts);
+    // Subscribe before starting the hardware so status changes fired during `start()` (e.g. a
+    // connector that's already occupied at boot) are buffered rather than lost.
+    let status_changes = runtime.subscribe_status_notifications();
     runtime
         .hardware()
         .start(runtime.hardware_events(), runtime.hardware_commands())
         .await?;
+
+    let hardware = runtime.hardware();
+    let vendor_name = hardware.vendor_name().await;
+    let model_name = hardware.model_name().await;
+    let outcome = runtime
+        .register_until_accepted(&csms, &TokioBackoff, vendor_name, model_name)
+        .await;
+
+    let heartbeat_sender = csms.clone();
+    tokio::spawn(async move {
+        run_heartbeat(&heartbeat_sender, &TokioBackoff, outcome.interval_secs).await;
+    });
+
+    let status_notifier = csms.clone();
+    tokio::spawn(async move {
+        run_status_notifications(status_changes, &status_notifier).await;
+    });
 
     Ok(runtime)
 }
@@ -34,11 +68,22 @@ mod tests {
         ChargePoint, Connector, Evse, HardwareCommandReceiver, HardwareEventSender,
         execute_hardware_command,
     };
-    use crate::state::{ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent};
+    use crate::provisioning::BootNotificationOutcome;
+    use crate::provisioning::test_support::FixedBootNotifier;
+    use crate::state::{
+        ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, RegistrationStatus,
+    };
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use core::convert::Infallible;
     use core::sync::atomic::{AtomicBool, Ordering};
+
+    fn accepted_boot_notifier() -> FixedBootNotifier {
+        FixedBootNotifier(BootNotificationOutcome {
+            status: RegistrationStatus::Accepted,
+            interval_secs: 60,
+        })
+    }
 
     struct TestChargePoint {
         evses: [TestEvse; 1],
@@ -136,14 +181,17 @@ mod tests {
     #[tokio::test]
     async fn setup_routes_startup_hardware_events_into_runtime_state() {
         let locked = Arc::new(AtomicBool::new(false));
-        let runtime = setup(TestChargePoint {
-            evses: [TestEvse {
-                connectors: [TestConnector {
-                    locked: locked.clone(),
-                    lock_succeeds: true,
+        let runtime = setup(
+            TestChargePoint {
+                evses: [TestEvse {
+                    connectors: [TestConnector {
+                        locked: locked.clone(),
+                        lock_succeeds: true,
+                    }],
                 }],
-            }],
-        })
+            },
+            accepted_boot_notifier(),
+        )
         .await
         .unwrap();
 
@@ -157,14 +205,17 @@ mod tests {
     #[tokio::test]
     async fn a_failed_hardware_command_reports_a_connector_fault() {
         let locked = Arc::new(AtomicBool::new(false));
-        let runtime = setup(TestChargePoint {
-            evses: [TestEvse {
-                connectors: [TestConnector {
-                    locked: locked.clone(),
-                    lock_succeeds: false,
+        let runtime = setup(
+            TestChargePoint {
+                evses: [TestEvse {
+                    connectors: [TestConnector {
+                        locked: locked.clone(),
+                        lock_succeeds: false,
+                    }],
                 }],
-            }],
-        })
+            },
+            accepted_boot_notifier(),
+        )
         .await
         .unwrap();
 

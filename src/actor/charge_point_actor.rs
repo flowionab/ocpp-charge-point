@@ -1,8 +1,11 @@
-use crate::state::{ChargePointEffect, ChargePointEvent, ChargePointState, HardwareCommand};
+use crate::state::{
+    ChargePointEffect, ChargePointEvent, ChargePointState, ConnectorStatusChanged, HardwareCommand,
+};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const MAILBOX_CAPACITY: usize = 32;
 const COMMAND_CAPACITY: usize = 32;
+const STATUS_NOTIFICATION_CAPACITY: usize = 32;
 
 enum Command {
     Event {
@@ -21,6 +24,7 @@ pub struct ChargePointActor {
     sender: mpsc::Sender<Command>,
     state: watch::Receiver<ChargePointState>,
     commands: broadcast::Sender<HardwareCommand>,
+    status_notifications: broadcast::Sender<ConnectorStatusChanged>,
 }
 
 impl ChargePointActor {
@@ -29,12 +33,20 @@ impl ChargePointActor {
         let (sender, receiver) = mpsc::channel(MAILBOX_CAPACITY);
         let (updates, state_receiver) = watch::channel(state.clone());
         let (commands, _) = broadcast::channel(COMMAND_CAPACITY);
-        tokio::spawn(run(state, receiver, updates, commands.clone()));
+        let (status_notifications, _) = broadcast::channel(STATUS_NOTIFICATION_CAPACITY);
+        tokio::spawn(run(
+            state,
+            receiver,
+            updates,
+            commands.clone(),
+            status_notifications.clone(),
+        ));
 
         Self {
             sender,
             state: state_receiver,
             commands,
+            status_notifications,
         }
     }
 
@@ -61,6 +73,10 @@ impl ChargePointActor {
     pub fn subscribe_commands(&self) -> broadcast::Receiver<HardwareCommand> {
         self.commands.subscribe()
     }
+
+    pub fn subscribe_status_notifications(&self) -> broadcast::Receiver<ConnectorStatusChanged> {
+        self.status_notifications.subscribe()
+    }
 }
 
 async fn run(
@@ -68,6 +84,7 @@ async fn run(
     mut receiver: mpsc::Receiver<Command>,
     updates: watch::Sender<ChargePointState>,
     commands: broadcast::Sender<HardwareCommand>,
+    status_notifications: broadcast::Sender<ConnectorStatusChanged>,
 ) {
     while let Some(command) = receiver.recv().await {
         match command {
@@ -84,6 +101,9 @@ async fn run(
                         }
                         ChargePointEffect::HardwareCommand(command) => {
                             let _ = commands.send(command);
+                        }
+                        ChargePointEffect::StatusNotification(changed) => {
+                            let _ = status_notifications.send(changed);
                         }
                     }
                 }

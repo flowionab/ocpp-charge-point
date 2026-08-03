@@ -7,7 +7,7 @@ mod tests {
     use super::ChargePointActor;
     use crate::state::{
         ChargePointEffect, ChargePointEvent, ChargePointState, ConnectorEvent, ConnectorState,
-        EvseEvent, HardwareCommand, LifecycleState,
+        ConnectorStatus, ConnectorStatusChanged, EvseEvent, HardwareCommand, LifecycleState,
     };
     use alloc::vec;
 
@@ -30,6 +30,11 @@ mod tests {
                 ChargePointEffect::HardwareCommand(HardwareCommand::LockConnector {
                     evse_id: 0,
                     connector_id: 1,
+                }),
+                ChargePointEffect::StatusNotification(ConnectorStatusChanged {
+                    evse_id: 0,
+                    connector_id: 1,
+                    status: ConnectorStatus::Occupied,
                 }),
             ]
         );
@@ -69,6 +74,11 @@ mod tests {
                 ChargePointEffect::HardwareCommand(HardwareCommand::LockConnector {
                     evse_id: 0,
                     connector_id: 0,
+                }),
+                ChargePointEffect::StatusNotification(ConnectorStatusChanged {
+                    evse_id: 0,
+                    connector_id: 0,
+                    status: ConnectorStatus::Occupied,
                 }),
             ]
         );
@@ -120,6 +130,11 @@ mod tests {
                     evse_id: 0,
                     connector_id: 0,
                 }),
+                ChargePointEffect::StatusNotification(ConnectorStatusChanged {
+                    evse_id: 0,
+                    connector_id: 0,
+                    status: ConnectorStatus::Faulted,
+                }),
             ]
         );
 
@@ -146,6 +161,11 @@ mod tests {
                 ChargePointEffect::HardwareCommand(HardwareCommand::UnlockConnector {
                     evse_id: 0,
                     connector_id: 0,
+                }),
+                ChargePointEffect::StatusNotification(ConnectorStatusChanged {
+                    evse_id: 0,
+                    connector_id: 0,
+                    status: ConnectorStatus::Occupied,
                 }),
             ]
         );

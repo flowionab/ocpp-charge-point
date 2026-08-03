@@ -10,15 +10,17 @@ keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
 
 [features]
 std = []
-default = ["ocpp_1_6", "ocpp_2_0_1"]
+default = ["ocpp_1_6", "ocpp_2_0_1", "ocpp_2_1"]
 ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
 ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
+ocpp_2_1 = ["ocpp-client/ocpp_2_1"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 ocpp-client = { git = "https://github.com/flowionab/ocpp-client" }
 async-trait = "^0.1"
 tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"]}

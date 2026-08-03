@@ -1,7 +1,12 @@
 use crate::actor::{ActorError, ChargePointActor};
 use crate::hardware::{HardwareCommandReceiver, HardwareEventSender};
-use crate::state::{ChargePointEvent, ChargePointState};
-use tokio::sync::watch;
+use crate::provisioning::{
+    Backoff, BootNotificationOutcome, BootNotifier, DEFAULT_RETRY_INTERVAL_SECS,
+};
+use crate::state::{
+    ChargePointEvent, ChargePointState, ConnectorStatusChanged, RegistrationStatus,
+};
+use tokio::sync::{broadcast, watch};
 
 pub struct ChargePointRuntime<T = ()> {
     hardware: T,
@@ -20,12 +25,68 @@ impl<T> ChargePointRuntime<T> {
         self.actor.send(event).await
     }
 
+    /// Runs the Provisioning functional block's BootNotification exchange: sends a
+    /// BootNotification via `notifier` and applies the CSMS's decision to the charge point's
+    /// state (see `ChargePointEvent::RegistrationStatusReceived`).
+    ///
+    /// This performs a single BootNotification attempt. On `Pending`/`Rejected`, callers are
+    /// responsible for retrying after the returned outcome's interval, per the OCPP spec.
+    pub async fn register<N: BootNotifier>(
+        &self,
+        notifier: &N,
+        vendor_name: &str,
+        model_name: &str,
+    ) -> Result<RegistrationStatus, N::Error> {
+        let outcome = notifier.notify_boot(vendor_name, model_name).await?;
+        let _ = self
+            .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
+            .await;
+        Ok(outcome.status)
+    }
+
+    /// Runs BootNotification repeatedly until the CSMS accepts registration, applying every
+    /// intermediate decision to the charge point's state. Per OCPP, a charge point does not
+    /// give up: on `Pending`/`Rejected` it waits the response's `interval_secs` before retrying,
+    /// and on a transport-level failure it waits [`DEFAULT_RETRY_INTERVAL_SECS`] instead.
+    pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
+        &self,
+        notifier: &N,
+        backoff: &B,
+        vendor_name: &str,
+        model_name: &str,
+    ) -> BootNotificationOutcome {
+        loop {
+            match notifier.notify_boot(vendor_name, model_name).await {
+                Ok(outcome) => {
+                    let _ = self
+                        .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
+                        .await;
+                    if outcome.status == RegistrationStatus::Accepted {
+                        return outcome;
+                    }
+                    backoff.wait(outcome.interval_secs).await;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "boot notification failed, retrying");
+                    backoff.wait(DEFAULT_RETRY_INTERVAL_SECS).await;
+                }
+            }
+        }
+    }
+
     pub fn hardware_events(&self) -> HardwareEventSender {
         HardwareEventSender::new(self.actor.clone())
     }
 
     pub fn hardware_commands(&self) -> HardwareCommandReceiver {
         HardwareCommandReceiver::new(self.actor.subscribe_commands())
+    }
+
+    /// Subscribes to connector status changes for the Availability functional block. Subscribe
+    /// before starting the hardware so early transitions (e.g. a connector already occupied at
+    /// startup) aren't missed - the channel buffers them until a consumer reads them.
+    pub fn subscribe_status_notifications(&self) -> broadcast::Receiver<ConnectorStatusChanged> {
+        self.actor.subscribe_status_notifications()
     }
 
     pub fn state(&self) -> ChargePointState {
@@ -44,9 +105,215 @@ impl<T> ChargePointRuntime<T> {
 #[cfg(test)]
 mod tests {
     use super::ChargePointRuntime;
+    use crate::provisioning::{BootNotificationOutcome, BootNotifier};
     use crate::state::{
         ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, LifecycleState,
+        RegistrationStatus,
     };
+    use alloc::boxed::Box;
+
+    struct FakeBootNotifier {
+        outcome: BootNotificationOutcome,
+    }
+
+    #[async_trait::async_trait]
+    impl BootNotifier for FakeBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_boot(
+            &self,
+            vendor_name: &str,
+            model_name: &str,
+        ) -> Result<BootNotificationOutcome, Self::Error> {
+            assert_eq!(vendor_name, "Acme");
+            assert_eq!(model_name, "Charger 9000");
+            Ok(self.outcome)
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_registration_makes_the_charge_point_available() {
+        let runtime = ChargePointRuntime::new((), [1]);
+        let notifier = FakeBootNotifier {
+            outcome: BootNotificationOutcome {
+                status: RegistrationStatus::Accepted,
+                interval_secs: 60,
+            },
+        };
+        let mut states = runtime.subscribe();
+
+        let status = runtime
+            .register(&notifier, "Acme", "Charger 9000")
+            .await
+            .unwrap();
+        states.changed().await.unwrap();
+
+        assert_eq!(status, RegistrationStatus::Accepted);
+        assert_eq!(
+            runtime.state().registration,
+            Some(RegistrationStatus::Accepted)
+        );
+        assert_eq!(runtime.state().lifecycle, LifecycleState::Available);
+    }
+
+    #[tokio::test]
+    async fn pending_registration_records_status_without_becoming_available() {
+        let runtime = ChargePointRuntime::new((), [1]);
+        let notifier = FakeBootNotifier {
+            outcome: BootNotificationOutcome {
+                status: RegistrationStatus::Pending,
+                interval_secs: 10,
+            },
+        };
+        let mut states = runtime.subscribe();
+
+        let status = runtime
+            .register(&notifier, "Acme", "Charger 9000")
+            .await
+            .unwrap();
+        states.changed().await.unwrap();
+
+        assert_eq!(status, RegistrationStatus::Pending);
+        assert_eq!(
+            runtime.state().registration,
+            Some(RegistrationStatus::Pending)
+        );
+        assert_eq!(runtime.state().lifecycle, LifecycleState::Booting);
+    }
+
+    struct ScriptedBootNotifier {
+        responses: alloc::vec::Vec<BootNotificationOutcome>,
+        calls: core::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BootNotifier for ScriptedBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_boot(
+            &self,
+            _vendor_name: &str,
+            _model_name: &str,
+        ) -> Result<BootNotificationOutcome, Self::Error> {
+            let index = self
+                .calls
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            Ok(self.responses[index])
+        }
+    }
+
+    struct FlakyThenAcceptedNotifier {
+        remaining_failures: core::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct FakeTransportError;
+
+    impl core::fmt::Display for FakeTransportError {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("simulated transport failure")
+        }
+    }
+
+    impl core::error::Error for FakeTransportError {}
+
+    #[async_trait::async_trait]
+    impl BootNotifier for FlakyThenAcceptedNotifier {
+        type Error = FakeTransportError;
+
+        async fn notify_boot(
+            &self,
+            _vendor_name: &str,
+            _model_name: &str,
+        ) -> Result<BootNotificationOutcome, Self::Error> {
+            if self
+                .remaining_failures
+                .fetch_update(
+                    core::sync::atomic::Ordering::SeqCst,
+                    core::sync::atomic::Ordering::SeqCst,
+                    |n| if n > 0 { Some(n - 1) } else { None },
+                )
+                .is_ok()
+            {
+                Err(FakeTransportError)
+            } else {
+                Ok(BootNotificationOutcome {
+                    status: RegistrationStatus::Accepted,
+                    interval_secs: 60,
+                })
+            }
+        }
+    }
+
+    struct NoopBackoff {
+        waits: core::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::Backoff for NoopBackoff {
+        async fn wait(&self, _seconds: u32) {
+            self.waits
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn register_until_accepted_retries_through_pending_and_rejected() {
+        let runtime = ChargePointRuntime::new((), [1]);
+        let notifier = ScriptedBootNotifier {
+            responses: alloc::vec![
+                BootNotificationOutcome {
+                    status: RegistrationStatus::Pending,
+                    interval_secs: 5,
+                },
+                BootNotificationOutcome {
+                    status: RegistrationStatus::Rejected,
+                    interval_secs: 5,
+                },
+                BootNotificationOutcome {
+                    status: RegistrationStatus::Accepted,
+                    interval_secs: 60,
+                },
+            ],
+            calls: core::sync::atomic::AtomicUsize::new(0),
+        };
+        let backoff = NoopBackoff {
+            waits: core::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let outcome = runtime
+            .register_until_accepted(&notifier, &backoff, "Acme", "Charger 9000")
+            .await;
+
+        assert_eq!(outcome.status, RegistrationStatus::Accepted);
+        assert_eq!(outcome.interval_secs, 60);
+        assert_eq!(
+            runtime.state().registration,
+            Some(RegistrationStatus::Accepted)
+        );
+        assert_eq!(runtime.state().lifecycle, LifecycleState::Available);
+        assert_eq!(notifier.calls.load(core::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(backoff.waits.load(core::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn register_until_accepted_retries_past_transport_failures() {
+        let runtime = ChargePointRuntime::new((), [1]);
+        let notifier = FlakyThenAcceptedNotifier {
+            remaining_failures: core::sync::atomic::AtomicUsize::new(2),
+        };
+        let backoff = NoopBackoff {
+            waits: core::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let outcome = runtime
+            .register_until_accepted(&notifier, &backoff, "Acme", "Charger 9000")
+            .await;
+
+        assert_eq!(outcome.status, RegistrationStatus::Accepted);
+        assert_eq!(runtime.state().lifecycle, LifecycleState::Available);
+        assert_eq!(backoff.waits.load(core::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn runtime_routes_hardware_events_to_the_supervisor_actor() {

@@ -1,3 +1,5 @@
+use crate::state::{ConnectorStatus, RegistrationStatus};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChargePointEvent {
     BootCompleted,
@@ -5,7 +7,12 @@ pub enum ChargePointEvent {
     SetUnavailable,
     HardwareFault,
     FaultCleared,
-    Evse { evse_id: usize, event: EvseEvent },
+    /// The CSMS answered a BootNotification with its registration decision.
+    RegistrationStatusReceived(RegistrationStatus),
+    Evse {
+        evse_id: usize,
+        event: EvseEvent,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +46,17 @@ pub enum ConnectorEvent {
 pub enum ChargePointEffect {
     StateChanged,
     HardwareCommand(HardwareCommand),
+    /// A connector's OCPP-visible status changed; the Availability functional block reports
+    /// this to the CSMS via StatusNotification.
+    StatusNotification(ConnectorStatusChanged),
+}
+
+/// A connector's [`ConnectorStatus`] changed, reported to the CSMS via StatusNotification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectorStatusChanged {
+    pub evse_id: usize,
+    pub connector_id: usize,
+    pub status: ConnectorStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
