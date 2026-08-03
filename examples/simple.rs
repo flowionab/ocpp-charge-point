@@ -1,5 +1,6 @@
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
 use ocpp_charge_point::setup;
+use ocpp_charge_point::state::{ChargePointEvent, EvseEvent, ConnectorEvent};
 
 struct SampleChargePoint {
     evses: [SampleEvse; 2],
@@ -88,7 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let _runtime = setup(SampleChargePoint::new()).await?;
+    let runtime = setup(SampleChargePoint::new()).await?;
+    runtime.send(ChargePointEvent::Evse{ evse_id: 1, event: EvseEvent::Connector { connector_id: 1, event: ConnectorEvent::CableConnected }}).await.unwrap();
 
     Ok(())
 }

@@ -75,9 +75,11 @@ async fn run(
                 event,
                 acknowledged,
             } => {
+                tracing::info!(event = ?event, "new charge point event");
                 for effect in state.apply(event) {
                     match effect {
                         ChargePointEffect::StateChanged => {
+                            tracing::info!(state = ?state, "charge point state updated");
                             updates.send_replace(state.clone());
                         }
                         ChargePointEffect::HardwareCommand(command) => {
