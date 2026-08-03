@@ -7,6 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/ocpp-charge-point)](https://crates.io/crates/ocpp-charge-point)
 [![Documentation](https://docs.rs/ocpp-charge-point/badge.svg)](https://docs.rs/ocpp-charge-point)
 [![.github/workflows/ci.yaml](https://github.com/flowionab/ocpp-charge-point/actions/workflows/ci.yaml/badge.svg)](https://github.com/flowionab/ocpp-charge-point/actions/workflows/ci.yaml)
+[![no_std](https://img.shields.io/badge/no__std-supported-blue.svg)](#-no_std-support)
 
 ---
 
@@ -173,6 +174,39 @@ Current targets:
 | Other ARM Cortex-M platforms | Planned        |
 
 Additional platforms can be supported by implementing the required hardware interfaces.
+
+---
+
+## 🔩 no_std Support
+
+OCPP Charge Point is built to run on microcontrollers without an OS.
+
+By default, the crate builds with the `tokio-runtime` feature (which implies `std`) enabled, so `cargo build`/`cargo test` work with zero configuration on a normal host:
+
+```toml
+[dependencies]
+ocpp-charge-point = "0.x"
+```
+
+For a real `#![no_std]` + `alloc` build, disable default features:
+
+```toml
+[dependencies]
+ocpp-charge-point = { version = "0.x", default-features = false, features = ["ocpp_2_1"] }
+```
+
+`cargo check --no-default-features --lib` compiles this crate under `#![no_std]` - internally it's backed by [`embassy-sync`](https://docs.rs/embassy-sync) (`CriticalSectionRawMutex`-based `Mutex`/`Signal`) instead of `tokio::sync`, so no async runtime is baked in.
+
+To link a `--no-default-features` build, an embedded target must:
+
+* register a [`critical-section`](https://docs.rs/critical-section) backend via `critical_section::set_impl!` (the `std` feature does this automatically via `critical-section`'s own `std` backend),
+* implement `ocpp_charge_point::executor::Executor` (how to spawn a background task),
+* implement `ocpp_charge_point::provisioning::Backoff` (how to wait between retries), and
+* implement `ocpp_charge_point::clock::Clock` (how to get the current time), if using the Availability/Transactions functional blocks.
+
+std/tokio users get all four for free (`TokioExecutor`, `TokioBackoff`, `SystemClock`) behind the `tokio-runtime`/`std` features.
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) §0 for the detailed history of what's been abstracted and what's still tracked.
 
 ---
 
