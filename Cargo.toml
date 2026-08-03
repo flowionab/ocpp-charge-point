@@ -12,19 +12,24 @@ keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
 # Forwards to ocpp-client's own `std` feature (validator/regex-based payload validation), to
 # chrono's `clock` feature (`Utc::now()`, used by `clock::SystemClock`), and to
 # critical-section's `std` backend (used by `src/sync.rs`'s embassy-sync-backed primitives, via
-# `CriticalSectionRawMutex` - without a backend registered, any code touching the actor's
-# channels panics at runtime). In default features for zero-config `std` ergonomics, matching
+# `CriticalSectionRawMutex` - without a backend registered, linking any binary that touches the
+# actor's channels fails). Does NOT imply `tokio-runtime`: `std` alone is a real configuration
+# (e.g. a std binary using a non-tokio async executor, supplying its own `Executor`/`Backoff`).
+std = ["ocpp-client/std", "chrono/clock", "critical-section/std"]
+# `TokioExecutor`/`TokioBackoff` (the tokio-backed `Executor`/`Backoff` impls). Implies `std`.
+# Mirrors ocpp-client's own `tokio-runtime` feature/convention.
+tokio-runtime = ["std", "dep:tokio"]
+# `tokio-runtime` (and therefore `std`) in default features for zero-config ergonomics, matching
 # `ocpp-client`'s own convention; embedded targets build with `--no-default-features` and
 # register their own critical-section backend via `critical_section::set_impl!`, plus supply
-# their own `Executor`/`Backoff`/`Clock` (see `docs/ROADMAP.md` §0 for what's still tokio-only).
-std = ["ocpp-client/std", "chrono/clock", "critical-section/std"]
-default = ["std", "ocpp_1_6", "ocpp_2_0_1", "ocpp_2_1"]
+# their own `Executor`/`Backoff`/`Clock` (see `docs/ROADMAP.md` §0).
+default = ["tokio-runtime", "ocpp_1_6", "ocpp_2_0_1", "ocpp_2_1"]
 ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
 ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
 ocpp_2_1 = ["ocpp-client/ocpp_2_1"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
 ocpp-client = { git = "https://github.com/flowionab/ocpp-client", default-features = false }
 async-trait = "^0.1"
 tracing = "0.1"

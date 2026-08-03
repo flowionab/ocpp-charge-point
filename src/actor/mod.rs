@@ -5,6 +5,7 @@ pub use self::charge_point_actor::{ActorError, ChargePointActor};
 #[cfg(test)]
 mod tests {
     use super::ChargePointActor;
+    use crate::executor::TokioExecutor;
     use crate::state::{
         AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
         ConnectorEvent, ConnectorState, ConnectorStatus, ConnectorStatusChanged, EvseEvent,
@@ -211,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn charge_point_actor_serializes_events_and_publishes_latest_state() {
-        let actor = ChargePointActor::spawn([1]);
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
         let mut states = actor.subscribe();
 
         actor.send(ChargePointEvent::BootCompleted).await.unwrap();

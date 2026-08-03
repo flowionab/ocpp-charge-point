@@ -55,7 +55,7 @@ where
         connector_counts.push(evse.connectors().await.len());
     }
 
-    let runtime = ChargePointRuntime::new(charge_point, connector_counts);
+    let runtime = ChargePointRuntime::new(charge_point, connector_counts, &executor);
     // Subscribe before starting the hardware so status/transaction/authorization events fired
     // during `start()` (e.g. a connector that's already occupied at boot) are buffered rather
     // than lost.

@@ -1,4 +1,5 @@
 use crate::actor::{ActorError, ChargePointActor};
+use crate::executor::Executor;
 use crate::hardware::{HardwareCommandReceiver, HardwareEventSender};
 use crate::provisioning::{
     Backoff, BootNotificationOutcome, BootNotifier, DEFAULT_RETRY_INTERVAL_SECS,
@@ -15,10 +16,14 @@ pub struct ChargePointRuntime<T = ()> {
 }
 
 impl<T> ChargePointRuntime<T> {
-    pub fn new(hardware: T, connector_counts: impl IntoIterator<Item = usize>) -> Self {
+    pub fn new(
+        hardware: T,
+        connector_counts: impl IntoIterator<Item = usize>,
+        executor: &dyn Executor,
+    ) -> Self {
         Self {
             hardware,
-            actor: ChargePointActor::spawn(connector_counts),
+            actor: ChargePointActor::spawn(connector_counts, executor),
         }
     }
 
@@ -127,6 +132,7 @@ impl<T> ChargePointRuntime<T> {
 #[cfg(test)]
 mod tests {
     use super::ChargePointRuntime;
+    use crate::executor::TokioExecutor;
     use crate::provisioning::{BootNotificationOutcome, BootNotifier};
     use crate::state::{
         ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, LifecycleState,
@@ -155,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_registration_makes_the_charge_point_available() {
-        let runtime = ChargePointRuntime::new((), [1]);
+        let runtime = ChargePointRuntime::new((), [1], &TokioExecutor);
         let notifier = FakeBootNotifier {
             outcome: BootNotificationOutcome {
                 status: RegistrationStatus::Accepted,
@@ -180,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_registration_records_status_without_becoming_available() {
-        let runtime = ChargePointRuntime::new((), [1]);
+        let runtime = ChargePointRuntime::new((), [1], &TokioExecutor);
         let notifier = FakeBootNotifier {
             outcome: BootNotificationOutcome {
                 status: RegistrationStatus::Pending,
@@ -281,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_until_accepted_retries_through_pending_and_rejected() {
-        let runtime = ChargePointRuntime::new((), [1]);
+        let runtime = ChargePointRuntime::new((), [1], &TokioExecutor);
         let notifier = ScriptedBootNotifier {
             responses: alloc::vec![
                 BootNotificationOutcome {
@@ -320,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_until_accepted_retries_past_transport_failures() {
-        let runtime = ChargePointRuntime::new((), [1]);
+        let runtime = ChargePointRuntime::new((), [1], &TokioExecutor);
         let notifier = FlakyThenAcceptedNotifier {
             remaining_failures: core::sync::atomic::AtomicUsize::new(2),
         };
@@ -339,7 +345,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_routes_hardware_events_to_the_supervisor_actor() {
-        let runtime = ChargePointRuntime::new((), [1]);
+        let runtime = ChargePointRuntime::new((), [1], &TokioExecutor);
         let mut states = runtime.subscribe();
 
         runtime.send(ChargePointEvent::BootCompleted).await.unwrap();

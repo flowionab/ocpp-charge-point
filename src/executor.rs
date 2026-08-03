@@ -10,20 +10,20 @@ pub trait Executor {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>);
 }
 
-/// An [`Executor`] that spawns onto the ambient tokio runtime via `tokio::spawn`. Not gated
-/// behind the `std` feature: tokio is still a mandatory dependency of this crate regardless
-/// (see `docs/ROADMAP.md` §0) - that will change once the channel abstraction lands, at which
-/// point this impl will move behind a real `tokio-runtime` feature.
+/// An [`Executor`] that spawns onto the ambient tokio runtime via `tokio::spawn`. Requires the
+/// `tokio-runtime` feature.
+#[cfg(feature = "tokio-runtime")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokioExecutor;
 
+#[cfg(feature = "tokio-runtime")]
 impl Executor for TokioExecutor {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
         tokio::spawn(future);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio-runtime"))]
 mod tests {
     use super::{Executor, TokioExecutor};
     use alloc::boxed::Box;

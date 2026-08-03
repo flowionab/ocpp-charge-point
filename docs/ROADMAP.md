@@ -45,10 +45,12 @@ Not a functional block, but a prerequisite for all of them.
   injection tests yet.
 - ⬜ Rustdoc coverage pass on all public APIs (see `CLAUDE.md` documentation
   standard).
-- ✅🚧 Real `no_std` support. `lib.rs` gates on `#![cfg_attr(not(feature =
+- ✅ Real `no_std` support. `lib.rs` gates on `#![cfg_attr(not(feature =
   "std"), no_std)]` - `cargo check --no-default-features --lib` now
   genuinely compiles this crate under `#![no_std]` (verified directly, not
-  just "features happen to be off"). What got it there:
+  just "features happen to be off"), and `tokio` is a fully optional
+  dependency behind a `tokio-runtime` feature. What got it there (kept as
+  a changelog since each piece landed in its own step):
   - ✅ `ocpp-client = { ..., default-features = false }`, with our own
     features forwarding only what's needed (`ocpp_1_6`/`ocpp_2_0_1`/
     `ocpp_2_1` map to its same-named features; our `std` feature forwards
@@ -108,16 +110,32 @@ Not a functional block, but a prerequisite for all of them.
     library still *compiles* fine (confirmed above) - only *linking* a
     final binary/test needs one, which is exactly the expected no_std
     story.
-  - ⬜ One piece deliberately left out of this step:
-    `ChargePointActor::spawn`'s own `tokio::spawn(run(...))` call (the
-    actor's core run loop) still calls `tokio::spawn` directly rather than
-    going through `Executor` - `ChargePointRuntime::new`/`ChargePointActor
-    ::spawn` would need an `Executor` parameter too. Small (the trait is
-    already object-safe, so `&dyn Executor` would do), left as a follow-up
-    to keep this step's diff reviewable. `tokio` also remains a mandatory
-    (non-optional) Cargo dependency, since `TokioExecutor`/`TokioBackoff`/
-    tests still need it unconditionally; making it truly optional (behind
-    a real `tokio-runtime` feature) is the last piece.
+  - ✅ `tokio` is now a genuinely optional dependency (`optional = true`),
+    gated behind a new `tokio-runtime` feature (`tokio-runtime = ["std",
+    "dep:tokio"]`, mirroring `ocpp-client`'s own feature of the same
+    name). `TokioExecutor`/`TokioBackoff` now require `tokio-runtime`
+    specifically (not just `std` - a std binary using a non-tokio async
+    executor is a real, supported configuration: it gets `std`'s
+    ocpp-client/chrono/critical-section conveniences without pulling in
+    tokio at all). Closing this required finishing the one piece left out
+    of the previous step: `ChargePointActor::spawn`'s own
+    `tokio::spawn(run(...))` call (the actor's core run loop) now takes an
+    `executor: &dyn Executor` parameter too (object-safe, so `&dyn` avoids
+    a new generic on `ChargePointRuntime<T>`), threaded through
+    `ChargePointRuntime::new` and `setup()`. This was no longer optional
+    once `tokio` became an optional dependency: without it,
+    `ChargePointActor::spawn`'s hardcoded `tokio::spawn` call wouldn't
+    even resolve the `tokio` crate name under `--no-default-features`.
+    `default` features now list `tokio-runtime` (which implies `std`)
+    instead of `std` directly.
+  - Verified across three configurations: `cargo check --no-default-features
+    --lib` (true no_std, still compiles clean under `#![no_std]`);
+    `cargo check --no-default-features --features
+    std,ocpp_1_6,ocpp_2_0_1,ocpp_2_1 --lib` (the new intermediate
+    "std, no tokio" configuration - compiles clean); and `cargo test`/
+    `cargo test --all-features` (43 tests each) plus `cargo run --example
+    simple` (runs correctly end-to-end) for the default tokio-runtime
+    path.
 
 ---
 

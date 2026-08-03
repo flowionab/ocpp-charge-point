@@ -61,6 +61,7 @@ pub async fn run_authorization_requests<A: Authorizer>(
 mod tests {
     use super::{Authorizer, run_authorization_requests};
     use crate::actor::ChargePointActor;
+    use crate::executor::TokioExecutor;
     use crate::state::{
         AuthorizationRequested, AuthorizationStatus, ChargePointEvent, ConnectorEvent,
         ConnectorState, EvseEvent, IdToken, IdTokenKind,
@@ -89,7 +90,7 @@ mod tests {
     /// Spawns an actor with connector 0 already in `Authorizing` (an id token has been
     /// presented, and the CSMS's decision is pending).
     async fn authorizing_actor() -> ChargePointActor {
-        let actor = ChargePointActor::spawn([1]);
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,

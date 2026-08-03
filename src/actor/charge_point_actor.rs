@@ -1,3 +1,4 @@
+use crate::executor::Executor;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
     ConnectorStatusChanged, HardwareCommand, TransactionEventOccurred,
@@ -6,6 +7,7 @@ use crate::sync::{
     BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
     watch_channel,
 };
+use alloc::boxed::Box;
 
 enum Command {
     Event {
@@ -30,7 +32,10 @@ pub struct ChargePointActor {
 }
 
 impl ChargePointActor {
-    pub fn spawn(connector_counts: impl IntoIterator<Item = usize>) -> Self {
+    pub fn spawn(
+        connector_counts: impl IntoIterator<Item = usize>,
+        executor: &dyn Executor,
+    ) -> Self {
         let state = ChargePointState::new(connector_counts);
         let mailbox = Chan::new();
         let (updates, state_receiver) = watch_channel(state.clone());
@@ -38,7 +43,7 @@ impl ChargePointActor {
         let status_notifications = broadcast_channel();
         let transaction_events = broadcast_channel();
         let authorization_requests = broadcast_channel();
-        tokio::spawn(run(
+        executor.spawn(Box::pin(run(
             state,
             mailbox.clone(),
             updates,
@@ -46,7 +51,7 @@ impl ChargePointActor {
             status_notifications.clone(),
             transaction_events.clone(),
             authorization_requests.clone(),
-        ));
+        )));
 
         Self {
             mailbox,
