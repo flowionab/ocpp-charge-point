@@ -12,6 +12,7 @@ pub mod provisioning;
 mod runtime;
 mod setup;
 pub mod state;
+pub mod sync;
 pub mod transactions;
 
 pub use self::runtime::ChargePointRuntime;

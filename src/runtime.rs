@@ -7,7 +7,7 @@ use crate::state::{
     AuthorizationRequested, ChargePointEvent, ChargePointState, ConnectorStatusChanged,
     RegistrationStatus, TransactionEventOccurred,
 };
-use tokio::sync::{broadcast, watch};
+use crate::sync::{BroadcastReceiver, WatchReceiver};
 
 pub struct ChargePointRuntime<T = ()> {
     hardware: T,
@@ -86,21 +86,21 @@ impl<T> ChargePointRuntime<T> {
     /// Subscribes to connector status changes for the Availability functional block. Subscribe
     /// before starting the hardware so early transitions (e.g. a connector already occupied at
     /// startup) aren't missed - the channel buffers them until a consumer reads them.
-    pub fn subscribe_status_notifications(&self) -> broadcast::Receiver<ConnectorStatusChanged> {
+    pub fn subscribe_status_notifications(&self) -> BroadcastReceiver<ConnectorStatusChanged> {
         self.actor.subscribe_status_notifications()
     }
 
     /// Subscribes to transaction lifecycle events for the Transactions functional block.
     /// Subscribe before starting the hardware, for the same reason as
     /// [`Self::subscribe_status_notifications`].
-    pub fn subscribe_transaction_events(&self) -> broadcast::Receiver<TransactionEventOccurred> {
+    pub fn subscribe_transaction_events(&self) -> BroadcastReceiver<TransactionEventOccurred> {
         self.actor.subscribe_transaction_events()
     }
 
     /// Subscribes to authorization requests for the Authorization functional block. Subscribe
     /// before starting the hardware, for the same reason as
     /// [`Self::subscribe_status_notifications`].
-    pub fn subscribe_authorization_requests(&self) -> broadcast::Receiver<AuthorizationRequested> {
+    pub fn subscribe_authorization_requests(&self) -> BroadcastReceiver<AuthorizationRequested> {
         self.actor.subscribe_authorization_requests()
     }
 
@@ -108,7 +108,7 @@ impl<T> ChargePointRuntime<T> {
         self.actor.state()
     }
 
-    pub fn subscribe(&self) -> watch::Receiver<ChargePointState> {
+    pub fn subscribe(&self) -> WatchReceiver<ChargePointState> {
         self.actor.subscribe()
     }
 
@@ -168,7 +168,7 @@ mod tests {
             .register(&notifier, "Acme", "Charger 9000")
             .await
             .unwrap();
-        states.changed().await.unwrap();
+        states.changed().await;
 
         assert_eq!(status, RegistrationStatus::Accepted);
         assert_eq!(
@@ -193,7 +193,7 @@ mod tests {
             .register(&notifier, "Acme", "Charger 9000")
             .await
             .unwrap();
-        states.changed().await.unwrap();
+        states.changed().await;
 
         assert_eq!(status, RegistrationStatus::Pending);
         assert_eq!(
@@ -343,7 +343,7 @@ mod tests {
         let mut states = runtime.subscribe();
 
         runtime.send(ChargePointEvent::BootCompleted).await.unwrap();
-        states.changed().await.unwrap();
+        states.changed().await;
 
         runtime
             .send(ChargePointEvent::Evse {
@@ -355,7 +355,7 @@ mod tests {
             })
             .await
             .unwrap();
-        states.changed().await.unwrap();
+        states.changed().await;
 
         assert_eq!(runtime.state().lifecycle, LifecycleState::Available);
         assert_eq!(

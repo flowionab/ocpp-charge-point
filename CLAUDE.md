@@ -38,12 +38,19 @@ responsibility.
   firmware's internal model — the same internal state must be representable
   (with graceful downgrade) across all three.
 - This is embedded firmware: the long-term goal is genuine `no_std` (+
-  `alloc`) support so it runs on microcontrollers without an OS. This is
-  **not** the current state — `tokio` is still a hard, unconditional
-  dependency in several places — but new code should avoid adding further
-  unconditional `std`/`tokio` dependencies where a no_std-friendly
-  alternative is reasonable, and existing hard dependencies should be
-  treated as a tracked gap (see `docs/ROADMAP.md` §0), not the intended
+  `alloc`) support so it runs on microcontrollers without an OS.
+  `cargo check --no-default-features --lib` now genuinely compiles under
+  `#![no_std]` (channels are `embassy-sync`-backed, not `tokio::sync` -
+  see `src/sync.rs`), but `tokio` remains a mandatory Cargo dependency
+  (used unconditionally by `TokioExecutor`/`TokioBackoff`/tests, and by
+  `ChargePointActor::spawn`'s own `tokio::spawn` call), and `std` is in
+  this crate's `default` features for zero-config ergonomics - true no_std
+  requires `--no-default-features` plus registering a `critical-section`
+  backend and supplying your own `Executor`/`Backoff`/`Clock`. New code
+  should avoid adding further unconditional `std`/`tokio` dependencies
+  where a no_std-friendly alternative is reasonable, and remaining hard
+  dependencies should be treated as a tracked gap (see `docs/ROADMAP.md`
+  §0), not the intended
   end state.
 
 ## Error handling

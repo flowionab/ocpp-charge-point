@@ -2,8 +2,8 @@
 //! TransactionEvent. See `docs/ROADMAP.md` §5.
 
 use crate::state::{TransactionEventKind, TransactionEventOccurred};
+use crate::sync::{BroadcastReceiver, RecvError};
 use alloc::boxed::Box;
-use tokio::sync::broadcast;
 
 /// Reports a transaction lifecycle event to the CSMS via TransactionEvent. Implemented per
 /// protocol version (see the `ocpp_2_1` module), mirroring
@@ -25,7 +25,7 @@ pub trait TransactionNotifier {
 /// Errors are logged and do not stop the loop - the actor already applied the event to state;
 /// only the CSMS-facing report failed.
 pub async fn run_transaction_events<N: TransactionNotifier>(
-    mut events: broadcast::Receiver<TransactionEventOccurred>,
+    mut events: BroadcastReceiver<TransactionEventOccurred>,
     notifier: &N,
 ) {
     loop {
@@ -43,13 +43,7 @@ pub async fn run_transaction_events<N: TransactionNotifier>(
                     tracing::warn!(error = %err, "transaction event notification failed");
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped,
-                    "transaction event receiver lagged, some events were dropped"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(RecvError::Closed) => break,
         }
     }
 }
@@ -61,9 +55,10 @@ mod tests {
         Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
         TransactionId,
     };
+    use crate::sync::broadcast_channel;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
-    use tokio::sync::{broadcast, watch};
+    use tokio::sync::watch;
 
     struct RecordingTransactionNotifier {
         seen: watch::Sender<Vec<(usize, usize, TransactionEventKind, Transaction)>>,
@@ -88,7 +83,8 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_every_transaction_event_to_the_notifier_in_order() {
-        let (sender, receiver) = broadcast::channel(8);
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
         let (seen_tx, mut seen_rx) = watch::channel(Vec::new());
         let notifier = RecordingTransactionNotifier { seen: seen_tx };
 
@@ -102,14 +98,12 @@ mod tests {
             stop_reason: None,
             seq_no: 0,
         };
-        sender
-            .send(TransactionEventOccurred {
-                evse_id: 0,
-                connector_id: 0,
-                kind: TransactionEventKind::Started,
-                transaction,
-            })
-            .unwrap();
+        sender.send(TransactionEventOccurred {
+            evse_id: 0,
+            connector_id: 0,
+            kind: TransactionEventKind::Started,
+            transaction,
+        });
 
         seen_rx
             .wait_for(|seen| seen.len() == 1)

@@ -215,7 +215,7 @@ mod tests {
         let mut states = actor.subscribe();
 
         actor.send(ChargePointEvent::BootCompleted).await.unwrap();
-        states.changed().await.unwrap();
+        states.changed().await;
 
         actor
             .send(ChargePointEvent::Evse {
@@ -227,7 +227,7 @@ mod tests {
             })
             .await
             .unwrap();
-        states.changed().await.unwrap();
+        states.changed().await;
 
         assert_eq!(actor.state().lifecycle, LifecycleState::Available);
         assert_eq!(

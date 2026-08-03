@@ -2,18 +2,15 @@ use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
     ConnectorStatusChanged, HardwareCommand, TransactionEventOccurred,
 };
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
-
-const MAILBOX_CAPACITY: usize = 32;
-const COMMAND_CAPACITY: usize = 32;
-const STATUS_NOTIFICATION_CAPACITY: usize = 32;
-const TRANSACTION_EVENT_CAPACITY: usize = 32;
-const AUTHORIZATION_REQUEST_CAPACITY: usize = 32;
+use crate::sync::{
+    BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
+    watch_channel,
+};
 
 enum Command {
     Event {
         event: ChargePointEvent,
-        acknowledged: oneshot::Sender<()>,
+        acknowledged: OneShot<()>,
     },
 }
 
@@ -24,26 +21,26 @@ pub enum ActorError {
 
 #[derive(Clone)]
 pub struct ChargePointActor {
-    sender: mpsc::Sender<Command>,
-    state: watch::Receiver<ChargePointState>,
-    commands: broadcast::Sender<HardwareCommand>,
-    status_notifications: broadcast::Sender<ConnectorStatusChanged>,
-    transaction_events: broadcast::Sender<TransactionEventOccurred>,
-    authorization_requests: broadcast::Sender<AuthorizationRequested>,
+    mailbox: Chan<Command>,
+    state: WatchReceiver<ChargePointState>,
+    commands: BroadcastSender<HardwareCommand>,
+    status_notifications: BroadcastSender<ConnectorStatusChanged>,
+    transaction_events: BroadcastSender<TransactionEventOccurred>,
+    authorization_requests: BroadcastSender<AuthorizationRequested>,
 }
 
 impl ChargePointActor {
     pub fn spawn(connector_counts: impl IntoIterator<Item = usize>) -> Self {
         let state = ChargePointState::new(connector_counts);
-        let (sender, receiver) = mpsc::channel(MAILBOX_CAPACITY);
-        let (updates, state_receiver) = watch::channel(state.clone());
-        let (commands, _) = broadcast::channel(COMMAND_CAPACITY);
-        let (status_notifications, _) = broadcast::channel(STATUS_NOTIFICATION_CAPACITY);
-        let (transaction_events, _) = broadcast::channel(TRANSACTION_EVENT_CAPACITY);
-        let (authorization_requests, _) = broadcast::channel(AUTHORIZATION_REQUEST_CAPACITY);
+        let mailbox = Chan::new();
+        let (updates, state_receiver) = watch_channel(state.clone());
+        let commands = broadcast_channel();
+        let status_notifications = broadcast_channel();
+        let transaction_events = broadcast_channel();
+        let authorization_requests = broadcast_channel();
         tokio::spawn(run(
             state,
-            receiver,
+            mailbox.clone(),
             updates,
             commands.clone(),
             status_notifications.clone(),
@@ -52,7 +49,7 @@ impl ChargePointActor {
         ));
 
         Self {
-            sender,
+            mailbox,
             state: state_receiver,
             commands,
             status_notifications,
@@ -62,80 +59,76 @@ impl ChargePointActor {
     }
 
     pub async fn send(&self, event: ChargePointEvent) -> Result<(), ActorError> {
-        let (acknowledged, receipt) = oneshot::channel();
-        self.sender
-            .send(Command::Event {
-                event,
-                acknowledged,
-            })
-            .await
-            .map_err(|_| ActorError::Stopped)?;
-        receipt.await.map_err(|_| ActorError::Stopped)
+        let acknowledged = OneShot::new();
+        self.mailbox.send(Command::Event {
+            event,
+            acknowledged: acknowledged.clone(),
+        });
+        acknowledged.wait().await;
+        Ok(())
     }
 
     pub fn state(&self) -> ChargePointState {
-        self.state.borrow().clone()
+        self.state.borrow()
     }
 
-    pub fn subscribe(&self) -> watch::Receiver<ChargePointState> {
+    pub fn subscribe(&self) -> WatchReceiver<ChargePointState> {
         self.state.clone()
     }
 
-    pub fn subscribe_commands(&self) -> broadcast::Receiver<HardwareCommand> {
+    pub fn subscribe_commands(&self) -> BroadcastReceiver<HardwareCommand> {
         self.commands.subscribe()
     }
 
-    pub fn subscribe_status_notifications(&self) -> broadcast::Receiver<ConnectorStatusChanged> {
+    pub fn subscribe_status_notifications(&self) -> BroadcastReceiver<ConnectorStatusChanged> {
         self.status_notifications.subscribe()
     }
 
-    pub fn subscribe_transaction_events(&self) -> broadcast::Receiver<TransactionEventOccurred> {
+    pub fn subscribe_transaction_events(&self) -> BroadcastReceiver<TransactionEventOccurred> {
         self.transaction_events.subscribe()
     }
 
-    pub fn subscribe_authorization_requests(&self) -> broadcast::Receiver<AuthorizationRequested> {
+    pub fn subscribe_authorization_requests(&self) -> BroadcastReceiver<AuthorizationRequested> {
         self.authorization_requests.subscribe()
     }
 }
 
 async fn run(
     mut state: ChargePointState,
-    mut receiver: mpsc::Receiver<Command>,
-    updates: watch::Sender<ChargePointState>,
-    commands: broadcast::Sender<HardwareCommand>,
-    status_notifications: broadcast::Sender<ConnectorStatusChanged>,
-    transaction_events: broadcast::Sender<TransactionEventOccurred>,
-    authorization_requests: broadcast::Sender<AuthorizationRequested>,
+    mailbox: Chan<Command>,
+    updates: crate::sync::WatchSender<ChargePointState>,
+    commands: BroadcastSender<HardwareCommand>,
+    status_notifications: BroadcastSender<ConnectorStatusChanged>,
+    transaction_events: BroadcastSender<TransactionEventOccurred>,
+    authorization_requests: BroadcastSender<AuthorizationRequested>,
 ) {
-    while let Some(command) = receiver.recv().await {
-        match command {
-            Command::Event {
-                event,
-                acknowledged,
-            } => {
-                tracing::info!(event = ?event, "new charge point event");
-                for effect in state.apply(event) {
-                    match effect {
-                        ChargePointEffect::StateChanged => {
-                            tracing::info!(state = ?state, "charge point state updated");
-                            updates.send_replace(state.clone());
-                        }
-                        ChargePointEffect::HardwareCommand(command) => {
-                            let _ = commands.send(command);
-                        }
-                        ChargePointEffect::StatusNotification(changed) => {
-                            let _ = status_notifications.send(changed);
-                        }
-                        ChargePointEffect::TransactionEvent(occurred) => {
-                            let _ = transaction_events.send(occurred);
-                        }
-                        ChargePointEffect::AuthorizationRequested(requested) => {
-                            let _ = authorization_requests.send(requested);
-                        }
-                    }
+    loop {
+        let Command::Event {
+            event,
+            acknowledged,
+        } = mailbox.recv().await;
+
+        tracing::info!(event = ?event, "new charge point event");
+        for effect in state.apply(event) {
+            match effect {
+                ChargePointEffect::StateChanged => {
+                    tracing::info!(state = ?state, "charge point state updated");
+                    updates.send_replace(state.clone());
                 }
-                let _ = acknowledged.send(());
+                ChargePointEffect::HardwareCommand(command) => {
+                    commands.send(command);
+                }
+                ChargePointEffect::StatusNotification(changed) => {
+                    status_notifications.send(changed);
+                }
+                ChargePointEffect::TransactionEvent(occurred) => {
+                    transaction_events.send(occurred);
+                }
+                ChargePointEffect::AuthorizationRequested(requested) => {
+                    authorization_requests.send(requested);
+                }
             }
         }
+        acknowledged.send(());
     }
 }

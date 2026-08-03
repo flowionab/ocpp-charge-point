@@ -2,8 +2,8 @@
 //! StatusNotification. See `docs/ROADMAP.md` §7.
 
 use crate::state::{ConnectorStatus, ConnectorStatusChanged};
+use crate::sync::{BroadcastReceiver, RecvError};
 use alloc::boxed::Box;
-use tokio::sync::broadcast;
 
 /// Reports a connector's status to the CSMS via StatusNotification. Implemented per protocol
 /// version (see the `ocpp_2_1` module), mirroring [`crate::provisioning::BootNotifier`].
@@ -23,7 +23,7 @@ pub trait StatusNotifier {
 /// forever. Errors are logged and do not stop the loop or drop the change - the actor already
 /// applied it to state; only the CSMS-facing report failed.
 pub async fn run_status_notifications<N: StatusNotifier>(
-    mut changes: broadcast::Receiver<ConnectorStatusChanged>,
+    mut changes: BroadcastReceiver<ConnectorStatusChanged>,
     notifier: &N,
 ) {
     loop {
@@ -36,13 +36,7 @@ pub async fn run_status_notifications<N: StatusNotifier>(
                     tracing::warn!(error = %err, "status notification failed");
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped,
-                    "status notification receiver lagged, some updates were dropped"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(RecvError::Closed) => break,
         }
     }
 }
@@ -51,9 +45,10 @@ pub async fn run_status_notifications<N: StatusNotifier>(
 mod tests {
     use super::{StatusNotifier, run_status_notifications};
     use crate::state::{ConnectorStatus, ConnectorStatusChanged};
+    use crate::sync::broadcast_channel;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
-    use tokio::sync::{broadcast, watch};
+    use tokio::sync::watch;
 
     struct RecordingStatusNotifier {
         seen: watch::Sender<Vec<(usize, usize, ConnectorStatus)>>,
@@ -77,7 +72,8 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_every_status_change_to_the_notifier_in_order() {
-        let (sender, receiver) = broadcast::channel(8);
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
         let (seen_tx, mut seen_rx) = watch::channel(Vec::new());
         let notifier = RecordingStatusNotifier { seen: seen_tx };
 
@@ -85,20 +81,16 @@ mod tests {
             run_status_notifications(receiver, &notifier).await;
         });
 
-        sender
-            .send(ConnectorStatusChanged {
-                evse_id: 0,
-                connector_id: 0,
-                status: ConnectorStatus::Occupied,
-            })
-            .unwrap();
-        sender
-            .send(ConnectorStatusChanged {
-                evse_id: 0,
-                connector_id: 1,
-                status: ConnectorStatus::Faulted,
-            })
-            .unwrap();
+        sender.send(ConnectorStatusChanged {
+            evse_id: 0,
+            connector_id: 0,
+            status: ConnectorStatus::Occupied,
+        });
+        sender.send(ConnectorStatusChanged {
+            evse_id: 0,
+            connector_id: 1,
+            status: ConnectorStatus::Faulted,
+        });
 
         seen_rx
             .wait_for(|seen| seen.len() == 2)

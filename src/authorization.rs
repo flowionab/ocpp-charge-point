@@ -6,8 +6,8 @@ use crate::state::{
     AuthorizationRequested, AuthorizationStatus, ChargePointEvent, ConnectorEvent, EvseEvent,
     IdToken,
 };
+use crate::sync::{BroadcastReceiver, RecvError};
 use alloc::boxed::Box;
-use tokio::sync::broadcast;
 
 /// Decides whether an [`IdToken`] may start charging, via Authorize. Implemented per protocol
 /// version (see the `ocpp_2_1` module), mirroring
@@ -24,7 +24,7 @@ pub trait Authorizer {
 /// forever. A transport-level failure is treated as denied - erratic connectivity must not
 /// leave a connector waiting indefinitely (see CLAUDE.md's error-handling guidance).
 pub async fn run_authorization_requests<A: Authorizer>(
-    mut requests: broadcast::Receiver<AuthorizationRequested>,
+    mut requests: BroadcastReceiver<AuthorizationRequested>,
     authorizer: &A,
     actor: ChargePointActor,
 ) {
@@ -52,13 +52,7 @@ pub async fn run_authorization_requests<A: Authorizer>(
                     })
                     .await;
             }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped,
-                    "authorization request receiver lagged, some requests were dropped"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(RecvError::Closed) => break,
         }
     }
 }
@@ -71,8 +65,8 @@ mod tests {
         AuthorizationRequested, AuthorizationStatus, ChargePointEvent, ConnectorEvent,
         ConnectorState, EvseEvent, IdToken, IdTokenKind,
     };
+    use crate::sync::broadcast_channel;
     use alloc::boxed::Box;
-    use tokio::sync::broadcast;
 
     fn test_id_token() -> IdToken {
         IdToken {
@@ -118,16 +112,15 @@ mod tests {
     #[tokio::test]
     async fn an_accepted_decision_authorizes_charging() {
         let actor = authorizing_actor().await;
-        let (sender, receiver) = broadcast::channel(4);
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
         let authorizer = FixedAuthorizer(AuthorizationStatus::Accepted);
 
-        sender
-            .send(AuthorizationRequested {
-                evse_id: 0,
-                connector_id: 0,
-                id_token: test_id_token(),
-            })
-            .unwrap();
+        sender.send(AuthorizationRequested {
+            evse_id: 0,
+            connector_id: 0,
+            id_token: test_id_token(),
+        });
         // Dropping the sender closes the channel, which ends `run_authorization_requests`'s
         // loop once it has processed the request above.
         drop(sender);
@@ -143,16 +136,15 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_decision_leaves_the_connector_locked() {
         let actor = authorizing_actor().await;
-        let (sender, receiver) = broadcast::channel(4);
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
         let authorizer = FixedAuthorizer(AuthorizationStatus::Rejected);
 
-        sender
-            .send(AuthorizationRequested {
-                evse_id: 0,
-                connector_id: 0,
-                id_token: test_id_token(),
-            })
-            .unwrap();
+        sender.send(AuthorizationRequested {
+            evse_id: 0,
+            connector_id: 0,
+            id_token: test_id_token(),
+        });
         drop(sender);
 
         run_authorization_requests(receiver, &authorizer, actor.clone()).await;

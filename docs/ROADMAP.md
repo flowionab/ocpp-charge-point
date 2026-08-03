@@ -45,9 +45,10 @@ Not a functional block, but a prerequisite for all of them.
   injection tests yet.
 - ⬜ Rustdoc coverage pass on all public APIs (see `CLAUDE.md` documentation
   standard).
-- 🚧 Real `no_std` support. `lib.rs` gates on `#![cfg_attr(not(feature =
-  "std"), no_std)]`; two pieces of dependency/clock hygiene are done, the
-  big one (an executor/channel abstraction) is not:
+- ✅🚧 Real `no_std` support. `lib.rs` gates on `#![cfg_attr(not(feature =
+  "std"), no_std)]` - `cargo check --no-default-features --lib` now
+  genuinely compiles this crate under `#![no_std]` (verified directly, not
+  just "features happen to be off"). What got it there:
   - ✅ `ocpp-client = { ..., default-features = false }`, with our own
     features forwarding only what's needed (`ocpp_1_6`/`ocpp_2_0_1`/
     `ocpp_2_1` map to its same-named features; our `std` feature forwards
@@ -65,29 +66,58 @@ Not a functional block, but a prerequisite for all of them.
     features (`std` off) now succeed cleanly (42 tests), as does
     `--no-default-features` (32 tests) and `--features std` /
     `--all-features`.
-  - 🚧 `setup()`'s four `tokio::spawn` calls (heartbeat, status,
-    transaction, authorization loops) now go through a new `executor::
-    Executor` trait (mirroring `ocpp-client`'s own `Executor`) instead of
-    calling `tokio::spawn` directly - `setup()` takes an `executor: X`
-    parameter (plus a `backoff: B` parameter, replacing the previously
-    hardcoded `TokioBackoff`), so std/tokio users pass
+  - ✅ `setup()`'s four background loops (heartbeat, status, transaction,
+    authorization) go through a new `executor::Executor` trait (mirroring
+    `ocpp-client`'s own `Executor`) instead of calling `tokio::spawn`
+    directly - `setup()` takes an `executor: X` parameter (plus a
+    `backoff: B` parameter, replacing the previously hardcoded
+    `TokioBackoff`), so std/tokio users pass
     `executor::TokioExecutor`/`provisioning::TokioBackoff` explicitly and
-    embedded targets can supply their own. `TokioExecutor`/`TokioBackoff`
-    are deliberately **not** gated behind `std`, unlike `SystemClock`:
-    tokio is still a mandatory, unconditional Cargo dependency of this
-    crate regardless of feature flags (see below), so gating them would
-    only break the default build without reflecting any real constraint;
-    they'll move behind a real `tokio-runtime` feature once tokio itself
-    becomes optional.
-  - ⬜ `tokio`'s mpsc/broadcast/oneshot/watch are still hard, unconditional
-    dependencies in `actor.rs` and `runtime.rs` (the mailbox and the three
-    broadcast fanouts: status, transaction, authorization; plus the
-    state-watch mechanism). This is the remaining, larger piece:
-    `embassy-sync`-backed (or trait-based) replacements for all of these,
-    mirroring `ocpp-client`'s own `src/sync.rs`. Until this lands, the
-    `tokio` dependency itself can't become `optional`, so disabling `std`
-    narrows what ocpp-client/chrono pull in but does not yet produce an
-    actual no_std build of this crate.
+    embedded targets can supply their own.
+  - ✅ `src/sync.rs` (new): no_std+alloc `embassy-sync`-backed replacements
+    for `tokio::sync::{oneshot, mpsc, watch, broadcast}` - `OneShot`,
+    `Chan` (the actor's mailbox), `Watch{Sender,Receiver}` (the
+    `ChargePointState` broadcast `subscribe()`/`state()` relies on), and
+    payload-carrying `Broadcast{Sender,Receiver}` (status/transaction/
+    authorization fan-out; `HardwareCommandReceiver` too). Mirrors
+    `ocpp-client`'s own `src/sync.rs` pattern (`CriticalSectionRawMutex`-
+    backed blocking `Mutex`/`Signal`), extended with `Watch` and a
+    payload-carrying `Broadcast` that crate didn't need. `actor.rs`/
+    `runtime.rs`/`availability.rs`/`transactions.rs`/`authorization.rs`/
+    `hardware/command_receiver.rs` all rewired onto these instead of
+    `tokio::sync` types. Deliberate simplifications, documented in
+    `src/sync.rs`'s module docs: every queue is unbounded (no
+    `tokio::sync::broadcast`-style "Lagged" case - a stalled subscriber
+    grows its queue instead of dropping messages), and the actor's `run`
+    loop no longer detects "all senders dropped" and exit (it used to via
+    `mpsc::Receiver::recv() -> None`; now it just parks forever once
+    nothing sends - matching `ocpp-client`'s own long-running-task
+    philosophy, and not exercised by anything today since actors live for
+    the process lifetime in practice).
+  - `embassy-sync`/`critical-section` are new unconditional dependencies
+    (mirroring `ocpp-client`'s choice to keep them unconditional too).
+    `critical-section` needs a backend registered to even *link* (not just
+    compile) - our `std` feature forwards to `critical-section/std` for
+    that, and **`std` is now in this crate's `default` features** (added
+    this step), matching `ocpp-client`'s own convention: `cargo build`/
+    `cargo test` with zero flags keeps working with no config, and
+    `--no-default-features` is the deliberate no_std opt-in, where an
+    embedded target must register its own backend via
+    `critical_section::set_impl!` (and supply its own
+    `Executor`/`Backoff`/`Clock`). Without a registered backend, the
+    library still *compiles* fine (confirmed above) - only *linking* a
+    final binary/test needs one, which is exactly the expected no_std
+    story.
+  - ⬜ One piece deliberately left out of this step:
+    `ChargePointActor::spawn`'s own `tokio::spawn(run(...))` call (the
+    actor's core run loop) still calls `tokio::spawn` directly rather than
+    going through `Executor` - `ChargePointRuntime::new`/`ChargePointActor
+    ::spawn` would need an `Executor` parameter too. Small (the trait is
+    already object-safe, so `&dyn Executor` would do), left as a follow-up
+    to keep this step's diff reviewable. `tokio` also remains a mandatory
+    (non-optional) Cargo dependency, since `TokioExecutor`/`TokioBackoff`/
+    tests still need it unconditionally; making it truly optional (behind
+    a real `tokio-runtime` feature) is the last piece.
 
 ---
 

@@ -1,16 +1,16 @@
 use crate::state::HardwareCommand;
-use tokio::sync::broadcast;
+use crate::sync::{BroadcastReceiver, RecvError};
 
 pub struct HardwareCommandReceiver {
-    receiver: broadcast::Receiver<HardwareCommand>,
+    receiver: BroadcastReceiver<HardwareCommand>,
 }
 
 impl HardwareCommandReceiver {
-    pub(crate) fn new(receiver: broadcast::Receiver<HardwareCommand>) -> Self {
+    pub(crate) fn new(receiver: BroadcastReceiver<HardwareCommand>) -> Self {
         Self { receiver }
     }
 
-    pub async fn recv(&mut self) -> Result<HardwareCommand, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<HardwareCommand, RecvError> {
         self.receiver.recv().await
     }
 }
