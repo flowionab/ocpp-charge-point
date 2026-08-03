@@ -8,6 +8,8 @@ mod tests {
     use crate::state::{
         ChargePointEffect, ChargePointEvent, ChargePointState, ConnectorEvent, ConnectorState,
         ConnectorStatus, ConnectorStatusChanged, EvseEvent, HardwareCommand, LifecycleState,
+        Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
+        TransactionId,
     };
     use alloc::vec;
 
@@ -106,6 +108,17 @@ mod tests {
                 ChargePointEffect::HardwareCommand(HardwareCommand::CloseContactor {
                     evse_id: 0,
                     connector_id: 0,
+                }),
+                ChargePointEffect::TransactionEvent(TransactionEventOccurred {
+                    evse_id: 0,
+                    connector_id: 0,
+                    kind: TransactionEventKind::Started,
+                    transaction: Transaction {
+                        id: TransactionId(0),
+                        charging_state: TransactionChargingState::EvConnected,
+                        stop_reason: None,
+                        seq_no: 0,
+                    },
                 }),
             ]
         );

@@ -2,8 +2,9 @@ use alloc::vec::Vec;
 
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
-    ChargePointEffect, ChargePointEvent, ConnectorStatusChanged, EvseEvent, EvseState,
-    HardwareCommand, RegistrationStatus,
+    ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState, ConnectorStatusChanged,
+    EvseEvent, EvseState, HardwareCommand, RegistrationStatus, StopReason, Transaction,
+    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +14,8 @@ pub struct ChargePointState {
     /// BootNotification response arrives.
     pub registration: Option<RegistrationStatus>,
     pub evses: Vec<EvseState>,
+    /// The id to assign to the next transaction that starts, incremented every time one does.
+    pub next_transaction_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +32,7 @@ impl ChargePointState {
             lifecycle: LifecycleState::Booting,
             registration: None,
             evses: connector_counts.into_iter().map(EvseState::new).collect(),
+            next_transaction_id: 0,
         }
     }
 
@@ -55,15 +59,16 @@ impl ChargePointState {
                     connector_id,
                     event,
                 } => {
-                    let Some(connector) = self
-                        .evses
-                        .get_mut(evse_id)
-                        .and_then(|evse| evse.connectors.get_mut(connector_id))
-                    else {
+                    let Some(evse) = self.evses.get_mut(evse_id) else {
+                        return effects;
+                    };
+                    let Some(connector) = evse.connectors.get_mut(connector_id) else {
                         return effects;
                     };
                     let previous_status = connector.availability_status();
+                    let previous_state = *connector;
                     let transition = connector.apply(event);
+                    let new_state = *connector;
                     if let Some(command) = transition.command {
                         effects.push(ChargePointEffect::HardwareCommand(match command {
                             ConnectorCommand::Lock => HardwareCommand::LockConnector {
@@ -84,7 +89,7 @@ impl ChargePointState {
                             },
                         }));
                     }
-                    let status = connector.availability_status();
+                    let status = new_state.availability_status();
                     if status != previous_status {
                         effects.push(ChargePointEffect::StatusNotification(
                             ConnectorStatusChanged {
@@ -93,6 +98,28 @@ impl ChargePointState {
                                 status,
                             },
                         ));
+                    }
+                    let stop_reason = match event {
+                        ConnectorEvent::ChargingStopped(reason) => Some(reason),
+                        _ => None,
+                    };
+                    if let Some(slot) = evse.transactions.get_mut(connector_id) {
+                        if let Some((kind, transaction)) = advance_transaction(
+                            slot,
+                            &mut self.next_transaction_id,
+                            previous_state,
+                            new_state,
+                            stop_reason,
+                        ) {
+                            effects.push(ChargePointEffect::TransactionEvent(
+                                TransactionEventOccurred {
+                                    evse_id,
+                                    connector_id,
+                                    kind,
+                                    transaction,
+                                },
+                            ));
+                        }
                     }
                     transition.changed
                 }
@@ -107,6 +134,57 @@ impl ChargePointState {
             effects.insert(0, ChargePointEffect::StateChanged);
         }
         effects
+    }
+}
+
+/// Advances a connector's transaction alongside its `previous_state` -> `new_state` transition,
+/// returning the TransactionEvent to report, if any. `event_stop_reason` is the `StopReason`
+/// carried by the triggering `ConnectorEvent::ChargingStopped`, if that's what caused this
+/// transition.
+fn advance_transaction(
+    slot: &mut Option<Transaction>,
+    next_transaction_id: &mut u64,
+    previous_state: ConnectorState,
+    new_state: ConnectorState,
+    event_stop_reason: Option<StopReason>,
+) -> Option<(TransactionEventKind, Transaction)> {
+    match (previous_state, new_state) {
+        (ConnectorState::Locked, ConnectorState::Starting) => {
+            let id = TransactionId(*next_transaction_id);
+            *next_transaction_id += 1;
+            let transaction = Transaction {
+                id,
+                charging_state: TransactionChargingState::EvConnected,
+                stop_reason: None,
+                seq_no: 0,
+            };
+            *slot = Some(transaction);
+            Some((TransactionEventKind::Started, transaction))
+        }
+        (ConnectorState::Starting, ConnectorState::Charging) => {
+            let transaction = slot.as_mut()?;
+            transaction.charging_state = TransactionChargingState::Charging;
+            transaction.seq_no += 1;
+            Some((TransactionEventKind::Updated, *transaction))
+        }
+        (ConnectorState::Charging, ConnectorState::Stopping) => {
+            let transaction = slot.as_mut()?;
+            transaction.stop_reason = event_stop_reason;
+            None
+        }
+        (ConnectorState::Stopping, ConnectorState::Finishing) => {
+            let mut transaction = slot.take()?;
+            transaction.charging_state = TransactionChargingState::EvConnected;
+            transaction.seq_no += 1;
+            Some((TransactionEventKind::Ended, transaction))
+        }
+        (_, ConnectorState::Faulted) => {
+            let mut transaction = slot.take()?;
+            transaction.stop_reason = Some(StopReason::EmergencyStop);
+            transaction.seq_no += 1;
+            Some((TransactionEventKind::Ended, transaction))
+        }
+        _ => None,
     }
 }
 
@@ -220,6 +298,176 @@ mod tests {
             !effects
                 .iter()
                 .any(|effect| matches!(effect, ChargePointEffect::StatusNotification(_)))
+        );
+    }
+
+    fn apply_connector_event(
+        state: &mut ChargePointState,
+        event: ConnectorEvent,
+    ) -> Vec<ChargePointEffect> {
+        state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::Connector {
+                connector_id: 0,
+                event,
+            },
+        })
+    }
+
+    /// Drives connector 0 from `Available` up to (and including) `ChargingAuthorized`, i.e.
+    /// just before the transaction starts.
+    fn plug_in_and_authorize(state: &mut ChargePointState) {
+        apply_connector_event(state, ConnectorEvent::CableConnected);
+        apply_connector_event(state, ConnectorEvent::LockConfirmed);
+    }
+
+    #[test]
+    fn authorizing_a_locked_connector_starts_a_transaction() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+
+        let expected_transaction = Transaction {
+            id: TransactionId(0),
+            charging_state: TransactionChargingState::EvConnected,
+            stop_reason: None,
+            seq_no: 0,
+        };
+        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
+        assert!(effects.contains(&ChargePointEffect::TransactionEvent(
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Started,
+                transaction: expected_transaction,
+            }
+        )));
+    }
+
+    #[test]
+    fn the_contactor_closing_updates_the_transaction_to_charging() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        let expected_transaction = Transaction {
+            id: TransactionId(0),
+            charging_state: TransactionChargingState::Charging,
+            stop_reason: None,
+            seq_no: 1,
+        };
+        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
+        assert!(effects.contains(&ChargePointEffect::TransactionEvent(
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Updated,
+                transaction: expected_transaction,
+            }
+        )));
+    }
+
+    #[test]
+    fn stopping_charging_ends_the_transaction_once_the_contactor_confirms_open() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        let stop_effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        assert!(
+            !stop_effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_))),
+            "no TransactionEvent until the contactor actually confirms it opened"
+        );
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Stopping);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+
+        let expected_transaction = Transaction {
+            id: TransactionId(0),
+            charging_state: TransactionChargingState::EvConnected,
+            stop_reason: Some(StopReason::Local),
+            seq_no: 2,
+        };
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
+        assert_eq!(state.evses[0].transactions[0], None);
+        assert!(effects.contains(&ChargePointEffect::TransactionEvent(
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Ended,
+                transaction: expected_transaction,
+            }
+        )));
+    }
+
+    #[test]
+    fn a_hardware_fault_during_charging_immediately_ends_the_transaction() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
+
+        let expected_transaction = Transaction {
+            id: TransactionId(0),
+            charging_state: TransactionChargingState::Charging,
+            stop_reason: Some(StopReason::EmergencyStop),
+            seq_no: 2,
+        };
+        assert_eq!(state.evses[0].transactions[0], None);
+        assert!(effects.contains(&ChargePointEffect::TransactionEvent(
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Ended,
+                transaction: expected_transaction,
+            }
+        )));
+    }
+
+    #[test]
+    fn a_fault_with_no_active_transaction_reports_no_transaction_event() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
+    }
+
+    #[test]
+    fn transaction_ids_increment_across_separate_sessions() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+
+        assert_eq!(
+            state.evses[0].transactions[0].map(|transaction| transaction.id),
+            Some(TransactionId(1))
         );
     }
 }

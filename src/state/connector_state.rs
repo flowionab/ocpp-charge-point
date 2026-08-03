@@ -7,6 +7,11 @@ pub enum ConnectorState {
     Locked,
     Starting,
     Charging,
+    /// Charging has stopped and the contactor is opening; the cable is still locked.
+    Stopping,
+    /// The contactor is open and the connector has been unlocked; the cable may still be
+    /// plugged in.
+    Finishing,
     Unavailable,
     Faulted,
     FaultedSafe,
@@ -34,9 +39,13 @@ impl ConnectorState {
     pub fn availability_status(&self) -> ConnectorStatus {
         match self {
             Self::Available => ConnectorStatus::Available,
-            Self::Connected | Self::Locked | Self::Starting | Self::Charging | Self::Unlocking => {
-                ConnectorStatus::Occupied
-            }
+            Self::Connected
+            | Self::Locked
+            | Self::Starting
+            | Self::Charging
+            | Self::Stopping
+            | Self::Finishing
+            | Self::Unlocking => ConnectorStatus::Occupied,
             Self::Unavailable => ConnectorStatus::Unavailable,
             Self::Faulted | Self::FaultedSafe => ConnectorStatus::Faulted,
         }
@@ -52,6 +61,13 @@ impl ConnectorState {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))
             }
             (Self::Starting, ConnectorEvent::ContactorClosed) => (Self::Charging, None),
+            (Self::Charging, ConnectorEvent::ChargingStopped(_)) => {
+                (Self::Stopping, Some(ConnectorCommand::OpenContactor))
+            }
+            (Self::Stopping, ConnectorEvent::ContactorOpened) => {
+                (Self::Finishing, Some(ConnectorCommand::Unlock))
+            }
+            (Self::Finishing, ConnectorEvent::UnlockConfirmed) => (Self::Connected, None),
             (Self::Connected, ConnectorEvent::CableDisconnected) => (Self::Available, None),
             (_, ConnectorEvent::SetUnavailable) => (Self::Unavailable, None),
             (Self::Faulted | Self::FaultedSafe, ConnectorEvent::SetAvailable) => (*self, None),

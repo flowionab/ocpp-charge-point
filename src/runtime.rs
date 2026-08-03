@@ -5,6 +5,7 @@ use crate::provisioning::{
 };
 use crate::state::{
     ChargePointEvent, ChargePointState, ConnectorStatusChanged, RegistrationStatus,
+    TransactionEventOccurred,
 };
 use tokio::sync::{broadcast, watch};
 
@@ -87,6 +88,13 @@ impl<T> ChargePointRuntime<T> {
     /// startup) aren't missed - the channel buffers them until a consumer reads them.
     pub fn subscribe_status_notifications(&self) -> broadcast::Receiver<ConnectorStatusChanged> {
         self.actor.subscribe_status_notifications()
+    }
+
+    /// Subscribes to transaction lifecycle events for the Transactions functional block.
+    /// Subscribe before starting the hardware, for the same reason as
+    /// [`Self::subscribe_status_notifications`].
+    pub fn subscribe_transaction_events(&self) -> broadcast::Receiver<TransactionEventOccurred> {
+        self.actor.subscribe_transaction_events()
     }
 
     pub fn state(&self) -> ChargePointState {

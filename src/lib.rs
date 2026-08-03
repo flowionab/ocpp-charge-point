@@ -9,6 +9,7 @@ pub mod provisioning;
 mod runtime;
 mod setup;
 pub mod state;
+pub mod transactions;
 
 pub use self::runtime::ChargePointRuntime;
 pub use self::setup::setup;

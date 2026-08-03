@@ -1,12 +1,15 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::state::{ConnectorState, EvseEvent};
+use crate::state::{ConnectorState, EvseEvent, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvseState {
     pub status: EvseStatus,
     pub connectors: Vec<ConnectorState>,
+    /// The active transaction for each connector, indexed the same as `connectors`. `None`
+    /// when that connector has no transaction in progress.
+    pub transactions: Vec<Option<Transaction>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +24,7 @@ impl EvseState {
         Self {
             status: EvseStatus::Available,
             connectors: vec![ConnectorState::Available; connector_count],
+            transactions: vec![None; connector_count],
         }
     }
 

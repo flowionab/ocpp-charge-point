@@ -4,13 +4,15 @@ use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
 use crate::provisioning::{BootNotifier, HeartbeatSender, TokioBackoff, run_heartbeat};
+use crate::transactions::{TransactionNotifier, run_transaction_events};
 use alloc::vec::Vec;
 
 /// Starts the hardware, then runs the Provisioning functional block's BootNotification
 /// exchange (retrying with backoff on `Pending`/`Rejected` or a transport failure - see
 /// [`ChargePointRuntime::register_until_accepted`]). Once accepted, spawns background tasks
-/// that send a Heartbeat at the interval the CSMS returned, and forward every connector status
-/// change to the CSMS via StatusNotification, for as long as the process runs.
+/// that send a Heartbeat at the interval the CSMS returned, forward every connector status
+/// change to the CSMS via StatusNotification, and forward every transaction lifecycle event via
+/// TransactionEvent, for as long as the process runs.
 pub async fn setup<T, E, C, N>(
     charge_point: T,
     csms: N,
@@ -19,7 +21,14 @@ where
     T: ChargePoint<E, C>,
     E: Evse<C>,
     C: Connector,
-    N: BootNotifier + HeartbeatSender + StatusNotifier + Clone + Send + Sync + 'static,
+    N: BootNotifier
+        + HeartbeatSender
+        + StatusNotifier
+        + TransactionNotifier
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     tracing::info!(
         vendor = charge_point.vendor_name().await,
@@ -33,9 +42,11 @@ where
     }
 
     let runtime = ChargePointRuntime::new(charge_point, connector_counts);
-    // Subscribe before starting the hardware so status changes fired during `start()` (e.g. a
-    // connector that's already occupied at boot) are buffered rather than lost.
+    // Subscribe before starting the hardware so status/transaction changes fired during
+    // `start()` (e.g. a connector that's already occupied at boot) are buffered rather than
+    // lost.
     let status_changes = runtime.subscribe_status_notifications();
+    let transaction_events = runtime.subscribe_transaction_events();
     runtime
         .hardware()
         .start(runtime.hardware_events(), runtime.hardware_commands())
@@ -56,6 +67,11 @@ where
     let status_notifier = csms.clone();
     tokio::spawn(async move {
         run_status_notifications(status_changes, &status_notifier).await;
+    });
+
+    let transaction_notifier = csms.clone();
+    tokio::spawn(async move {
+        run_transaction_events(transaction_events, &transaction_notifier).await;
     });
 
     Ok(runtime)

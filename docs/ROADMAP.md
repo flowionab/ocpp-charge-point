@@ -148,9 +148,30 @@ The core charging session lifecycle.
   trigger reason, stop reason, charging state, linked id token, running
   totals) distinct from `ConnectorState`. Today `ConnectorState::Starting`/
   `Charging` conflate connector and transaction state.
-- Status: 🚧 partial — connector-level charging states exist, but there is
-  no transaction entity, no trigger/stop reason modeling, no
-  `TransactionEvent` sequencing.
+- Status: 🚧 partial — a first-class `Transaction` entity now exists
+  (`TransactionId`, `TransactionChargingState`, `StopReason`, `seq_no`),
+  separate from `ConnectorState` and tracked per-connector on `EvseState`.
+  The connector state machine gained a normal charge-stop path (`Stopping`,
+  `Finishing`, `ConnectorEvent::ChargingStopped(StopReason)`) - previously
+  the only way out of `Charging` was a hardware fault. `ChargePointState`
+  emits `ChargePointEffect::TransactionEvent` on Started (authorized while
+  locked), Updated (contactor confirms closed), and Ended (contactor
+  confirms open after a normal stop, or immediately on a hardware fault
+  while a transaction is active, with `StopReason::EmergencyStop`). Wired
+  end-to-end the same way as Provisioning/Availability: a broadcast channel
+  on the actor, a protocol-agnostic `TransactionNotifier` trait
+  (`transactions::run_transaction_events`), implemented for `ocpp-client`'s
+  OCPP 2.1 client, spawned from `setup()`. `StopReason` only covers
+  Local/Remote/EVDisconnected/EmergencyStop so far (a subset of the full
+  spec `ReasonEnumType`) since RemoteControl/Authorization, which would
+  supply richer reasons, don't exist yet; `TriggerReasonEnumType` is
+  derived entirely in the OCPP 2.1 adapter rather than carried in the
+  internal model, per the version-adapter principle in `CLAUDE.md`. Still
+  missing: `id_token` (needs Authorization, §3), running totals/energy
+  (needs Meter values, §10), `RequestStartTransaction`/
+  `RequestStopTransaction` (needs Remote control, §6), and multiple
+  `Updated` events per transaction (today only the single Charging
+  transition produces one).
 - Version notes: this is the highest-value adapter target — 2.x's single
   `TransactionEvent` stream must project down to 1.6J's discrete
   Start/Stop/MeterValues calls.

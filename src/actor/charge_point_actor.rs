@@ -1,11 +1,13 @@
 use crate::state::{
     ChargePointEffect, ChargePointEvent, ChargePointState, ConnectorStatusChanged, HardwareCommand,
+    TransactionEventOccurred,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const MAILBOX_CAPACITY: usize = 32;
 const COMMAND_CAPACITY: usize = 32;
 const STATUS_NOTIFICATION_CAPACITY: usize = 32;
+const TRANSACTION_EVENT_CAPACITY: usize = 32;
 
 enum Command {
     Event {
@@ -25,6 +27,7 @@ pub struct ChargePointActor {
     state: watch::Receiver<ChargePointState>,
     commands: broadcast::Sender<HardwareCommand>,
     status_notifications: broadcast::Sender<ConnectorStatusChanged>,
+    transaction_events: broadcast::Sender<TransactionEventOccurred>,
 }
 
 impl ChargePointActor {
@@ -34,12 +37,14 @@ impl ChargePointActor {
         let (updates, state_receiver) = watch::channel(state.clone());
         let (commands, _) = broadcast::channel(COMMAND_CAPACITY);
         let (status_notifications, _) = broadcast::channel(STATUS_NOTIFICATION_CAPACITY);
+        let (transaction_events, _) = broadcast::channel(TRANSACTION_EVENT_CAPACITY);
         tokio::spawn(run(
             state,
             receiver,
             updates,
             commands.clone(),
             status_notifications.clone(),
+            transaction_events.clone(),
         ));
 
         Self {
@@ -47,6 +52,7 @@ impl ChargePointActor {
             state: state_receiver,
             commands,
             status_notifications,
+            transaction_events,
         }
     }
 
@@ -77,6 +83,10 @@ impl ChargePointActor {
     pub fn subscribe_status_notifications(&self) -> broadcast::Receiver<ConnectorStatusChanged> {
         self.status_notifications.subscribe()
     }
+
+    pub fn subscribe_transaction_events(&self) -> broadcast::Receiver<TransactionEventOccurred> {
+        self.transaction_events.subscribe()
+    }
 }
 
 async fn run(
@@ -85,6 +95,7 @@ async fn run(
     updates: watch::Sender<ChargePointState>,
     commands: broadcast::Sender<HardwareCommand>,
     status_notifications: broadcast::Sender<ConnectorStatusChanged>,
+    transaction_events: broadcast::Sender<TransactionEventOccurred>,
 ) {
     while let Some(command) = receiver.recv().await {
         match command {
@@ -104,6 +115,9 @@ async fn run(
                         }
                         ChargePointEffect::StatusNotification(changed) => {
                             let _ = status_notifications.send(changed);
+                        }
+                        ChargePointEffect::TransactionEvent(occurred) => {
+                            let _ = transaction_events.send(occurred);
                         }
                     }
                 }

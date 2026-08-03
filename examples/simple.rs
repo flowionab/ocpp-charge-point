@@ -3,12 +3,14 @@ use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
 use ocpp_charge_point::provisioning::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
 use ocpp_charge_point::setup;
 use ocpp_charge_point::state::{
-    ChargePointEvent, ConnectorEvent, ConnectorStatus, EvseEvent, RegistrationStatus,
+    ChargePointEvent, ConnectorEvent, ConnectorStatus, EvseEvent, RegistrationStatus, Transaction,
+    TransactionEventKind,
 };
+use ocpp_charge_point::transactions::TransactionNotifier;
 
 /// A stand-in for a real CSMS connection. Real deployments pass an `ocpp-client` version
 /// client (e.g. `ocpp_client::connect_2_1`) instead, which already implements `BootNotifier`,
-/// `HeartbeatSender`, and `StatusNotifier`.
+/// `HeartbeatSender`, `StatusNotifier`, and `TransactionNotifier`.
 #[derive(Clone)]
 struct AlwaysAcceptBootNotifier;
 
@@ -46,6 +48,21 @@ impl StatusNotifier for AlwaysAcceptBootNotifier {
         _evse_id: usize,
         _connector_id: usize,
         _status: ConnectorStatus,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionNotifier for AlwaysAcceptBootNotifier {
+    type Error = core::convert::Infallible;
+
+    async fn notify_transaction_event(
+        &self,
+        _evse_id: usize,
+        _connector_id: usize,
+        _kind: TransactionEventKind,
+        _transaction: Transaction,
     ) -> Result<(), Self::Error> {
         Ok(())
     }

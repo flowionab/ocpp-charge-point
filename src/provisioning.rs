@@ -172,6 +172,21 @@ pub(crate) mod test_support {
             Ok(())
         }
     }
+
+    #[async_trait::async_trait]
+    impl crate::transactions::TransactionNotifier for FixedBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_transaction_event(
+            &self,
+            _evse_id: usize,
+            _connector_id: usize,
+            _kind: crate::state::TransactionEventKind,
+            _transaction: crate::state::Transaction,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]
