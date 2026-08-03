@@ -1,6 +1,6 @@
-use crate::state::{ConnectorStatus, RegistrationStatus, StopReason, Transaction};
+use crate::state::{ConnectorStatus, IdToken, RegistrationStatus, StopReason, Transaction};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChargePointEvent {
     BootCompleted,
     SetAvailable,
@@ -15,7 +15,7 @@ pub enum ChargePointEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvseEvent {
     SetAvailable,
     SetUnavailable,
@@ -27,13 +27,20 @@ pub enum EvseEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectorEvent {
     CableConnected,
     CableDisconnected,
     LockConfirmed,
     UnlockConfirmed,
+    /// The driver/EV presented an identifier while the connector is locked; the Authorization
+    /// functional block asks the CSMS whether it may start charging.
+    IdTokenPresented(IdToken),
+    /// The CSMS accepted the presented identifier (or, for the moment, some other decision
+    /// producing the same effect - see `docs/ROADMAP.md` §3).
     ChargingAuthorized,
+    /// The CSMS rejected the presented identifier.
+    AuthorizationDenied,
     ContactorClosed,
     ContactorOpened,
     /// Charging has stopped (locally, remotely, or the EV finished) and the contactor should
@@ -45,7 +52,7 @@ pub enum ConnectorEvent {
     FaultCleared,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChargePointEffect {
     StateChanged,
     HardwareCommand(HardwareCommand),
@@ -55,6 +62,18 @@ pub enum ChargePointEffect {
     /// A transaction started, was updated, or ended; the Transactions functional block reports
     /// this to the CSMS via TransactionEvent.
     TransactionEvent(TransactionEventOccurred),
+    /// An identifier was presented and needs an authorization decision; the Authorization
+    /// functional block asks the CSMS via Authorize.
+    AuthorizationRequested(AuthorizationRequested),
+}
+
+/// An [`IdToken`] was presented on a connector and needs an authorization decision, reported to
+/// the CSMS via Authorize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationRequested {
+    pub evse_id: usize,
+    pub connector_id: usize,
+    pub id_token: IdToken,
 }
 
 /// A connector's [`ConnectorStatus`] changed, reported to the CSMS via StatusNotification.

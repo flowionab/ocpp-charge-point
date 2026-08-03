@@ -120,9 +120,27 @@ Deciding whether an identifier is allowed to start/continue charging.
 - Messages: `Authorize`, `IdTokenInfo` on transaction events.
 - Internal state needed: an authorization request/response flow, group
   id tokens, cache TTL, offline authorization policy.
-- Status: ⬜ not started. `ConnectorEvent::ChargingAuthorized` exists as an
-  input today but nothing produces it from an actual authorization
-  decision — it's just wired straight through in tests.
+- Status: 🚧 partial — `ConnectorState` gained an `Authorizing` step between
+  `Locked` and `Starting`: presenting an `IdToken` (`ConnectorEvent::
+  IdTokenPresented`) moves a locked connector into `Authorizing` and emits
+  a `ChargePointEffect::AuthorizationRequested`; the CSMS's decision comes
+  back as `ChargingAuthorized` (→ `Starting`, and now also creates the
+  transaction - see §5) or `AuthorizationDenied` (→ back to `Locked`).
+  Wired end-to-end the same way as the other blocks: a broadcast channel on
+  the actor, a protocol-agnostic `Authorizer` trait
+  (`authorization::run_authorization_requests`, which treats a
+  transport-level failure as a denial rather than hanging), implemented
+  for `ocpp-client`'s OCPP 2.1 client, spawned from `setup()`. Our
+  `AuthorizationStatus` is deliberately binary (Accepted/Rejected) — the
+  OCPP 2.1 adapter collapses the wire spec's 10-value
+  `AuthorizationStatusEnumType` down to this, since nothing downstream
+  (yet) distinguishes *why* a token was rejected; `ConcurrentTx` in
+  particular is folded into `Rejected` even though the spec's own guidance
+  ("advised to not stop charging if status is Accepted or ConcurrentTx")
+  suggests it may deserve different treatment once transactions can run
+  concurrently per token. Still missing: group id tokens, cache TTL/offline
+  authorization policy, and `idTokenInfo`'s richer fields (e.g.
+  `evseId`-scoped validity).
 - Version notes: 1.6J's `Authorize.req`/`.conf` maps closely; 2.1 adds
   richer `IdTokenInfo` (groups, restrictions) that must downgrade to
   1.6J's flatter `idTagInfo`.

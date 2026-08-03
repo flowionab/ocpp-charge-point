@@ -1,4 +1,5 @@
 use crate::ChargePointRuntime;
+use crate::authorization::{Authorizer, run_authorization_requests};
 use crate::availability::{StatusNotifier, run_status_notifications};
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
@@ -11,8 +12,9 @@ use alloc::vec::Vec;
 /// exchange (retrying with backoff on `Pending`/`Rejected` or a transport failure - see
 /// [`ChargePointRuntime::register_until_accepted`]). Once accepted, spawns background tasks
 /// that send a Heartbeat at the interval the CSMS returned, forward every connector status
-/// change to the CSMS via StatusNotification, and forward every transaction lifecycle event via
-/// TransactionEvent, for as long as the process runs.
+/// change to the CSMS via StatusNotification, forward every transaction lifecycle event via
+/// TransactionEvent, and answer every presented-id-token authorization request via Authorize,
+/// for as long as the process runs.
 pub async fn setup<T, E, C, N>(
     charge_point: T,
     csms: N,
@@ -25,6 +27,7 @@ where
         + HeartbeatSender
         + StatusNotifier
         + TransactionNotifier
+        + Authorizer
         + Clone
         + Send
         + Sync
@@ -42,11 +45,12 @@ where
     }
 
     let runtime = ChargePointRuntime::new(charge_point, connector_counts);
-    // Subscribe before starting the hardware so status/transaction changes fired during
-    // `start()` (e.g. a connector that's already occupied at boot) are buffered rather than
-    // lost.
+    // Subscribe before starting the hardware so status/transaction/authorization events fired
+    // during `start()` (e.g. a connector that's already occupied at boot) are buffered rather
+    // than lost.
     let status_changes = runtime.subscribe_status_notifications();
     let transaction_events = runtime.subscribe_transaction_events();
+    let authorization_requests = runtime.subscribe_authorization_requests();
     runtime
         .hardware()
         .start(runtime.hardware_events(), runtime.hardware_commands())
@@ -72,6 +76,12 @@ where
     let transaction_notifier = csms.clone();
     tokio::spawn(async move {
         run_transaction_events(transaction_events, &transaction_notifier).await;
+    });
+
+    let authorizer = csms.clone();
+    let actor = runtime.actor();
+    tokio::spawn(async move {
+        run_authorization_requests(authorization_requests, &authorizer, actor).await;
     });
 
     Ok(runtime)

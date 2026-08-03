@@ -2,9 +2,10 @@ use alloc::vec::Vec;
 
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
-    ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState, ConnectorStatusChanged,
-    EvseEvent, EvseState, HardwareCommand, RegistrationStatus, StopReason, Transaction,
-    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
+    AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
+    ConnectorStatusChanged, EvseEvent, EvseState, HardwareCommand, RegistrationStatus, StopReason,
+    Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
+    TransactionId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,14 @@ impl ChargePointState {
                     };
                     let previous_status = connector.availability_status();
                     let previous_state = *connector;
+                    let stop_reason = match &event {
+                        ConnectorEvent::ChargingStopped(reason) => Some(*reason),
+                        _ => None,
+                    };
+                    let presented_id_token = match &event {
+                        ConnectorEvent::IdTokenPresented(id_token) => Some(id_token.clone()),
+                        _ => None,
+                    };
                     let transition = connector.apply(event);
                     let new_state = *connector;
                     if let Some(command) = transition.command {
@@ -99,10 +108,17 @@ impl ChargePointState {
                             },
                         ));
                     }
-                    let stop_reason = match event {
-                        ConnectorEvent::ChargingStopped(reason) => Some(reason),
-                        _ => None,
-                    };
+                    if new_state == ConnectorState::Authorizing {
+                        if let Some(id_token) = presented_id_token {
+                            effects.push(ChargePointEffect::AuthorizationRequested(
+                                AuthorizationRequested {
+                                    evse_id,
+                                    connector_id,
+                                    id_token,
+                                },
+                            ));
+                        }
+                    }
                     if let Some(slot) = evse.transactions.get_mut(connector_id) {
                         if let Some((kind, transaction)) = advance_transaction(
                             slot,
@@ -149,7 +165,7 @@ fn advance_transaction(
     event_stop_reason: Option<StopReason>,
 ) -> Option<(TransactionEventKind, Transaction)> {
     match (previous_state, new_state) {
-        (ConnectorState::Locked, ConnectorState::Starting) => {
+        (ConnectorState::Authorizing, ConnectorState::Starting) => {
             let id = TransactionId(*next_transaction_id);
             *next_transaction_id += 1;
             let transaction = Transaction {
@@ -200,7 +216,7 @@ fn set_if_changed<T: PartialEq>(current: &mut T, next: T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ChargePointEffect;
+    use crate::state::{ChargePointEffect, IdToken, IdTokenKind};
 
     #[test]
     fn accepted_registration_records_status_and_makes_the_charge_point_available() {
@@ -314,11 +330,70 @@ mod tests {
         })
     }
 
-    /// Drives connector 0 from `Available` up to (and including) `ChargingAuthorized`, i.e.
-    /// just before the transaction starts.
+    fn test_id_token() -> IdToken {
+        IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        }
+    }
+
+    /// Drives connector 0 from `Available` to `Authorizing`, i.e. just before the CSMS's
+    /// authorization decision (`ChargingAuthorized`/`AuthorizationDenied`) arrives.
     fn plug_in_and_authorize(state: &mut ChargePointState) {
         apply_connector_event(state, ConnectorEvent::CableConnected);
         apply_connector_event(state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(state, ConnectorEvent::IdTokenPresented(test_id_token()));
+    }
+
+    #[test]
+    fn presenting_an_id_token_while_locked_requests_authorization() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Authorizing);
+        assert!(effects.contains(&ChargePointEffect::AuthorizationRequested(
+            AuthorizationRequested {
+                evse_id: 0,
+                connector_id: 0,
+                id_token: test_id_token(),
+            }
+        )));
+        assert_eq!(state.evses[0].transactions[0], None);
+    }
+
+    #[test]
+    fn an_id_token_presented_while_not_locked_is_ignored() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn a_denied_authorization_returns_the_connector_to_locked_without_a_transaction() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::AuthorizationDenied);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Locked);
+        assert_eq!(state.evses[0].transactions[0], None);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
     }
 
     #[test]

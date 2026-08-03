@@ -1,6 +1,6 @@
 use crate::state::{
-    ChargePointEffect, ChargePointEvent, ChargePointState, ConnectorStatusChanged, HardwareCommand,
-    TransactionEventOccurred,
+    AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
+    ConnectorStatusChanged, HardwareCommand, TransactionEventOccurred,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -8,6 +8,7 @@ const MAILBOX_CAPACITY: usize = 32;
 const COMMAND_CAPACITY: usize = 32;
 const STATUS_NOTIFICATION_CAPACITY: usize = 32;
 const TRANSACTION_EVENT_CAPACITY: usize = 32;
+const AUTHORIZATION_REQUEST_CAPACITY: usize = 32;
 
 enum Command {
     Event {
@@ -28,6 +29,7 @@ pub struct ChargePointActor {
     commands: broadcast::Sender<HardwareCommand>,
     status_notifications: broadcast::Sender<ConnectorStatusChanged>,
     transaction_events: broadcast::Sender<TransactionEventOccurred>,
+    authorization_requests: broadcast::Sender<AuthorizationRequested>,
 }
 
 impl ChargePointActor {
@@ -38,6 +40,7 @@ impl ChargePointActor {
         let (commands, _) = broadcast::channel(COMMAND_CAPACITY);
         let (status_notifications, _) = broadcast::channel(STATUS_NOTIFICATION_CAPACITY);
         let (transaction_events, _) = broadcast::channel(TRANSACTION_EVENT_CAPACITY);
+        let (authorization_requests, _) = broadcast::channel(AUTHORIZATION_REQUEST_CAPACITY);
         tokio::spawn(run(
             state,
             receiver,
@@ -45,6 +48,7 @@ impl ChargePointActor {
             commands.clone(),
             status_notifications.clone(),
             transaction_events.clone(),
+            authorization_requests.clone(),
         ));
 
         Self {
@@ -53,6 +57,7 @@ impl ChargePointActor {
             commands,
             status_notifications,
             transaction_events,
+            authorization_requests,
         }
     }
 
@@ -87,6 +92,10 @@ impl ChargePointActor {
     pub fn subscribe_transaction_events(&self) -> broadcast::Receiver<TransactionEventOccurred> {
         self.transaction_events.subscribe()
     }
+
+    pub fn subscribe_authorization_requests(&self) -> broadcast::Receiver<AuthorizationRequested> {
+        self.authorization_requests.subscribe()
+    }
 }
 
 async fn run(
@@ -96,6 +105,7 @@ async fn run(
     commands: broadcast::Sender<HardwareCommand>,
     status_notifications: broadcast::Sender<ConnectorStatusChanged>,
     transaction_events: broadcast::Sender<TransactionEventOccurred>,
+    authorization_requests: broadcast::Sender<AuthorizationRequested>,
 ) {
     while let Some(command) = receiver.recv().await {
         match command {
@@ -118,6 +128,9 @@ async fn run(
                         }
                         ChargePointEffect::TransactionEvent(occurred) => {
                             let _ = transaction_events.send(occurred);
+                        }
+                        ChargePointEffect::AuthorizationRequested(requested) => {
+                            let _ = authorization_requests.send(requested);
                         }
                     }
                 }

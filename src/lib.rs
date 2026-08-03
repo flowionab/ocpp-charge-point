@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod actor;
+pub mod authorization;
 pub mod availability;
 pub mod hardware;
 pub mod provisioning;

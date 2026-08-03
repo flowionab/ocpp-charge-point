@@ -5,6 +5,8 @@ pub enum ConnectorState {
     Available,
     Connected,
     Locked,
+    /// An identifier was presented and the CSMS's authorization decision is pending.
+    Authorizing,
     Starting,
     Charging,
     /// Charging has stopped and the contactor is opening; the cable is still locked.
@@ -41,6 +43,7 @@ impl ConnectorState {
             Self::Available => ConnectorStatus::Available,
             Self::Connected
             | Self::Locked
+            | Self::Authorizing
             | Self::Starting
             | Self::Charging
             | Self::Stopping
@@ -57,9 +60,11 @@ impl ConnectorState {
                 (Self::Connected, Some(ConnectorCommand::Lock))
             }
             (Self::Connected, ConnectorEvent::LockConfirmed) => (Self::Locked, None),
-            (Self::Locked, ConnectorEvent::ChargingAuthorized) => {
+            (Self::Locked, ConnectorEvent::IdTokenPresented(_)) => (Self::Authorizing, None),
+            (Self::Authorizing, ConnectorEvent::ChargingAuthorized) => {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))
             }
+            (Self::Authorizing, ConnectorEvent::AuthorizationDenied) => (Self::Locked, None),
             (Self::Starting, ConnectorEvent::ContactorClosed) => (Self::Charging, None),
             (Self::Charging, ConnectorEvent::ChargingStopped(_)) => {
                 (Self::Stopping, Some(ConnectorCommand::OpenContactor))

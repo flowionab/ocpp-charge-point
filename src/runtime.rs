@@ -4,8 +4,8 @@ use crate::provisioning::{
     Backoff, BootNotificationOutcome, BootNotifier, DEFAULT_RETRY_INTERVAL_SECS,
 };
 use crate::state::{
-    ChargePointEvent, ChargePointState, ConnectorStatusChanged, RegistrationStatus,
-    TransactionEventOccurred,
+    AuthorizationRequested, ChargePointEvent, ChargePointState, ConnectorStatusChanged,
+    RegistrationStatus, TransactionEventOccurred,
 };
 use tokio::sync::{broadcast, watch};
 
@@ -97,6 +97,13 @@ impl<T> ChargePointRuntime<T> {
         self.actor.subscribe_transaction_events()
     }
 
+    /// Subscribes to authorization requests for the Authorization functional block. Subscribe
+    /// before starting the hardware, for the same reason as
+    /// [`Self::subscribe_status_notifications`].
+    pub fn subscribe_authorization_requests(&self) -> broadcast::Receiver<AuthorizationRequested> {
+        self.actor.subscribe_authorization_requests()
+    }
+
     pub fn state(&self) -> ChargePointState {
         self.actor.state()
     }
@@ -107,6 +114,13 @@ impl<T> ChargePointRuntime<T> {
 
     pub(crate) fn hardware(&self) -> &T {
         &self.hardware
+    }
+
+    /// A cheap-to-clone handle to the underlying actor, independent of `T` - lets background
+    /// tasks (like [`crate::authorization::run_authorization_requests`]) feed events back in
+    /// without needing to be generic over the hardware type.
+    pub(crate) fn actor(&self) -> ChargePointActor {
+        self.actor.clone()
     }
 }
 

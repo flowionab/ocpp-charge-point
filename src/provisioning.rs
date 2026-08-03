@@ -187,6 +187,18 @@ pub(crate) mod test_support {
             Ok(())
         }
     }
+
+    #[async_trait::async_trait]
+    impl crate::authorization::Authorizer for FixedBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn authorize(
+            &self,
+            _id_token: &crate::state::IdToken,
+        ) -> Result<crate::state::AuthorizationStatus, Self::Error> {
+            Ok(crate::state::AuthorizationStatus::Accepted)
+        }
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]

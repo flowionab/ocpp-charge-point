@@ -6,10 +6,10 @@ pub use self::charge_point_actor::{ActorError, ChargePointActor};
 mod tests {
     use super::ChargePointActor;
     use crate::state::{
-        ChargePointEffect, ChargePointEvent, ChargePointState, ConnectorEvent, ConnectorState,
-        ConnectorStatus, ConnectorStatusChanged, EvseEvent, HardwareCommand, LifecycleState,
-        Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
-        TransactionId,
+        AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
+        ConnectorEvent, ConnectorState, ConnectorStatus, ConnectorStatusChanged, EvseEvent,
+        HardwareCommand, IdToken, IdTokenKind, LifecycleState, Transaction,
+        TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
     };
     use alloc::vec;
 
@@ -92,6 +92,31 @@ mod tests {
                 event: ConnectorEvent::LockConfirmed,
             },
         });
+
+        let id_token = IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        };
+        let presentation_effects = state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::Connector {
+                connector_id: 0,
+                event: ConnectorEvent::IdTokenPresented(id_token.clone()),
+            },
+        });
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Authorizing);
+        assert_eq!(
+            presentation_effects,
+            vec![
+                ChargePointEffect::StateChanged,
+                ChargePointEffect::AuthorizationRequested(AuthorizationRequested {
+                    evse_id: 0,
+                    connector_id: 0,
+                    id_token,
+                }),
+            ]
+        );
+
         let effects = state.apply(ChargePointEvent::Evse {
             evse_id: 0,
             event: EvseEvent::Connector {
