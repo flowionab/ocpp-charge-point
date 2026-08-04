@@ -97,6 +97,7 @@ mod tests {
             charging_state: TransactionChargingState::EvConnected,
             stop_reason: None,
             seq_no: 0,
+            last_meter_sample: None,
         };
         sender.send(TransactionEventOccurred {
             evse_id: 0,
@@ -122,9 +123,17 @@ mod tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    use crate::state::{StopReason, Transaction, TransactionChargingState, TransactionEventKind};
+    use crate::state::{
+        MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
+        TransactionUpdateReason,
+    };
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use chrono::{DateTime, Utc};
+    use ocpp_client::rust_ocpp::v2_1::datatypes::{MeterValueType, SampledValueType};
     use ocpp_client::rust_ocpp::v2_1::enumerations::{
-        ChargingStateEnumType, ReasonEnumType, TransactionEventEnumType, TriggerReasonEnumType,
+        ChargingStateEnumType, MeasurandEnumType, ReadingContextEnumType, ReasonEnumType,
+        TransactionEventEnumType, TriggerReasonEnumType,
     };
 
     // The four functions below are only consumed by `with_system_clock` (`std`-gated) and by
@@ -134,7 +143,7 @@ mod ocpp_2_1 {
     pub(super) fn map_event_type(kind: TransactionEventKind) -> TransactionEventEnumType {
         match kind {
             TransactionEventKind::Started => TransactionEventEnumType::Started,
-            TransactionEventKind::Updated => TransactionEventEnumType::Updated,
+            TransactionEventKind::Updated(_) => TransactionEventEnumType::Updated,
             TransactionEventKind::Ended => TransactionEventEnumType::Ended,
         }
     }
@@ -170,7 +179,12 @@ mod ocpp_2_1 {
     ) -> TriggerReasonEnumType {
         match kind {
             TransactionEventKind::Started => TriggerReasonEnumType::Authorized,
-            TransactionEventKind::Updated => TriggerReasonEnumType::ChargingStateChanged,
+            TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged) => {
+                TriggerReasonEnumType::ChargingStateChanged
+            }
+            TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic) => {
+                TriggerReasonEnumType::MeterValuePeriodic
+            }
             TransactionEventKind::Ended => match transaction.stop_reason {
                 Some(StopReason::EmergencyStop) => TriggerReasonEnumType::AbnormalCondition,
                 Some(StopReason::Remote) => TriggerReasonEnumType::RemoteStop,
@@ -180,18 +194,47 @@ mod ocpp_2_1 {
         }
     }
 
+    /// Builds the TransactionEvent `meterValue` list from a transaction's most recent sample -
+    /// empty if it never got one (e.g. `Started`, or a transaction that ended before charging
+    /// began). Only the energy register is modeled today; see `docs/ROADMAP.md` §10.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn build_meter_values(
+        sample: Option<MeterSample>,
+        timestamp: DateTime<Utc>,
+    ) -> Vec<MeterValueType> {
+        let Some(sample) = sample else {
+            return Vec::new();
+        };
+        vec![MeterValueType {
+            timestamp,
+            sampled_value: vec![SampledValueType {
+                value: sample.energy_wh as f64,
+                measurand: Some(MeasurandEnumType::EnergyActiveImportRegister),
+                context: Some(ReadingContextEnumType::SamplePeriodic),
+                phase: None,
+                location: None,
+                signed_meter_value: None,
+                unit_of_measure: None,
+                custom_data: None,
+            }],
+            custom_data: None,
+        }]
+    }
+
     // `TransactionEventRequest` needs a timestamp; producing one without a caller-supplied
     // `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so this impl - unlike
     // the rest of this file - needs both `ocpp_2_1` and `std`.
     #[cfg(feature = "std")]
     mod with_system_clock {
-        use super::{map_charging_state, map_event_type, map_stop_reason, trigger_reason_for};
+        use super::{
+            build_meter_values, map_charging_state, map_event_type, map_stop_reason,
+            trigger_reason_for,
+        };
         use crate::clock::{Clock, SystemClock};
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::TransactionNotifier;
         use alloc::boxed::Box;
         use alloc::string::ToString;
-        use alloc::vec::Vec;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
         use ocpp_client::rust_ocpp::v2_1::datatypes::{EVSEType, TransactionType};
@@ -208,11 +251,12 @@ mod ocpp_2_1 {
                 kind: TransactionEventKind,
                 transaction: Transaction,
             ) -> Result<(), Self::Error> {
+                let now = SystemClock.now();
                 self.send_transaction_event(TransactionEventRequest {
                     custom_data: None,
                     event_type: map_event_type(kind),
-                    meter_value: Vec::new(),
-                    timestamp: SystemClock.now(),
+                    meter_value: build_meter_values(transaction.last_meter_sample, now),
+                    timestamp: now,
                     trigger_reason: trigger_reason_for(kind, &transaction),
                     seq_no: transaction.seq_no as i32,
                     transaction_info: TransactionType {
@@ -251,7 +295,9 @@ mod ocpp_2_1 {
                 TransactionEventEnumType::Started
             );
             assert_eq!(
-                map_event_type(TransactionEventKind::Updated),
+                map_event_type(TransactionEventKind::Updated(
+                    TransactionUpdateReason::ChargingStateChanged
+                )),
                 TransactionEventEnumType::Updated
             );
             assert_eq!(
@@ -291,6 +337,7 @@ mod ocpp_2_1 {
                 charging_state: TransactionChargingState::Charging,
                 stop_reason: None,
                 seq_no: 0,
+                last_meter_sample: None,
             };
 
             assert_eq!(
@@ -298,8 +345,18 @@ mod ocpp_2_1 {
                 TriggerReasonEnumType::Authorized
             );
             assert_eq!(
-                trigger_reason_for(TransactionEventKind::Updated, &transaction),
+                trigger_reason_for(
+                    TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged),
+                    &transaction
+                ),
                 TriggerReasonEnumType::ChargingStateChanged
+            );
+            assert_eq!(
+                trigger_reason_for(
+                    TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic),
+                    &transaction
+                ),
+                TriggerReasonEnumType::MeterValuePeriodic
             );
         }
 
@@ -310,6 +367,7 @@ mod ocpp_2_1 {
                 charging_state: TransactionChargingState::EvConnected,
                 stop_reason: None,
                 seq_no: 2,
+                last_meter_sample: None,
             };
 
             assert_eq!(

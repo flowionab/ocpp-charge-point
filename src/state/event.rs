@@ -1,4 +1,6 @@
-use crate::state::{ConnectorStatus, IdToken, RegistrationStatus, StopReason, Transaction};
+use crate::state::{
+    ConnectorStatus, IdToken, MeterSample, RegistrationStatus, StopReason, Transaction,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChargePointEvent {
@@ -46,6 +48,10 @@ pub enum ConnectorEvent {
     /// Charging has stopped (locally, remotely, or the EV finished) and the contactor should
     /// open. Not used for hardware-fault-driven stops - those go through `FaultDetected`.
     ChargingStopped(StopReason),
+    /// Hardware sampled a meter reading. Reported to the CSMS (via the active transaction's
+    /// next TransactionEvent) only while the connector is actually `Charging`; ignored
+    /// otherwise. See `docs/ROADMAP.md` §10.
+    MeterValueSampled(MeterSample),
     SetAvailable,
     SetUnavailable,
     FaultDetected,
@@ -84,12 +90,23 @@ pub struct ConnectorStatusChanged {
     pub status: ConnectorStatus,
 }
 
-/// Which kind of TransactionEvent this is (OCPP `TransactionEventEnumType`).
+/// Which kind of TransactionEvent this is (OCPP `TransactionEventEnumType`). `Updated` carries
+/// *why* it fired - not part of the wire `eventType` itself (that's always `"Updated"`), but
+/// needed to pick the right `triggerReason` in the version adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionEventKind {
     Started,
-    Updated,
+    Updated(TransactionUpdateReason),
     Ended,
+}
+
+/// Why a `TransactionEventKind::Updated` fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionUpdateReason {
+    /// The transaction's `charging_state` changed (e.g. `EvConnected` -> `Charging`).
+    ChargingStateChanged,
+    /// A periodic meter reading was reported while charging.
+    MeterValuePeriodic,
 }
 
 /// A transaction lifecycle event, reported to the CSMS via TransactionEvent.

@@ -3,9 +3,9 @@ use alloc::vec::Vec;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, EvseEvent, EvseState, HardwareCommand, RegistrationStatus, StopReason,
-    Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
-    TransactionId,
+    ConnectorStatusChanged, EvseEvent, EvseState, HardwareCommand, MeterSample, RegistrationStatus,
+    StopReason, Transaction, TransactionChargingState, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +76,10 @@ impl ChargePointState {
                         ConnectorEvent::IdTokenPresented(id_token) => Some(id_token.clone()),
                         _ => None,
                     };
+                    let meter_sample = match &event {
+                        ConnectorEvent::MeterValueSampled(sample) => Some(*sample),
+                        _ => None,
+                    };
                     let transition = connector.apply(event);
                     let new_state = *connector;
                     if let Some(command) = transition.command {
@@ -136,6 +140,18 @@ impl ChargePointState {
                                 },
                             ));
                         }
+                        if let Some(sample) = meter_sample {
+                            if let Some((kind, transaction)) = apply_meter_sample(slot, sample) {
+                                effects.push(ChargePointEffect::TransactionEvent(
+                                    TransactionEventOccurred {
+                                        evse_id,
+                                        connector_id,
+                                        kind,
+                                        transaction,
+                                    },
+                                ));
+                            }
+                        }
                     }
                     transition.changed
                 }
@@ -173,6 +189,7 @@ fn advance_transaction(
                 charging_state: TransactionChargingState::EvConnected,
                 stop_reason: None,
                 seq_no: 0,
+                last_meter_sample: None,
             };
             *slot = Some(transaction);
             Some((TransactionEventKind::Started, transaction))
@@ -181,7 +198,10 @@ fn advance_transaction(
             let transaction = slot.as_mut()?;
             transaction.charging_state = TransactionChargingState::Charging;
             transaction.seq_no += 1;
-            Some((TransactionEventKind::Updated, *transaction))
+            Some((
+                TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged),
+                *transaction,
+            ))
         }
         (ConnectorState::Charging, ConnectorState::Stopping) => {
             let transaction = slot.as_mut()?;
@@ -204,6 +224,25 @@ fn advance_transaction(
     }
 }
 
+/// Records a meter reading against the connector's active transaction, if it's currently
+/// `Charging` - meter values are only meaningful (and only reported) while energy is actually
+/// flowing.
+fn apply_meter_sample(
+    slot: &mut Option<Transaction>,
+    sample: MeterSample,
+) -> Option<(TransactionEventKind, Transaction)> {
+    let transaction = slot.as_mut()?;
+    if transaction.charging_state != TransactionChargingState::Charging {
+        return None;
+    }
+    transaction.last_meter_sample = Some(sample);
+    transaction.seq_no += 1;
+    Some((
+        TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic),
+        *transaction,
+    ))
+}
+
 fn set_if_changed<T: PartialEq>(current: &mut T, next: T) -> bool {
     if *current == next {
         false
@@ -216,7 +255,7 @@ fn set_if_changed<T: PartialEq>(current: &mut T, next: T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ChargePointEffect, IdToken, IdTokenKind};
+    use crate::state::{ChargePointEffect, IdToken, IdTokenKind, TransactionUpdateReason};
 
     #[test]
     fn accepted_registration_records_status_and_makes_the_charge_point_available() {
@@ -408,6 +447,7 @@ mod tests {
             charging_state: TransactionChargingState::EvConnected,
             stop_reason: None,
             seq_no: 0,
+            last_meter_sample: None,
         };
         assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
@@ -433,16 +473,80 @@ mod tests {
             charging_state: TransactionChargingState::Charging,
             stop_reason: None,
             seq_no: 1,
+            last_meter_sample: None,
         };
         assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
             TransactionEventOccurred {
                 evse_id: 0,
                 connector_id: 0,
-                kind: TransactionEventKind::Updated,
+                kind: TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged),
                 transaction: expected_transaction,
             }
         )));
+    }
+
+    #[test]
+    fn a_meter_reading_while_charging_updates_the_transaction_and_is_reported() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        let sample = MeterSample { energy_wh: 1_500 };
+        let effects = apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample));
+
+        let expected_transaction = Transaction {
+            id: TransactionId(0),
+            charging_state: TransactionChargingState::Charging,
+            stop_reason: None,
+            seq_no: 2,
+            last_meter_sample: Some(sample),
+        };
+        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
+        // A meter reading never changes the connector's physical state.
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+        assert!(effects.contains(&ChargePointEffect::TransactionEvent(
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic),
+                transaction: expected_transaction,
+            }
+        )));
+    }
+
+    #[test]
+    fn a_meter_reading_while_not_charging_is_ignored() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        // Still `Starting` (EvConnected) here, not yet `Charging`.
+
+        let sample = MeterSample { energy_wh: 1_500 };
+        let effects = apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample));
+
+        assert_eq!(
+            state.evses[0].transactions[0].map(|transaction| transaction.last_meter_sample),
+            Some(None)
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
+    }
+
+    #[test]
+    fn a_meter_reading_with_no_active_transaction_is_ignored() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::MeterValueSampled(MeterSample { energy_wh: 1_500 }),
+        );
+
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -471,6 +575,7 @@ mod tests {
             charging_state: TransactionChargingState::EvConnected,
             stop_reason: Some(StopReason::Local),
             seq_no: 2,
+            last_meter_sample: None,
         };
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
         assert_eq!(state.evses[0].transactions[0], None);
@@ -498,6 +603,7 @@ mod tests {
             charging_state: TransactionChargingState::Charging,
             stop_reason: Some(StopReason::EmergencyStop),
             seq_no: 2,
+            last_meter_sample: None,
         };
         assert_eq!(state.evses[0].transactions[0], None);
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(

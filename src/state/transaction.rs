@@ -40,4 +40,7 @@ pub struct Transaction {
     pub stop_reason: Option<StopReason>,
     /// Monotonically increasing per transaction, per the OCPP TransactionEvent `seqNo` field.
     pub seq_no: u32,
+    /// The most recent meter reading reported while this transaction was `Charging`, if any -
+    /// see the Meter values functional block (`docs/ROADMAP.md` §10).
+    pub last_meter_sample: Option<crate::state::MeterSample>,
 }

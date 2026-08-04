@@ -342,12 +342,26 @@ Energy/power measurement reporting.
 
 - Messages: `MeterValues` (1.6J standalone; embedded in `TransactionEvent`
   for 2.x), sampled data configuration, clock-aligned data intervals.
-- Internal state needed: a metering hardware trait (currently absent from
-  `crate::hardware`), sampled-value buffering, clock-aligned scheduling.
-- Status: ⬜ not started — no metering hook exists in the hardware layer
-  at all yet.
+- Internal state needed: `state::MeterSample` (currently just an energy
+  register reading); `Transaction::last_meter_sample`;
+  `ConnectorEvent::MeterValueSampled`, which the hardware integration
+  pushes in (same pattern as `CableConnected`/`IdTokenPresented` - no
+  framework-driven polling loop, since `ChargePointRuntime<T>` doesn't hold
+  a `'static`-safe shared reference to hardware `T`). A sample is only
+  recorded (and reported) while the connector's transaction is `Charging`;
+  it's dropped otherwise. Recording a sample bumps `seq_no` and emits
+  `TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic)`,
+  which the 2.1 adapter (`transactions::ocpp_2_1::build_meter_values`)
+  embeds as the `meterValue` of the next `TransactionEvent`.
+- Status: 🟨 in progress — energy register (Wh) sampling and reporting via
+  embedded `TransactionEvent.meterValue` is implemented and tested. Not yet
+  done: standalone `MeterValues` for 1.6J, additional measurands
+  (power, current, voltage, SoC), sampled-data configuration, and
+  clock-aligned periodic scheduling (still requires an integrator-owned
+  timer today; the crate has no scheduling hook for it).
 - Version notes: measurand/unit enums are close to compatible across
-  versions; sampling-context differs slightly.
+  versions; sampling-context differs slightly. 1.6J needs a standalone
+  `MeterValues` sender, not yet built.
 
 ## 11. Smart charging
 
