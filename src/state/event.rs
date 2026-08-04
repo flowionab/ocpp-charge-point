@@ -45,6 +45,14 @@ pub enum ConnectorEvent {
     AuthorizationDenied,
     ContactorClosed,
     ContactorOpened,
+    /// The CSMS asked to unlock the connector (OCPP `UnlockConnector`) while it's `Locked` with
+    /// no active transaction. See `docs/ROADMAP.md` §6.
+    RemoteUnlockRequested,
+    /// The CSMS asked to start a transaction (OCPP `RequestStartTransaction`) while the
+    /// connector is `Locked` with no active transaction. Unlike `IdTokenPresented`, this skips
+    /// straight to `Starting` without a separate Authorize round-trip - the CSMS's own request
+    /// is itself the authorization decision. See `docs/ROADMAP.md` §6.
+    RemoteStartRequested,
     /// Charging has stopped (locally, remotely, or the EV finished) and the contactor should
     /// open. Not used for hardware-fault-driven stops - those go through `FaultDetected`.
     ChargingStopped(StopReason),

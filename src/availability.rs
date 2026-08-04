@@ -1,7 +1,11 @@
 //! Availability functional block: reporting connector status to the CSMS via
-//! StatusNotification. See `docs/ROADMAP.md` §7.
+//! StatusNotification, and handling CSMS-initiated `ChangeAvailability` requests. See
+//! `docs/ROADMAP.md` §7.
 
-use crate::state::{ConnectorStatus, ConnectorStatusChanged};
+use crate::actor::ChargePointActor;
+use crate::state::{
+    ChargePointEvent, ConnectorEvent, ConnectorStatus, ConnectorStatusChanged, EvseEvent,
+};
 use crate::sync::{BroadcastReceiver, RecvError};
 use alloc::boxed::Box;
 
@@ -17,6 +21,106 @@ pub trait StatusNotifier {
         connector_id: usize,
         status: ConnectorStatus,
     ) -> Result<(), Self::Error>;
+}
+
+/// The scope of a CSMS-initiated `ChangeAvailability` request - OCPP's optional `evse`/
+/// `connectorId` addressing collapsed to one of the three levels the internal state model
+/// tracks availability at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityTarget {
+    ChargePoint,
+    Evse { evse_id: usize },
+    Connector { evse_id: usize, connector_id: usize },
+}
+
+/// The outcome of a CSMS-initiated `ChangeAvailability` request, matching (a subset of) OCPP's
+/// `ChangeAvailabilityStatusEnumType`. `Scheduled` - deferring the change until an in-progress
+/// transaction ends - isn't modeled: `SetUnavailable` takes effect immediately regardless of an
+/// active transaction (see `docs/ROADMAP.md` §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeAvailabilityOutcome {
+    Accepted,
+    Rejected,
+}
+
+/// Handles a CSMS-initiated `ChangeAvailability` request against `actor`: rejects a `target`
+/// that doesn't address a real EVSE/connector, otherwise applies `available` as
+/// `SetAvailable`/`SetUnavailable` at the matching level of the internal state model
+/// (charge-point-wide, EVSE, or connector) and accepts. Availability changes apply
+/// synchronously within the actor (unlike e.g. `UnlockConnector`, no hardware round-trip is
+/// needed), so this doesn't need to wait for a confirming state change.
+pub async fn handle_change_availability_request(
+    actor: &ChargePointActor,
+    target: AvailabilityTarget,
+    available: bool,
+) -> ChangeAvailabilityOutcome {
+    let event = match target {
+        AvailabilityTarget::ChargePoint => availability_event(available),
+        AvailabilityTarget::Evse { evse_id } => {
+            if actor.state().evses.get(evse_id).is_none() {
+                return ChangeAvailabilityOutcome::Rejected;
+            }
+            ChargePointEvent::Evse {
+                evse_id,
+                event: evse_availability_event(available),
+            }
+        }
+        AvailabilityTarget::Connector {
+            evse_id,
+            connector_id,
+        } => {
+            let connector_exists = actor
+                .state()
+                .evses
+                .get(evse_id)
+                .is_some_and(|evse| evse.connectors.get(connector_id).is_some());
+            if !connector_exists {
+                return ChangeAvailabilityOutcome::Rejected;
+            }
+            ChargePointEvent::Evse {
+                evse_id,
+                event: EvseEvent::Connector {
+                    connector_id,
+                    event: connector_availability_event(available),
+                },
+            }
+        }
+    };
+
+    let _ = actor.send(event).await;
+    ChangeAvailabilityOutcome::Accepted
+}
+
+fn availability_event(available: bool) -> ChargePointEvent {
+    if available {
+        ChargePointEvent::SetAvailable
+    } else {
+        ChargePointEvent::SetUnavailable
+    }
+}
+
+fn evse_availability_event(available: bool) -> EvseEvent {
+    if available {
+        EvseEvent::SetAvailable
+    } else {
+        EvseEvent::SetUnavailable
+    }
+}
+
+fn connector_availability_event(available: bool) -> ConnectorEvent {
+    if available {
+        ConnectorEvent::SetAvailable
+    } else {
+        ConnectorEvent::SetUnavailable
+    }
+}
+
+/// Registers this charge point's inbound `ChangeAvailability` handling with the CSMS
+/// connection. Implemented per protocol version (see the `ocpp_2_1` module), mirroring
+/// [`crate::remote_control::UnlockConnectorHandler`].
+#[async_trait::async_trait]
+pub trait ChangeAvailabilityHandler {
+    async fn register_change_availability_handler(&self, actor: ChargePointActor);
 }
 
 /// Forwards every connector status change received on `changes` to the CSMS via `notifier`,
@@ -111,9 +215,126 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod change_availability_tests {
+    use super::{
+        AvailabilityTarget, ChangeAvailabilityOutcome, handle_change_availability_request,
+    };
+    use crate::actor::ChargePointActor;
+    use crate::executor::TokioExecutor;
+    use crate::state::{ConnectorState, EvseStatus, LifecycleState};
+
+    #[tokio::test]
+    async fn making_the_charge_point_unavailable_sets_the_lifecycle_state() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome =
+            handle_change_availability_request(&actor, AvailabilityTarget::ChargePoint, false)
+                .await;
+
+        assert_eq!(outcome, ChangeAvailabilityOutcome::Accepted);
+        assert_eq!(actor.state().lifecycle, LifecycleState::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn making_an_evse_unavailable_sets_only_that_evses_status() {
+        let actor = ChargePointActor::spawn([1, 1], &TokioExecutor);
+
+        let outcome = handle_change_availability_request(
+            &actor,
+            AvailabilityTarget::Evse { evse_id: 1 },
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome, ChangeAvailabilityOutcome::Accepted);
+        assert_eq!(actor.state().evses[1].status, EvseStatus::Unavailable);
+        assert_eq!(actor.state().evses[0].status, EvseStatus::Available);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_evse_is_rejected() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_change_availability_request(
+            &actor,
+            AvailabilityTarget::Evse { evse_id: 5 },
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome, ChangeAvailabilityOutcome::Rejected);
+    }
+
+    #[tokio::test]
+    async fn making_a_connector_unavailable_then_available_again_round_trips() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_change_availability_request(
+            &actor,
+            AvailabilityTarget::Connector {
+                evse_id: 0,
+                connector_id: 0,
+            },
+            false,
+        )
+        .await;
+        assert_eq!(outcome, ChangeAvailabilityOutcome::Accepted);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Unavailable
+        );
+
+        let outcome = handle_change_availability_request(
+            &actor,
+            AvailabilityTarget::Connector {
+                evse_id: 0,
+                connector_id: 0,
+            },
+            true,
+        )
+        .await;
+        assert_eq!(outcome, ChangeAvailabilityOutcome::Accepted);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_connector_is_rejected() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_change_availability_request(
+            &actor,
+            AvailabilityTarget::Connector {
+                evse_id: 0,
+                connector_id: 5,
+            },
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome, ChangeAvailabilityOutcome::Rejected);
+    }
+}
+
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
+    use crate::actor::ChargePointActor;
+    use crate::availability::{
+        AvailabilityTarget, ChangeAvailabilityHandler, ChangeAvailabilityOutcome,
+        handle_change_availability_request,
+    };
     use crate::state::ConnectorStatus;
+    use alloc::boxed::Box;
+    use ocpp_client::ocpp_2_1::OCPP2_1Client;
+    use ocpp_client::rust_ocpp::v2_1::enumerations::{
+        ChangeAvailabilityStatusEnumType, OperationalStatusEnumType,
+    };
+    use ocpp_client::rust_ocpp::v2_1::messages::change_availability::{
+        ChangeAvailabilityRequest, ChangeAvailabilityResponse,
+    };
     use ocpp_client::rust_ocpp::v2_1::messages::status_notification::ConnectorStatusEnumType;
 
     // Only consumed by `with_system_clock` below (`std`-gated) and by this module's own tests;
@@ -166,6 +387,56 @@ mod ocpp_2_1 {
         }
     }
 
+    /// `None` if the request's `evse`/`connectorId` addressing doesn't parse into a valid
+    /// (non-negative) index - handled the same as an unknown EVSE/connector, i.e. `Rejected`.
+    fn parse_target(request: &ChangeAvailabilityRequest) -> Option<AvailabilityTarget> {
+        let Some(evse) = &request.evse else {
+            return Some(AvailabilityTarget::ChargePoint);
+        };
+        let evse_id = usize::try_from(evse.id).ok()?;
+        match evse.connector_id {
+            None => Some(AvailabilityTarget::Evse { evse_id }),
+            Some(connector_id) => Some(AvailabilityTarget::Connector {
+                evse_id,
+                connector_id: usize::try_from(connector_id).ok()?,
+            }),
+        }
+    }
+
+    fn map_outcome(outcome: ChangeAvailabilityOutcome) -> ChangeAvailabilityStatusEnumType {
+        match outcome {
+            ChangeAvailabilityOutcome::Accepted => ChangeAvailabilityStatusEnumType::Accepted,
+            ChangeAvailabilityOutcome::Rejected => ChangeAvailabilityStatusEnumType::Rejected,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChangeAvailabilityHandler for OCPP2_1Client {
+        async fn register_change_availability_handler(&self, actor: ChargePointActor) {
+            self.on_change_availability(move |request, _client| {
+                let actor = actor.clone();
+                async move {
+                    let available = matches!(
+                        request.operational_status,
+                        OperationalStatusEnumType::Operative
+                    );
+                    let outcome = match parse_target(&request) {
+                        Some(target) => {
+                            handle_change_availability_request(&actor, target, available).await
+                        }
+                        None => ChangeAvailabilityOutcome::Rejected,
+                    };
+                    Ok(ChangeAvailabilityResponse {
+                        status: map_outcome(outcome),
+                        status_info: None,
+                        custom_data: None,
+                    })
+                }
+            })
+            .await;
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -191,6 +462,64 @@ mod ocpp_2_1 {
             assert_eq!(
                 map_status(ConnectorStatus::Faulted),
                 ConnectorStatusEnumType::Faulted
+            );
+        }
+
+        fn request(evse: Option<(i32, Option<i32>)>) -> ChangeAvailabilityRequest {
+            ChangeAvailabilityRequest {
+                evse: evse.map(|(id, connector_id)| {
+                    ocpp_client::rust_ocpp::v2_1::messages::change_availability::EVSEType {
+                        id,
+                        connector_id,
+                        custom_data: None,
+                    }
+                }),
+                operational_status: OperationalStatusEnumType::Inoperative,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn no_evse_targets_the_whole_charge_point() {
+            assert_eq!(
+                parse_target(&request(None)),
+                Some(AvailabilityTarget::ChargePoint)
+            );
+        }
+
+        #[test]
+        fn an_evse_with_no_connector_targets_the_evse() {
+            assert_eq!(
+                parse_target(&request(Some((1, None)))),
+                Some(AvailabilityTarget::Evse { evse_id: 1 })
+            );
+        }
+
+        #[test]
+        fn an_evse_with_a_connector_targets_the_connector() {
+            assert_eq!(
+                parse_target(&request(Some((1, Some(2))))),
+                Some(AvailabilityTarget::Connector {
+                    evse_id: 1,
+                    connector_id: 2,
+                })
+            );
+        }
+
+        #[test]
+        fn a_negative_evse_id_has_no_target() {
+            assert_eq!(parse_target(&request(Some((-1, None)))), None);
+        }
+
+        #[test]
+        fn every_outcome_maps_to_the_matching_wire_status() {
+            assert_eq!(
+                map_outcome(ChangeAvailabilityOutcome::Accepted),
+                ChangeAvailabilityStatusEnumType::Accepted
+            );
+            assert_eq!(
+                map_outcome(ChangeAvailabilityOutcome::Rejected),
+                ChangeAvailabilityStatusEnumType::Rejected
             );
         }
     }

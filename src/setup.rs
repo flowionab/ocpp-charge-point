@@ -1,11 +1,14 @@
 use crate::ChargePointRuntime;
 use crate::authorization::{Authorizer, run_authorization_requests};
-use crate::availability::{StatusNotifier, run_status_notifications};
+use crate::availability::{ChangeAvailabilityHandler, StatusNotifier, run_status_notifications};
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
+use crate::remote_control::{
+    RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
+};
 use crate::transactions::{TransactionNotifier, run_transaction_events};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -37,6 +40,10 @@ where
         + StatusNotifier
         + TransactionNotifier
         + Authorizer
+        + UnlockConnectorHandler
+        + ChangeAvailabilityHandler
+        + RequestStartTransactionHandler
+        + RequestStopTransactionHandler
         + Clone
         + Send
         + Sync
@@ -95,6 +102,15 @@ where
     executor.spawn(Box::pin(async move {
         run_authorization_requests(authorization_requests, &authorizer, actor).await;
     }));
+
+    csms.register_unlock_connector_handler(runtime.actor())
+        .await;
+    csms.register_change_availability_handler(runtime.actor())
+        .await;
+    csms.register_request_start_transaction_handler(runtime.actor())
+        .await;
+    csms.register_request_stop_transaction_handler(runtime.actor())
+        .await;
 
     Ok(runtime)
 }

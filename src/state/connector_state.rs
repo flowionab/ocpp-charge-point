@@ -61,6 +61,12 @@ impl ConnectorState {
             }
             (Self::Connected, ConnectorEvent::LockConfirmed) => (Self::Locked, None),
             (Self::Locked, ConnectorEvent::IdTokenPresented(_)) => (Self::Authorizing, None),
+            (Self::Locked, ConnectorEvent::RemoteUnlockRequested) => {
+                (Self::Unlocking, Some(ConnectorCommand::Unlock))
+            }
+            (Self::Locked, ConnectorEvent::RemoteStartRequested) => {
+                (Self::Starting, Some(ConnectorCommand::CloseContactor))
+            }
             (Self::Authorizing, ConnectorEvent::ChargingAuthorized) => {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))
             }

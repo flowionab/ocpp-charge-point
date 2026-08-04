@@ -1,9 +1,12 @@
 use ocpp_charge_point::authorization::Authorizer;
-use ocpp_charge_point::availability::StatusNotifier;
+use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
 use ocpp_charge_point::executor::TokioExecutor;
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
 use ocpp_charge_point::provisioning::{
     BootNotificationOutcome, BootNotifier, HeartbeatSender, TokioBackoff,
+};
+use ocpp_charge_point::remote_control::{
+    RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
 use ocpp_charge_point::setup;
 use ocpp_charge_point::state::{
@@ -78,6 +81,42 @@ impl Authorizer for AlwaysAcceptBootNotifier {
 
     async fn authorize(&self, _id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
         Ok(AuthorizationStatus::Accepted)
+    }
+}
+
+#[async_trait::async_trait]
+impl UnlockConnectorHandler for AlwaysAcceptBootNotifier {
+    async fn register_unlock_connector_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ChangeAvailabilityHandler for AlwaysAcceptBootNotifier {
+    async fn register_change_availability_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl RequestStartTransactionHandler for AlwaysAcceptBootNotifier {
+    async fn register_request_start_transaction_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl RequestStopTransactionHandler for AlwaysAcceptBootNotifier {
+    async fn register_request_stop_transaction_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
     }
 }
 

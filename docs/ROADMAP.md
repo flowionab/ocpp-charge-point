@@ -39,10 +39,15 @@ Not a functional block, but a prerequisite for all of them.
   to `ocpp-client/websocket`, implying `tokio-runtime`) is in `default` for
   zero-config ergonomics; embedded/no_std targets or std users needing a
   non-WebSocket transport still construct their own client and call
-  `setup()` directly. Still missing: there is no inbound OCPP call handling
-  yet (CSMS-initiated actions like `ChangeAvailability`,
-  `RequestStartTransaction`, etc.), and `connect_and_setup` only covers
-  OCPP 2.1 (the crate's primary target per `CLAUDE.md`), not 1.6J/2.0.1.
+  `setup()` directly. Inbound OCPP call handling has now started (see §6 -
+  `UnlockConnector`, `RequestStartTransaction`, and `RequestStopTransaction`
+  - and §7 - `ChangeAvailability` - which are wired end-to-end); other
+  CSMS-initiated actions still aren't. `TriggerMessage` is a special case
+  worth calling out here too: it has a protocol-agnostic internal handler
+  (§6) but no wire adapter is even possible yet - the OCPP 2.1 message
+  types don't exist upstream in `rust-ocpp`/`ocpp-client` at all (unlike
+  every other action in this list). `connect_and_setup` only covers OCPP
+  2.1 (the crate's primary target per `CLAUDE.md`), not 1.6J/2.0.1.
 - ⬜ Protocol-version-independent core → version adapters. The state model
   needs to be designed so a single internal representation projects down
   to 1.6J, 2.0.1, and 2.1 wire shapes.
@@ -269,10 +274,17 @@ The core charging session lifecycle.
   spec `ReasonEnumType`) since RemoteControl/Authorization, which would
   supply richer reasons, don't exist yet; `TriggerReasonEnumType` is
   derived entirely in the OCPP 2.1 adapter rather than carried in the
-  internal model, per the version-adapter principle in `CLAUDE.md`. Still
-  missing: `id_token` (needs Authorization, §3), running totals/energy
-  (needs Meter values, §10), `RequestStartTransaction`/
-  `RequestStopTransaction` (needs Remote control, §6), and multiple
+  internal model, per the version-adapter principle in `CLAUDE.md`. A
+  transaction can now also start via `RequestStartTransaction` (see §6),
+  not just a physically presented id token - either way it's the same
+  `Started` `TransactionEvent`, since `advance_transaction` triggers on
+  any transition into `ConnectorState::Starting` regardless of where it
+  came from. It can also be stopped remotely via `RequestStopTransaction`
+  (§6), which reuses the existing `ChargingStopped(StopReason::Remote)`
+  path unchanged - no new state-machine event was needed there, just a
+  new way to reach the existing one. Still missing: `id_token` (needs
+  Authorization, §3; a remote-started transaction's token isn't recorded
+  either), running totals/energy (needs Meter values, §10), and multiple
   `Updated` events per transaction (today only the single Charging
   transition produces one).
 - Version notes: this is the highest-value adapter target — 2.x's single
@@ -288,10 +300,109 @@ CSMS-initiated control of the charge point.
 - Internal state needed: inbound command handling that maps to existing
   `ChargePointEvent`/`ConnectorEvent` variants, plus request/response
   correlation back to the CSMS call.
-- Status: ⬜ not started (no inbound OCPP call handling exists yet — see
-  §0 network wiring).
+- Status: 🚧 partial — `UnlockConnector` is implemented, and is also the
+  first inbound OCPP call this crate handles at all (previously §0 noted
+  none existed). `ocpp-client`'s `Client::on::<A>`/`on_unlock_connector`
+  already provide inbound CALL dispatch on the transport side; the new
+  piece is `remote_control::handle_unlock_request` (evse_id, connector_id,
+  `&ChargePointActor`) - a protocol-agnostic async function, mirroring the
+  shape of the other functional-block modules but inbound rather than
+  outbound. It rejects out-of-range addresses (`UnknownConnector`) and a
+  connector with a transaction in progress
+  (`Authorizing`/`Starting`/`Charging`/`Stopping` →
+  `OngoingAuthorizedTransaction`, refused rather than interrupted); only a
+  `Locked` connector (cable locked, no active transaction) is actually
+  unlockable. A new `ConnectorEvent::RemoteUnlockRequested` drives
+  `Locked` → `Unlocking` (reusing the existing `Unlocking`/`UnlockConfirmed`
+  → `Available` path also used by the fault-clear flow), and the handler
+  then awaits the actor's state (via `ChargePointActor::subscribe`) until
+  it reaches `Available` (`Unlocked`) or `Faulted`/`FaultedSafe`
+  (`UnlockFailed`) - the OCPP `Unlocked` status must reflect an unlock
+  that actually happened, not merely one that was requested, so this
+  waits for real hardware confirmation rather than answering immediately.
+  A protocol-agnostic `UnlockConnectorHandler` trait
+  (`register_unlock_connector_handler`), implemented for `ocpp-client`'s
+  OCPP 2.1 client, is registered from `setup()` the same way the other
+  blocks wire in. `RequestStartTransaction` is implemented too:
+  `remote_control::handle_request_start_transaction` (an optional
+  `evse_id`, `&ChargePointActor`) finds a `Locked` connector - the one on
+  `evse_id`, or, if unspecified, the first `Locked` connector on any EVSE
+  - and drives it straight to `Starting` via a new
+  `ConnectorEvent::RemoteStartRequested`, deliberately *not* reusing
+  `IdTokenPresented`: that event's `Locked` → `Authorizing` transition
+  triggers `ChargePointEffect::AuthorizationRequested`, which would fire a
+  spurious outbound `Authorize.req` back at the CSMS for a token it just
+  told the charge point to accept - the CSMS's own request already *is*
+  the authorization decision. `advance_transaction` (in
+  `charge_point_state.rs`) was widened from matching only
+  `(Authorizing, Starting)` to `(Authorizing | Locked, Starting)` so a
+  remote-started transaction gets created and reported the same way a
+  physically-authorized one is; it's intentionally not just `(_, Starting)`
+  since a connector can self-loop `Starting` → `Starting` (e.g. a meter
+  sample applied before the contactor confirms closed) without that being
+  a new transaction. Rejects if `evse_id` is out of range or no connector
+  addressed by it (or, if unspecified, none at all) is currently `Locked`.
+  A `RequestStartTransactionHandler` trait, implemented for `ocpp-client`'s
+  OCPP 2.1 client (registering via `Client::on_request_start_transaction`),
+  reports the started `Transaction::id` back as the response's
+  `transactionId` (stringified) on `Accepted`. `RequestStopTransaction` is
+  implemented too, and needed no new `ConnectorEvent`:
+  `remote_control::handle_request_stop_transaction` (a `TransactionId`,
+  `&ChargePointActor`) finds the connector whose active transaction
+  matches the id and, only if it's currently `Charging`, dispatches the
+  same `ConnectorEvent::ChargingStopped(StopReason::Remote)` a local stop
+  would - `StopReason::Remote` already existed for exactly this case, just
+  unreachable until now. Rejects an unknown transaction id, or one that's
+  active but not yet `Charging` (e.g. still `Starting`, contactor not
+  confirmed closed) - the connector state machine's only stop path is
+  `Charging` → `Stopping`, so a not-yet-charging remote-started
+  transaction can't be stopped this way yet. A
+  `RequestStopTransactionHandler` trait, implemented for `ocpp-client`'s
+  OCPP 2.1 client (registering via `Client::on_request_stop_transaction`),
+  parses the wire `transactionId` string as a `u64`, treating anything
+  that doesn't parse as an unknown transaction. `TriggerMessage` has a
+  protocol-agnostic internal handler
+  (`remote_control::{TriggerableMessage, handle_trigger_message}`) but
+  **no CSMS-facing entry point at all** - blocked upstream, not something
+  fixable from this side. `rust-ocpp`'s `v2_1` module (gated behind its
+  own `wip_v2_1` feature) never declares a `trigger_message` message
+  module in the first place - `v2_1/messages/mod.rs` has no
+  `pub mod trigger_message;` line, so there's no
+  `TriggerMessageRequest`/`TriggerMessageResponse` to receive at all. This
+  is a step behind `NotifyReport`, which at least has an (empty) stub file
+  upstream - see `ocpp-client`'s own `CLAUDE.md`, which documents that gap
+  the same way. Consequently `ocpp-client`'s OCPP 2.1 actions module has
+  no `on_trigger_message`/`send_trigger_message` at all, and no
+  `TriggerMessageHandler` trait or `setup()` wiring exists here either -
+  adding either now, ahead of something that could implement it, would
+  just break every real caller of `setup()` (their `N` could never
+  satisfy the bound). What does exist: `TriggerableMessage` covers the
+  subset of OCPP's 13-value `MessageTriggerEnumType` this crate can
+  actually fulfil today, each backed by an outbound trait it already has
+  - `Heartbeat` (via `HeartbeatSender`) and `StatusNotification` (via
+  `StatusNotifier`, addressed with the same
+  `crate::availability::AvailabilityTarget` `ChangeAvailability` uses -
+  charge-point-wide, one EVSE, or one connector). `BootNotification` isn't
+  covered - it needs hardware vendor/model strings this module has no
+  access to (only `setup()` does). `MeterValues`/`TransactionEvent` aren't
+  either - both need a "resend the current snapshot" capability neither
+  functional block has (§10's meter reporting and §5's transaction
+  reporting are both purely event-driven today). The remaining six wire
+  values (log/firmware/certificate triggers, `CustomTrigger`) have no
+  supporting functional block at all (§1, §12). A transport failure while
+  (re-)sending is logged, not treated as a rejection - `Accepted` here
+  means the charge point attempted the trigger, matching how
+  `run_status_notifications` already treats a failed report elsewhere in
+  this file. `TriggerMessageStatusEnumType::NotImplemented` has no
+  equivalent on the internal `TriggerMessageOutcome` (`Accepted`/
+  `Rejected` only) - it only makes sense once a wire adapter can receive
+  a `MessageTriggerEnumType` this module has no variant for at all, so
+  that mapping belongs entirely to the (not yet possible) wire layer.
 - Version notes: 1.6J's `RemoteStartTransaction`/`RemoteStopTransaction`
-  map directly; `TriggerMessage` payload options differ per version.
+  map directly; `TriggerMessage` payload options differ per version, and -
+  once the upstream gap above closes - 1.6J's own `TriggerMessage` is
+  already wired up in `ocpp-client` (`ocpp_1_6::actions`), so that version
+  isn't blocked the way 2.1 is.
 
 ## 7. Availability
 
@@ -313,11 +424,27 @@ Operational availability of charge point / EVSE / connector.
   dedicated channel (`ChargePointActor::subscribe_status_notifications`);
   and `setup()` spawns `availability::run_status_notifications` to forward
   them to the CSMS via a `StatusNotifier` (implemented for `ocpp-client`'s
-  OCPP 2.1 client). Still missing: EVSE-level and charge-point-level
-  availability changes (`EvseStatus`/`LifecycleState` going
-  Unavailable/Faulted) don't yet fan out to per-connector
+  OCPP 2.1 client). Inbound `ChangeAvailability` is now wired too:
+  `availability::handle_change_availability_request` (an `AvailabilityTarget`
+  - `ChargePoint`/`Evse { evse_id }`/`Connector { evse_id, connector_id }`,
+  the collapsed form of OCPP's optional `evse`/`connectorId` addressing -
+  plus `available: bool`, and `&ChargePointActor`) is a protocol-agnostic
+  async function, mirroring §6's `remote_control::handle_unlock_request`
+  but simpler: `SetAvailable`/`SetUnavailable` apply synchronously within
+  the actor (no hardware round-trip), so it rejects an out-of-range
+  EVSE/connector and otherwise dispatches the matching
+  `ChargePointEvent`/`EvseEvent`/`ConnectorEvent::SetAvailable`/
+  `SetUnavailable` and immediately accepts - it doesn't wait for a
+  confirming state change the way the unlock handler does. A
+  `ChangeAvailabilityHandler` trait, implemented for `ocpp-client`'s OCPP
+  2.1 client (registering via `Client::on_change_availability`), is wired
+  in from `setup()` the same way. Still missing: EVSE-level and
+  charge-point-level availability changes (`EvseStatus`/`LifecycleState`
+  going Unavailable/Faulted) don't yet fan out to per-connector
   StatusNotifications, `Reserved` is unreachable until §8 Reservation
-  exists, and `ChangeAvailability` isn't wired as an inbound trigger.
+  exists, and OCPP's `Scheduled` status (deferring a `ChangeAvailability`
+  until an in-progress transaction ends, rather than interrupting it) isn't
+  modeled - `SetUnavailable` always applies immediately, even mid-transaction.
 - Version notes: status enum values differ between 1.6J and 2.0.1/2.1
   (`Reserved`, `SuspendedEV`, `SuspendedEVSE` etc. only exist from 2.x
   onward at connector level in some cases) — the internal enum must be a

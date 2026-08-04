@@ -202,6 +202,38 @@ pub(crate) mod test_support {
             Ok(crate::state::AuthorizationStatus::Accepted)
         }
     }
+
+    #[async_trait::async_trait]
+    impl crate::remote_control::UnlockConnectorHandler for FixedBootNotifier {
+        async fn register_unlock_connector_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::availability::ChangeAvailabilityHandler for FixedBootNotifier {
+        async fn register_change_availability_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_control::RequestStartTransactionHandler for FixedBootNotifier {
+        async fn register_request_start_transaction_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_control::RequestStopTransactionHandler for FixedBootNotifier {
+        async fn register_request_stop_transaction_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]

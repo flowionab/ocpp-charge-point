@@ -181,7 +181,12 @@ fn advance_transaction(
     event_stop_reason: Option<StopReason>,
 ) -> Option<(TransactionEventKind, Transaction)> {
     match (previous_state, new_state) {
-        (ConnectorState::Authorizing, ConnectorState::Starting) => {
+        // Reached from `Authorizing` (a physically presented id token was authorized) or
+        // directly from `Locked` (a CSMS-initiated `RequestStartTransaction` - see
+        // `docs/ROADMAP.md` §6) - either way, entering `Starting` from elsewhere always begins a
+        // new transaction. Excludes `Starting` -> `Starting` (e.g. a meter sample applied while
+        // still `Starting`, which doesn't change connector state) - that must stay a no-op.
+        (ConnectorState::Authorizing | ConnectorState::Locked, ConnectorState::Starting) => {
             let id = TransactionId(*next_transaction_id);
             *next_transaction_id += 1;
             let transaction = Transaction {
@@ -382,6 +387,84 @@ mod tests {
         apply_connector_event(state, ConnectorEvent::CableConnected);
         apply_connector_event(state, ConnectorEvent::LockConfirmed);
         apply_connector_event(state, ConnectorEvent::IdTokenPresented(test_id_token()));
+    }
+
+    #[test]
+    fn a_remote_unlock_request_while_locked_unlocks_the_connector() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteUnlockRequested);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Unlocking);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::UnlockConnector {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+    }
+
+    #[test]
+    fn a_remote_start_request_while_locked_starts_a_transaction_without_authorizing() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::AuthorizationRequested(_)))
+        );
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::CloseContactor {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+        let expected_transaction = Transaction {
+            id: TransactionId(0),
+            charging_state: TransactionChargingState::EvConnected,
+            stop_reason: None,
+            seq_no: 0,
+            last_meter_sample: None,
+        };
+        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
+        assert!(effects.contains(&ChargePointEffect::TransactionEvent(
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Started,
+                transaction: expected_transaction,
+            }
+        )));
+    }
+
+    #[test]
+    fn a_remote_start_request_is_ignored_outside_the_locked_state() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn a_remote_unlock_request_is_ignored_outside_the_locked_state() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteUnlockRequested);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+        assert!(effects.is_empty());
     }
 
     #[test]

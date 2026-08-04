@@ -11,6 +11,7 @@ mod connect;
 pub mod executor;
 pub mod hardware;
 pub mod provisioning;
+pub mod remote_control;
 mod runtime;
 mod setup;
 pub mod state;
