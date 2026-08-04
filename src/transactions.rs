@@ -130,42 +130,41 @@ mod ocpp_2_1 {
     use alloc::vec;
     use alloc::vec::Vec;
     use chrono::{DateTime, Utc};
-    use ocpp_client::rust_ocpp::v2_1::datatypes::{MeterValueType, SampledValueType};
-    use ocpp_client::rust_ocpp::v2_1::enumerations::{
-        ChargingStateEnumType, MeasurandEnumType, ReadingContextEnumType, ReasonEnumType,
-        TransactionEventEnumType, TriggerReasonEnumType,
+    use ocpp_client::ocpp_types::v21::common::{
+        ChargingStateEnum, MeasurandEnum, MeterValue, ReadingContextEnum, ReasonEnum,
+        SampledValue, TransactionEventEnum, TriggerReasonEnum,
     };
 
     // The four functions below are only consumed by `with_system_clock` (`std`-gated) and by
     // this module's own tests; without either, they're legitimately unused.
 
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    pub(super) fn map_event_type(kind: TransactionEventKind) -> TransactionEventEnumType {
+    pub(super) fn map_event_type(kind: TransactionEventKind) -> TransactionEventEnum {
         match kind {
-            TransactionEventKind::Started => TransactionEventEnumType::Started,
-            TransactionEventKind::Updated(_) => TransactionEventEnumType::Updated,
-            TransactionEventKind::Ended => TransactionEventEnumType::Ended,
+            TransactionEventKind::Started => TransactionEventEnum::Started,
+            TransactionEventKind::Updated(_) => TransactionEventEnum::Updated,
+            TransactionEventKind::Ended => TransactionEventEnum::Ended,
         }
     }
 
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    pub(super) fn map_charging_state(state: TransactionChargingState) -> ChargingStateEnumType {
+    pub(super) fn map_charging_state(state: TransactionChargingState) -> ChargingStateEnum {
         match state {
-            TransactionChargingState::EvConnected => ChargingStateEnumType::EVConnected,
-            TransactionChargingState::Charging => ChargingStateEnumType::Charging,
-            TransactionChargingState::SuspendedEV => ChargingStateEnumType::SuspendedEV,
-            TransactionChargingState::SuspendedEVSE => ChargingStateEnumType::SuspendedEVSE,
-            TransactionChargingState::Idle => ChargingStateEnumType::Idle,
+            TransactionChargingState::EvConnected => ChargingStateEnum::EVConnected,
+            TransactionChargingState::Charging => ChargingStateEnum::Charging,
+            TransactionChargingState::SuspendedEV => ChargingStateEnum::SuspendedEV,
+            TransactionChargingState::SuspendedEVSE => ChargingStateEnum::SuspendedEVSE,
+            TransactionChargingState::Idle => ChargingStateEnum::Idle,
         }
     }
 
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    pub(super) fn map_stop_reason(reason: StopReason) -> ReasonEnumType {
+    pub(super) fn map_stop_reason(reason: StopReason) -> ReasonEnum {
         match reason {
-            StopReason::Local => ReasonEnumType::Local,
-            StopReason::Remote => ReasonEnumType::Remote,
-            StopReason::EVDisconnected => ReasonEnumType::EVDisconnected,
-            StopReason::EmergencyStop => ReasonEnumType::EmergencyStop,
+            StopReason::Local => ReasonEnum::Local,
+            StopReason::Remote => ReasonEnum::Remote,
+            StopReason::EVDisconnected => ReasonEnum::EVDisconnected,
+            StopReason::EmergencyStop => ReasonEnum::EmergencyStop,
         }
     }
 
@@ -176,20 +175,20 @@ mod ocpp_2_1 {
     pub(super) fn trigger_reason_for(
         kind: TransactionEventKind,
         transaction: &Transaction,
-    ) -> TriggerReasonEnumType {
+    ) -> TriggerReasonEnum {
         match kind {
-            TransactionEventKind::Started => TriggerReasonEnumType::Authorized,
+            TransactionEventKind::Started => TriggerReasonEnum::Authorized,
             TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged) => {
-                TriggerReasonEnumType::ChargingStateChanged
+                TriggerReasonEnum::ChargingStateChanged
             }
             TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic) => {
-                TriggerReasonEnumType::MeterValuePeriodic
+                TriggerReasonEnum::MeterValuePeriodic
             }
             TransactionEventKind::Ended => match transaction.stop_reason {
-                Some(StopReason::EmergencyStop) => TriggerReasonEnumType::AbnormalCondition,
-                Some(StopReason::Remote) => TriggerReasonEnumType::RemoteStop,
-                Some(StopReason::EVDisconnected) => TriggerReasonEnumType::EVDeparted,
-                Some(StopReason::Local) | None => TriggerReasonEnumType::StopAuthorized,
+                Some(StopReason::EmergencyStop) => TriggerReasonEnum::AbnormalCondition,
+                Some(StopReason::Remote) => TriggerReasonEnum::RemoteStop,
+                Some(StopReason::EVDisconnected) => TriggerReasonEnum::EVDeparted,
+                Some(StopReason::Local) | None => TriggerReasonEnum::StopAuthorized,
             },
         }
     }
@@ -201,16 +200,16 @@ mod ocpp_2_1 {
     pub(super) fn build_meter_values(
         sample: Option<MeterSample>,
         timestamp: DateTime<Utc>,
-    ) -> Vec<MeterValueType> {
+    ) -> Vec<MeterValue> {
         let Some(sample) = sample else {
             return Vec::new();
         };
-        vec![MeterValueType {
-            timestamp,
-            sampled_value: vec![SampledValueType {
+        vec![MeterValue {
+            timestamp: timestamp.to_rfc3339(),
+            sampled_value: vec![SampledValue {
                 value: sample.energy_wh as f64,
-                measurand: Some(MeasurandEnumType::EnergyActiveImportRegister),
-                context: Some(ReadingContextEnumType::SamplePeriodic),
+                measurand: Some(MeasurandEnum::EnergyActiveImportRegister),
+                context: Some(ReadingContextEnum::SamplePeriodic),
                 phase: None,
                 location: None,
                 signed_meter_value: None,
@@ -234,11 +233,10 @@ mod ocpp_2_1 {
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::TransactionNotifier;
         use alloc::boxed::Box;
-        use alloc::string::ToString;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-        use ocpp_client::rust_ocpp::v2_1::datatypes::{EVSEType, TransactionType};
-        use ocpp_client::rust_ocpp::v2_1::messages::transaction_event::TransactionEventRequest;
+        use ocpp_client::ocpp_types::v21::TransactionEventRequest;
+        use ocpp_client::ocpp_types::v21::common::{Transaction as WireTransaction, EVSE};
 
         #[async_trait::async_trait]
         impl TransactionNotifier for OCPP2_1Client {
@@ -252,28 +250,42 @@ mod ocpp_2_1 {
                 transaction: Transaction,
             ) -> Result<(), Self::Error> {
                 let now = SystemClock.now();
+                let meter_value = build_meter_values(transaction.last_meter_sample, now);
                 self.send_transaction_event(TransactionEventRequest {
                     custom_data: None,
+                    cost_details: None,
                     event_type: map_event_type(kind),
-                    meter_value: build_meter_values(transaction.last_meter_sample, now),
-                    timestamp: now,
+                    evse_sleep: None,
+                    meter_value: if meter_value.is_empty() {
+                        None
+                    } else {
+                        Some(meter_value)
+                    },
+                    timestamp: now.to_rfc3339(),
                     trigger_reason: trigger_reason_for(kind, &transaction),
-                    seq_no: transaction.seq_no as i32,
-                    transaction_info: TransactionType {
-                        transaction_id: transaction.id.0.to_string(),
+                    seq_no: transaction.seq_no as i64,
+                    preconditioning_status: None,
+                    transaction_info: WireTransaction {
+                        // The transaction id is an internal `u64` formatted as decimal, always
+                        // well within the wire field's 36-byte bound.
+                        transaction_id: heapless::String::try_from(transaction.id.0)
+                            .expect("u64 transaction id always fits in a 36-byte wire field"),
                         charging_state: Some(map_charging_state(transaction.charging_state)),
                         time_spent_charging: None,
                         stopped_reason: transaction.stop_reason.map(map_stop_reason),
                         remote_start_id: None,
+                        operation_mode: None,
+                        tariff_id: None,
+                        transaction_limit: None,
                         custom_data: None,
                     },
                     offline: None,
                     number_of_phases_used: None,
                     cable_max_current: None,
                     reservation_id: None,
-                    evse: Some(EVSEType {
-                        id: evse_id as i32,
-                        connector_id: Some(connector_id as i32),
+                    evse: Some(EVSE {
+                        id: evse_id as i64,
+                        connector_id: Some(connector_id as i64),
                         custom_data: None,
                     }),
                     id_token: None,
@@ -292,17 +304,17 @@ mod ocpp_2_1 {
         fn every_kind_maps_to_the_matching_wire_event_type() {
             assert_eq!(
                 map_event_type(TransactionEventKind::Started),
-                TransactionEventEnumType::Started
+                TransactionEventEnum::Started
             );
             assert_eq!(
                 map_event_type(TransactionEventKind::Updated(
                     TransactionUpdateReason::ChargingStateChanged
                 )),
-                TransactionEventEnumType::Updated
+                TransactionEventEnum::Updated
             );
             assert_eq!(
                 map_event_type(TransactionEventKind::Ended),
-                TransactionEventEnumType::Ended
+                TransactionEventEnum::Ended
             );
         }
 
@@ -310,23 +322,23 @@ mod ocpp_2_1 {
         fn every_charging_state_maps_to_the_matching_wire_state() {
             assert_eq!(
                 map_charging_state(TransactionChargingState::EvConnected),
-                ChargingStateEnumType::EVConnected
+                ChargingStateEnum::EVConnected
             );
             assert_eq!(
                 map_charging_state(TransactionChargingState::Charging),
-                ChargingStateEnumType::Charging
+                ChargingStateEnum::Charging
             );
             assert_eq!(
                 map_charging_state(TransactionChargingState::SuspendedEV),
-                ChargingStateEnumType::SuspendedEV
+                ChargingStateEnum::SuspendedEV
             );
             assert_eq!(
                 map_charging_state(TransactionChargingState::SuspendedEVSE),
-                ChargingStateEnumType::SuspendedEVSE
+                ChargingStateEnum::SuspendedEVSE
             );
             assert_eq!(
                 map_charging_state(TransactionChargingState::Idle),
-                ChargingStateEnumType::Idle
+                ChargingStateEnum::Idle
             );
         }
 
@@ -342,21 +354,21 @@ mod ocpp_2_1 {
 
             assert_eq!(
                 trigger_reason_for(TransactionEventKind::Started, &transaction),
-                TriggerReasonEnumType::Authorized
+                TriggerReasonEnum::Authorized
             );
             assert_eq!(
                 trigger_reason_for(
                     TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged),
                     &transaction
                 ),
-                TriggerReasonEnumType::ChargingStateChanged
+                TriggerReasonEnum::ChargingStateChanged
             );
             assert_eq!(
                 trigger_reason_for(
                     TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic),
                     &transaction
                 ),
-                TriggerReasonEnumType::MeterValuePeriodic
+                TriggerReasonEnum::MeterValuePeriodic
             );
         }
 
@@ -378,7 +390,7 @@ mod ocpp_2_1 {
                         ..base
                     }
                 ),
-                TriggerReasonEnumType::AbnormalCondition
+                TriggerReasonEnum::AbnormalCondition
             );
             assert_eq!(
                 trigger_reason_for(
@@ -388,7 +400,7 @@ mod ocpp_2_1 {
                         ..base
                     }
                 ),
-                TriggerReasonEnumType::RemoteStop
+                TriggerReasonEnum::RemoteStop
             );
             assert_eq!(
                 trigger_reason_for(
@@ -398,7 +410,7 @@ mod ocpp_2_1 {
                         ..base
                     }
                 ),
-                TriggerReasonEnumType::EVDeparted
+                TriggerReasonEnum::EVDeparted
             );
             assert_eq!(
                 trigger_reason_for(
@@ -408,11 +420,11 @@ mod ocpp_2_1 {
                         ..base
                     }
                 ),
-                TriggerReasonEnumType::StopAuthorized
+                TriggerReasonEnum::StopAuthorized
             );
             assert_eq!(
                 trigger_reason_for(TransactionEventKind::Ended, &base),
-                TriggerReasonEnumType::StopAuthorized
+                TriggerReasonEnum::StopAuthorized
             );
         }
     }

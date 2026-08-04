@@ -159,12 +159,10 @@ mod ocpp_2_1 {
     use super::Authorizer;
     use crate::state::{AuthorizationStatus, IdToken, IdTokenKind};
     use alloc::boxed::Box;
-    use alloc::string::ToString;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::rust_ocpp::v2_1::datatypes::IdTokenType;
-    use ocpp_client::rust_ocpp::v2_1::enumerations::AuthorizationStatusEnumType;
-    use ocpp_client::rust_ocpp::v2_1::messages::authorize::AuthorizeRequest;
+    use ocpp_client::ocpp_types::v21::AuthorizeRequest;
+    use ocpp_client::ocpp_types::v21::common::{AuthorizationStatusEnum, IdToken as WireIdToken};
 
     pub(super) fn wire_type(kind: IdTokenKind) -> &'static str {
         match kind {
@@ -186,10 +184,15 @@ mod ocpp_2_1 {
         AuthorizeRequest {
             custom_data: None,
             certificate: None,
-            id_token: IdTokenType {
+            id_token: WireIdToken {
                 additional_info: None,
-                id_token: id_token.value.clone(),
-                type_: wire_type(id_token.kind).to_string(),
+                // `id_token.value` is our own already-validated internal id token; the wire
+                // field's 255-byte bound comfortably covers every OCPP-supported identifier
+                // format (RFID UIDs, eMAIDs, etc.), so this can't fail in practice.
+                id_token: heapless::String::try_from(id_token.value.as_str())
+                    .expect("id token value must fit in OCPP's 255-character bound"),
+                r#type: heapless::String::try_from(wire_type(id_token.kind))
+                    .expect("id token type name must fit in OCPP's 20-character bound"),
                 custom_data: None,
             },
             iso15118_certificate_hash_data: None,
@@ -199,9 +202,9 @@ mod ocpp_2_1 {
     /// Only `Accepted` maps to our `Accepted` - the wire enum's other 9 values (including
     /// `ConcurrentTx`, which per spec shouldn't necessarily stop an already-running
     /// transaction) all collapse to `Rejected` for now. See `docs/ROADMAP.md` §3.
-    pub(super) fn map_status(status: AuthorizationStatusEnumType) -> AuthorizationStatus {
+    pub(super) fn map_status(status: AuthorizationStatusEnum) -> AuthorizationStatus {
         match status {
-            AuthorizationStatusEnumType::Accepted => AuthorizationStatus::Accepted,
+            AuthorizationStatusEnum::Accepted => AuthorizationStatus::Accepted,
             _ => AuthorizationStatus::Rejected,
         }
     }
@@ -230,7 +233,7 @@ mod ocpp_2_1 {
             let request = build_request(&id_token);
 
             assert_eq!(request.id_token.id_token, "04A224B2");
-            assert_eq!(request.id_token.type_, "ISO14443");
+            assert_eq!(request.id_token.r#type, "ISO14443");
         }
 
         #[test]
@@ -251,19 +254,19 @@ mod ocpp_2_1 {
         #[test]
         fn only_accepted_maps_to_accepted() {
             assert_eq!(
-                map_status(AuthorizationStatusEnumType::Accepted),
+                map_status(AuthorizationStatusEnum::Accepted),
                 AuthorizationStatus::Accepted
             );
             assert_eq!(
-                map_status(AuthorizationStatusEnumType::Blocked),
+                map_status(AuthorizationStatusEnum::Blocked),
                 AuthorizationStatus::Rejected
             );
             assert_eq!(
-                map_status(AuthorizationStatusEnumType::ConcurrentTx),
+                map_status(AuthorizationStatusEnum::ConcurrentTx),
                 AuthorizationStatus::Rejected
             );
             assert_eq!(
-                map_status(AuthorizationStatusEnumType::Unknown),
+                map_status(AuthorizationStatusEnum::Unknown),
                 AuthorizationStatus::Rejected
             );
         }

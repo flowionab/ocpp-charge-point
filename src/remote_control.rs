@@ -13,7 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// The outcome of a CSMS-initiated `UnlockConnector` request, matching OCPP's
-/// `UnlockStatusEnumType`.
+/// `UnlockStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlockOutcome {
     /// The connector was unlocked.
@@ -88,7 +88,7 @@ pub trait UnlockConnectorHandler {
 }
 
 /// The outcome of a CSMS-initiated `RequestStartTransaction` request, matching (a subset of)
-/// OCPP's `RequestStartStopStatusEnumType`.
+/// OCPP's `RequestStartStopStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestStartTransactionOutcome {
     /// A transaction was started on the returned connector.
@@ -165,7 +165,7 @@ pub trait RequestStartTransactionHandler {
 }
 
 /// The outcome of a CSMS-initiated `RequestStopTransaction` request, matching (a subset of)
-/// OCPP's `RequestStartStopStatusEnumType`.
+/// OCPP's `RequestStartStopStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestStopTransactionOutcome {
     Accepted,
@@ -766,29 +766,22 @@ mod ocpp_2_1 {
     use crate::actor::ChargePointActor;
     use crate::state::TransactionId;
     use alloc::boxed::Box;
-    use alloc::string::ToString;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::rust_ocpp::v2_1::enumerations::{
-        RequestStartStopStatusEnumType, UnlockStatusEnumType,
-    };
-    use ocpp_client::rust_ocpp::v2_1::messages::request_start_transaction::{
+    use ocpp_client::ocpp_types::v21::common::{RequestStartStopStatusEnum, UnlockStatusEnum};
+    use ocpp_client::ocpp_types::v21::{
         RequestStartTransactionRequest, RequestStartTransactionResponse,
-    };
-    use ocpp_client::rust_ocpp::v2_1::messages::request_stop_transaction::{
-        RequestStopTransactionRequest, RequestStopTransactionResponse,
-    };
-    use ocpp_client::rust_ocpp::v2_1::messages::unlock_connector::{
-        UnlockConnectorRequest, UnlockConnectorResponse,
+        RequestStopTransactionRequest, RequestStopTransactionResponse, UnlockConnectorRequest,
+        UnlockConnectorResponse,
     };
 
-    pub(super) fn map_outcome(outcome: UnlockOutcome) -> UnlockStatusEnumType {
+    pub(super) fn map_outcome(outcome: UnlockOutcome) -> UnlockStatusEnum {
         match outcome {
-            UnlockOutcome::Unlocked => UnlockStatusEnumType::Unlocked,
-            UnlockOutcome::UnlockFailed => UnlockStatusEnumType::UnlockFailed,
+            UnlockOutcome::Unlocked => UnlockStatusEnum::Unlocked,
+            UnlockOutcome::UnlockFailed => UnlockStatusEnum::UnlockFailed,
             UnlockOutcome::OngoingAuthorizedTransaction => {
-                UnlockStatusEnumType::OngoingAuthorizedTransaction
+                UnlockStatusEnum::OngoingAuthorizedTransaction
             }
-            UnlockOutcome::UnknownConnector => UnlockStatusEnumType::UnknownConnector,
+            UnlockOutcome::UnknownConnector => UnlockStatusEnum::UnknownConnector,
         }
     }
 
@@ -825,17 +818,19 @@ mod ocpp_2_1 {
 
     fn map_start_outcome(
         outcome: RequestStartTransactionOutcome,
-    ) -> (
-        RequestStartStopStatusEnumType,
-        Option<alloc::string::String>,
-    ) {
+    ) -> (RequestStartStopStatusEnum, Option<heapless::String<36>>) {
         match outcome {
             RequestStartTransactionOutcome::Accepted { transaction_id } => (
-                RequestStartStopStatusEnumType::Accepted,
-                Some(transaction_id.0.to_string()),
+                RequestStartStopStatusEnum::Accepted,
+                // The transaction id is an internal `u64` formatted as decimal, always well
+                // within the wire field's 36-byte bound.
+                Some(
+                    heapless::String::try_from(transaction_id.0)
+                        .expect("u64 transaction id always fits in a 36-byte wire field"),
+                ),
             ),
             RequestStartTransactionOutcome::Rejected => {
-                (RequestStartStopStatusEnumType::Rejected, None)
+                (RequestStartStopStatusEnum::Rejected, None)
             }
         }
     }
@@ -872,10 +867,10 @@ mod ocpp_2_1 {
         }
     }
 
-    fn map_stop_outcome(outcome: RequestStopTransactionOutcome) -> RequestStartStopStatusEnumType {
+    fn map_stop_outcome(outcome: RequestStopTransactionOutcome) -> RequestStartStopStatusEnum {
         match outcome {
-            RequestStopTransactionOutcome::Accepted => RequestStartStopStatusEnumType::Accepted,
-            RequestStopTransactionOutcome::Rejected => RequestStartStopStatusEnumType::Rejected,
+            RequestStopTransactionOutcome::Accepted => RequestStartStopStatusEnum::Accepted,
+            RequestStopTransactionOutcome::Rejected => RequestStartStopStatusEnum::Rejected,
         }
     }
 
@@ -920,19 +915,19 @@ mod ocpp_2_1 {
         fn every_outcome_maps_to_the_matching_wire_status() {
             assert_eq!(
                 map_outcome(UnlockOutcome::Unlocked),
-                UnlockStatusEnumType::Unlocked
+                UnlockStatusEnum::Unlocked
             );
             assert_eq!(
                 map_outcome(UnlockOutcome::UnlockFailed),
-                UnlockStatusEnumType::UnlockFailed
+                UnlockStatusEnum::UnlockFailed
             );
             assert_eq!(
                 map_outcome(UnlockOutcome::OngoingAuthorizedTransaction),
-                UnlockStatusEnumType::OngoingAuthorizedTransaction
+                UnlockStatusEnum::OngoingAuthorizedTransaction
             );
             assert_eq!(
                 map_outcome(UnlockOutcome::UnknownConnector),
-                UnlockStatusEnumType::UnknownConnector
+                UnlockStatusEnum::UnknownConnector
             );
         }
 
@@ -954,8 +949,8 @@ mod ocpp_2_1 {
                     transaction_id: crate::state::TransactionId(7)
                 }),
                 (
-                    RequestStartStopStatusEnumType::Accepted,
-                    Some("7".to_string())
+                    RequestStartStopStatusEnum::Accepted,
+                    Some(heapless::String::try_from("7").unwrap())
                 )
             );
         }
@@ -964,19 +959,19 @@ mod ocpp_2_1 {
         fn a_rejected_outcome_maps_to_rejected_with_no_transaction_id() {
             assert_eq!(
                 map_start_outcome(RequestStartTransactionOutcome::Rejected),
-                (RequestStartStopStatusEnumType::Rejected, None)
+                (RequestStartStopStatusEnum::Rejected, None)
             );
         }
 
-        fn start_request(evse_id: Option<i32>) -> RequestStartTransactionRequest {
+        fn start_request(evse_id: Option<i64>) -> RequestStartTransactionRequest {
             RequestStartTransactionRequest {
                 custom_data: None,
                 evse_id,
                 group_id_token: None,
-                id_token: ocpp_client::rust_ocpp::v2_1::datatypes::IdTokenType {
+                id_token: ocpp_client::ocpp_types::v21::common::IdToken {
                     additional_info: None,
-                    id_token: "04A224B2".into(),
-                    type_: "ISO14443".into(),
+                    id_token: heapless::String::try_from("04A224B2").unwrap(),
+                    r#type: heapless::String::try_from("ISO14443").unwrap(),
                     custom_data: None,
                 },
                 remote_start_id: 1,
@@ -984,37 +979,61 @@ mod ocpp_2_1 {
             }
         }
 
+        // `RequestStartTransactionRequest` embeds `Option<ChargingProfile>`, and `ocpp-types`
+        // 0.1.1 has a codegen defect where `ChargingProfile`/`ChargingSchedule` keep
+        // `heapless::Vec` (not `alloc::vec::Vec`) for `charging_schedule`/
+        // `charging_schedule_period` even in the `#[cfg(feature = "alloc")]` struct variant this
+        // crate builds with - inlining up to 3 * 1024 nested structs and making the type itself
+        // ~80MB, regardless of which fields are actually populated. Building or holding one on
+        // an ordinary thread's stack overflows it, so these tests run on a thread with a large
+        // stack reserved just for that. This is a real, not just test-only, concern: the same
+        // oversized type crosses `ocpp-client`'s `on_request_start_transaction` callback by
+        // value, so a live CSMS sending `RequestStartTransaction` (with or without a
+        // `chargingProfile`) risks the same overflow in production - see this migration's final
+        // report for follow-up.
+        fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+            std::thread::Builder::new()
+                .stack_size(200 * 1024 * 1024)
+                .spawn(f)
+                .expect("spawning the oversized-stack test thread must not fail")
+                .join()
+                .expect("the oversized-stack test thread must not panic")
+        }
+
         #[test]
         fn no_evse_id_parses_to_none() {
-            assert_eq!(parse_evse_id(&start_request(None)), Ok(None));
+            let result = with_big_stack(|| parse_evse_id(&start_request(None)));
+            assert_eq!(result, Ok(None));
         }
 
         #[test]
         fn a_valid_evse_id_parses() {
-            assert_eq!(parse_evse_id(&start_request(Some(1))), Ok(Some(1)));
+            let result = with_big_stack(|| parse_evse_id(&start_request(Some(1))));
+            assert_eq!(result, Ok(Some(1)));
         }
 
         #[test]
         fn a_negative_evse_id_fails_to_parse() {
-            assert_eq!(parse_evse_id(&start_request(Some(-1))), Err(()));
+            let result = with_big_stack(|| parse_evse_id(&start_request(Some(-1))));
+            assert_eq!(result, Err(()));
         }
 
         #[test]
         fn every_stop_outcome_maps_to_the_matching_wire_status() {
             assert_eq!(
                 map_stop_outcome(RequestStopTransactionOutcome::Accepted),
-                RequestStartStopStatusEnumType::Accepted
+                RequestStartStopStatusEnum::Accepted
             );
             assert_eq!(
                 map_stop_outcome(RequestStopTransactionOutcome::Rejected),
-                RequestStartStopStatusEnumType::Rejected
+                RequestStartStopStatusEnum::Rejected
             );
         }
 
         fn stop_request(transaction_id: &str) -> RequestStopTransactionRequest {
             RequestStopTransactionRequest {
                 custom_data: None,
-                transaction_id: transaction_id.into(),
+                transaction_id: heapless::String::try_from(transaction_id).unwrap(),
             }
         }
 

@@ -36,15 +36,25 @@ websocket = ["tokio-runtime", "ocpp-client/websocket"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
-ocpp-client = { git = "https://github.com/flowionab/ocpp-client", default-features = false }
+ocpp-client = { version = "0.2", default-features = false }
 async-trait = "^0.1"
 tracing = "0.1"
-chrono = { version = "0.4", default-features = false }
+# `alloc` is unconditional (not tied to this crate's own `std` feature): this crate is
+# alloc-always per CLAUDE.md's no_std+alloc stance, and the OCPP 2.1 TransactionEvent/
+# StatusNotification wire timestamps are plain `String`s (ocpp-types doesn't depend on chrono),
+# so producing them from a `chrono::DateTime<Utc>` via `to_rfc3339()` needs chrono's `alloc`
+# feature regardless of whether `std` is enabled.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # no_std+alloc-friendly Mutex/Signal primitives backing src/sync.rs - used unconditionally by
 # the actor regardless of the `std` feature. Mirrors ocpp-client's own use of these.
 embassy-sync = { version = "0.8", default-features = false }
 critical-section = { version = "1" }
+
+# Matches the version `ocpp-types` (via `ocpp-client`) is built against - needed directly here
+# to construct its `heapless::String<N>`-bounded wire fields (e.g. transaction/id-token ids)
+# via `heapless::String::try_from`.
+heapless = { version = "0.8", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"]}

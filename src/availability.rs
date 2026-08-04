@@ -34,7 +34,7 @@ pub enum AvailabilityTarget {
 }
 
 /// The outcome of a CSMS-initiated `ChangeAvailability` request, matching (a subset of) OCPP's
-/// `ChangeAvailabilityStatusEnumType`. `Scheduled` - deferring the change until an in-progress
+/// `ChangeAvailabilityStatusEnum`. `Scheduled` - deferring the change until an in-progress
 /// transaction ends - isn't modeled: `SetUnavailable` takes effect immediately regardless of an
 /// active transaction (see `docs/ROADMAP.md` §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,24 +329,21 @@ mod ocpp_2_1 {
     use crate::state::ConnectorStatus;
     use alloc::boxed::Box;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::rust_ocpp::v2_1::enumerations::{
-        ChangeAvailabilityStatusEnumType, OperationalStatusEnumType,
+    use ocpp_client::ocpp_types::v21::common::{
+        ChangeAvailabilityStatusEnum, ConnectorStatusEnum, OperationalStatusEnum,
     };
-    use ocpp_client::rust_ocpp::v2_1::messages::change_availability::{
-        ChangeAvailabilityRequest, ChangeAvailabilityResponse,
-    };
-    use ocpp_client::rust_ocpp::v2_1::messages::status_notification::ConnectorStatusEnumType;
+    use ocpp_client::ocpp_types::v21::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 
     // Only consumed by `with_system_clock` below (`std`-gated) and by this module's own tests;
     // without either, it's legitimately unused.
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
-    pub(super) fn map_status(status: ConnectorStatus) -> ConnectorStatusEnumType {
+    pub(super) fn map_status(status: ConnectorStatus) -> ConnectorStatusEnum {
         match status {
-            ConnectorStatus::Available => ConnectorStatusEnumType::Available,
-            ConnectorStatus::Occupied => ConnectorStatusEnumType::Occupied,
-            ConnectorStatus::Reserved => ConnectorStatusEnumType::Reserved,
-            ConnectorStatus::Unavailable => ConnectorStatusEnumType::Unavailable,
-            ConnectorStatus::Faulted => ConnectorStatusEnumType::Faulted,
+            ConnectorStatus::Available => ConnectorStatusEnum::Available,
+            ConnectorStatus::Occupied => ConnectorStatusEnum::Occupied,
+            ConnectorStatus::Reserved => ConnectorStatusEnum::Reserved,
+            ConnectorStatus::Unavailable => ConnectorStatusEnum::Unavailable,
+            ConnectorStatus::Faulted => ConnectorStatusEnum::Faulted,
         }
     }
 
@@ -362,7 +359,7 @@ mod ocpp_2_1 {
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-        use ocpp_client::rust_ocpp::v2_1::messages::status_notification::StatusNotificationRequest;
+        use ocpp_client::ocpp_types::v21::StatusNotificationRequest;
 
         #[async_trait::async_trait]
         impl StatusNotifier for OCPP2_1Client {
@@ -376,10 +373,10 @@ mod ocpp_2_1 {
             ) -> Result<(), Self::Error> {
                 self.send_status_notification(StatusNotificationRequest {
                     custom_data: None,
-                    timestamp: SystemClock.now(),
+                    timestamp: SystemClock.now().to_rfc3339(),
                     connector_status: map_status(status),
-                    evse_id: evse_id as i32,
-                    connector_id: connector_id as i32,
+                    evse_id: evse_id as i64,
+                    connector_id: connector_id as i64,
                 })
                 .await?;
                 Ok(())
@@ -403,10 +400,10 @@ mod ocpp_2_1 {
         }
     }
 
-    fn map_outcome(outcome: ChangeAvailabilityOutcome) -> ChangeAvailabilityStatusEnumType {
+    fn map_outcome(outcome: ChangeAvailabilityOutcome) -> ChangeAvailabilityStatusEnum {
         match outcome {
-            ChangeAvailabilityOutcome::Accepted => ChangeAvailabilityStatusEnumType::Accepted,
-            ChangeAvailabilityOutcome::Rejected => ChangeAvailabilityStatusEnumType::Rejected,
+            ChangeAvailabilityOutcome::Accepted => ChangeAvailabilityStatusEnum::Accepted,
+            ChangeAvailabilityOutcome::Rejected => ChangeAvailabilityStatusEnum::Rejected,
         }
     }
 
@@ -418,7 +415,7 @@ mod ocpp_2_1 {
                 async move {
                     let available = matches!(
                         request.operational_status,
-                        OperationalStatusEnumType::Operative
+                        OperationalStatusEnum::Operative
                     );
                     let outcome = match parse_target(&request) {
                         Some(target) => {
@@ -445,36 +442,36 @@ mod ocpp_2_1 {
         fn every_internal_status_maps_to_the_matching_wire_status() {
             assert_eq!(
                 map_status(ConnectorStatus::Available),
-                ConnectorStatusEnumType::Available
+                ConnectorStatusEnum::Available
             );
             assert_eq!(
                 map_status(ConnectorStatus::Occupied),
-                ConnectorStatusEnumType::Occupied
+                ConnectorStatusEnum::Occupied
             );
             assert_eq!(
                 map_status(ConnectorStatus::Reserved),
-                ConnectorStatusEnumType::Reserved
+                ConnectorStatusEnum::Reserved
             );
             assert_eq!(
                 map_status(ConnectorStatus::Unavailable),
-                ConnectorStatusEnumType::Unavailable
+                ConnectorStatusEnum::Unavailable
             );
             assert_eq!(
                 map_status(ConnectorStatus::Faulted),
-                ConnectorStatusEnumType::Faulted
+                ConnectorStatusEnum::Faulted
             );
         }
 
-        fn request(evse: Option<(i32, Option<i32>)>) -> ChangeAvailabilityRequest {
+        fn request(evse: Option<(i64, Option<i64>)>) -> ChangeAvailabilityRequest {
             ChangeAvailabilityRequest {
                 evse: evse.map(|(id, connector_id)| {
-                    ocpp_client::rust_ocpp::v2_1::messages::change_availability::EVSEType {
+                    ocpp_client::ocpp_types::v21::common::EVSE {
                         id,
                         connector_id,
                         custom_data: None,
                     }
                 }),
-                operational_status: OperationalStatusEnumType::Inoperative,
+                operational_status: OperationalStatusEnum::Inoperative,
                 custom_data: None,
             }
         }
@@ -515,11 +512,11 @@ mod ocpp_2_1 {
         fn every_outcome_maps_to_the_matching_wire_status() {
             assert_eq!(
                 map_outcome(ChangeAvailabilityOutcome::Accepted),
-                ChangeAvailabilityStatusEnumType::Accepted
+                ChangeAvailabilityStatusEnum::Accepted
             );
             assert_eq!(
                 map_outcome(ChangeAvailabilityOutcome::Rejected),
-                ChangeAvailabilityStatusEnumType::Rejected
+                ChangeAvailabilityStatusEnum::Rejected
             );
         }
     }

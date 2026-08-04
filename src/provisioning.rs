@@ -241,37 +241,39 @@ mod ocpp_2_1 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
     use crate::state::RegistrationStatus;
     use alloc::boxed::Box;
-    use alloc::string::ToString;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::rust_ocpp::v2_1::enumerations::{
-        BootReasonEnumType, RegistrationStatusEnumType,
+    use ocpp_client::ocpp_types::v21::common::{
+        BootReasonEnum, ChargingStation, RegistrationStatusEnum,
     };
-    use ocpp_client::rust_ocpp::v2_1::messages::boot_notification::{
-        BootNotificationRequest, ChargingStationType,
-    };
-    use ocpp_client::rust_ocpp::v2_1::messages::heartbeat::HeartbeatRequest;
+    use ocpp_client::ocpp_types::v21::BootNotificationRequest;
+    use ocpp_client::ocpp_types::v21::HeartbeatRequest;
 
     pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
         BootNotificationRequest {
-            charging_station: ChargingStationType {
+            charging_station: ChargingStation {
                 custom_data: None,
                 firmware_version: None,
-                model: model_name.to_string(),
+                // Vendor/model names are integrator-supplied configuration, not runtime
+                // hardware readings - a name that doesn't fit the OCPP spec's bounded field
+                // is a configuration error, not something to recover from at this boundary.
+                model: heapless::String::try_from(model_name)
+                    .expect("model name must fit in OCPP's 20-character bound"),
                 modem: None,
                 serial_number: None,
-                vendor_name: vendor_name.to_string(),
+                vendor_name: heapless::String::try_from(vendor_name)
+                    .expect("vendor name must fit in OCPP's 50-character bound"),
             },
             custom_data: None,
-            reason: BootReasonEnumType::PowerUp,
+            reason: BootReasonEnum::PowerUp,
         }
     }
 
-    pub(super) fn map_status(status: RegistrationStatusEnumType) -> RegistrationStatus {
+    pub(super) fn map_status(status: RegistrationStatusEnum) -> RegistrationStatus {
         match status {
-            RegistrationStatusEnumType::Accepted => RegistrationStatus::Accepted,
-            RegistrationStatusEnumType::Pending => RegistrationStatus::Pending,
-            RegistrationStatusEnumType::Rejected => RegistrationStatus::Rejected,
+            RegistrationStatusEnum::Accepted => RegistrationStatus::Accepted,
+            RegistrationStatusEnum::Pending => RegistrationStatus::Pending,
+            RegistrationStatusEnum::Rejected => RegistrationStatus::Rejected,
         }
     }
 
@@ -316,21 +318,21 @@ mod ocpp_2_1 {
 
             assert_eq!(request.charging_station.vendor_name, "Acme");
             assert_eq!(request.charging_station.model, "Charger 9000");
-            assert_eq!(request.reason, BootReasonEnumType::PowerUp);
+            assert_eq!(request.reason, BootReasonEnum::PowerUp);
         }
 
         #[test]
         fn every_wire_registration_status_maps_to_our_internal_status() {
             assert_eq!(
-                map_status(RegistrationStatusEnumType::Accepted),
+                map_status(RegistrationStatusEnum::Accepted),
                 RegistrationStatus::Accepted
             );
             assert_eq!(
-                map_status(RegistrationStatusEnumType::Pending),
+                map_status(RegistrationStatusEnum::Pending),
                 RegistrationStatus::Pending
             );
             assert_eq!(
-                map_status(RegistrationStatusEnumType::Rejected),
+                map_status(RegistrationStatusEnum::Rejected),
                 RegistrationStatus::Rejected
             );
         }
