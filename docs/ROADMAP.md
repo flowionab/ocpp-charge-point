@@ -29,11 +29,20 @@ Not a functional block, but a prerequisite for all of them.
 - 🚧 `ocpp-client` wiring — outbound state → OCPP calls now exist for
   BootNotification, Heartbeat, and StatusNotification (see §2, §7), each
   via a small protocol-agnostic trait (`BootNotifier`, `HeartbeatSender`,
-  `StatusNotifier`) implemented for `ocpp-client`'s OCPP 2.1 client. Still
-  missing: `setup()` doesn't itself open a live connection - callers must
-  construct and pass in an already-connected client - and there is no
-  inbound OCPP call handling yet (CSMS-initiated actions like
-  `ChangeAvailability`, `RequestStartTransaction`, etc.).
+  `StatusNotifier`) implemented for `ocpp-client`'s OCPP 2.1 client.
+  `setup()` itself still only takes an already-connected client, but a new
+  `connect_and_setup` (`src/connect.rs`, `std`+`websocket`+`ocpp_2_1`-gated)
+  now closes that gap for std/tokio users: it dials `address` with
+  `ocpp_client::connect_2_1` and hands the resulting client straight to
+  `setup()`, verified end-to-end against a real local WebSocket server in
+  `tests/connect_2_1_websocket.rs`. A new `websocket` feature (forwarding
+  to `ocpp-client/websocket`, implying `tokio-runtime`) is in `default` for
+  zero-config ergonomics; embedded/no_std targets or std users needing a
+  non-WebSocket transport still construct their own client and call
+  `setup()` directly. Still missing: there is no inbound OCPP call handling
+  yet (CSMS-initiated actions like `ChangeAvailability`,
+  `RequestStartTransaction`, etc.), and `connect_and_setup` only covers
+  OCPP 2.1 (the crate's primary target per `CLAUDE.md`), not 1.6J/2.0.1.
 - ⬜ Protocol-version-independent core → version adapters. The state model
   needs to be designed so a single internal representation projects down
   to 1.6J, 2.0.1, and 2.1 wire shapes.
@@ -179,9 +188,10 @@ Boot, configuration, and the Component/Variable device model.
   spawns `provisioning::run_heartbeat` as a background task that sends a
   `Heartbeat` via a `HeartbeatSender` every accepted interval, forever
   (implemented for `ocpp-client`'s OCPP 2.1 client alongside `BootNotifier`
-  under the `ocpp_2_1` feature). Still missing: an actual live `ocpp-client`
-  connection wired end-to-end (today callers must supply their own
-  connected `BootNotifier`/`HeartbeatSender`), the Component/Variable
+  under the `ocpp_2_1` feature). A live `ocpp-client` WebSocket connection
+  is now wired end-to-end via `connect_and_setup` (see §0) for std/tokio
+  users; embedded/no_std callers still supply their own connected
+  `BootNotifier`/`HeartbeatSender`. Still missing: the Component/Variable
   device model, and `Reset`.
 - Version notes: 1.6J's `Configuration` key/value model and 2.0.1's
   Component/Variable model both need to be projections of one internal

@@ -23,10 +23,16 @@ tokio-runtime = ["std", "dep:tokio"]
 # `ocpp-client`'s own convention; embedded targets build with `--no-default-features` and
 # register their own critical-section backend via `critical_section::set_impl!`, plus supply
 # their own `Executor`/`Backoff`/`Clock` (see `docs/ROADMAP.md` §0).
-default = ["tokio-runtime", "ocpp_1_6", "ocpp_2_0_1", "ocpp_2_1"]
+default = ["tokio-runtime", "websocket", "ocpp_1_6", "ocpp_2_0_1", "ocpp_2_1"]
 ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
 ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
 ocpp_2_1 = ["ocpp-client/ocpp_2_1"]
+# Forwards to ocpp-client's own `websocket` feature (tokio-tungstenite-backed WebSocket
+# transport, `connect_1_6`/`connect_2_0_1`/`connect_2_1`). Implies `tokio-runtime` (and
+# therefore `std`), same as `ocpp-client`'s own convention - a WebSocket transport inherently
+# needs a tokio runtime. In `default` for zero-config ergonomics; embedded/no_std targets that
+# supply their own transport build with `--no-default-features`.
+websocket = ["tokio-runtime", "ocpp-client/websocket"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
@@ -43,3 +49,6 @@ critical-section = { version = "1" }
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"]}
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+serde_json = "1"
