@@ -33,6 +33,7 @@ pub mod offline_queue;
 pub mod provisioning;
 pub mod remote_control;
 pub mod reservation;
+pub mod reset;
 mod runtime;
 pub mod security;
 mod setup;

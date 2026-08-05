@@ -4,9 +4,9 @@ use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
     ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
-    IdToken, LocalAuthorizationList, MeterSample, RegistrationStatus, StopReason, Transaction,
-    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
-    TransactionUpdateReason,
+    IdToken, LocalAuthorizationList, MeterSample, PendingReset, RegistrationStatus, ResetKind,
+    ResetTarget, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason,
 };
 
 /// The protocol-version-independent internal state of the whole charge point: its lifecycle,
@@ -26,6 +26,9 @@ pub struct ChargePointState {
     /// The offline authorization cache maintained via `SendLocalList`/`GetLocalListVersion`. See
     /// `docs/ROADMAP.md` §4.
     pub local_authorization_list: LocalAuthorizationList,
+    /// A CSMS-initiated `Reset` request waiting for its target to settle before rebooting. See
+    /// `docs/ROADMAP.md` §2.
+    pub pending_reset: Option<PendingReset>,
     /// The Component/Variable device model (OCPP `GetVariables`/`SetVariables`). See
     /// `docs/ROADMAP.md` §2 and `crate::device_model`.
     pub device_model: DeviceModel,
@@ -57,6 +60,7 @@ impl ChargePointState {
             evses: connector_counts.into_iter().map(EvseState::new).collect(),
             next_transaction_id: 0,
             local_authorization_list: LocalAuthorizationList::new(),
+            pending_reset: None,
             device_model: DeviceModel::new(),
         }
     }
@@ -102,6 +106,25 @@ impl ChargePointState {
                 effects.push(ChargePointEffect::SecurityEventOccurred(event));
                 false
             }
+            ChargePointEvent::ResetRequested { target, kind } => {
+                self.pending_reset = Some(PendingReset { target, kind });
+                // `Immediate` kicks off the fail-safe stop right away, fanned out to every
+                // connector in scope - each one's own state machine decides whether it's
+                // actually affected (see `ConnectorEvent::ResetRequested`). `OnIdle` just
+                // records the request; `check_pending_reset` below fires the reboot once (or
+                // if) the target is already idle.
+                if kind == ResetKind::Immediate {
+                    for (evse_id, connector_id) in self.target_connector_addresses(target) {
+                        self.apply_connector_event(
+                            evse_id,
+                            connector_id,
+                            ConnectorEvent::ResetRequested,
+                            &mut effects,
+                        );
+                    }
+                }
+                true
+            }
             ChargePointEvent::DeviceModel(event) => match event {
                 DeviceModelEvent::VariableRegistered {
                     component,
@@ -140,15 +163,18 @@ impl ChargePointState {
         if changed {
             effects.insert(0, ChargePointEffect::StateChanged);
         }
+        self.check_pending_reset(&mut effects);
         effects
     }
 
-    /// Applies a single `ConnectorEvent` to one connector, pushing whatever
-    /// `ChargePointEffect`s result (hardware commands, status notifications, authorization
-    /// requests, transaction events, cost updates). Returns whether anything actually changed.
-    /// Shared by direct connector events and by fault cascading (below), so a cascaded
+    /// Applies a [`ConnectorEvent`] to one `(evse_id, connector_id)`, pushing every resulting
+    /// effect onto `effects` and returning whether anything actually changed. Shared by the
+    /// normal per-connector event path (`ChargePointEvent::Evse { event: EvseEvent::Connector {
+    /// .. }, .. }`), by an `Immediate` `Reset`'s fan-out to every connector in its target scope
+    /// (see `ChargePointEvent::ResetRequested`), and by fault cascading (below) - so a cascaded
     /// `FaultDetected`/`FaultCleared` produces exactly the same effects a single-connector fault
-    /// would.
+    /// would. All three need the exact same transition/hardware-command/status/transaction
+    /// bookkeeping.
     fn apply_connector_event(
         &mut self,
         evse_id: usize,
@@ -165,6 +191,7 @@ impl ChargePointState {
         let previous_state = *connector;
         let stop_reason = match &event {
             ConnectorEvent::ChargingStopped(reason) => Some(*reason),
+            ConnectorEvent::ResetRequested => Some(StopReason::Reset),
             _ => None,
         };
         let presented_id_token = match &event {
@@ -291,8 +318,8 @@ impl ChargePointState {
         // Only recorded while a transaction is actually active on this connector - there's
         // nothing meaningful to attach a cost to otherwise. A recorded cost doesn't change
         // `ConnectorState` itself, so `transition.changed` alone wouldn't notice it - without
-        // folding it into `changed` here, the actor's watch channel would never publish it (see
-        // `ChargePointEffect::StateChanged`).
+        // folding it into the returned value here, the actor's watch channel would never
+        // publish it (see `ChargePointEffect::StateChanged`).
         let cost_recorded = cost_update.is_some_and(|total_cost| {
             if evse
                 .transactions
@@ -307,6 +334,80 @@ impl ChargePointState {
             false
         });
         transition.changed || cost_recorded
+    }
+
+    /// Every `evse_id` a [`ResetTarget`] covers - every EVSE, for
+    /// [`ResetTarget::ChargePoint`], or the one addressed EVSE (if it exists) for
+    /// [`ResetTarget::Evse`].
+    fn target_evse_ids(&self, target: ResetTarget) -> Vec<usize> {
+        match target {
+            ResetTarget::ChargePoint => (0..self.evses.len()).collect(),
+            ResetTarget::Evse { evse_id } => {
+                if evse_id < self.evses.len() {
+                    alloc::vec![evse_id]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// Every `(evse_id, connector_id)` a [`ResetTarget`] covers.
+    fn target_connector_addresses(&self, target: ResetTarget) -> Vec<(usize, usize)> {
+        self.target_evse_ids(target)
+            .into_iter()
+            .flat_map(|evse_id| {
+                let connector_count = self.evses[evse_id].connectors.len();
+                (0..connector_count).map(move |connector_id| (evse_id, connector_id))
+            })
+            .collect()
+    }
+
+    /// Whether `pending`'s target has settled enough to reboot: for `Immediate`, every
+    /// connector in scope has moved past the fail-safe stop this crate itself drove it through
+    /// (no longer `Stopping`/`Finishing`); for `OnIdle`, no connector in scope has a transaction
+    /// in progress. Either way, this can already be true the instant the request comes in (an
+    /// already-idle `OnIdle` target, or an `Immediate` target with nothing to interrupt) - the
+    /// reboot then fires immediately, without waiting on any hardware confirmation.
+    fn pending_reset_ready(&self, pending: &PendingReset) -> bool {
+        match pending.kind {
+            ResetKind::Immediate => !self
+                .target_connector_addresses(pending.target)
+                .into_iter()
+                .any(|(evse_id, connector_id)| {
+                    matches!(
+                        self.evses[evse_id].connectors[connector_id],
+                        ConnectorState::Stopping | ConnectorState::Finishing
+                    )
+                }),
+            ResetKind::OnIdle => !self
+                .target_connector_addresses(pending.target)
+                .into_iter()
+                .any(|(evse_id, connector_id)| {
+                    self.evses[evse_id].transactions[connector_id].is_some()
+                }),
+        }
+    }
+
+    /// Fires the reboot - one [`HardwareCommand::Reboot`] per EVSE in scope - and clears
+    /// `pending_reset` once [`Self::pending_reset_ready`] says the target has settled. Called
+    /// unconditionally at the end of every [`Self::apply`], since any event (a hardware
+    /// confirmation completing a forced stop, or a transaction ending naturally) can be the one
+    /// that satisfies it.
+    fn check_pending_reset(&mut self, effects: &mut Vec<ChargePointEffect>) {
+        let Some(pending) = self.pending_reset else {
+            return;
+        };
+        if !self.pending_reset_ready(&pending) {
+            return;
+        }
+        self.pending_reset = None;
+        effects.push(ChargePointEffect::StateChanged);
+        for evse_id in self.target_evse_ids(pending.target) {
+            effects.push(ChargePointEffect::HardwareCommand(HardwareCommand::Reboot {
+                evse_id,
+            }));
+        }
     }
 
     /// Cascades a hardware fault (`detected = true`) or its clearing (`detected = false`) from
@@ -367,10 +468,10 @@ impl ChargePointState {
 
 /// Advances a connector's transaction alongside its `previous_state` -> `new_state` transition,
 /// returning the TransactionEvent to report, if any. `event_stop_reason` is the `StopReason`
-/// carried by the triggering `ConnectorEvent::ChargingStopped`, if that's what caused this
-/// transition. `event_id_token` is the identifier carried by a triggering `ChargingAuthorized`/
-/// `RemoteStartRequested`, if that's what caused this transition - recorded on the new
-/// `Transaction`.
+/// carried by the triggering `ConnectorEvent::ChargingStopped`/`ConnectorEvent::ResetRequested`,
+/// if that's what caused this transition. `event_id_token` is the identifier carried by a
+/// triggering `ChargingAuthorized`/`RemoteStartRequested`, if that's what caused this transition
+/// - recorded on the new `Transaction`.
 fn advance_transaction(
     slot: &mut Option<Transaction>,
     next_transaction_id: &mut u64,
@@ -408,7 +509,10 @@ fn advance_transaction(
                 transaction.clone(),
             ))
         }
-        (ConnectorState::Charging, ConnectorState::Stopping) => {
+        // Normally reached only from `Charging` (`ChargingStopped`). A CSMS-initiated `Reset`
+        // (Immediate) can also interrupt a transaction that's still `Starting` (contactor not
+        // yet confirmed closed) - see `ConnectorEvent::ResetRequested`.
+        (ConnectorState::Charging | ConnectorState::Starting, ConnectorState::Stopping) => {
             let transaction = slot.as_mut()?;
             transaction.stop_reason = event_stop_reason;
             None

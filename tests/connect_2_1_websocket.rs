@@ -49,8 +49,14 @@ impl ChargePoint<TestEvse, TestConnector> for TestChargePoint {
 
 #[async_trait::async_trait]
 impl Evse<TestConnector> for TestEvse {
+    type Error = core::convert::Infallible;
+
     async fn connectors(&self) -> &[TestConnector] {
         &self.connectors
+    }
+
+    async fn reboot(&self) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 

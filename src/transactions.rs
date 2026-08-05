@@ -176,6 +176,7 @@ mod ocpp_2_1 {
             StopReason::Remote => ReasonEnum::Remote,
             StopReason::EVDisconnected => ReasonEnum::EVDisconnected,
             StopReason::EmergencyStop => ReasonEnum::EmergencyStop,
+            StopReason::Reset => ReasonEnum::ImmediateReset,
         }
     }
 
@@ -199,6 +200,7 @@ mod ocpp_2_1 {
                 Some(StopReason::EmergencyStop) => TriggerReasonEnum::AbnormalCondition,
                 Some(StopReason::Remote) => TriggerReasonEnum::RemoteStop,
                 Some(StopReason::EVDisconnected) => TriggerReasonEnum::EVDeparted,
+                Some(StopReason::Reset) => TriggerReasonEnum::ResetCommand,
                 Some(StopReason::Local) | None => TriggerReasonEnum::StopAuthorized,
             },
         }
@@ -592,6 +594,7 @@ mod ocpp_2_0_1 {
             StopReason::Remote => ReasonEnum::Remote,
             StopReason::EVDisconnected => ReasonEnum::EVDisconnected,
             StopReason::EmergencyStop => ReasonEnum::EmergencyStop,
+            StopReason::Reset => ReasonEnum::ImmediateReset,
         }
     }
 
@@ -613,6 +616,7 @@ mod ocpp_2_0_1 {
                 Some(StopReason::EmergencyStop) => TriggerReasonEnum::AbnormalCondition,
                 Some(StopReason::Remote) => TriggerReasonEnum::RemoteStop,
                 Some(StopReason::EVDisconnected) => TriggerReasonEnum::EVDeparted,
+                Some(StopReason::Reset) => TriggerReasonEnum::ResetCommand,
                 Some(StopReason::Local) | None => TriggerReasonEnum::StopAuthorized,
             },
         }
@@ -947,6 +951,11 @@ mod ocpp_1_6 {
             StopReason::Remote => Reason::Remote,
             StopReason::EVDisconnected => Reason::EVDisconnected,
             StopReason::EmergencyStop => Reason::EmergencyStop,
+            // A CSMS-initiated `Reset` (`ResetKind::Immediate`) that interrupted this
+            // transaction is, on the wire, indistinguishable from any other "the whole charge
+            // point restarted" stop - 1.6J's `Reason` enum's closest match is `HardReset`
+            // (mirroring the `Hard`/`Immediate` pairing `crate::reset::ocpp_1_6` uses).
+            StopReason::Reset => Reason::HardReset,
         }
     }
 

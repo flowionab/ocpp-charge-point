@@ -2,7 +2,8 @@ use alloc::vec::Vec;
 
 use crate::state::{
     ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry, MeterSample,
-    RegistrationStatus, Reservation, SecurityEvent, StopReason, Transaction,
+    RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent, StopReason,
+    Transaction,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -43,6 +44,17 @@ pub enum ChargePointEvent {
     /// via [`crate::security::report_security_event`], not tied to connector/EVSE state. See
     /// `docs/ROADMAP.md` §1.
     SecurityEventOccurred(SecurityEvent),
+    /// The CSMS requested a `Reset` (OCPP `Reset`). Recorded as a
+    /// [`crate::state::PendingReset`] and fulfilled - possibly immediately, possibly once
+    /// `target` goes idle - as a [`HardwareCommand::Reboot`]. See `crate::reset` and
+    /// `docs/ROADMAP.md` §2.
+    ResetRequested {
+        /// The scope the reset applies to (the whole charge point, or one EVSE).
+        target: ResetTarget,
+        /// Whether to interrupt anything in progress right away, or wait for `target` to go
+        /// idle first.
+        kind: ResetKind,
+    },
     /// An event mutating the Component/Variable device model (OCPP `GetVariables`/
     /// `SetVariables`, or 1.6J's `GetConfiguration`/`ChangeConfiguration` projection onto it) -
     /// see `crate::state::device_model` and `crate::device_model`. See `docs/ROADMAP.md` §2.
@@ -135,6 +147,14 @@ pub enum ConnectorEvent {
     /// The CSMS reported a new running total cost for this connector's active transaction (OCPP
     /// `CostUpdated`). Ignored if there's no active transaction. See `docs/ROADMAP.md` §9.
     CostUpdated(f64),
+    /// A CSMS-initiated `Reset` (`ResetKind::Immediate`) covers this connector. Any state where
+    /// a cable is engaged (`Connected`/`Locked`/`Authorizing`/`Starting`/`Charging`) is driven
+    /// through the same fail-safe stop already used for a normal charging stop (open the
+    /// contactor via `Stopping`, then unlock via `Finishing`) - reusing that path rather than a
+    /// parallel one, per `CLAUDE.md`. A connector already `Available`/`Reserved`/`Unavailable`/
+    /// faulted, or already mid-stop (`Stopping`/`Finishing`/`Unlocking`), ignores this. See
+    /// `docs/ROADMAP.md` §2.
+    ResetRequested,
     /// The connector is made available (OCPP `ChangeAvailability` addressing this specific
     /// connector). See `docs/ROADMAP.md` §7.
     SetAvailable,
@@ -271,5 +291,12 @@ pub enum HardwareCommand {
         evse_id: usize,
         /// The targeted connector's index within its EVSE.
         connector_id: usize,
+    },
+    /// Reboots this EVSE's hardware (OCPP `Reset`). A charge-point-wide reset expands to one of
+    /// these per EVSE. Dispatched via [`crate::hardware::Evse::reboot`]. See
+    /// `docs/ROADMAP.md` §2.
+    Reboot {
+        /// The targeted EVSE's index.
+        evse_id: usize,
     },
 }

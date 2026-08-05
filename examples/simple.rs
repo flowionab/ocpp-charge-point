@@ -15,6 +15,7 @@ use ocpp_charge_point::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
 use ocpp_charge_point::reservation::{CancelReservationHandler, ReserveNowHandler};
+use ocpp_charge_point::reset::ResetHandler;
 use ocpp_charge_point::security::SecurityEventNotifier;
 use ocpp_charge_point::setup;
 use ocpp_charge_point::state::{
@@ -145,6 +146,11 @@ impl CancelReservationHandler for AlwaysAcceptBootNotifier {
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {
     }
+}
+
+#[async_trait::async_trait]
+impl ResetHandler for AlwaysAcceptBootNotifier {
+    async fn register_reset_handler(&self, _actor: ocpp_charge_point::actor::ChargePointActor) {}
 }
 
 #[async_trait::async_trait]
@@ -282,8 +288,14 @@ impl ChargePoint<SampleEvse, SampleConnector> for SampleChargePoint {
 
 #[async_trait::async_trait]
 impl Evse<SampleConnector> for SampleEvse {
+    type Error = core::convert::Infallible;
+
     async fn connectors(&self) -> &[SampleConnector] {
         return &self.connectors;
+    }
+
+    async fn reboot(&self) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
