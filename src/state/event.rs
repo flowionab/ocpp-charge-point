@@ -1,5 +1,6 @@
 use crate::state::{
-    ConnectorStatus, IdToken, MeterSample, RegistrationStatus, StopReason, Transaction,
+    ConnectorStatus, IdToken, MeterSample, RegistrationStatus, Reservation, StopReason,
+    Transaction,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,12 @@ pub enum ConnectorEvent {
     /// next TransactionEvent) only while the connector is actually `Charging`; ignored
     /// otherwise. See `docs/ROADMAP.md` §10.
     MeterValueSampled(MeterSample),
+    /// The CSMS reserved this connector (OCPP `ReserveNow`) while it's `Available`. See
+    /// `docs/ROADMAP.md` §8.
+    Reserved(Reservation),
+    /// The CSMS cancelled this connector's reservation (OCPP `CancelReservation`) while it's
+    /// `Reserved`. See `docs/ROADMAP.md` §8.
+    ReservationCancelled,
     SetAvailable,
     SetUnavailable,
     FaultDetected,

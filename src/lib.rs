@@ -12,6 +12,7 @@ pub mod executor;
 pub mod hardware;
 pub mod provisioning;
 pub mod remote_control;
+pub mod reservation;
 mod runtime;
 mod setup;
 pub mod state;

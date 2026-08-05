@@ -18,6 +18,9 @@ pub enum ConnectorState {
     Faulted,
     FaultedSafe,
     Unlocking,
+    /// The CSMS has reserved this connector (OCPP `ReserveNow`) for a specific id token; no
+    /// cable is connected yet. See `docs/ROADMAP.md` §8.
+    Reserved,
 }
 
 pub(crate) enum ConnectorCommand {
@@ -51,14 +54,17 @@ impl ConnectorState {
             | Self::Unlocking => ConnectorStatus::Occupied,
             Self::Unavailable => ConnectorStatus::Unavailable,
             Self::Faulted | Self::FaultedSafe => ConnectorStatus::Faulted,
+            Self::Reserved => ConnectorStatus::Reserved,
         }
     }
 
     pub(crate) fn apply(&mut self, event: ConnectorEvent) -> ConnectorTransition {
         let (next, command) = match (*self, event) {
-            (Self::Available, ConnectorEvent::CableConnected) => {
+            (Self::Available | Self::Reserved, ConnectorEvent::CableConnected) => {
                 (Self::Connected, Some(ConnectorCommand::Lock))
             }
+            (Self::Available, ConnectorEvent::Reserved(_)) => (Self::Reserved, None),
+            (Self::Reserved, ConnectorEvent::ReservationCancelled) => (Self::Available, None),
             (Self::Connected, ConnectorEvent::LockConfirmed) => (Self::Locked, None),
             (Self::Locked, ConnectorEvent::IdTokenPresented(_)) => (Self::Authorizing, None),
             (Self::Locked, ConnectorEvent::RemoteUnlockRequested) => {

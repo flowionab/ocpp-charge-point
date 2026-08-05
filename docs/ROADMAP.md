@@ -457,8 +457,40 @@ Reserving a connector/EVSE ahead of use.
 - Messages: `ReserveNow`, `CancelReservation`.
 - Internal state needed: reservation entity (id, expiry, id token,
   target EVSE/connector), a `Reserved` connector state, expiry timer.
-- Status: ⬜ not started — no `Reserved` state exists in
-  `ConnectorState` yet.
+- Status: 🚧 partial — `ConnectorState` gained a `Reserved` state, reachable
+  only from `Available` (`ConnectorEvent::Reserved(Reservation)`) and left via
+  `ConnectorEvent::ReservationCancelled` (back to `Available`) or
+  `ConnectorEvent::CableConnected` (straight into the normal `Connected` flow,
+  same as plugging into an `Available` connector - the reservation is cleared
+  either way). `availability_status()` now actually reaches
+  `ConnectorStatus::Reserved`, previously unreachable per §7's own notes. A
+  first-class `Reservation` entity (`ReservationId`, `id_token`) exists,
+  separate from `ConnectorState`, tracked per-connector on `EvseState`
+  alongside `transactions` - mirroring how `Transaction` was added for §5.
+  Wired end-to-end the same way as Availability/RemoteControl: a
+  protocol-agnostic `reservation::handle_reserve_now`/
+  `handle_cancel_reservation`, `ReserveNowHandler`/`CancelReservationHandler`
+  traits, implemented for `ocpp-client`'s OCPP 2.1 client (registering via
+  `Client::on_reserve_now`/`on_cancel_reservation`), wired in from `setup()`.
+  Unlike `ChangeAvailability`/`RequestStartTransaction`, OCPP's `ReserveNow`
+  has no `connectorId` addressing at all (`evseId` is optional, with no
+  finer-grained field) - `handle_reserve_now` finds the first `Available`
+  connector on the addressed EVSE (or, if unspecified, the first `Available`
+  connector on any EVSE), matching `RequestStartTransaction`'s "first locked
+  connector" pattern but for `Available` instead. When no connector is
+  `Available`, the outcome reports the most informative wire status
+  (`Faulted`/`Unavailable`/`Occupied`, in that priority order) rather than
+  collapsing everything to a bare rejection. `CancelReservation` finds the
+  connector by `ReservationId` and frees it. Still missing: expiry (no timer
+  infrastructure exists to drive a reservation back to `Available` on its
+  own - see `docs/ROADMAP.md` §0's note on `ChargePointRuntime`'s lack of a
+  scheduling hook, same gap blocking clock-aligned meter sampling in §10),
+  `groupIdToken` (not modeled, same gap as §3), `connectorType` filtering
+  (hardware doesn't expose connector type yet), and matching the presented
+  `id_token` against the reservation's on cable connection - the CSMS's own
+  `Authorize` decision (§3) is still what accepts or rejects the token, same
+  as an unreserved connector; the charge point doesn't locally enforce "only
+  the reserving token may use this connector".
 - Version notes: broadly compatible between 1.6J and 2.x.
 
 ## 9. Tariff and cost

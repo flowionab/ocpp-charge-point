@@ -80,8 +80,19 @@ impl ChargePointState {
                         ConnectorEvent::MeterValueSampled(sample) => Some(*sample),
                         _ => None,
                     };
+                    let reservation_made = match &event {
+                        ConnectorEvent::Reserved(reservation) => Some(reservation.clone()),
+                        _ => None,
+                    };
                     let transition = connector.apply(event);
                     let new_state = *connector;
+                    if let Some(slot) = evse.reservations.get_mut(connector_id) {
+                        if new_state == ConnectorState::Reserved {
+                            *slot = reservation_made;
+                        } else if previous_state == ConnectorState::Reserved {
+                            *slot = None;
+                        }
+                    }
                     if let Some(command) = transition.command {
                         effects.push(ChargePointEffect::HardwareCommand(match command {
                             ConnectorCommand::Lock => HardwareCommand::LockConnector {
@@ -354,11 +365,9 @@ mod tests {
             },
         });
 
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, ChargePointEffect::StatusNotification(_)))
-        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ChargePointEffect::StatusNotification(_))));
     }
 
     fn apply_connector_event(
@@ -418,11 +427,9 @@ mod tests {
         let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested);
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, ChargePointEffect::AuthorizationRequested(_)))
-        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ChargePointEffect::AuthorizationRequested(_))));
         assert!(effects.contains(&ChargePointEffect::HardwareCommand(
             HardwareCommand::CloseContactor {
                 evse_id: 0,
@@ -511,11 +518,9 @@ mod tests {
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Locked);
         assert_eq!(state.evses[0].transactions[0], None);
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
-        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_))));
     }
 
     #[test]
@@ -705,11 +710,74 @@ mod tests {
 
         let effects = apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
 
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
-        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_))));
+    }
+
+    fn reservation(id: i64) -> crate::state::Reservation {
+        crate::state::Reservation {
+            id: crate::state::ReservationId(id),
+            id_token: test_id_token(),
+        }
+    }
+
+    #[test]
+    fn reserving_an_available_connector_records_the_reservation_and_reports_reserved() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::Reserved(reservation(1)));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Reserved);
+        assert_eq!(state.evses[0].reservations[0], Some(reservation(1)));
+        assert!(effects.contains(&ChargePointEffect::StatusNotification(
+            ConnectorStatusChanged {
+                evse_id: 0,
+                connector_id: 0,
+                status: crate::state::ConnectorStatus::Reserved,
+            }
+        )));
+    }
+
+    #[test]
+    fn reserving_an_occupied_connector_is_ignored() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+        apply_connector_event(&mut state, ConnectorEvent::Reserved(reservation(1)));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Locked);
+        assert_eq!(state.evses[0].reservations[0], None);
+    }
+
+    #[test]
+    fn cancelling_a_reservation_frees_the_connector() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::Reserved(reservation(1)));
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ReservationCancelled);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+        assert_eq!(state.evses[0].reservations[0], None);
+        assert!(effects.contains(&ChargePointEffect::StatusNotification(
+            ConnectorStatusChanged {
+                evse_id: 0,
+                connector_id: 0,
+                status: crate::state::ConnectorStatus::Available,
+            }
+        )));
+    }
+
+    #[test]
+    fn plugging_in_a_reserved_connector_proceeds_normally_and_clears_the_reservation() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::Reserved(reservation(1)));
+
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Connected);
+        assert_eq!(state.evses[0].reservations[0], None);
     }
 
     #[test]

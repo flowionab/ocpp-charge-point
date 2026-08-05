@@ -234,6 +234,20 @@ pub(crate) mod test_support {
         ) {
         }
     }
+
+    #[async_trait::async_trait]
+    impl crate::reservation::ReserveNowHandler for FixedBootNotifier {
+        async fn register_reserve_now_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reservation::CancelReservationHandler for FixedBootNotifier {
+        async fn register_cancel_reservation_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]

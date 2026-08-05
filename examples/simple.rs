@@ -8,6 +8,7 @@ use ocpp_charge_point::provisioning::{
 use ocpp_charge_point::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
+use ocpp_charge_point::reservation::{CancelReservationHandler, ReserveNowHandler};
 use ocpp_charge_point::setup;
 use ocpp_charge_point::state::{
     AuthorizationStatus, ChargePointEvent, ConnectorEvent, ConnectorStatus, EvseEvent, IdToken,
@@ -114,6 +115,24 @@ impl RequestStartTransactionHandler for AlwaysAcceptBootNotifier {
 #[async_trait::async_trait]
 impl RequestStopTransactionHandler for AlwaysAcceptBootNotifier {
     async fn register_request_stop_transaction_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ReserveNowHandler for AlwaysAcceptBootNotifier {
+    async fn register_reserve_now_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl CancelReservationHandler for AlwaysAcceptBootNotifier {
+    async fn register_cancel_reservation_handler(
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {

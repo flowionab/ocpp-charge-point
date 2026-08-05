@@ -9,6 +9,7 @@ use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat}
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
+use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::transactions::{TransactionNotifier, run_transaction_events};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -44,6 +45,8 @@ where
         + ChangeAvailabilityHandler
         + RequestStartTransactionHandler
         + RequestStopTransactionHandler
+        + ReserveNowHandler
+        + CancelReservationHandler
         + Clone
         + Send
         + Sync
@@ -110,6 +113,9 @@ where
     csms.register_request_start_transaction_handler(runtime.actor())
         .await;
     csms.register_request_stop_transaction_handler(runtime.actor())
+        .await;
+    csms.register_reserve_now_handler(runtime.actor()).await;
+    csms.register_cancel_reservation_handler(runtime.actor())
         .await;
 
     Ok(runtime)
