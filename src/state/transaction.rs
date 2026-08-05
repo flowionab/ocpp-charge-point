@@ -28,6 +28,9 @@ pub enum StopReason {
     EVDisconnected,
     /// Stopped because a hardware fault was detected.
     EmergencyStop,
+    /// Stopped because a CSMS-initiated `Reset` (`Immediate`) interrupted it. See
+    /// `docs/ROADMAP.md` §2.
+    Reset,
 }
 
 /// A charging session tied to one connector, distinct from [`crate::state::ConnectorState`] -

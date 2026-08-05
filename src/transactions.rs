@@ -165,6 +165,7 @@ mod ocpp_2_1 {
             StopReason::Remote => ReasonEnum::Remote,
             StopReason::EVDisconnected => ReasonEnum::EVDisconnected,
             StopReason::EmergencyStop => ReasonEnum::EmergencyStop,
+            StopReason::Reset => ReasonEnum::ImmediateReset,
         }
     }
 
@@ -188,6 +189,7 @@ mod ocpp_2_1 {
                 Some(StopReason::EmergencyStop) => TriggerReasonEnum::AbnormalCondition,
                 Some(StopReason::Remote) => TriggerReasonEnum::RemoteStop,
                 Some(StopReason::EVDisconnected) => TriggerReasonEnum::EVDeparted,
+                Some(StopReason::Reset) => TriggerReasonEnum::ResetCommand,
                 Some(StopReason::Local) | None => TriggerReasonEnum::StopAuthorized,
             },
         }

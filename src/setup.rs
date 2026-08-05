@@ -11,6 +11,7 @@ use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
+use crate::reset::ResetHandler;
 use crate::security::{run_security_events, SecurityEventNotifier};
 use crate::transactions::{run_transaction_events, TransactionNotifier};
 use crate::ChargePointRuntime;
@@ -51,6 +52,7 @@ where
         + RequestStopTransactionHandler
         + ReserveNowHandler
         + CancelReservationHandler
+        + ResetHandler
         + SendLocalListHandler
         + GetLocalListVersionHandler
         + SecurityEventNotifier
@@ -131,6 +133,7 @@ where
     csms.register_reserve_now_handler(runtime.actor()).await;
     csms.register_cancel_reservation_handler(runtime.actor())
         .await;
+    csms.register_reset_handler(runtime.actor()).await;
     csms.register_send_local_list_handler(runtime.actor()).await;
     csms.register_get_local_list_version_handler(runtime.actor())
         .await;
@@ -227,8 +230,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Evse<TestConnector> for TestEvse {
+        type Error = TestConnectorError;
+
         async fn connectors(&self) -> &[TestConnector] {
             &self.connectors
+        }
+
+        async fn reboot(&self) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 

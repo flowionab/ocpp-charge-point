@@ -81,6 +81,21 @@ impl ConnectorState {
             (Self::Charging, ConnectorEvent::ChargingStopped(_)) => {
                 (Self::Stopping, Some(ConnectorCommand::OpenContactor))
             }
+            // A CSMS-initiated `Reset` (Immediate) interrupts any state where a cable is
+            // engaged, reusing the exact same fail-safe stop (open contactor, then unlock via
+            // `Stopping`/`Finishing`) as a normal charging stop rather than a parallel path
+            // (e.g. `Faulted`/`FaultedSafe`, which would misreport this connector as faulted to
+            // the CSMS). Already-idle states (`Available`/`Reserved`/`Unavailable`/faulted) and
+            // already-settling ones (`Stopping`/`Finishing`/`Unlocking`) are unaffected - see
+            // `docs/ROADMAP.md` §2.
+            (
+                Self::Connected
+                | Self::Locked
+                | Self::Authorizing
+                | Self::Starting
+                | Self::Charging,
+                ConnectorEvent::ResetRequested,
+            ) => (Self::Stopping, Some(ConnectorCommand::OpenContactor)),
             (Self::Stopping, ConnectorEvent::ContactorOpened) => {
                 (Self::Finishing, Some(ConnectorCommand::Unlock))
             }

@@ -250,6 +250,11 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::reset::ResetHandler for FixedBootNotifier {
+        async fn register_reset_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
     impl crate::local_authorization_list::SendLocalListHandler for FixedBootNotifier {
         async fn register_send_local_list_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }

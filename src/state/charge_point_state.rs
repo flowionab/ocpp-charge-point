@@ -4,8 +4,9 @@ use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
     ConnectorStatusChanged, EvseEvent, EvseState, HardwareCommand, LocalAuthorizationList,
-    MeterSample, RegistrationStatus, StopReason, Transaction, TransactionChargingState,
-    TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
+    MeterSample, PendingReset, RegistrationStatus, ResetKind, ResetTarget, StopReason,
+    Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
+    TransactionId, TransactionUpdateReason,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +21,9 @@ pub struct ChargePointState {
     /// The offline authorization cache maintained via `SendLocalList`/`GetLocalListVersion`. See
     /// `docs/ROADMAP.md` §4.
     pub local_authorization_list: LocalAuthorizationList,
+    /// A CSMS-initiated `Reset` request waiting for its target to settle before rebooting. See
+    /// `docs/ROADMAP.md` §2.
+    pub pending_reset: Option<PendingReset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +42,7 @@ impl ChargePointState {
             evses: connector_counts.into_iter().map(EvseState::new).collect(),
             next_transaction_id: 0,
             local_authorization_list: LocalAuthorizationList::new(),
+            pending_reset: None,
         }
     }
 
@@ -67,149 +72,30 @@ impl ChargePointState {
                 effects.push(ChargePointEffect::SecurityEventOccurred(event));
                 false
             }
+            ChargePointEvent::ResetRequested { target, kind } => {
+                self.pending_reset = Some(PendingReset { target, kind });
+                // `Immediate` kicks off the fail-safe stop right away, fanned out to every
+                // connector in scope - each one's own state machine decides whether it's
+                // actually affected (see `ConnectorEvent::ResetRequested`). `OnIdle` just
+                // records the request; `check_pending_reset` below fires the reboot once (or
+                // if) the target is already idle.
+                if kind == ResetKind::Immediate {
+                    for (evse_id, connector_id) in self.target_connector_addresses(target) {
+                        self.apply_connector_event(
+                            evse_id,
+                            connector_id,
+                            ConnectorEvent::ResetRequested,
+                            &mut effects,
+                        );
+                    }
+                }
+                true
+            }
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
                     connector_id,
                     event,
-                } => {
-                    let Some(evse) = self.evses.get_mut(evse_id) else {
-                        return effects;
-                    };
-                    let Some(connector) = evse.connectors.get_mut(connector_id) else {
-                        return effects;
-                    };
-                    let previous_status = connector.availability_status();
-                    let previous_state = *connector;
-                    let stop_reason = match &event {
-                        ConnectorEvent::ChargingStopped(reason) => Some(*reason),
-                        _ => None,
-                    };
-                    let presented_id_token = match &event {
-                        ConnectorEvent::IdTokenPresented(id_token) => Some(id_token.clone()),
-                        _ => None,
-                    };
-                    let meter_sample = match &event {
-                        ConnectorEvent::MeterValueSampled(sample) => Some(*sample),
-                        _ => None,
-                    };
-                    let reservation_made = match &event {
-                        ConnectorEvent::Reserved(reservation) => Some(reservation.clone()),
-                        _ => None,
-                    };
-                    let cost_update = match &event {
-                        ConnectorEvent::CostUpdated(total_cost) => Some(*total_cost),
-                        _ => None,
-                    };
-                    let transition = connector.apply(event);
-                    let new_state = *connector;
-                    if let Some(slot) = evse.reservations.get_mut(connector_id) {
-                        if new_state == ConnectorState::Reserved {
-                            *slot = reservation_made;
-                        } else if previous_state == ConnectorState::Reserved {
-                            *slot = None;
-                        }
-                    }
-                    if let Some(command) = transition.command {
-                        effects.push(ChargePointEffect::HardwareCommand(match command {
-                            ConnectorCommand::Lock => HardwareCommand::LockConnector {
-                                evse_id,
-                                connector_id,
-                            },
-                            ConnectorCommand::Unlock => HardwareCommand::UnlockConnector {
-                                evse_id,
-                                connector_id,
-                            },
-                            ConnectorCommand::CloseContactor => HardwareCommand::CloseContactor {
-                                evse_id,
-                                connector_id,
-                            },
-                            ConnectorCommand::OpenContactor => HardwareCommand::OpenContactor {
-                                evse_id,
-                                connector_id,
-                            },
-                        }));
-                    }
-                    let status = new_state.availability_status();
-                    if status != previous_status {
-                        effects.push(ChargePointEffect::StatusNotification(
-                            ConnectorStatusChanged {
-                                evse_id,
-                                connector_id,
-                                status,
-                            },
-                        ));
-                    }
-                    if new_state == ConnectorState::Authorizing {
-                        if let Some(id_token) = presented_id_token {
-                            effects.push(ChargePointEffect::AuthorizationRequested(
-                                AuthorizationRequested {
-                                    evse_id,
-                                    connector_id,
-                                    id_token,
-                                },
-                            ));
-                        }
-                    }
-                    if let Some(slot) = evse.transactions.get_mut(connector_id) {
-                        if let Some((kind, transaction)) = advance_transaction(
-                            slot,
-                            &mut self.next_transaction_id,
-                            previous_state,
-                            new_state,
-                            stop_reason,
-                        ) {
-                            // A new transaction must not inherit a previous one's running cost,
-                            // and an ended transaction's cost is no longer meaningful.
-                            if matches!(
-                                kind,
-                                TransactionEventKind::Started | TransactionEventKind::Ended
-                            ) {
-                                if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
-                                    *cost_slot = None;
-                                }
-                            }
-                            effects.push(ChargePointEffect::TransactionEvent(
-                                TransactionEventOccurred {
-                                    evse_id,
-                                    connector_id,
-                                    kind,
-                                    transaction,
-                                },
-                            ));
-                        }
-                        if let Some(sample) = meter_sample {
-                            if let Some((kind, transaction)) = apply_meter_sample(slot, sample) {
-                                effects.push(ChargePointEffect::TransactionEvent(
-                                    TransactionEventOccurred {
-                                        evse_id,
-                                        connector_id,
-                                        kind,
-                                        transaction,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                    // Only recorded while a transaction is actually active on this connector -
-                    // there's nothing meaningful to attach a cost to otherwise. A recorded cost
-                    // doesn't change `ConnectorState` itself, so `transition.changed` alone
-                    // wouldn't notice it - without folding it into `changed` here, the actor's
-                    // watch channel would never publish it (see `ChargePointEffect::StateChanged`).
-                    let cost_recorded = cost_update.is_some_and(|total_cost| {
-                        if evse
-                            .transactions
-                            .get(connector_id)
-                            .is_some_and(Option::is_some)
-                        {
-                            if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
-                                *cost_slot = Some(total_cost);
-                                return true;
-                            }
-                        }
-                        false
-                    });
-                    transition.changed || cost_recorded
-                }
+                } => self.apply_connector_event(evse_id, connector_id, event, &mut effects),
                 _ => self
                     .evses
                     .get_mut(evse_id)
@@ -220,14 +106,242 @@ impl ChargePointState {
         if changed {
             effects.insert(0, ChargePointEffect::StateChanged);
         }
+        self.check_pending_reset(&mut effects);
         effects
+    }
+
+    /// Applies a [`ConnectorEvent`] to one `(evse_id, connector_id)`, pushing every resulting
+    /// effect onto `effects` and returning whether anything actually changed. Shared by the
+    /// normal per-connector event path (`ChargePointEvent::Evse { event: EvseEvent::Connector {
+    /// .. }, .. }`) and by an `Immediate` `Reset`'s fan-out to every connector in its target
+    /// scope (see `ChargePointEvent::ResetRequested`) - both need the exact same
+    /// transition/hardware-command/status/transaction bookkeeping.
+    fn apply_connector_event(
+        &mut self,
+        evse_id: usize,
+        connector_id: usize,
+        event: ConnectorEvent,
+        effects: &mut Vec<ChargePointEffect>,
+    ) -> bool {
+        let Some(evse) = self.evses.get_mut(evse_id) else {
+            return false;
+        };
+        let Some(connector) = evse.connectors.get_mut(connector_id) else {
+            return false;
+        };
+        let previous_status = connector.availability_status();
+        let previous_state = *connector;
+        let stop_reason = match &event {
+            ConnectorEvent::ChargingStopped(reason) => Some(*reason),
+            ConnectorEvent::ResetRequested => Some(StopReason::Reset),
+            _ => None,
+        };
+        let presented_id_token = match &event {
+            ConnectorEvent::IdTokenPresented(id_token) => Some(id_token.clone()),
+            _ => None,
+        };
+        let meter_sample = match &event {
+            ConnectorEvent::MeterValueSampled(sample) => Some(*sample),
+            _ => None,
+        };
+        let reservation_made = match &event {
+            ConnectorEvent::Reserved(reservation) => Some(reservation.clone()),
+            _ => None,
+        };
+        let cost_update = match &event {
+            ConnectorEvent::CostUpdated(total_cost) => Some(*total_cost),
+            _ => None,
+        };
+        let transition = connector.apply(event);
+        let new_state = *connector;
+        if let Some(slot) = evse.reservations.get_mut(connector_id) {
+            if new_state == ConnectorState::Reserved {
+                *slot = reservation_made;
+            } else if previous_state == ConnectorState::Reserved {
+                *slot = None;
+            }
+        }
+        if let Some(command) = transition.command {
+            effects.push(ChargePointEffect::HardwareCommand(match command {
+                ConnectorCommand::Lock => HardwareCommand::LockConnector {
+                    evse_id,
+                    connector_id,
+                },
+                ConnectorCommand::Unlock => HardwareCommand::UnlockConnector {
+                    evse_id,
+                    connector_id,
+                },
+                ConnectorCommand::CloseContactor => HardwareCommand::CloseContactor {
+                    evse_id,
+                    connector_id,
+                },
+                ConnectorCommand::OpenContactor => HardwareCommand::OpenContactor {
+                    evse_id,
+                    connector_id,
+                },
+            }));
+        }
+        let status = new_state.availability_status();
+        if status != previous_status {
+            effects.push(ChargePointEffect::StatusNotification(
+                ConnectorStatusChanged {
+                    evse_id,
+                    connector_id,
+                    status,
+                },
+            ));
+        }
+        if new_state == ConnectorState::Authorizing {
+            if let Some(id_token) = presented_id_token {
+                effects.push(ChargePointEffect::AuthorizationRequested(
+                    AuthorizationRequested {
+                        evse_id,
+                        connector_id,
+                        id_token,
+                    },
+                ));
+            }
+        }
+        if let Some(slot) = evse.transactions.get_mut(connector_id) {
+            if let Some((kind, transaction)) = advance_transaction(
+                slot,
+                &mut self.next_transaction_id,
+                previous_state,
+                new_state,
+                stop_reason,
+            ) {
+                // A new transaction must not inherit a previous one's running cost, and an
+                // ended transaction's cost is no longer meaningful.
+                if matches!(
+                    kind,
+                    TransactionEventKind::Started | TransactionEventKind::Ended
+                ) {
+                    if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
+                        *cost_slot = None;
+                    }
+                }
+                effects.push(ChargePointEffect::TransactionEvent(
+                    TransactionEventOccurred {
+                        evse_id,
+                        connector_id,
+                        kind,
+                        transaction,
+                    },
+                ));
+            }
+            if let Some(sample) = meter_sample {
+                if let Some((kind, transaction)) = apply_meter_sample(slot, sample) {
+                    effects.push(ChargePointEffect::TransactionEvent(
+                        TransactionEventOccurred {
+                            evse_id,
+                            connector_id,
+                            kind,
+                            transaction,
+                        },
+                    ));
+                }
+            }
+        }
+        // Only recorded while a transaction is actually active on this connector - there's
+        // nothing meaningful to attach a cost to otherwise. A recorded cost doesn't change
+        // `ConnectorState` itself, so `transition.changed` alone wouldn't notice it - without
+        // folding it into the returned value here, the actor's watch channel would never
+        // publish it (see `ChargePointEffect::StateChanged`).
+        let cost_recorded = cost_update.is_some_and(|total_cost| {
+            if evse
+                .transactions
+                .get(connector_id)
+                .is_some_and(Option::is_some)
+            {
+                if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
+                    *cost_slot = Some(total_cost);
+                    return true;
+                }
+            }
+            false
+        });
+        transition.changed || cost_recorded
+    }
+
+    /// Every `evse_id` a [`ResetTarget`] covers - every EVSE, for
+    /// [`ResetTarget::ChargePoint`], or the one addressed EVSE (if it exists) for
+    /// [`ResetTarget::Evse`].
+    fn target_evse_ids(&self, target: ResetTarget) -> Vec<usize> {
+        match target {
+            ResetTarget::ChargePoint => (0..self.evses.len()).collect(),
+            ResetTarget::Evse { evse_id } => {
+                if evse_id < self.evses.len() {
+                    alloc::vec![evse_id]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// Every `(evse_id, connector_id)` a [`ResetTarget`] covers.
+    fn target_connector_addresses(&self, target: ResetTarget) -> Vec<(usize, usize)> {
+        self.target_evse_ids(target)
+            .into_iter()
+            .flat_map(|evse_id| {
+                let connector_count = self.evses[evse_id].connectors.len();
+                (0..connector_count).map(move |connector_id| (evse_id, connector_id))
+            })
+            .collect()
+    }
+
+    /// Whether `pending`'s target has settled enough to reboot: for `Immediate`, every
+    /// connector in scope has moved past the fail-safe stop this crate itself drove it through
+    /// (no longer `Stopping`/`Finishing`); for `OnIdle`, no connector in scope has a transaction
+    /// in progress. Either way, this can already be true the instant the request comes in (an
+    /// already-idle `OnIdle` target, or an `Immediate` target with nothing to interrupt) - the
+    /// reboot then fires immediately, without waiting on any hardware confirmation.
+    fn pending_reset_ready(&self, pending: &PendingReset) -> bool {
+        match pending.kind {
+            ResetKind::Immediate => !self
+                .target_connector_addresses(pending.target)
+                .into_iter()
+                .any(|(evse_id, connector_id)| {
+                    matches!(
+                        self.evses[evse_id].connectors[connector_id],
+                        ConnectorState::Stopping | ConnectorState::Finishing
+                    )
+                }),
+            ResetKind::OnIdle => !self
+                .target_connector_addresses(pending.target)
+                .into_iter()
+                .any(|(evse_id, connector_id)| {
+                    self.evses[evse_id].transactions[connector_id].is_some()
+                }),
+        }
+    }
+
+    /// Fires the reboot - one [`HardwareCommand::Reboot`] per EVSE in scope - and clears
+    /// `pending_reset` once [`Self::pending_reset_ready`] says the target has settled. Called
+    /// unconditionally at the end of every [`Self::apply`], since any event (a hardware
+    /// confirmation completing a forced stop, or a transaction ending naturally) can be the one
+    /// that satisfies it.
+    fn check_pending_reset(&mut self, effects: &mut Vec<ChargePointEffect>) {
+        let Some(pending) = self.pending_reset else {
+            return;
+        };
+        if !self.pending_reset_ready(&pending) {
+            return;
+        }
+        self.pending_reset = None;
+        effects.push(ChargePointEffect::StateChanged);
+        for evse_id in self.target_evse_ids(pending.target) {
+            effects.push(ChargePointEffect::HardwareCommand(HardwareCommand::Reboot {
+                evse_id,
+            }));
+        }
     }
 }
 
 /// Advances a connector's transaction alongside its `previous_state` -> `new_state` transition,
 /// returning the TransactionEvent to report, if any. `event_stop_reason` is the `StopReason`
-/// carried by the triggering `ConnectorEvent::ChargingStopped`, if that's what caused this
-/// transition.
+/// carried by the triggering `ConnectorEvent::ChargingStopped`/`ConnectorEvent::ResetRequested`,
+/// if that's what caused this transition.
 fn advance_transaction(
     slot: &mut Option<Transaction>,
     next_transaction_id: &mut u64,
@@ -263,7 +377,10 @@ fn advance_transaction(
                 *transaction,
             ))
         }
-        (ConnectorState::Charging, ConnectorState::Stopping) => {
+        // Normally reached only from `Charging` (`ChargingStopped`). A CSMS-initiated `Reset`
+        // (Immediate) can also interrupt a transaction that's still `Starting` (contactor not
+        // yet confirmed closed) - see `ConnectorEvent::ResetRequested`.
+        (ConnectorState::Charging | ConnectorState::Starting, ConnectorState::Stopping) => {
             let transaction = slot.as_mut()?;
             transaction.stop_reason = event_stop_reason;
             None
