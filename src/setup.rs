@@ -13,6 +13,7 @@ use crate::provisioning::{run_heartbeat, Backoff, BootNotifier, HeartbeatSender}
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
+use crate::reporting::{GetBaseReportHandler, GetReportHandler};
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::security::SecurityEventNotifier;
 use crate::transactions::TransactionNotifier;
@@ -59,6 +60,8 @@ where
         + GetLocalListVersionHandler
         + GetVariablesHandler
         + SetVariablesHandler
+        + GetBaseReportHandler
+        + GetReportHandler
         + SecurityEventNotifier
         + CostUpdatedHandler
         + ReconnectHandler
@@ -267,6 +270,9 @@ where
         .await;
     csms.register_get_variables_handler(runtime.actor()).await;
     csms.register_set_variables_handler(runtime.actor()).await;
+    csms.register_get_base_report_handler(runtime.actor())
+        .await;
+    csms.register_get_report_handler(runtime.actor()).await;
     csms.register_cost_updated_handler(runtime.actor()).await;
 
     Ok(runtime)

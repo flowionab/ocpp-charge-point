@@ -3,6 +3,7 @@ use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier}
 use ocpp_charge_point::connection::ReconnectHandler;
 use ocpp_charge_point::cost::CostUpdatedHandler;
 use ocpp_charge_point::device_model::{GetVariablesHandler, SetVariablesHandler};
+use ocpp_charge_point::reporting::{GetBaseReportHandler, GetReportHandler};
 use ocpp_charge_point::executor::TokioExecutor;
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
 use ocpp_charge_point::local_authorization_list::{
@@ -180,6 +181,21 @@ impl SetVariablesHandler for AlwaysAcceptBootNotifier {
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetBaseReportHandler for AlwaysAcceptBootNotifier {
+    async fn register_get_base_report_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetReportHandler for AlwaysAcceptBootNotifier {
+    async fn register_get_report_handler(&self, _actor: ocpp_charge_point::actor::ChargePointActor) {
     }
 }
 
