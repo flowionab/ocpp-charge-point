@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 
 use crate::state::{
-    ConnectorState, ConnectorStatus, IdToken, LocalListEntry, MeterSample, RegistrationStatus,
-    Reservation, SecurityEvent, StopReason, Transaction,
+    ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry, MeterSample,
+    RegistrationStatus, Reservation, SecurityEvent, StopReason, Transaction,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -43,6 +43,10 @@ pub enum ChargePointEvent {
     /// via [`crate::security::report_security_event`], not tied to connector/EVSE state. See
     /// `docs/ROADMAP.md` §1.
     SecurityEventOccurred(SecurityEvent),
+    /// An event mutating the Component/Variable device model (OCPP `GetVariables`/
+    /// `SetVariables`, or 1.6J's `GetConfiguration`/`ChangeConfiguration` projection onto it) -
+    /// see `crate::state::device_model` and `crate::device_model`. See `docs/ROADMAP.md` §2.
+    DeviceModel(DeviceModelEvent),
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {
         /// The addressed EVSE's index.

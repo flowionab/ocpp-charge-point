@@ -2,6 +2,7 @@ use crate::authorization::{run_authorization_requests, Authorizer};
 use crate::availability::{ChangeAvailabilityHandler, DedupedStatusNotifier, StatusNotifier};
 use crate::connection::{reregister_on_reconnect, ReconnectHandler};
 use crate::cost::CostUpdatedHandler;
+use crate::device_model::{GetVariablesHandler, SetVariablesHandler};
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
@@ -56,6 +57,8 @@ where
         + CancelReservationHandler
         + SendLocalListHandler
         + GetLocalListVersionHandler
+        + GetVariablesHandler
+        + SetVariablesHandler
         + SecurityEventNotifier
         + CostUpdatedHandler
         + ReconnectHandler
@@ -262,6 +265,8 @@ where
     csms.register_send_local_list_handler(runtime.actor()).await;
     csms.register_get_local_list_version_handler(runtime.actor())
         .await;
+    csms.register_get_variables_handler(runtime.actor()).await;
+    csms.register_set_variables_handler(runtime.actor()).await;
     csms.register_cost_updated_handler(runtime.actor()).await;
 
     Ok(runtime)
