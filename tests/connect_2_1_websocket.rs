@@ -127,6 +127,7 @@ async fn connect_and_setup_completes_boot_notification_over_a_real_websocket() {
         },
         &format!("ws://{addr}"),
         None,
+        None,
         TokioExecutor,
         TokioBackoff,
     )
@@ -137,6 +138,54 @@ async fn connect_and_setup_completes_boot_notification_over_a_real_websocket() {
         runtime.state().registration,
         Some(RegistrationStatus::Accepted)
     );
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn connect_and_setup_reports_an_unsupported_negotiated_version_instead_of_hanging() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        // The CSMS only speaks 1.6J - a real, valid WebSocket-layer negotiation outcome this
+        // crate can't yet drive a full session in (see `connect.rs`'s module docs).
+        tokio_tungstenite::accept_hdr_async(
+            tcp,
+            |_req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+             mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                response
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", "ocpp1.6".parse().unwrap());
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+    });
+
+    let result = connect_and_setup(
+        TestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector],
+            }],
+        },
+        &format!("ws://{addr}"),
+        None,
+        None,
+        TokioExecutor,
+        TokioBackoff,
+    )
+    .await;
+    let error = result.err().expect("expected connect_and_setup to reject the negotiated version");
+
+    assert!(matches!(
+        error,
+        ocpp_charge_point::ConnectAndSetupError::UnsupportedNegotiatedVersion(
+            ocpp_client::OcppVersion::V1_6
+        )
+    ));
 
     server.await.unwrap();
 }

@@ -7,6 +7,7 @@ use core::pin::Pin;
 
 /// Runs a future to completion in the background, detached from the caller.
 pub trait Executor {
+    /// Spawns `future`, running it to completion in the background.
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>);
 }
 

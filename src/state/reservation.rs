@@ -12,6 +12,8 @@ pub struct ReservationId(pub i64);
 /// connection, not by elapsed time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
+    /// This reservation's identifier, assigned by the CSMS.
     pub id: ReservationId,
+    /// The identifier this reservation is held for.
     pub id_token: IdToken,
 }

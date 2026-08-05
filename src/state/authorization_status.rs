@@ -3,6 +3,8 @@
 /// collapsed into `Rejected` and why).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorizationStatus {
+    /// The identifier is allowed to start charging.
     Accepted,
+    /// The identifier is not allowed to start charging.
     Rejected,
 }

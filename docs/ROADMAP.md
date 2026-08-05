@@ -48,17 +48,370 @@ Not a functional block, but a prerequisite for all of them.
   types don't exist upstream in `rust-ocpp`/`ocpp-client` at all (unlike
   every other action in this list). `connect_and_setup` only covers OCPP
   2.1 (the crate's primary target per `CLAUDE.md`), not 1.6J/2.0.1.
-- ⬜ Protocol-version-independent core → version adapters. The state model
-  needs to be designed so a single internal representation projects down
-  to 1.6J, 2.0.1, and 2.1 wire shapes.
-- ⬜ Version negotiation / connection lifecycle (connecting, reconnecting,
-  offline message queueing, backoff).
-- 🚧 Erratic-hardware fault containment — `Faulted`/`FaultedSafe` exist for
-  connectors; not yet generalized to EVSE/charge-point-level hardware
-  faults (meter stalls, contactor stick, sensor glitches), and no fault
-  injection tests yet.
-- ⬜ Rustdoc coverage pass on all public APIs (see `CLAUDE.md` documentation
-  standard).
+- 🚧 Protocol-version-independent core → version adapters. The pattern
+  itself already existed implicitly - every functional block already
+  defines a protocol-agnostic trait (`BootNotifier`, `StatusNotifier`,
+  `TransactionNotifier`, etc.) with a per-version `impl ... for
+  OCPP2_1Client` in its own `ocpp_2_1` submodule - but until now every
+  single one of those `impl`s targeted `OCPP2_1Client` only (verified
+  directly - grepped for `impl .* for OCPP1_6Client`/`OCPP2_0_1Client`
+  across the whole crate: zero hits before this). So the "single internal
+  representation projects down to 1.6J/2.0.1/2.1" claim was aspirational,
+  not demonstrated. First real projections landed for Provisioning (§2):
+  `provisioning.rs` now has `ocpp_1_6`/`ocpp_2_0_1` submodules alongside
+  the existing `ocpp_2_1` one, each with its own `build_request`/
+  `map_status` and `BootNotifier`/`HeartbeatSender` impls for
+  `OCPP1_6Client`/`OCPP2_0_1Client` - the same internal
+  `BootNotificationOutcome`/`RegistrationStatus` now genuinely projects to
+  all three wire shapes, not just 2.1's. 2.0.1's `BootNotificationRequest`
+  turned out byte-for-byte identical in shape to 2.1's (same
+  `ChargingStation`/`BootReasonEnum`/`RegistrationStatusEnum`), so that
+  adapter is close to a copy of the 2.1 one; 1.6J's differs more (no
+  `reason` field - that's a 2.x addition - and flattens
+  `charging_station.vendor_name`/`model` into top-level
+  `charge_point_vendor`/`charge_point_model`), which is exactly the kind
+  of version-specific projection this bullet is about. Each new submodule
+  is compiled and tested in isolation too (`cargo check --no-default-
+  features --features std,ocpp_1_6 --lib` / `...,ocpp_2_0_1...`), not
+  just alongside `ocpp_2_1`, so they don't secretly depend on it.
+  Availability's `StatusNotifier` - the harder case flagged above, since
+  1.6J addresses connectors with a single flat `connectorId: i64` (no
+  EVSE concept at all) while this crate's internal model addresses every
+  connector as an `(evse_id, connector_id)` pair - now has a real 1.6J
+  adapter too: `ConnectorStatusChanged`/`StatusNotifier::notify_status`
+  gained a `connector_state: ConnectorState` field/parameter alongside
+  the existing coarse `status: ConnectorStatus`, giving version adapters
+  access to the full internal state. A new
+  `availability::Ocpp1_6StatusNotifier` wraps `OCPP1_6Client` together
+  with the charge point's connector topology (each EVSE's connector
+  count, captured once at construction - the topology `notify_status`'s
+  per-call `(evse_id, connector_id)` alone can't supply) and uses a new
+  `flatten_connector_id` helper (1-based, summing prior EVSEs' connector
+  counts) to translate to 1.6J's numbering, plus a `map_status` that
+  reads the richer `ConnectorState` directly (not the already-collapsed
+  `ConnectorStatus`) to produce 1.6J's fuller status enum
+  (`Preparing`/`Charging`/`Finishing`/`Unavailable`/`Faulted`/
+  `Reserved`/`Available` - `SuspendedEV`/`SuspendedEVSE` have no mapping
+  yet since nothing in this crate's connector state machine currently
+  distinguishes them).
+
+  The emission-cadence gap this first landed with is now closed too:
+  `ChargePointState::apply_connector_event` fires `StatusNotification`
+  on every actual `ConnectorState` transition (`transition.changed`) now,
+  not only ones that cross a coarse `ConnectorStatus` boundary - so a
+  session's `Locked` -> `Authorizing` -> `Starting` -> `Charging`
+  progression (all `Occupied`) reports each step, letting 1.6J's adapter
+  report `Preparing` -> `Charging` correctly instead of getting stuck on
+  whichever `ConnectorState` happened to be current the one time
+  `Occupied` was first entered. Two tests encoding the old, coarser
+  cadence as a guarantee needed rewriting to match
+  (`state::charge_point_state::tests` had one asserting *no*
+  notification for `Connected` -> `Locked`; `actor::tests` had exact
+  effect-vector assertions missing the now-additional notifications for
+  `Locked` -> `Authorizing` and `Authorizing` -> `Starting`) - both now
+  assert the richer, correct behavior instead of just being made to pass.
+  That wire-traffic tradeoff is now closed too, without touching
+  `OCPP2_1Client`/`OCPP2_0_1Client` or `setup()`'s signature: a new
+  `availability::DedupedStatusNotifier<N>` wraps *any* `StatusNotifier`
+  (protocol-agnostic - it has no idea `N` might be an OCPP client at
+  all) and only forwards a call when `status` actually differs from the
+  last one seen for that connector (or is the first one ever seen for
+  it), using a small `BTreeMap<(usize, usize), ConnectorStatus>` cache
+  behind the same `embassy-sync` `CriticalSectionRawMutex`-backed
+  blocking mutex `src/sync.rs`'s own primitives are built on (so it
+  stays no_std-safe without pulling in `std`/`tokio`). `setup()` wraps
+  `csms` in this specifically for its `StatusNotifier` use
+  (`DedupedStatusNotifier::new(csms.clone())`) - every other trait call
+  still goes straight to `csms` unwrapped - so 2.1/2.0.1 deployments
+  going through `setup()` keep exactly the wire cadence they had before
+  `ChargePointState` started reporting every transition, with no changes
+  needed to either client type or to what `setup()` requires callers to
+  pass. `Ocpp1_6StatusNotifier` is deliberately *not* wrapped in this
+  anywhere - it needs every call, including ones where `status` repeats
+  but `connector_state` doesn't, which is the entire reason the
+  emission-cadence fix happened. 4 new tests cover: first-call-always-
+  forwards, a repeated status is suppressed, a genuinely different
+  status forwards again, and connectors are deduped independently of
+  each other.
+
+  Transactions' `TransactionNotifier` now has a 1.6J adapter too - the
+  hardest case yet, for a reason neither `BootNotifier` nor
+  `StatusNotifier` ran into: **the CSMS assigns the transaction id, not
+  the charge point.** `StartTransaction.conf` returns a CSMS-picked
+  `transactionId` that every later `MeterValues`/`StopTransaction` for
+  that session must use instead of this crate's own `TransactionId` -
+  the opposite of every other identifier in this crate (and of 2.x's own
+  `TransactionEvent`, where the charge point mints the id). Closing that
+  gap needed real state, not just a mapping function:
+  `transactions::Ocpp1_6TransactionNotifier` wraps `OCPP1_6Client` with a
+  `TransactionId -> i64` cache (same `embassy-sync`-backed blocking
+  mutex as `DedupedStatusNotifier`'s), populated when `StartTransaction`
+  returns and consulted - then removed - on `Ended`. It also reuses
+  `Ocpp1_6StatusNotifier`'s connector-topology wrapping for
+  `StartTransaction`/`MeterValues`'s flat `connectorId`; the shared
+  logic (`flatten_ocpp_1_6_connector_id`) moved out of `availability.rs`
+  into a new `src/topology.rs` so both adapters call the same function
+  instead of carrying their own copies - the first time this crate has
+  shared logic across two version-adapter modules rather than letting
+  each carry its own small duplicate, since a topology bug in one place
+  would need finding and fixing in both otherwise.
+
+  Building `StartTransaction.req` exposed a real, pre-existing gap:
+  1.6J needs `idTag` (who's charging) and `meterStart` (the energy
+  register reading at session start), and `Transaction` had neither.
+  `idTag` got a real fix, not a placeholder: `Transaction` gained an
+  `id_token: Option<IdToken>` field, threaded through both ways a
+  transaction can start - `ConnectorEvent::ChargingAuthorized`/
+  `RemoteStartRequested` now carry the `IdToken` (previously unit
+  variants), recorded by `state::charge_point_state::advance_transaction`
+  when it builds the new `Transaction`. This is a real, if scoped,
+  change to the protocol-version-independent core, not just another
+  adapter - and since `IdToken` isn't `Copy` (it owns a `String`),
+  `Transaction`/`TransactionEventOccurred` lost their `Copy` derive too,
+  which rippled into `.clone()`/`.as_ref()` fixups across ~6 files
+  wherever code relied on implicit copies (`cost.rs`, `remote_control.rs`,
+  the state machine's own `advance_transaction`/`apply_meter_sample`,
+  and test fixtures throughout). `meterStart` didn't get an equally real
+  fix: this crate's `MeterSample` is only ever recorded once charging is
+  already under way (see §10 below), so there's no reading captured *at*
+  `Started` to report - `Ocpp1_6TransactionNotifier` falls back to `0`,
+  documented as a known limitation rather than silently wrong. One more
+  real fix along the way: 1.6J's `IdTag` caps identifiers at 20 bytes,
+  tighter than 2.x's 255-byte `IdTokenType.idToken` - a legitimately
+  longer identifier is truncated to fit rather than dropping the whole
+  `StartTransaction`/`StopTransaction`.
+
+  2.0.1's coverage is now essentially finished, closing out the "every
+  adapter targets `OCPP2_1Client` only" gap this bullet opened with:
+  `OCPP2_0_1Client` now implements `ReconnectHandler`, `Authorizer`,
+  `StatusNotifier`, `ChangeAvailabilityHandler`, `TransactionNotifier`,
+  `UnlockConnectorHandler`, `RequestStartTransactionHandler`,
+  `RequestStopTransactionHandler`, `ReserveNowHandler`,
+  `CancelReservationHandler`, `SendLocalListHandler`,
+  `GetLocalListVersionHandler`, `CostUpdatedHandler`,
+  `DataTransferSender`, and `DataTransferRegistrar` - every one of
+  `setup()`'s required traits except `SecurityEventNotifier` (verified
+  directly, not assumed: a scratch `assert_bound::<OCPP2_0_1Client>()`
+  against `setup()`'s exact trait bound, minus `SecurityEventNotifier`,
+  compiled clean). Almost every block's 2.0.1 wire shape turned out
+  identical or near-identical to 2.1's - the real, version-specific work
+  concentrated in one place: **2.0.1's `IdToken.type` is a closed
+  8-value enum (`IdTokenEnum`), not 2.1's free-form string**, hit first
+  in `authorization::ocpp_2_0_1::map_id_token_kind` (falling back to
+  `Central` for `DirectPayment`/`EVCCID`/`Vin`, which 2.0.1 has no
+  variant for at all - the same real, honest gap 1.6J's status/id-tag
+  adapters already had to make similar calls for), then reused - not
+  re-derived - by `remote_control::ocpp_2_0_1` (the reverse direction:
+  wire enum back to internal kind, for `RequestStartTransaction`'s
+  inbound token) and by `reservation::ocpp_2_0_1`/
+  `local_authorization_list::ocpp_2_0_1` (both import
+  `remote_control::ocpp_2_0_1::map_id_token_kind` directly rather than
+  each carrying a fourth copy - the first time this crate's version
+  adapters share a *mapping function*, not just a topology helper like
+  `flatten_ocpp_1_6_connector_id`). `security.rs`'s `wire_type` also
+  moved to module-level scope, ready for a 2.0.1 adapter to reuse the
+  moment one becomes possible, instead of staying buried inside
+  `ocpp_2_1` where a future 2.0.1 module couldn't reach it.
+
+  **`SecurityEventNotifier` is the one block that could not be ported,
+  and it's a real upstream wall, not a gap this crate left unclosed**:
+  `ocpp-client` 0.2.0 simply does not implement `SecurityEventNotification`
+  for OCPP 2.0.1 at all - verified directly, not assumed, by grepping its
+  complete `ocpp_2_0_1::actions` list (66 actions, covering every other
+  message this crate needs, from `BootNotification` through
+  `TransactionEvent` to `SendLocalList` - just not this one). There is no
+  `Action` type or `send_*`/`on_*` method to call, so there is nothing
+  for an adapter in this crate to wrap; per `CLAUDE.md`'s "delegate
+  wire-protocol concerns to `ocpp-client`," this has to be fixed
+  upstream, not worked around here. Until then, `setup()` (and
+  `connect_and_setup`'s `UnsupportedNegotiatedVersion` handling for a
+  2.0.1-negotiated connection) still can't accept a bare
+  `OCPP2_0_1Client` - it's one trait short. See `docs/ROADMAP.md` §1.
+
+  1.6J's coverage is now essentially finished too: `OCPP1_6Client` (or a
+  topology-aware wrapper around it, for the handlers whose request
+  addresses a connector) implements `Authorizer`, `UnlockConnectorHandler`,
+  `ChangeAvailabilityHandler`, `RequestStartTransactionHandler`,
+  `RequestStopTransactionHandler`, `ReserveNowHandler`,
+  `CancelReservationHandler`, `SendLocalListHandler`,
+  `GetLocalListVersionHandler`, `DataTransferSender`, and
+  `DataTransferRegistrar` - every block except `SecurityEventNotifier`/
+  `CostUpdatedHandler`, which don't apply to 1.6J at all (no such messages
+  exist pre-2.x; not a gap, a real spec boundary). 1.6J's defining
+  difference from 2.x runs through this whole batch: **it has no EVSE
+  concept and addresses connectors with a single flat `connectorId: i64`**,
+  so every handler whose 2.x counterpart takes an `evseId` needs
+  [`crate::topology::unflatten_ocpp_1_6_connector_id`] (the wire-to-internal
+  reverse of the `flatten_ocpp_1_6_connector_id` the outbound adapters
+  already had) to resolve one, wrapped in a small per-block struct
+  (`crate::remote_control::Ocpp1_6RemoteControlHandler`,
+  `crate::availability::Ocpp1_6ChangeAvailabilityHandler`,
+  `crate::reservation::Ocpp1_6ReserveNowHandler`) that captures
+  `connector_counts` the same way the outbound `Ocpp1_6StatusNotifier`/
+  `Ocpp1_6TransactionNotifier` already did - handlers that need no
+  topology at all (`RequestStopTransactionHandler`,
+  `SendLocalListHandler`/`GetLocalListVersionHandler`,
+  `DataTransferSender`/`DataTransferRegistrar`) are implemented directly
+  on `OCPP1_6Client` instead, with no wrapper.
+
+  A few of 1.6J's request shapes need *more* precision than the internal
+  model's handlers accept, not less: `RemoteStartTransactionRequest`'s
+  optional `connectorId` and `ReserveNowRequest`'s mandatory one (`0`
+  meaning "the Charge Point may choose") both address one specific flat
+  connector, but `handle_request_start_transaction`/`handle_reserve_now`
+  only target at EVSE granularity (picking the first matching connector on
+  it themselves) - the same granularity every 2.x adapter's `evseId`
+  already works at. Rather than widen those internal functions for one
+  version, the resolved `connectorId` is unflattened down to its EVSE half
+  and the specific connector within it is dropped, documented at the call
+  site as a deliberate reduction, not an oversight.
+
+  1.6J's `IdTag`/`AuthorizeRequest`/`local_authorization_list` items carry
+  no type/kind metadata at all (unlike every later version's
+  `IdTokenType`), so a new [`crate::id_tag::map_id_token`] (the reverse of
+  the `map_id_tag` the outbound 1.6J adapters already shared) fills in
+  `IdTokenKind::Central` for every inbound identifier this block receives
+  - the closest fit for "an identifier the CSMS itself is presenting,"
+  reused by `remote_control::ocpp_1_6`, `reservation::ocpp_1_6`, and
+  `local_authorization_list::ocpp_1_6` rather than triplicated. One
+  genuine version-shape win surfaced in `data_transfer.rs`: 1.6J's
+  `DataTransferRequest`/`DataTransferResponse.data` is a real
+  `Option<String>`, not the `Option<()>` every 2.x binding collapsed to
+  (see that module's top-level docs) - so the 1.6J adapter is the only one
+  of the three that actually carries a payload across the wire instead of
+  silently dropping it.
+- ✅ Version negotiation / connection lifecycle (connecting, reconnecting,
+  offline message queueing, backoff). Reconnecting-with-backoff turned out
+  to already exist entirely inside `ocpp-client` 0.2 (verified directly
+  against the pinned dependency, not assumed): `connect_1_6`/
+  `connect_2_0_1`/`connect_2_1` build a `Client` with automatic reconnect
+  (`ConnectOptions::reconnect`, `ReconnectPolicy` exponential backoff)
+  enabled *by default* - this crate's own `connect_and_setup` was already
+  forwarding `ConnectOptions` straight through, so that part was working
+  unnoticed. What `ocpp-client` explicitly leaves to the caller (its own
+  `Client::on_reconnect` docs say so directly: "this crate does not
+  re-run BootNotification or replay any state on its own") is
+  resynchronizing application state after a reconnect - a real gap, since
+  nothing in this crate was calling `on_reconnect` at all. Closed via a
+  new `src/connection.rs`: a protocol-agnostic `ReconnectHandler` trait
+  (`register_reconnect_handler`, wrapping `Client::on_reconnect`,
+  implemented for `OCPP2_1Client`) and `reregister_on_reconnect`, which
+  re-runs BootNotification-until-accepted (`provisioning::
+  register_until_accepted`, now a free function taking `&ChargePointActor`
+  instead of a `ChargePointRuntime` method, so both `ChargePointRuntime`
+  and this new caller share the same implementation) every time the
+  connection comes back after dropping - never on the initial connect,
+  which already gets its own registration in `setup()`. Wired into
+  `setup()` automatically for every csms type meeting the new
+  `ReconnectHandler` bound.
+
+  Version negotiation is now wired up too: `connect_and_setup` dials via
+  `ocpp_client::connect` (not the hardcoded `connect_2_1` it used
+  before), offering a caller-supplied `versions: Option<&[OcppVersion]>`
+  - or every version compiled into the build, if `None` - and letting
+  the CSMS pick one over the WebSocket subprotocol handshake, per RFC
+  6455. This is real negotiation, not a stub: the handshake genuinely
+  offers whichever versions are asked for and the CSMS genuinely
+  chooses. What it can't do yet is anything useful with a 1.6J/2.0.1
+  outcome - `setup()` requires a client implementing every functional
+  block's trait, and today only `OCPP2_1Client` does (see the
+  "protocol-version-independent core" item above for the running
+  tally). Rather than pretend otherwise, `connect_and_setup` now returns
+  a new `ConnectAndSetupError::UnsupportedNegotiatedVersion(OcppVersion)`
+  when the CSMS picks 1.6J or 2.0.1 - a real, valid handshake outcome
+  this crate simply can't run a session in yet, surfaced as an explicit
+  error instead of a confusing later failure or a silent wrong-version
+  attempt. Callers who only want 2.1 (this function's behavior before
+  version negotiation existed) pass `Some(&[OcppVersion::V2_1])`. A new
+  integration test (`tests/connect_2_1_websocket.rs`, alongside the
+  existing happy-path one) drives a real WebSocket handshake where the
+  mock CSMS negotiates 1.6J and asserts `connect_and_setup` returns that
+  error rather than hanging or panicking - the two together are the
+  first end-to-end proof that negotiation actually round-trips over a
+  real connection, not just that the types compile.
+
+  Offline message queueing is now closed too. `ocpp-client`'s
+  `Client::call`/`send_notification` still write straight to whatever
+  transport is currently installed and fail immediately if it's down -
+  that's `ocpp-client`'s behavior to own, not this crate's to duplicate
+  (per `CLAUDE.md`'s "delegate networking to `ocpp-client`" guidance) -
+  so the fix lives at this crate's own layer instead: a new
+  `src/offline_queue.rs` with `OfflineQueue<M>` (a small FIFO queue,
+  generic over the message type, built on the same `embassy-sync`
+  blocking mutex `DedupedStatusNotifier`'s cache uses) and two functions
+  - `run_with_offline_queue` (a drop-in replacement for the existing
+  `run_status_notifications`-style forwarding loops, queuing a failed
+  send instead of just logging it) and `flush_offline_queue` (drains the
+  backlog, in order, stopping at the first still-failing message rather
+  than skipping ahead and misordering e.g. `TransactionEvent`s the CSMS
+  relies on arriving in sequence). `setup()` now wires all three of
+  Status/Transaction/Security through an `OfflineQueue`: a failed report
+  is retried both the next time a new report of that kind comes in *and*
+  - via a `register_reconnect_handler` callback registered alongside the
+  forwarder - the moment the connection itself reconnects, so a queued
+  report doesn't sit waiting for an unrelated event to trigger a retry.
+  `DedupedStatusNotifier` is wrapped in `Arc` so the live forwarder and
+  the reconnect-flush closure share the exact same dedup cache instead
+  of each getting its own (which would have let a status re-forward
+  after reconnect even though the live path had already deduped it
+  away). The original `run_status_notifications`/`run_transaction_events`/
+  `run_security_events` functions are unchanged and still exported -
+  `setup()` just doesn't use them anymore - for callers who genuinely
+  want the simpler fire-and-forget behavior. 3 new tests in
+  `offline_queue.rs` cover: a successful send is delivered without ever
+  being queued; a failed send is queued and both it and a later message
+  get delivered, in order, once sending starts succeeding again; and a
+  flush stops at the first failure rather than skipping ahead to a later
+  message that might currently succeed.
+- ✅ Erratic-hardware fault containment generalized beyond connectors.
+  `Faulted`/`FaultedSafe` already existed per-connector; `EvseEvent::
+  FaultDetected`/`FaultCleared` and top-level `ChargePointEvent::
+  HardwareFault`/`FaultCleared` existed in the event model too, but
+  previously only flipped `EvseStatus`/`LifecycleState` without touching
+  the connectors underneath - a hardware fault reported at EVSE or
+  charge-point scope (e.g. a shared meter stall, a contactor bank fault)
+  didn't actually open any contactors, which violated `CLAUDE.md`'s
+  fail-safe-over-fail-open guidance. `ChargePointState::apply` now
+  cascades: an EVSE fault forces every connector it owns through the same
+  `ConnectorEvent::FaultDetected` path a direct connector fault takes
+  (`Faulted` + `OpenContactor` + ending any active transaction), reusing
+  the extracted `apply_connector_event` helper so the effects are
+  identical either way; a charge-point-wide `HardwareFault` cascades that
+  to every EVSE in turn. Recovery cascades symmetrically but stays
+  fail-safe: `FaultCleared` only advances a connector past `FaultedSafe`
+  once its contactor has actually confirmed open, so connectors that
+  haven't yet reported `ContactorOpened` are correctly left `Faulted`
+  even after the fault is cleared at their EVSE/charge point. No new
+  hardware-facing API was needed - integrators already push these events
+  via `HardwareEventSender::send` (any `ChargePointEvent`), just nothing
+  drove them from EVSE/charge-point scope with a real effect before now.
+  Fault injection tests cover: an EVSE fault opening every connector's
+  contactor and ending in-flight transactions; a partial-recovery case
+  where only the connector that confirmed its contactor open unlocks; and
+  the charge-point-wide fault/clear cascade across multiple EVSEs. Meter
+  stalls, contactor stick, and sensor glitches themselves still have no
+  dedicated detection logic (that's a hardware-integration concern, not a
+  state-machine one) - this closes the "faults don't propagate" gap, not
+  "we detect every possible fault".
+- ✅ Rustdoc coverage pass on all public APIs (see `CLAUDE.md` documentation
+  standard). `lib.rs` now carries `#![warn(missing_docs)]`, and every item it
+  flagged (219 warnings, across ~30 files - every public trait/method,
+  enum/variant, and struct/field reachable from the crate root) got a real
+  doc comment explaining behaviour, not just a signature restatement:
+  what an enum variant means, what a trait method does and when it's
+  called, what a struct field represents and how it's indexed. Two
+  crate-level gaps also got closed: a top-level `//!` crate doc on
+  `lib.rs`, and `//!`-less re-exports (`actor`, `state`) got a one-line
+  `///` at their `pub mod` declaration instead. `missing_docs` stays a
+  `warn`, not a `deny` - `cargo build`/`clippy` won't fail CI on it, but
+  any new public item without docs will show up as a warning going
+  forward. Verified via `RUSTFLAGS="-W missing_docs" cargo build
+  --all-features --lib` (0 warnings, down from 219), `cargo doc
+  --all-features --no-deps` (clean), and the full test suite plus both
+  no_std configurations (`--no-default-features --lib` and
+  `--no-default-features --features std,ocpp_1_6,ocpp_2_0_1,ocpp_2_1
+  --lib`) unaffected, since this was a docs-only change with no logic
+  touched.
 - ✅ Real `no_std` support. `lib.rs` gates on `#![cfg_attr(not(feature =
   "std"), no_std)]` - `cargo check --no-default-features --lib` now
   genuinely compiles this crate under `#![no_std]` (verified directly, not
@@ -187,7 +540,14 @@ Secures the OCPP connection and reports security-relevant events.
   switch, the same way `MeterValueSampled` is pushed in) or by future
   functional blocks once they exist, but nothing calls it today. Version
   notes below on the certificate messages still apply for the eventual rest
-  of this block.
+  of this block. **2.0.1 is blocked upstream, not by this crate**: unlike
+  every other block ported to 2.0.1 in §0's "protocol-version-independent
+  core" writeup, `SecurityEventNotifier` has no `OCPP2_0_1Client` impl,
+  because `ocpp-client` 0.2.0 doesn't implement the `SecurityEventNotification`
+  action for OCPP 2.0.1 at all (verified directly against its
+  `ocpp_2_0_1::actions` list, not assumed) - there's no `Action`
+  type/`send_*`/`on_*` method to wrap. Fixing this needs an `ocpp-client`
+  release, not a change here.
 - Version notes: OCPP 1.6J only has basic auth / TLS via security
   whitepaper extensions, no in-band certificate messages — this block
   mostly collapses to "not applicable" under 1.6J.
@@ -334,14 +694,22 @@ The core charging session lifecycle.
   came from. It can also be stopped remotely via `RequestStopTransaction`
   (§6), which reuses the existing `ChargingStopped(StopReason::Remote)`
   path unchanged - no new state-machine event was needed there, just a
-  new way to reach the existing one. Still missing: `id_token` (needs
-  Authorization, §3; a remote-started transaction's token isn't recorded
-  either), running totals/energy (needs Meter values, §10), and multiple
-  `Updated` events per transaction (today only the single Charging
-  transition produces one).
-- Version notes: this is the highest-value adapter target — 2.x's single
-  `TransactionEvent` stream must project down to 1.6J's discrete
-  Start/Stop/MeterValues calls.
+  new way to reach the existing one. `Transaction` now records `id_token`
+  too - both the physically-presented path (`ChargingAuthorized`) and the
+  CSMS-initiated one (`RequestStartTransaction` → `RemoteStartRequested`)
+  carry the `IdToken` through to `advance_transaction`, closing the gap
+  §0's 1.6J `TransactionNotifier` adapter needed (`StartTransaction.req`'s
+  `idTag`) - see §0 for the fuller writeup, including the `Copy` ripple
+  that came with it. Still missing: running totals/energy (needs Meter
+  values, §10, which is also why 1.6J's `StartTransaction.req.meterStart`
+  falls back to `0` today), and multiple `Updated` events per transaction
+  (today only the single Charging transition produces one).
+- Version notes: this was the highest-value adapter target — 2.x's single
+  `TransactionEvent` stream projects down to 1.6J's discrete Start/Stop/
+  MeterValues calls via `transactions::Ocpp1_6TransactionNotifier` (see
+  §0) - the one real wrinkle being that 1.6J's CSMS assigns the
+  transaction id instead of the charge point, requiring the adapter to
+  track that mapping itself.
 
 ## 6. Remote control
 

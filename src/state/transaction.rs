@@ -9,9 +9,13 @@ pub struct TransactionId(pub u64);
 pub enum TransactionChargingState {
     /// The EV is connected but energy is not (yet, or no longer) flowing.
     EvConnected,
+    /// Energy is actively flowing to the EV.
     Charging,
+    /// Charging is suspended by the EV.
     SuspendedEV,
+    /// Charging is suspended by the EVSE.
     SuspendedEVSE,
+    /// The transaction has no EV connected.
     Idle,
 }
 
@@ -33,10 +37,18 @@ pub enum StopReason {
 /// A charging session tied to one connector, distinct from [`crate::state::ConnectorState`] -
 /// several connector states (e.g. `Starting`, `Charging`, `Stopping`) share one active
 /// transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
+    /// This transaction's identifier.
     pub id: TransactionId,
+    /// The identifier that authorized this transaction - the one physically presented, or the
+    /// one a CSMS-initiated `RequestStartTransaction` supplied. `None` only if this crate is
+    /// somehow asked to report a transaction that started neither way (shouldn't happen through
+    /// this crate's own state machine, but not modeled as impossible at the type level).
+    pub id_token: Option<crate::state::IdToken>,
+    /// The transaction's current charging state.
     pub charging_state: TransactionChargingState,
+    /// Why the transaction stopped, if it has.
     pub stop_reason: Option<StopReason>,
     /// Monotonically increasing per transaction, per the OCPP TransactionEvent `seqNo` field.
     pub seq_no: u32,

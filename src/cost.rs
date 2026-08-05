@@ -50,7 +50,7 @@ fn find_transaction(
     state.evses.iter().enumerate().find_map(|(evse_id, evse)| {
         evse.transactions
             .iter()
-            .position(|transaction| transaction.is_some_and(|t| t.id == transaction_id))
+            .position(|transaction| transaction.as_ref().is_some_and(|t| t.id == transaction_id))
             .map(|connector_id| (evse_id, connector_id))
     })
 }
@@ -60,6 +60,8 @@ fn find_transaction(
 /// [`crate::reservation::ReserveNowHandler`].
 #[async_trait::async_trait]
 pub trait CostUpdatedHandler {
+    /// Registers a `CostUpdated` handler with the CSMS connection that dispatches incoming
+    /// requests to [`handle_cost_updated`] against `actor`.
     async fn register_cost_updated_handler(&self, actor: ChargePointActor);
 }
 
@@ -85,7 +87,7 @@ mod tests {
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
             ConnectorEvent::IdTokenPresented(test_id_token()),
-            ConnectorEvent::ChargingAuthorized,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
         ] {
             actor
                 .send(ChargePointEvent::Evse {
@@ -148,6 +150,65 @@ mod ocpp_2_1 {
                 let actor = actor.clone();
                 async move {
                     // No status to report either way - see this module's top-level docs.
+                    if let Some(transaction_id) = parse_transaction_id(&request) {
+                        handle_cost_updated(&actor, transaction_id, request.total_cost).await;
+                    }
+                    Ok(CostUpdatedResponse { custom_data: None })
+                }
+            })
+            .await;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn request(transaction_id: &str) -> CostUpdatedRequest {
+            CostUpdatedRequest {
+                custom_data: None,
+                total_cost: 4.5,
+                transaction_id: heapless::String::try_from(transaction_id).unwrap(),
+            }
+        }
+
+        #[test]
+        fn a_valid_transaction_id_parses() {
+            assert_eq!(parse_transaction_id(&request("7")), Some(TransactionId(7)));
+        }
+
+        #[test]
+        fn a_non_numeric_transaction_id_fails_to_parse() {
+            assert_eq!(parse_transaction_id(&request("not-a-number")), None);
+        }
+    }
+}
+
+/// The OCPP 2.0.1 projection - identical `CostUpdatedRequest`/`CostUpdatedResponse` wire shape to
+/// 2.1's, so this is a copy of the 2.1 module, just targeting `OCPP2_0_1Client`.
+#[cfg(feature = "ocpp_2_0_1")]
+mod ocpp_2_0_1 {
+    use super::{handle_cost_updated, CostUpdatedHandler};
+    use crate::actor::ChargePointActor;
+    use crate::state::TransactionId;
+    use alloc::boxed::Box;
+    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
+    use ocpp_client::ocpp_types::v201::{CostUpdatedRequest, CostUpdatedResponse};
+
+    fn parse_transaction_id(request: &CostUpdatedRequest) -> Option<TransactionId> {
+        request
+            .transaction_id
+            .parse::<u64>()
+            .ok()
+            .map(TransactionId)
+    }
+
+    #[async_trait::async_trait]
+    impl CostUpdatedHandler for OCPP2_0_1Client {
+        async fn register_cost_updated_handler(&self, actor: ChargePointActor) {
+            self.on_cost_updated(move |request, _client| {
+                let actor = actor.clone();
+                async move {
                     if let Some(transaction_id) = parse_transaction_id(&request) {
                         handle_cost_updated(&actor, transaction_id, request.total_cost).await;
                     }

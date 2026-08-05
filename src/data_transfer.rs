@@ -24,9 +24,13 @@ use alloc::string::String;
 /// The outcome of a `DataTransfer` exchange, matching OCPP's `DataTransferStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataTransferOutcome {
+    /// The receiver understood and accepted the message.
     Accepted,
+    /// The receiver understood the vendor/message id but rejected the message.
     Rejected,
+    /// The receiver recognized `vendor_id` but not `message_id`.
     UnknownMessageId,
+    /// The receiver didn't recognize `vendor_id` at all.
     UnknownVendorId,
 }
 
@@ -35,7 +39,11 @@ pub enum DataTransferOutcome {
 /// caller (outbound) gives them meaning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataTransferMessage {
+    /// Identifies the vendor extension this message belongs to (reverse-DNS-style, e.g.
+    /// `"com.example.charger"`).
     pub vendor_id: String,
+    /// An optional sub-selector within `vendor_id`'s extension, identifying which message this
+    /// is.
     pub message_id: Option<String>,
     /// Raw JSON payload. Always `None` on the wire today - see this module's docs.
     pub data: Option<String>,
@@ -44,6 +52,7 @@ pub struct DataTransferMessage {
 /// The response to a [`DataTransferMessage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataTransferResult {
+    /// Whether the message was understood/accepted.
     pub outcome: DataTransferOutcome,
     /// Raw JSON payload. Always `None` on the wire today - see this module's docs.
     pub data: Option<String>,
@@ -54,8 +63,10 @@ pub struct DataTransferResult {
 /// that wants to use a vendor extension, not spawned as a background loop by `setup()`.
 #[async_trait::async_trait]
 pub trait DataTransferSender {
+    /// The error type returned if the DataTransfer request itself fails.
     type Error: core::error::Error + Send + Sync + 'static;
 
+    /// Sends `message` to the CSMS and returns its response.
     async fn transfer_data(
         &self,
         message: &DataTransferMessage,
@@ -66,6 +77,7 @@ pub trait DataTransferSender {
 /// integrator - this crate has no way to interpret `data` itself.
 #[async_trait::async_trait]
 pub trait DataTransferHandler {
+    /// Answers a CSMS-initiated `DataTransfer` carrying `message`.
     async fn handle_data_transfer(&self, message: DataTransferMessage) -> DataTransferResult;
 }
 
@@ -74,6 +86,7 @@ pub trait DataTransferHandler {
 /// [`crate::setup`] - see this module's docs for why.
 #[async_trait::async_trait]
 pub trait DataTransferRegistrar {
+    /// Registers `handler` to answer every future CSMS-initiated `DataTransfer`.
     async fn register_data_transfer_handler<H>(&self, handler: H)
     where
         H: DataTransferHandler + Clone + Send + Sync + 'static;
@@ -293,6 +306,351 @@ mod ocpp_2_1 {
             let mapped = map_request(&request("com.example.charger", None));
 
             assert_eq!(mapped.message_id, None);
+        }
+    }
+}
+
+/// The OCPP 2.0.1 projection - identical `DataTransferRequest`/`DataTransferResponse`/
+/// `DataTransferStatusEnum` wire shape to 2.1's (including the same `data: Option<()>` codegen
+/// limitation noted in this module's top-level docs), so this is a copy of the 2.1 module, just
+/// targeting `OCPP2_0_1Client`.
+#[cfg(feature = "ocpp_2_0_1")]
+mod ocpp_2_0_1 {
+    use super::{
+        DataTransferHandler, DataTransferMessage, DataTransferOutcome, DataTransferRegistrar,
+        DataTransferResult, DataTransferSender,
+    };
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use ocpp_client::ClientError;
+    use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
+    use ocpp_client::ocpp_types::v201::common::DataTransferStatusEnum;
+    use ocpp_client::ocpp_types::v201::{DataTransferRequest, DataTransferResponse};
+
+    fn map_status_to_outcome(status: DataTransferStatusEnum) -> DataTransferOutcome {
+        match status {
+            DataTransferStatusEnum::Accepted => DataTransferOutcome::Accepted,
+            DataTransferStatusEnum::Rejected => DataTransferOutcome::Rejected,
+            DataTransferStatusEnum::UnknownMessageId => DataTransferOutcome::UnknownMessageId,
+            DataTransferStatusEnum::UnknownVendorId => DataTransferOutcome::UnknownVendorId,
+        }
+    }
+
+    fn map_outcome_to_status(outcome: DataTransferOutcome) -> DataTransferStatusEnum {
+        match outcome {
+            DataTransferOutcome::Accepted => DataTransferStatusEnum::Accepted,
+            DataTransferOutcome::Rejected => DataTransferStatusEnum::Rejected,
+            DataTransferOutcome::UnknownMessageId => DataTransferStatusEnum::UnknownMessageId,
+            DataTransferOutcome::UnknownVendorId => DataTransferStatusEnum::UnknownVendorId,
+        }
+    }
+
+    fn map_request(request: &DataTransferRequest) -> DataTransferMessage {
+        DataTransferMessage {
+            vendor_id: request.vendor_id.to_string(),
+            message_id: request.message_id.as_ref().map(|id| id.to_string()),
+            data: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DataTransferSender for OCPP2_0_1Client {
+        type Error = ClientError<OCPP2_0_1Error>;
+
+        async fn transfer_data(
+            &self,
+            message: &DataTransferMessage,
+        ) -> Result<DataTransferResult, Self::Error> {
+            let response = self
+                .send_data_transfer(DataTransferRequest {
+                    custom_data: None,
+                    data: None,
+                    message_id: message
+                        .message_id
+                        .as_deref()
+                        .and_then(|id| heapless::String::try_from(id).ok()),
+                    vendor_id: heapless::String::try_from(message.vendor_id.as_str())
+                        .expect("vendor id must fit OCPP's 255-byte bound"),
+                })
+                .await?;
+            Ok(DataTransferResult {
+                outcome: map_status_to_outcome(response.status),
+                data: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DataTransferRegistrar for OCPP2_0_1Client {
+        async fn register_data_transfer_handler<H>(&self, handler: H)
+        where
+            H: DataTransferHandler + Clone + Send + Sync + 'static,
+        {
+            self.on_data_transfer(move |request, _client| {
+                let handler = handler.clone();
+                async move {
+                    let message = map_request(&request);
+                    let result = handler.handle_data_transfer(message).await;
+                    Ok(DataTransferResponse {
+                        custom_data: None,
+                        data: None,
+                        status: map_outcome_to_status(result.outcome),
+                        status_info: None,
+                    })
+                }
+            })
+            .await;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn every_wire_status_maps_to_the_matching_outcome() {
+            assert_eq!(
+                map_status_to_outcome(DataTransferStatusEnum::Accepted),
+                DataTransferOutcome::Accepted
+            );
+            assert_eq!(
+                map_status_to_outcome(DataTransferStatusEnum::Rejected),
+                DataTransferOutcome::Rejected
+            );
+            assert_eq!(
+                map_status_to_outcome(DataTransferStatusEnum::UnknownMessageId),
+                DataTransferOutcome::UnknownMessageId
+            );
+            assert_eq!(
+                map_status_to_outcome(DataTransferStatusEnum::UnknownVendorId),
+                DataTransferOutcome::UnknownVendorId
+            );
+        }
+
+        #[test]
+        fn every_outcome_maps_to_the_matching_wire_status() {
+            assert_eq!(
+                map_outcome_to_status(DataTransferOutcome::Accepted),
+                DataTransferStatusEnum::Accepted
+            );
+            assert_eq!(
+                map_outcome_to_status(DataTransferOutcome::Rejected),
+                DataTransferStatusEnum::Rejected
+            );
+            assert_eq!(
+                map_outcome_to_status(DataTransferOutcome::UnknownMessageId),
+                DataTransferStatusEnum::UnknownMessageId
+            );
+            assert_eq!(
+                map_outcome_to_status(DataTransferOutcome::UnknownVendorId),
+                DataTransferStatusEnum::UnknownVendorId
+            );
+        }
+
+        fn request(vendor_id: &str, message_id: Option<&str>) -> DataTransferRequest {
+            DataTransferRequest {
+                custom_data: None,
+                data: None,
+                message_id: message_id.map(|id| heapless::String::try_from(id).unwrap()),
+                vendor_id: heapless::String::try_from(vendor_id).unwrap(),
+            }
+        }
+
+        #[test]
+        fn a_request_maps_to_a_message_with_no_data() {
+            let mapped = map_request(&request("com.example.charger", Some("Ping")));
+
+            assert_eq!(mapped.vendor_id, "com.example.charger");
+            assert_eq!(mapped.message_id.as_deref(), Some("Ping"));
+            assert_eq!(mapped.data, None);
+        }
+
+        #[test]
+        fn a_request_with_no_message_id_maps_to_none() {
+            let mapped = map_request(&request("com.example.charger", None));
+
+            assert_eq!(mapped.message_id, None);
+        }
+    }
+}
+
+/// The OCPP 1.6J projection - the one version whose `DataTransferRequest`/`DataTransferResponse.data`
+/// field is a real `Option<String>`, not the `Option<()>` every 2.x binding collapsed to (see this
+/// module's top-level docs) - so, unlike the `ocpp_2_1`/`ocpp_2_0_1` adapters, this one actually
+/// carries [`DataTransferMessage::data`]/[`DataTransferResult::data`] across the wire instead of
+/// silently dropping them. `DataTransferResponseStatus`/`vendorId`'s 255-byte bound/`messageId`'s
+/// 50-byte bound are otherwise identical to 2.x's, so [`map_status_to_outcome`]/
+/// [`map_outcome_to_status`] are a straight 1:1 mapping, same as the other two versions'.
+#[cfg(feature = "ocpp_1_6")]
+mod ocpp_1_6 {
+    use super::{
+        DataTransferHandler, DataTransferMessage, DataTransferOutcome, DataTransferRegistrar,
+        DataTransferResult, DataTransferSender,
+    };
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use ocpp_client::ClientError;
+    use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
+    use ocpp_client::ocpp_types::v16::common::DataTransferResponseStatus;
+    use ocpp_client::ocpp_types::v16::{DataTransferRequest, DataTransferResponse};
+
+    fn map_status_to_outcome(status: DataTransferResponseStatus) -> DataTransferOutcome {
+        match status {
+            DataTransferResponseStatus::Accepted => DataTransferOutcome::Accepted,
+            DataTransferResponseStatus::Rejected => DataTransferOutcome::Rejected,
+            DataTransferResponseStatus::UnknownMessageId => DataTransferOutcome::UnknownMessageId,
+            DataTransferResponseStatus::UnknownVendorId => DataTransferOutcome::UnknownVendorId,
+        }
+    }
+
+    fn map_outcome_to_status(outcome: DataTransferOutcome) -> DataTransferResponseStatus {
+        match outcome {
+            DataTransferOutcome::Accepted => DataTransferResponseStatus::Accepted,
+            DataTransferOutcome::Rejected => DataTransferResponseStatus::Rejected,
+            DataTransferOutcome::UnknownMessageId => DataTransferResponseStatus::UnknownMessageId,
+            DataTransferOutcome::UnknownVendorId => DataTransferResponseStatus::UnknownVendorId,
+        }
+    }
+
+    fn map_request(request: &DataTransferRequest) -> DataTransferMessage {
+        DataTransferMessage {
+            vendor_id: request.vendor_id.to_string(),
+            message_id: request.message_id.as_ref().map(|id| id.to_string()),
+            data: request.data.clone(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DataTransferSender for OCPP1_6Client {
+        type Error = ClientError<OCPP1_6Error>;
+
+        async fn transfer_data(
+            &self,
+            message: &DataTransferMessage,
+        ) -> Result<DataTransferResult, Self::Error> {
+            let response = self
+                .send_data_transfer(DataTransferRequest {
+                    data: message.data.clone(),
+                    // Silently dropped if it doesn't fit OCPP's 50-byte bound - degrades to no
+                    // sub-selector rather than failing the whole transfer.
+                    message_id: message
+                        .message_id
+                        .as_deref()
+                        .and_then(|id| heapless::String::try_from(id).ok()),
+                    // Vendor ids are short, reverse-DNS-style strings (e.g.
+                    // "com.example.charger") that always fit OCPP's 255-byte bound in practice.
+                    vendor_id: heapless::String::try_from(message.vendor_id.as_str())
+                        .expect("vendor id must fit OCPP's 255-byte bound"),
+                })
+                .await?;
+            Ok(DataTransferResult {
+                outcome: map_status_to_outcome(response.status),
+                data: response.data,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DataTransferRegistrar for OCPP1_6Client {
+        async fn register_data_transfer_handler<H>(&self, handler: H)
+        where
+            H: DataTransferHandler + Clone + Send + Sync + 'static,
+        {
+            self.on_data_transfer(move |request, _client| {
+                let handler = handler.clone();
+                async move {
+                    let message = map_request(&request);
+                    let result = handler.handle_data_transfer(message).await;
+                    Ok(DataTransferResponse {
+                        data: result.data,
+                        status: map_outcome_to_status(result.outcome),
+                    })
+                }
+            })
+            .await;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn every_wire_status_maps_to_the_matching_outcome() {
+            assert_eq!(
+                map_status_to_outcome(DataTransferResponseStatus::Accepted),
+                DataTransferOutcome::Accepted
+            );
+            assert_eq!(
+                map_status_to_outcome(DataTransferResponseStatus::Rejected),
+                DataTransferOutcome::Rejected
+            );
+            assert_eq!(
+                map_status_to_outcome(DataTransferResponseStatus::UnknownMessageId),
+                DataTransferOutcome::UnknownMessageId
+            );
+            assert_eq!(
+                map_status_to_outcome(DataTransferResponseStatus::UnknownVendorId),
+                DataTransferOutcome::UnknownVendorId
+            );
+        }
+
+        #[test]
+        fn every_outcome_maps_to_the_matching_wire_status() {
+            assert_eq!(
+                map_outcome_to_status(DataTransferOutcome::Accepted),
+                DataTransferResponseStatus::Accepted
+            );
+            assert_eq!(
+                map_outcome_to_status(DataTransferOutcome::Rejected),
+                DataTransferResponseStatus::Rejected
+            );
+            assert_eq!(
+                map_outcome_to_status(DataTransferOutcome::UnknownMessageId),
+                DataTransferResponseStatus::UnknownMessageId
+            );
+            assert_eq!(
+                map_outcome_to_status(DataTransferOutcome::UnknownVendorId),
+                DataTransferResponseStatus::UnknownVendorId
+            );
+        }
+
+        fn request(
+            vendor_id: &str,
+            message_id: Option<&str>,
+            data: Option<&str>,
+        ) -> DataTransferRequest {
+            DataTransferRequest {
+                data: data.map(Into::into),
+                message_id: message_id.map(|id| heapless::String::try_from(id).unwrap()),
+                vendor_id: heapless::String::try_from(vendor_id).unwrap(),
+            }
+        }
+
+        #[test]
+        fn a_request_maps_to_a_message_carrying_its_data() {
+            let mapped = map_request(&request(
+                "com.example.charger",
+                Some("Ping"),
+                Some("payload"),
+            ));
+
+            assert_eq!(mapped.vendor_id, "com.example.charger");
+            assert_eq!(mapped.message_id.as_deref(), Some("Ping"));
+            assert_eq!(mapped.data.as_deref(), Some("payload"));
+        }
+
+        #[test]
+        fn a_request_with_no_message_id_maps_to_none() {
+            let mapped = map_request(&request("com.example.charger", None, None));
+
+            assert_eq!(mapped.message_id, None);
+        }
+
+        #[test]
+        fn ocpp1_6_client_implements_the_data_transfer_traits() {
+            fn assert_impl<T: DataTransferSender>() {}
+            assert_impl::<OCPP1_6Client>();
         }
     }
 }

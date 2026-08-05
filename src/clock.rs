@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 /// TransactionEvent timestamps). Implement this on embedded targets without a
 /// `clock`-capable chrono - typically backed by an RTC peripheral.
 pub trait Clock {
+    /// The current time.
     fn now(&self) -> DateTime<Utc>;
 }
 

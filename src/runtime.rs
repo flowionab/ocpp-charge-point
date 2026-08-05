@@ -1,21 +1,25 @@
 use crate::actor::{ActorError, ChargePointActor};
 use crate::executor::Executor;
 use crate::hardware::{HardwareCommandReceiver, HardwareEventSender};
-use crate::provisioning::{
-    Backoff, BootNotificationOutcome, BootNotifier, DEFAULT_RETRY_INTERVAL_SECS,
-};
+use crate::provisioning::{Backoff, BootNotificationOutcome, BootNotifier};
 use crate::state::{
     AuthorizationRequested, ChargePointEvent, ChargePointState, ConnectorStatusChanged,
     RegistrationStatus, SecurityEvent, TransactionEventOccurred,
 };
 use crate::sync::{BroadcastReceiver, WatchReceiver};
 
+/// Owns the charge point's [`ChargePointActor`] together with the integrator's hardware binding
+/// `T`, and provides the entry points [`crate::setup`] wires together: registering with the
+/// CSMS, feeding hardware events in, and subscribing every functional block to the state changes
+/// and effects it cares about.
 pub struct ChargePointRuntime<T = ()> {
     hardware: T,
     actor: ChargePointActor,
 }
 
 impl<T> ChargePointRuntime<T> {
+    /// Creates a runtime wrapping `hardware`, spawning a fresh [`ChargePointActor`] with one
+    /// EVSE per entry in `connector_counts` (each value is that EVSE's connector count).
     pub fn new(
         hardware: T,
         connector_counts: impl IntoIterator<Item = usize>,
@@ -27,33 +31,25 @@ impl<T> ChargePointRuntime<T> {
         }
     }
 
+    /// Feeds `event` into the charge point's state machine. See
+    /// [`ChargePointActor::send`].
     pub async fn send(&self, event: ChargePointEvent) -> Result<(), ActorError> {
         self.actor.send(event).await
     }
 
-    /// Runs the Provisioning functional block's BootNotification exchange: sends a
-    /// BootNotification via `notifier` and applies the CSMS's decision to the charge point's
-    /// state (see `ChargePointEvent::RegistrationStatusReceived`).
-    ///
-    /// This performs a single BootNotification attempt. On `Pending`/`Rejected`, callers are
-    /// responsible for retrying after the returned outcome's interval, per the OCPP spec.
+    /// Runs the Provisioning functional block's BootNotification exchange. See
+    /// [`crate::provisioning::register`].
     pub async fn register<N: BootNotifier>(
         &self,
         notifier: &N,
         vendor_name: &str,
         model_name: &str,
     ) -> Result<RegistrationStatus, N::Error> {
-        let outcome = notifier.notify_boot(vendor_name, model_name).await?;
-        let _ = self
-            .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
-            .await;
-        Ok(outcome.status)
+        crate::provisioning::register(&self.actor, notifier, vendor_name, model_name).await
     }
 
-    /// Runs BootNotification repeatedly until the CSMS accepts registration, applying every
-    /// intermediate decision to the charge point's state. Per OCPP, a charge point does not
-    /// give up: on `Pending`/`Rejected` it waits the response's `interval_secs` before retrying,
-    /// and on a transport-level failure it waits [`DEFAULT_RETRY_INTERVAL_SECS`] instead.
+    /// Runs BootNotification repeatedly until the CSMS accepts registration. See
+    /// [`crate::provisioning::register_until_accepted`].
     pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
         &self,
         notifier: &N,
@@ -61,29 +57,24 @@ impl<T> ChargePointRuntime<T> {
         vendor_name: &str,
         model_name: &str,
     ) -> BootNotificationOutcome {
-        loop {
-            match notifier.notify_boot(vendor_name, model_name).await {
-                Ok(outcome) => {
-                    let _ = self
-                        .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
-                        .await;
-                    if outcome.status == RegistrationStatus::Accepted {
-                        return outcome;
-                    }
-                    backoff.wait(outcome.interval_secs).await;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "boot notification failed, retrying");
-                    backoff.wait(DEFAULT_RETRY_INTERVAL_SECS).await;
-                }
-            }
-        }
+        crate::provisioning::register_until_accepted(
+            &self.actor,
+            notifier,
+            backoff,
+            vendor_name,
+            model_name,
+        )
+        .await
     }
 
+    /// A handle a hardware binding uses to push events into the state machine. See
+    /// [`crate::hardware::ChargePoint::start`].
     pub fn hardware_events(&self) -> HardwareEventSender {
         HardwareEventSender::new(self.actor.clone())
     }
 
+    /// The hardware commands (lock/unlock, open/close contactor) a hardware binding must drain
+    /// and carry out. See [`crate::hardware::ChargePoint::start`].
     pub fn hardware_commands(&self) -> HardwareCommandReceiver {
         HardwareCommandReceiver::new(self.actor.subscribe_commands())
     }
@@ -115,10 +106,12 @@ impl<T> ChargePointRuntime<T> {
         self.actor.subscribe_security_events()
     }
 
+    /// A snapshot of the charge point's current state. See [`ChargePointActor::state`].
     pub fn state(&self) -> ChargePointState {
         self.actor.state()
     }
 
+    /// Subscribes to every future state change. See [`ChargePointActor::subscribe`].
     pub fn subscribe(&self) -> WatchReceiver<ChargePointState> {
         self.actor.subscribe()
     }

@@ -8,7 +8,9 @@ use crate::state::{AuthorizationStatus, IdToken};
 /// `docs/ROADMAP.md` §3/§4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalListEntry {
+    /// The identifier this entry decides.
     pub id_token: IdToken,
+    /// Whether `id_token` is authorized.
     pub status: AuthorizationStatus,
 }
 
@@ -19,11 +21,15 @@ pub struct LocalListEntry {
 /// connection-state tracking from §0 first).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalAuthorizationList {
+    /// The list's version number, as set by the CSMS's most recent `SendLocalList` (or `0` for a
+    /// never-populated list).
     pub version: i64,
+    /// The list's entries.
     pub entries: Vec<LocalListEntry>,
 }
 
 impl LocalAuthorizationList {
+    /// An empty list at version `0`.
     pub fn new() -> Self {
         Self {
             version: 0,

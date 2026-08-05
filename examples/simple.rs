@@ -1,5 +1,6 @@
 use ocpp_charge_point::authorization::Authorizer;
 use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
+use ocpp_charge_point::connection::ReconnectHandler;
 use ocpp_charge_point::cost::CostUpdatedHandler;
 use ocpp_charge_point::executor::TokioExecutor;
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
@@ -61,6 +62,7 @@ impl StatusNotifier for AlwaysAcceptBootNotifier {
         _evse_id: usize,
         _connector_id: usize,
         _status: ConnectorStatus,
+        _connector_state: ocpp_charge_point::state::ConnectorState,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -181,6 +183,16 @@ impl CostUpdatedHandler for AlwaysAcceptBootNotifier {
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ReconnectHandler for AlwaysAcceptBootNotifier {
+    async fn register_reconnect_handler<F, FF>(&self, _callback: F)
+    where
+        F: FnMut() -> FF + Send + Sync + 'static,
+        FF: core::future::Future<Output = ()> + Send + 'static,
+    {
     }
 }
 
