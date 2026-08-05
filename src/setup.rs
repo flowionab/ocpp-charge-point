@@ -15,9 +15,11 @@ use crate::remote_control::{
 };
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::security::SecurityEventNotifier;
+use crate::state::{ChargePointEvent, Component, DeviceModelEvent, Variable, VariableAttributeType};
 use crate::transactions::TransactionNotifier;
 use crate::ChargePointRuntime;
 use alloc::boxed::Box;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -100,6 +102,30 @@ where
         .register_until_accepted(&csms, &backoff, vendor_name, model_name)
         .await;
 
+    // The accepted BootNotification interval *is* the `OCPPCommCtrlr`/`HeartbeatInterval`
+    // device model variable (see `crate::state::DeviceModel::register_defaults`) - land it there
+    // so a CSMS reading it back via `GetVariables`/`GetConfiguration` sees the value actually in
+    // effect, and so `run_heartbeat` (which reads the device model on every cycle) starts from
+    // it rather than a value only known to this function.
+    let _ = runtime
+        .actor()
+        .send(ChargePointEvent::DeviceModel(
+            DeviceModelEvent::AttributeValueSet {
+                component: Component {
+                    name: "OCPPCommCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: Variable {
+                    name: "HeartbeatInterval".into(),
+                    instance: None,
+                },
+                attribute_type: VariableAttributeType::Actual,
+                value: outcome.interval_secs.to_string(),
+            },
+        ))
+        .await;
+
     reregister_on_reconnect(
         runtime.actor(),
         csms.clone(),
@@ -111,8 +137,15 @@ where
 
     let heartbeat_sender = csms.clone();
     let heartbeat_backoff = backoff.clone();
+    let heartbeat_actor = runtime.actor();
     executor.spawn(Box::pin(async move {
-        run_heartbeat(&heartbeat_sender, &heartbeat_backoff, outcome.interval_secs).await;
+        run_heartbeat(
+            &heartbeat_sender,
+            &heartbeat_backoff,
+            &heartbeat_actor,
+            outcome.interval_secs,
+        )
+        .await;
     }));
 
     // Wrapped in `DedupedStatusNotifier` so `csms` only sees a wire-visible status change, not

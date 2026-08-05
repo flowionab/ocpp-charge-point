@@ -2,7 +2,9 @@
 //! CSMS. See `docs/ROADMAP.md` §2.
 
 use crate::actor::ChargePointActor;
-use crate::state::{ChargePointEvent, RegistrationStatus};
+use crate::state::{
+    ChargePointEvent, Component, RegistrationStatus, Variable, VariableAttributeType,
+};
 use alloc::boxed::Box;
 #[cfg(feature = "tokio-runtime")]
 use core::time::Duration;
@@ -122,15 +124,58 @@ pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
     }
 }
 
-/// Sends a Heartbeat every `interval_secs` (the interval an accepted BootNotification
-/// returned), forever. Errors are logged and do not stop the loop - the next heartbeat is
-/// still due at the regular interval, per OCPP.
+/// The `(Component, Variable)` this crate's device model uses for the heartbeat interval - see
+/// [`crate::state::DeviceModel::register_defaults`].
+fn heartbeat_interval_variable() -> (Component, Variable) {
+    (
+        Component {
+            name: "OCPPCommCtrlr".into(),
+            instance: None,
+            evse: None,
+        },
+        Variable {
+            name: "HeartbeatInterval".into(),
+            instance: None,
+        },
+    )
+}
+
+/// Reads `actor`'s current `OCPPCommCtrlr`/`HeartbeatInterval` device model value, parsed as
+/// whole seconds. `None` if the variable isn't registered, has no `Actual` attribute, its value
+/// doesn't parse as a `u32`, or parses to `0` - a `0`-second interval would turn
+/// [`run_heartbeat`]'s loop into a busy-spin, so it's treated the same as "not set" rather than
+/// honoured. Callers fall back to a caller-supplied default in every one of those cases.
+fn heartbeat_interval_secs(actor: &ChargePointActor) -> Option<u32> {
+    let (component, variable) = heartbeat_interval_variable();
+    let state = actor.state();
+    let value = state
+        .device_model
+        .get(&component, &variable)?
+        .attribute(VariableAttributeType::Actual)?
+        .value
+        .parse::<u32>()
+        .ok()?;
+    (value != 0).then_some(value)
+}
+
+/// Sends a Heartbeat every cycle, forever, honouring `actor`'s current
+/// `OCPPCommCtrlr`/`HeartbeatInterval` device model value (see [`heartbeat_interval_secs`]) on
+/// every iteration - so a CSMS that changes it via `SetVariables` (OCPP 2.x) or
+/// `ChangeConfiguration` (1.6J, projected onto the same variable - see
+/// `crate::device_model::ocpp_1_6`) takes effect on the very next heartbeat, without a reboot.
+/// Falls back to `fallback_interval_secs` (the interval the accepted BootNotification returned -
+/// see [`register_until_accepted`]) whenever the device model's value is missing, unparseable,
+/// or `0`, so a bad `SetVariables` write can never turn this into a busy-spin. Errors sending the
+/// heartbeat itself are logged and do not stop the loop - the next heartbeat is still due at the
+/// regular interval, per OCPP.
 pub async fn run_heartbeat<H: HeartbeatSender, B: Backoff>(
     sender: &H,
     backoff: &B,
-    interval_secs: u32,
+    actor: &ChargePointActor,
+    fallback_interval_secs: u32,
 ) {
     loop {
+        let interval_secs = heartbeat_interval_secs(actor).unwrap_or(fallback_interval_secs);
         backoff.wait(interval_secs).await;
         if let Err(err) = sender.send_heartbeat().await {
             tracing::warn!(error = %err, "heartbeat failed");
@@ -140,10 +185,17 @@ pub async fn run_heartbeat<H: HeartbeatSender, B: Backoff>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_heartbeat, Backoff, HeartbeatSender};
+    use super::{heartbeat_interval_secs, run_heartbeat, Backoff, HeartbeatSender};
+    use crate::actor::ChargePointActor;
+    use crate::executor::TokioExecutor;
+    use crate::state::{
+        ChargePointEvent, Component, DeviceModelEvent, Variable, VariableAttributeType,
+    };
     use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use core::time::Duration;
+    use std::sync::Mutex;
 
     struct CountingHeartbeatSender {
         calls: AtomicUsize,
@@ -172,19 +224,162 @@ mod tests {
         }
     }
 
+    /// A [`Backoff`] that records every `seconds` value it was called with (in order), so a test
+    /// can inspect exactly which interval `run_heartbeat` used on each cycle.
+    struct RecordingBackoff {
+        seen: Arc<Mutex<alloc::vec::Vec<u32>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Backoff for RecordingBackoff {
+        async fn wait(&self, seconds: u32) {
+            self.seen.lock().unwrap().push(seconds);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn heartbeat_component_and_variable() -> (Component, Variable) {
+        (
+            Component {
+                name: "OCPPCommCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            Variable {
+                name: "HeartbeatInterval".into(),
+                instance: None,
+            },
+        )
+    }
+
+    async fn set_heartbeat_interval(actor: &ChargePointActor, value: &str) {
+        let (component, variable) = heartbeat_component_and_variable();
+        actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component,
+                    variable,
+                    attribute_type: VariableAttributeType::Actual,
+                    value: value.into(),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn run_heartbeat_sends_at_every_interval_and_never_stops() {
         let sender = CountingHeartbeatSender {
             calls: AtomicUsize::new(0),
         };
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
 
         let _ = tokio::time::timeout(
             Duration::from_millis(20),
-            run_heartbeat(&sender, &NoopBackoff, 5),
+            run_heartbeat(&sender, &NoopBackoff, &actor, 5),
         )
         .await;
 
         assert!(sender.calls.load(Ordering::SeqCst) > 1);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_actor_reports_the_built_in_default_heartbeat_interval() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        assert_eq!(heartbeat_interval_secs(&actor), Some(60));
+    }
+
+    #[tokio::test]
+    async fn a_set_variables_change_is_reflected_immediately() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        set_heartbeat_interval(&actor, "120").await;
+
+        assert_eq!(heartbeat_interval_secs(&actor), Some(120));
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_value_falls_back_to_none() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        set_heartbeat_interval(&actor, "not-a-number").await;
+
+        assert_eq!(heartbeat_interval_secs(&actor), None);
+    }
+
+    #[tokio::test]
+    async fn a_zero_value_falls_back_to_none_rather_than_busy_spinning() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        set_heartbeat_interval(&actor, "0").await;
+
+        assert_eq!(heartbeat_interval_secs(&actor), None);
+    }
+
+    #[tokio::test]
+    async fn a_missing_actual_attribute_falls_back_to_none() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let (component, variable) = heartbeat_component_and_variable();
+        // Re-registers the variable with only a `Target` attribute - no `Actual` at all, the
+        // same shape as a hardware binding that never populated it.
+        actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::VariableRegistered {
+                    component,
+                    variable,
+                    characteristics: crate::state::VariableCharacteristics {
+                        data_type: crate::state::VariableDataType::Integer,
+                        unit: Some("s".into()),
+                        min_limit: None,
+                        max_limit: None,
+                        values_list: None,
+                        supports_monitoring: false,
+                    },
+                    attributes: alloc::vec![crate::state::VariableAttribute {
+                        attribute_type: crate::state::VariableAttributeType::Target,
+                        value: "60".into(),
+                        mutability: crate::state::VariableMutability::ReadWrite,
+                        persistent: true,
+                        constant: false,
+                        requires_reboot: false,
+                    }],
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(heartbeat_interval_secs(&actor), None);
+    }
+
+    #[tokio::test]
+    async fn run_heartbeat_picks_up_a_set_variables_change_without_restarting() {
+        let sender = CountingHeartbeatSender {
+            calls: AtomicUsize::new(0),
+        };
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let seen = Arc::new(Mutex::new(alloc::vec::Vec::new()));
+        let backoff = RecordingBackoff { seen: seen.clone() };
+
+        let heartbeat_actor = actor.clone();
+        let handle = tokio::spawn(async move {
+            run_heartbeat(&sender, &backoff, &heartbeat_actor, 999).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        set_heartbeat_interval(&actor, "5").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        handle.abort();
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.contains(&60),
+            "expected the built-in default (60s) to have been used before the change: {seen:?}"
+        );
+        assert!(
+            seen.contains(&5),
+            "expected the new interval (5s) to have been picked up without restarting: {seen:?}"
+        );
     }
 }
 
