@@ -20,12 +20,23 @@ Status legend: ✅ done · 🚧 partial · ⬜ not started
 
 Not a functional block, but a prerequisite for all of them.
 
-- 🚧 Actor model core (`ChargePointActor`, `ChargePointState`) — exists, but
-  only covers lifecycle/EVSE/connector, not transactions or the wider
-  device model.
+- 🚧 Actor model core (`ChargePointActor`, `ChargePointState`) — no longer
+  just lifecycle/EVSE/connector. `ChargePointState` now also owns
+  transactions (§5), reservations (§8), the local authorization list (§4),
+  running cost (§9), a pending `Reset` (§2), and the Component/Variable
+  device model (§2) - all mutated only through `ChargePointEvent`, none of
+  it shared mutable state. Still open: persistence (nothing in the state
+  model survives a restart today - see `VariableAttribute::persistent`,
+  recorded but not acted on), and the `spawn` bound choices noted below.
 - 🚧 Hardware abstraction (`crate::hardware`: `ChargePoint`, `Evse`,
-  `Connector`) — covers lock/unlock/contactor only; no metering, no
-  temperature/safety hooks yet.
+  `Connector`) — lock/unlock/contactor, plus metering pushed in by the
+  integrator (`ConnectorEvent::MeterValueSampled`, §10) and `Evse::reboot`
+  for `Reset` (§2). Adding `reboot` (and its `Evse::Error` associated type)
+  was a deliberate breaking change to the integrator surface, taken because
+  `execute_hardware_command` only ever receives `&[E]`. Still missing:
+  temperature/safety hooks, and any hardware-capability model (nothing lets
+  hardware declare that it can't do bidirectional power, ISO 15118, or a
+  display - see §13, §15, §17).
 - 🚧 `ocpp-client` wiring — outbound state → OCPP calls now exist for
   BootNotification, Heartbeat, and StatusNotification (see §2, §7), each
   via a small protocol-agnostic trait (`BootNotifier`, `HeartbeatSender`,
@@ -39,15 +50,24 @@ Not a functional block, but a prerequisite for all of them.
   to `ocpp-client/websocket`, implying `tokio-runtime`) is in `default` for
   zero-config ergonomics; embedded/no_std targets or std users needing a
   non-WebSocket transport still construct their own client and call
-  `setup()` directly. Inbound OCPP call handling has now started (see §6 -
-  `UnlockConnector`, `RequestStartTransaction`, and `RequestStopTransaction`
-  - and §7 - `ChangeAvailability` - which are wired end-to-end); other
-  CSMS-initiated actions still aren't. `TriggerMessage` is a special case
+  `setup()` directly. Inbound OCPP call handling is now broad rather than
+  just "started": `UnlockConnector`, `RequestStartTransaction`,
+  `RequestStopTransaction` (§6), `ChangeAvailability` (§7), `ReserveNow`,
+  `CancelReservation` (§8), `SendLocalList`, `GetLocalListVersion` (§4),
+  `CostUpdated` (§9), and `GetVariables`, `SetVariables`, `GetBaseReport`,
+  `GetReport`, `Reset` (§2) are all wired end-to-end through `setup()`.
+  What's still unwired is listed per block below - chiefly `SetNetworkProfile`
+  (§2), the certificate messages (§1), and everything in §11-§18.
+  `TriggerMessage` is a special case
   worth calling out here too: it has a protocol-agnostic internal handler
-  (§6) but no wire adapter is even possible yet - the OCPP 2.1 message
+  (§6) but no 2.1 wire adapter is possible yet - the OCPP 2.1 message
   types don't exist upstream in `rust-ocpp`/`ocpp-client` at all (unlike
-  every other action in this list). `connect_and_setup` only covers OCPP
-  2.1 (the crate's primary target per `CLAUDE.md`), not 1.6J/2.0.1.
+  every other action in this list). Note this blocker is narrower than it
+  used to read: `OCPP2_0_1Client` and `OCPP1_6Client` *do* have real
+  `on_trigger_message`/`send_trigger_message` methods in `ocpp-client`
+  0.2.0 (re-verified against the vendored source), so 2.0.1 and 1.6J
+  adapters are buildable today - see §6. `connect_and_setup` only covers
+  OCPP 2.1 (the crate's primary target per `CLAUDE.md`), not 1.6J/2.0.1.
 - 🚧 Protocol-version-independent core → version adapters. The pattern
   itself already existed implicitly - every functional block already
   defines a protocol-agnostic trait (`BootNotifier`, `StatusNotifier`,
@@ -1099,11 +1119,17 @@ Energy/power measurement reporting.
   wired. `current_ma` (milliamps) is the one field with a non-obvious unit -
   chosen over whole amps for enough resolution at typical EV charging
   currents; the wire adapter divides by 1000 before reporting. Not yet done:
-  standalone `MeterValues` for 1.6J (no 1.6J wire adapter of any kind exists
-  yet in this crate - see `docs/ROADMAP.md` §0/§2's "still missing" notes,
-  every adapter implemented so far targets `OCPP2_1Client` only), per-phase
+  standalone `MeterValues` for 1.6J - note the parenthetical that used to sit
+  here ("no 1.6J wire adapter of any kind exists yet in this crate ... every
+  adapter implemented so far targets `OCPP2_1Client` only") is long stale and
+  has been removed; 1.6J and 2.0.1 adapters exist throughout, including a
+  1.6J `MeterValues` embedded in `Ocpp1_6TransactionNotifier`. What's
+  genuinely missing is the *standalone* 1.6J sender. Also missing: per-phase
   measurements (`SampledValue.phase` is always `None`), sampled-data
-  configuration (needs the Provisioning device model, §2), and
+  configuration - no longer blocked, since the §2 device model it needed now
+  exists (`SampledDataCtrlr`/`TxUpdatedInterval` is already in the 1.6J
+  configuration-key alias table; nothing reads it yet, which makes it exactly
+  the inert-variable trap `HeartbeatInterval` was fixed out of) - and
   clock-aligned periodic scheduling (still requires an integrator-owned
   timer today; the crate has no scheduling hook for it - same gap noted
   against §8's reservation expiry).
@@ -1245,3 +1271,26 @@ practice §0 (foundation) → §2 (Provisioning/BootNotification) → §7
 → §10 (Meter values) form the critical path to a minimally useful charger
 that can actually hold a session with a CSMS. Everything else (§1, §4,
 §6, §8, §9, §11–18) layers on top once that spine exists.
+
+That spine is now in place: every block on it is at least 🚧 with its core
+flow wired end-to-end through `setup()`, across 1.6J/2.0.1/2.1. The most
+useful next chunks, roughly in order of value per unit of work:
+
+1. **§11 Smart charging** — the largest genuinely-missing block, and the
+   one a real deployment is most likely to demand next (load management).
+   Needs a charging-profile store, schedule composition, and a schedule →
+   hardware current-limit projection, which in turn needs a new hardware
+   hook (nothing in `crate::hardware` can express "limit to N amps" today).
+2. **§2's leftovers** — `SetNetworkProfile`, device-model persistence, and
+   sampled-data configuration actually driving §10's sampling (see the
+   inert-variable note there).
+3. **`TriggerMessage` for 2.0.1 and 1.6J** (§6) — cheap: the
+   protocol-agnostic handler already exists and the upstream types turn out
+   to be present for both versions; only 2.1 is blocked.
+4. **§12 Firmware management / §14 Diagnostics** — both need a file-transfer
+   abstraction this crate doesn't have yet, so doing them together and
+   sharing that abstraction is worth more than doing either alone.
+
+§13 (ISO 15118), §17 (DER/V2X) and §18 (battery swap) all depend on
+hardware capabilities most chargers don't have, and want the
+capability-model gap noted in §0's hardware bullet closed first.
