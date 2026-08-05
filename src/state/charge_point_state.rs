@@ -3,8 +3,8 @@ use alloc::vec::Vec;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, EvseEvent, EvseState, HardwareCommand, IdToken,
-    LocalAuthorizationList, MeterSample, RegistrationStatus, StopReason, Transaction,
+    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
+    IdToken, LocalAuthorizationList, MeterSample, RegistrationStatus, StopReason, Transaction,
     TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
     TransactionUpdateReason,
 };
@@ -26,6 +26,9 @@ pub struct ChargePointState {
     /// The offline authorization cache maintained via `SendLocalList`/`GetLocalListVersion`. See
     /// `docs/ROADMAP.md` §4.
     pub local_authorization_list: LocalAuthorizationList,
+    /// The Component/Variable device model (OCPP `GetVariables`/`SetVariables`). See
+    /// `docs/ROADMAP.md` §2 and `crate::device_model`.
+    pub device_model: DeviceModel,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -54,6 +57,7 @@ impl ChargePointState {
             evses: connector_counts.into_iter().map(EvseState::new).collect(),
             next_transaction_id: 0,
             local_authorization_list: LocalAuthorizationList::new(),
+            device_model: DeviceModel::new(),
         }
     }
 
@@ -98,6 +102,27 @@ impl ChargePointState {
                 effects.push(ChargePointEffect::SecurityEventOccurred(event));
                 false
             }
+            ChargePointEvent::DeviceModel(event) => match event {
+                DeviceModelEvent::VariableRegistered {
+                    component,
+                    variable,
+                    characteristics,
+                    attributes,
+                } => {
+                    self.device_model
+                        .register(component, variable, characteristics, attributes);
+                    true
+                }
+                DeviceModelEvent::AttributeValueSet {
+                    component,
+                    variable,
+                    attribute_type,
+                    value,
+                } => {
+                    self.device_model
+                        .set_attribute_value(&component, &variable, attribute_type, value)
+                }
+            },
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
                     connector_id,
@@ -1133,6 +1158,111 @@ mod tests {
         assert_eq!(state.local_authorization_list.version, 1);
         assert_eq!(state.local_authorization_list.entries, alloc::vec![entry]);
         assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn registering_a_device_model_variable_adds_it_and_reports_a_change() {
+        let mut state = ChargePointState::new([1]);
+        let component = crate::state::Component {
+            name: "Custom".into(),
+            instance: None,
+            evse: None,
+        };
+        let variable = crate::state::Variable {
+            name: "Setting".into(),
+            instance: None,
+        };
+
+        let effects = state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::VariableRegistered {
+                component: component.clone(),
+                variable: variable.clone(),
+                characteristics: crate::state::VariableCharacteristics {
+                    data_type: crate::state::VariableDataType::String,
+                    unit: None,
+                    min_limit: None,
+                    max_limit: None,
+                    values_list: None,
+                    supports_monitoring: false,
+                },
+                attributes: alloc::vec![crate::state::VariableAttribute {
+                    attribute_type: crate::state::VariableAttributeType::Actual,
+                    value: "hello".into(),
+                    mutability: crate::state::VariableMutability::ReadWrite,
+                    persistent: false,
+                    constant: false,
+                    requires_reboot: false,
+                }],
+            },
+        ));
+
+        assert!(state.device_model.has_component(&component));
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn setting_a_device_model_attribute_value_updates_it_and_reports_a_change() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::AttributeValueSet {
+                component: crate::state::Component {
+                    name: "OCPPCommCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: "HeartbeatInterval".into(),
+                    instance: None,
+                },
+                attribute_type: crate::state::VariableAttributeType::Actual,
+                value: "120".into(),
+            },
+        ));
+
+        let value = state
+            .device_model
+            .get(
+                &crate::state::Component {
+                    name: "OCPPCommCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                &crate::state::Variable {
+                    name: "HeartbeatInterval".into(),
+                    instance: None,
+                },
+            )
+            .unwrap()
+            .attribute(crate::state::VariableAttributeType::Actual)
+            .unwrap()
+            .value
+            .clone();
+        assert_eq!(value, "120");
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn setting_an_unregistered_device_model_attribute_is_a_no_op() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::AttributeValueSet {
+                component: crate::state::Component {
+                    name: "Nonexistent".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: "X".into(),
+                    instance: None,
+                },
+                attribute_type: crate::state::VariableAttributeType::Actual,
+                value: "1".into(),
+            },
+        ));
+
+        assert!(effects.is_empty());
     }
 
     #[test]

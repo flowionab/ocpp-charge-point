@@ -23,6 +23,7 @@ mod connect;
 pub mod connection;
 pub mod cost;
 pub mod data_transfer;
+pub mod device_model;
 pub mod executor;
 pub mod hardware;
 #[cfg(feature = "ocpp_1_6")]

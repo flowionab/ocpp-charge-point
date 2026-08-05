@@ -323,6 +323,16 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::device_model::GetVariablesHandler for FixedBootNotifier {
+        async fn register_get_variables_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::device_model::SetVariablesHandler for FixedBootNotifier {
+        async fn register_set_variables_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
     impl crate::security::SecurityEventNotifier for FixedBootNotifier {
         type Error = core::convert::Infallible;
 

@@ -2,6 +2,7 @@ use ocpp_charge_point::authorization::Authorizer;
 use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
 use ocpp_charge_point::connection::ReconnectHandler;
 use ocpp_charge_point::cost::CostUpdatedHandler;
+use ocpp_charge_point::device_model::{GetVariablesHandler, SetVariablesHandler};
 use ocpp_charge_point::executor::TokioExecutor;
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
 use ocpp_charge_point::local_authorization_list::{
@@ -158,6 +159,24 @@ impl SendLocalListHandler for AlwaysAcceptBootNotifier {
 #[async_trait::async_trait]
 impl GetLocalListVersionHandler for AlwaysAcceptBootNotifier {
     async fn register_get_local_list_version_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetVariablesHandler for AlwaysAcceptBootNotifier {
+    async fn register_get_variables_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SetVariablesHandler for AlwaysAcceptBootNotifier {
+    async fn register_set_variables_handler(
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {
