@@ -669,7 +669,30 @@ Vendor-specific extension channel.
 - Internal state needed: a pass-through hook so integrators can register
   vendor-specific handlers without the crate needing to understand the
   payload.
-- Status: ⬜ not started.
+- Status: 🚧 partial — a new `src/data_transfer.rs` module handles both
+  directions (`DataTransferSender::transfer_data` outbound,
+  `DataTransferRegistrar::register_data_transfer_handler` inbound,
+  implemented for `ocpp-client`'s OCPP 2.1 client). Unlike every other
+  CSMS-initiated action this crate handles, `DataTransfer` is explicitly
+  vendor-defined, so this module deliberately isn't wired into `setup()`
+  like `ReserveNow`/`ChangeAvailability`/etc. are - only integrators that
+  actually use a vendor extension call
+  `register_data_transfer_handler`/`transfer_data` directly against their
+  own (cloned) CSMS client handle, supplying their own
+  `DataTransferHandler` impl for inbound dispatch (the crate can't decide
+  Accepted/Rejected/UnknownVendorId/UnknownMessageId on its own - that's
+  the whole point of the block). **Known limitation, verified directly
+  (not from a stale comment) against the pinned `ocpp-types` 0.1.2**:
+  `DataTransferRequest`/`DataTransferResponse.data` is typed `Option<()>` -
+  OCPP's schema allows `data` to be any JSON value, which upstream codegen
+  couldn't represent, so it collapsed to Rust's unit type, with no generic
+  escape hatch on `send_data_transfer`/`on_data_transfer` either. This
+  crate's own `DataTransferMessage`/`DataTransferResult.data` are real
+  `Option<String>` (raw JSON) fields, ready for a payload, but the OCPP 2.1
+  adapter can only ever send/receive `None` until `ocpp-types` is fixed
+  upstream - `vendor_id`/`message_id` routing and
+  Accepted/Rejected/Unknown* outcomes work today; the actual payload
+  doesn't yet.
 - Version notes: present and compatible across all three versions.
 
 ## 17. Bidirectional power / DER control (2.1)

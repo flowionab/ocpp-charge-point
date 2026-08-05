@@ -8,6 +8,7 @@ pub mod availability;
 pub mod clock;
 #[cfg(all(feature = "std", feature = "websocket", feature = "ocpp_2_1"))]
 mod connect;
+pub mod data_transfer;
 pub mod executor;
 pub mod hardware;
 pub mod local_authorization_list;
