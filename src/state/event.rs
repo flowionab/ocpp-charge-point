@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use crate::state::{
     ConnectorStatus, IdToken, LocalListEntry, MeterSample, RegistrationStatus, Reservation,
-    StopReason, Transaction,
+    SecurityEvent, StopReason, Transaction,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,10 @@ pub enum ChargePointEvent {
         version: i64,
         entries: Vec<LocalListEntry>,
     },
+    /// A security-relevant event occurred, to be reported via SecurityEventNotification. Raised
+    /// via [`crate::security::report_security_event`], not tied to connector/EVSE state. See
+    /// `docs/ROADMAP.md` §1.
+    SecurityEventOccurred(SecurityEvent),
     Evse {
         evse_id: usize,
         event: EvseEvent,
@@ -96,6 +100,9 @@ pub enum ChargePointEffect {
     /// An identifier was presented and needs an authorization decision; the Authorization
     /// functional block asks the CSMS via Authorize.
     AuthorizationRequested(AuthorizationRequested),
+    /// A security-relevant event occurred; the Security functional block reports this to the
+    /// CSMS via SecurityEventNotification.
+    SecurityEventOccurred(SecurityEvent),
 }
 
 /// An [`IdToken`] was presented on a connector and needs an authorization decision, reported to

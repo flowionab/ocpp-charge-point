@@ -1,11 +1,11 @@
 use crate::executor::Executor;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
-    ConnectorStatusChanged, HardwareCommand, TransactionEventOccurred,
+    ConnectorStatusChanged, HardwareCommand, SecurityEvent, TransactionEventOccurred,
 };
 use crate::sync::{
-    BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
-    watch_channel,
+    broadcast_channel, watch_channel, BroadcastReceiver, BroadcastSender, Chan, OneShot,
+    WatchReceiver,
 };
 use alloc::boxed::Box;
 
@@ -29,6 +29,7 @@ pub struct ChargePointActor {
     status_notifications: BroadcastSender<ConnectorStatusChanged>,
     transaction_events: BroadcastSender<TransactionEventOccurred>,
     authorization_requests: BroadcastSender<AuthorizationRequested>,
+    security_events: BroadcastSender<SecurityEvent>,
 }
 
 impl ChargePointActor {
@@ -43,6 +44,7 @@ impl ChargePointActor {
         let status_notifications = broadcast_channel();
         let transaction_events = broadcast_channel();
         let authorization_requests = broadcast_channel();
+        let security_events = broadcast_channel();
         executor.spawn(Box::pin(run(
             state,
             mailbox.clone(),
@@ -51,6 +53,7 @@ impl ChargePointActor {
             status_notifications.clone(),
             transaction_events.clone(),
             authorization_requests.clone(),
+            security_events.clone(),
         )));
 
         Self {
@@ -60,6 +63,7 @@ impl ChargePointActor {
             status_notifications,
             transaction_events,
             authorization_requests,
+            security_events,
         }
     }
 
@@ -96,6 +100,10 @@ impl ChargePointActor {
     pub fn subscribe_authorization_requests(&self) -> BroadcastReceiver<AuthorizationRequested> {
         self.authorization_requests.subscribe()
     }
+
+    pub fn subscribe_security_events(&self) -> BroadcastReceiver<SecurityEvent> {
+        self.security_events.subscribe()
+    }
 }
 
 async fn run(
@@ -106,6 +114,7 @@ async fn run(
     status_notifications: BroadcastSender<ConnectorStatusChanged>,
     transaction_events: BroadcastSender<TransactionEventOccurred>,
     authorization_requests: BroadcastSender<AuthorizationRequested>,
+    security_events: BroadcastSender<SecurityEvent>,
 ) {
     loop {
         let Command::Event {
@@ -131,6 +140,9 @@ async fn run(
                 }
                 ChargePointEffect::AuthorizationRequested(requested) => {
                     authorization_requests.send(requested);
+                }
+                ChargePointEffect::SecurityEventOccurred(event) => {
+                    security_events.send(event);
                 }
             }
         }

@@ -12,6 +12,7 @@ use ocpp_charge_point::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
 use ocpp_charge_point::reservation::{CancelReservationHandler, ReserveNowHandler};
+use ocpp_charge_point::security::SecurityEventNotifier;
 use ocpp_charge_point::setup;
 use ocpp_charge_point::state::{
     AuthorizationStatus, ChargePointEvent, ConnectorEvent, ConnectorStatus, EvseEvent, IdToken,
@@ -157,6 +158,19 @@ impl GetLocalListVersionHandler for AlwaysAcceptBootNotifier {
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SecurityEventNotifier for AlwaysAcceptBootNotifier {
+    type Error = core::convert::Infallible;
+
+    async fn notify_security_event(
+        &self,
+        _event_type: &ocpp_charge_point::state::SecurityEventType,
+        _tech_info: Option<&str>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 

@@ -6,7 +6,7 @@ use crate::provisioning::{
 };
 use crate::state::{
     AuthorizationRequested, ChargePointEvent, ChargePointState, ConnectorStatusChanged,
-    RegistrationStatus, TransactionEventOccurred,
+    RegistrationStatus, SecurityEvent, TransactionEventOccurred,
 };
 use crate::sync::{BroadcastReceiver, WatchReceiver};
 
@@ -107,6 +107,12 @@ impl<T> ChargePointRuntime<T> {
     /// [`Self::subscribe_status_notifications`].
     pub fn subscribe_authorization_requests(&self) -> BroadcastReceiver<AuthorizationRequested> {
         self.actor.subscribe_authorization_requests()
+    }
+
+    /// Subscribes to security events for the Security functional block. Subscribe before
+    /// starting the hardware, for the same reason as [`Self::subscribe_status_notifications`].
+    pub fn subscribe_security_events(&self) -> BroadcastReceiver<SecurityEvent> {
+        self.actor.subscribe_security_events()
     }
 
     pub fn state(&self) -> ChargePointState {

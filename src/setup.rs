@@ -10,6 +10,7 @@ use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
+use crate::security::{run_security_events, SecurityEventNotifier};
 use crate::transactions::{run_transaction_events, TransactionNotifier};
 use crate::ChargePointRuntime;
 use alloc::boxed::Box;
@@ -20,8 +21,9 @@ use alloc::vec::Vec;
 /// [`ChargePointRuntime::register_until_accepted`]). Once accepted, uses `executor` to spawn
 /// background tasks that send a Heartbeat at the interval the CSMS returned, forward every
 /// connector status change to the CSMS via StatusNotification, forward every transaction
-/// lifecycle event via TransactionEvent, and answer every presented-id-token authorization
-/// request via Authorize, for as long as the process runs.
+/// lifecycle event via TransactionEvent, answer every presented-id-token authorization
+/// request via Authorize, and forward every reported security event via
+/// SecurityEventNotification, for as long as the process runs.
 ///
 /// `executor`/`backoff` are caller-supplied (rather than defaulting to tokio) so this function
 /// doesn't hard-depend on an async runtime - std/tokio users can pass
@@ -50,6 +52,7 @@ where
         + CancelReservationHandler
         + SendLocalListHandler
         + GetLocalListVersionHandler
+        + SecurityEventNotifier
         + Clone
         + Send
         + Sync
@@ -75,6 +78,7 @@ where
     let status_changes = runtime.subscribe_status_notifications();
     let transaction_events = runtime.subscribe_transaction_events();
     let authorization_requests = runtime.subscribe_authorization_requests();
+    let security_events = runtime.subscribe_security_events();
     runtime
         .hardware()
         .start(runtime.hardware_events(), runtime.hardware_commands())
@@ -107,6 +111,11 @@ where
     let actor = runtime.actor();
     executor.spawn(Box::pin(async move {
         run_authorization_requests(authorization_requests, &authorizer, actor).await;
+    }));
+
+    let security_event_notifier = csms.clone();
+    executor.spawn(Box::pin(async move {
+        run_security_events(security_events, &security_event_notifier).await;
     }));
 
     csms.register_unlock_connector_handler(runtime.actor())

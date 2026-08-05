@@ -63,6 +63,10 @@ impl ChargePointState {
                 self.local_authorization_list = LocalAuthorizationList { version, entries };
                 true
             }
+            ChargePointEvent::SecurityEventOccurred(event) => {
+                effects.push(ChargePointEffect::SecurityEventOccurred(event));
+                false
+            }
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
                     connector_id,
@@ -811,6 +815,22 @@ mod tests {
         assert_eq!(state.local_authorization_list.version, 1);
         assert_eq!(state.local_authorization_list.entries, alloc::vec![entry]);
         assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn a_security_event_is_reported_without_changing_state() {
+        let mut state = ChargePointState::new([1]);
+        let event = crate::state::SecurityEvent {
+            event_type: crate::state::SecurityEventType::TamperDetectionActivated,
+            tech_info: Some("case opened".into()),
+        };
+
+        let effects = state.apply(ChargePointEvent::SecurityEventOccurred(event.clone()));
+
+        assert_eq!(
+            effects,
+            alloc::vec![ChargePointEffect::SecurityEventOccurred(event)]
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod local_authorization_list;
 mod meter_sample;
 mod registration_status;
 mod reservation;
+mod security_event;
 mod transaction;
 
 pub use self::authorization_status::AuthorizationStatus;
@@ -26,4 +27,5 @@ pub use self::local_authorization_list::{LocalAuthorizationList, LocalListEntry}
 pub use self::meter_sample::MeterSample;
 pub use self::registration_status::RegistrationStatus;
 pub use self::reservation::{Reservation, ReservationId};
+pub use self::security_event::{SecurityEvent, SecurityEventType};
 pub use self::transaction::{StopReason, Transaction, TransactionChargingState, TransactionId};

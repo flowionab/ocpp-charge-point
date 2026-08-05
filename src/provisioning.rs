@@ -262,6 +262,19 @@ pub(crate) mod test_support {
         ) {
         }
     }
+
+    #[async_trait::async_trait]
+    impl crate::security::SecurityEventNotifier for FixedBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_security_event(
+            &self,
+            _event_type: &crate::state::SecurityEventType,
+            _tech_info: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]

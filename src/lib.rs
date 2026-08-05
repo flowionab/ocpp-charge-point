@@ -15,6 +15,7 @@ pub mod provisioning;
 pub mod remote_control;
 pub mod reservation;
 mod runtime;
+pub mod security;
 mod setup;
 pub mod state;
 pub mod sync;

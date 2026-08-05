@@ -162,7 +162,32 @@ Secures the OCPP connection and reports security-relevant events.
   `DeleteCertificate`, `InstallCertificate`, `GetInstalledCertificateIds`.
 - Internal state needed: certificate store abstraction, security event log,
   security profile (1/2/3) configuration.
-- Status: ⬜ not started.
+- Status: 🚧 partial — `SecurityEventNotification` (outbound only) is
+  implemented; the certificate messages (`SignCertificate`,
+  `CertificateSigned`, `Get15118EVCertificate`, `GetCertificateStatus`,
+  `DeleteCertificate`, `InstallCertificate`, `GetInstalledCertificateIds`)
+  are not - no certificate store abstraction exists, and several need real
+  crypto (signing, verification) this crate has no hook for yet. A
+  `SecurityEvent` (`event_type: SecurityEventType`, `tech_info: Option<
+  String>`) is reported via a new `src/security.rs` module, wired the same
+  way as every other outbound report: a protocol-agnostic
+  `SecurityEventNotifier` trait, implemented for `ocpp-client`'s OCPP 2.1
+  client, forwarded by `run_security_events` (spawned from `setup()`) over a
+  new dedicated broadcast channel on the actor
+  (`ChargePointActor::subscribe_security_events`). `SecurityEventType`
+  covers OCPP's standardized "Security events" list (18 values, e.g.
+  `TamperDetectionActivated`, `InvalidCsmsCertificate`,
+  `MemoryExhaustion`) plus `Other(String)` for vendor-specific/uncovered
+  ones - mirroring `StopReason`'s "subset of the full spec enum" pattern.
+  Critically, **nothing in this crate raises one of these on its own yet**:
+  there's no certificate handling (the rest of this block), no firmware
+  update flow (§12), and no TLS-layer visibility (that lives in
+  `ocpp-client`, not here). `security::report_security_event(actor, event)`
+  is the one public entry point - callable by hardware (e.g. a tamper
+  switch, the same way `MeterValueSampled` is pushed in) or by future
+  functional blocks once they exist, but nothing calls it today. Version
+  notes below on the certificate messages still apply for the eventual rest
+  of this block.
 - Version notes: OCPP 1.6J only has basic auth / TLS via security
   whitepaper extensions, no in-band certificate messages — this block
   mostly collapses to "not applicable" under 1.6J.
