@@ -175,7 +175,10 @@ impl SecurityEventNotifier for AlwaysAcceptBootNotifier {
 }
 
 struct SampleChargePoint {
-    evses: [SampleEvse; 2],
+    // `Arc` so `start()` can clone a handle into its spawned command-processing loop while
+    // `evses()` keeps borrowing from `&self` - see `ChargePoint::start`'s docs on why a real
+    // implementation generally can't service `commands` from within `start()` itself.
+    evses: std::sync::Arc<[SampleEvse; 2]>,
 }
 
 struct SampleEvse {
@@ -195,7 +198,7 @@ impl SampleEvse {
 impl SampleChargePoint {
     pub fn new() -> Self {
         Self {
-            evses: [SampleEvse::new(), SampleEvse::new()],
+            evses: std::sync::Arc::new([SampleEvse::new(), SampleEvse::new()]),
         }
     }
 }
@@ -212,14 +215,26 @@ impl ChargePoint<SampleEvse, SampleConnector> for SampleChargePoint {
     }
 
     async fn evses(&self) -> &[SampleEvse] {
-        return &self.evses;
+        &self.evses[..]
     }
 
     async fn start(
         &self,
-        _events: ocpp_charge_point::hardware::HardwareEventSender,
-        _commands: ocpp_charge_point::hardware::HardwareCommandReceiver,
+        events: ocpp_charge_point::hardware::HardwareEventSender,
+        mut commands: ocpp_charge_point::hardware::HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
+        // Real hardware bindings should service `commands` for as long as the process runs -
+        // `execute_hardware_command` dispatches each one to the right `Connector` and reports
+        // the outcome back via `events`, including turning a hardware failure into the right
+        // fault event. `start()` itself must return promptly (setup() awaits it before
+        // registering with the CSMS), so the loop runs in a spawned task instead.
+        let evses = self.evses.clone();
+        tokio::spawn(async move {
+            while let Ok(command) = commands.recv().await {
+                ocpp_charge_point::hardware::execute_hardware_command(&evses[..], command, &events)
+                    .await;
+            }
+        });
         Ok(())
     }
 }

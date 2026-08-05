@@ -1,6 +1,20 @@
 use crate::hardware::{Connector, Evse, HardwareEventSender};
 use crate::state::{ChargePointEvent, ConnectorEvent, HardwareCommand};
 
+/// Dispatches a single [`HardwareCommand`] to the [`Connector`] it addresses and reports the
+/// outcome back via `events`, as the matching `ConnectorEvent`
+/// (`LockConfirmed`/`UnlockConfirmed`/`ContactorClosed`/`ContactorOpened`).
+///
+/// A failed hardware call, or a command addressing an EVSE/connector index that doesn't exist
+/// (which should not happen in practice - `HardwareCommand`s are only ever emitted by this
+/// crate's own state machine for connectors it already knows about), is reported as
+/// [`ConnectorEvent::FaultDetected`] rather than propagated as an error or a panic - per
+/// `CLAUDE.md`'s error-handling guidance, a hardware problem must drive the connector into an
+/// explicit faulted state, never take down the process.
+///
+/// Most [`ChargePoint::start`](crate::hardware::ChargePoint::start) implementations should loop
+/// this over `commands.recv()` for as long as it returns `Ok`, rather than dispatching commands
+/// by hand.
 pub async fn execute_hardware_command<E: Evse<C>, C: Connector>(
     evses: &[E],
     command: HardwareCommand,
@@ -44,6 +58,8 @@ pub async fn execute_hardware_command<E: Evse<C>, C: Connector>(
         .await;
 }
 
+/// The `(evse_id, connector_id)` a [`HardwareCommand`] addresses - every variant carries the
+/// same two fields, just for a different physical action.
 fn command_address(command: HardwareCommand) -> (usize, usize) {
     match command {
         HardwareCommand::LockConnector {
