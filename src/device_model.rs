@@ -1112,13 +1112,30 @@ mod ocpp_2_0_1 {
 /// by `GetConfiguration` and never resolve from a requested key. Only the `Actual` attribute is
 /// exposed - the only one 1.6J's single-valued keys can express.
 ///
-/// A key that doesn't decode under this convention - including 1.6J's own real standard key names
-/// (e.g. `"HeartbeatInterval"`, with no component prefix at all) - is reported as `unknownKey`
-/// (`GetConfiguration`) or `NotSupported` (`ChangeConfiguration`). This is a real, deliberate
-/// limitation of this projection: this crate's device model doesn't know any bare aliases for its
-/// variables, so a 1.6J CSMS that only knows the real standard key names won't find them under
-/// this scheme. Closing that gap would need a hand-maintained alias table per standard variable
-/// (out of scope here - see `docs/ROADMAP.md` §2's "still missing" notes).
+/// # Standard key aliases
+///
+/// 1.6J's own real standard configuration key names (e.g. `"HeartbeatInterval"`,
+/// `"AuthorizeRemoteTxRequests"`) have no component prefix at all, so they don't decode under the
+/// flat-key convention above by themselves. `STANDARD_KEY_ALIASES` is a hand-maintained table
+/// mapping a subset of those standard key names directly to the `(Component, Variable)` pair that
+/// OCPP 2.0.1 Part 2's "Referenced Components and Variables" appendix documents as replacing them
+/// (mirrored, in CSV form, at `docs/OCPP-2.0.1/Appendices_CSV_v1.5/dm_components_vars.csv`). Both
+/// [`encode_key`] and [`decode_key`] consult this table before falling back to the dotted
+/// convention, so `GetConfiguration`/`ChangeConfiguration` recognise a real 1.6J CSMS's own key
+/// names for whatever standard key is in the table - and `GetConfiguration` with no `key` filter
+/// reports those aliased variables under their standard name rather than the dotted form.
+///
+/// The table is **deliberately partial** - it only covers standard 1.6J keys this crate's device
+/// model can plausibly own today (this crate's built-in defaults - see
+/// [`DeviceModel::register_defaults`] - plus whatever a hardware binding registers), not the
+/// entirety of OCPP 1.6's Appendix 1 of standard configuration keys. Notably absent:
+/// `ConnectorPhaseRotation`, whose single 1.6J key packs a per-connector list
+/// (`"0.RST,1.RST,..."`) into one string, where 2.0.1 models `PhaseRotation` as one variable per
+/// connector - collapsing that fan-out needs more than a static `key -> (Component, Variable)`
+/// entry, so it's left as a real gap rather than modeled incorrectly. A standard key that isn't in
+/// the table - or any non-standard/vendor key - still falls back to the dotted convention,
+/// degrading to `unknownKey`/`NotSupported` exactly as before rather than breaking; extend the
+/// table by adding a `StandardKeyAlias` entry as more of the device model grows in.
 ///
 /// `GetConfiguration` is answered directly against the device model - it needs the `readonly` bit
 /// [`crate::device_model::GetVariableOutcome`] doesn't carry, and its "return everything" shape
@@ -1169,12 +1186,158 @@ mod ocpp_1_6 {
         }
     }
 
-    /// Encodes `(component, variable)` into this module's flat-key convention (see the module
-    /// docs), truncated to fit 1.6J's 50-byte key bound. `None` for an EVSE/connector-scoped
+    /// One entry in [`STANDARD_KEY_ALIASES`]: a 1.6J standard configuration key name and the
+    /// `(Component, Variable)` pair it maps to in the 2.x device model. See the module docs'
+    /// "Standard key aliases" section.
+    struct StandardKeyAlias {
+        /// The 1.6J standard configuration key name, exactly as OCPP 1.6's Appendix 1 spells it.
+        key: &'static str,
+        /// The device model component name this key maps to. Every entry today is charge-point-
+        /// wide (no component instance, no EVSE/connector scoping), matching 1.6J's own lack of
+        /// addressing.
+        component: &'static str,
+        /// The device model variable name this key maps to.
+        variable: &'static str,
+        /// The variable's instance, if the 2.x variable disambiguates with one (e.g.
+        /// `MessageAttempts[TransactionEvent]`).
+        instance: Option<&'static str>,
+    }
+
+    /// The standard 1.6J configuration keys this crate knows a device model alias for, sourced
+    /// from `docs/OCPP-2.0.1/Appendices_CSV_v1.5/dm_components_vars.csv` (row numbers as of that
+    /// file's current revision) - see the module docs' "Standard key aliases" section for how
+    /// this table is used and why it's deliberately partial.
+    const STANDARD_KEY_ALIASES: &[StandardKeyAlias] = &[
+        // dm_components_vars.csv:232
+        StandardKeyAlias {
+            key: "HeartbeatInterval",
+            component: "OCPPCommCtrlr",
+            variable: "HeartbeatInterval",
+            instance: None,
+        },
+        // dm_components_vars.csv:94 - 1.6's "AuthorizeRemoteTxRequests" was renamed
+        // "AuthorizeRemoteStart" in 2.0.1.
+        StandardKeyAlias {
+            key: "AuthorizeRemoteTxRequests",
+            component: "AuthCtrlr",
+            variable: "AuthorizeRemoteStart",
+            instance: None,
+        },
+        // dm_components_vars.csv:260 - 1.6's "MeterValueSampleInterval" became
+        // "SampledDataCtrlr.TxUpdatedInterval".
+        StandardKeyAlias {
+            key: "MeterValueSampleInterval",
+            component: "SampledDataCtrlr",
+            variable: "TxUpdatedInterval",
+            instance: None,
+        },
+        // dm_components_vars.csv:96
+        StandardKeyAlias {
+            key: "LocalAuthorizeOffline",
+            component: "AuthCtrlr",
+            variable: "LocalAuthorizeOffline",
+            instance: None,
+        },
+        // dm_components_vars.csv:97
+        StandardKeyAlias {
+            key: "LocalPreAuthorize",
+            component: "AuthCtrlr",
+            variable: "LocalPreAuthorize",
+            instance: None,
+        },
+        // dm_components_vars.csv:99
+        StandardKeyAlias {
+            key: "AllowOfflineTxForUnknownId",
+            component: "AuthCtrlr",
+            variable: "OfflineTxForUnknownIdEnabled",
+            instance: None,
+        },
+        // dm_components_vars.csv:319
+        StandardKeyAlias {
+            key: "StopTransactionOnInvalidId",
+            component: "TxCtrlr",
+            variable: "StopTxOnInvalidId",
+            instance: None,
+        },
+        // dm_components_vars.csv:245
+        StandardKeyAlias {
+            key: "UnlockConnectorOnEVSideDisconnect",
+            component: "OCPPCommCtrlr",
+            variable: "UnlockOnEVSideDisconnect",
+            instance: None,
+        },
+        // dm_components_vars.csv:235
+        StandardKeyAlias {
+            key: "TransactionMessageAttempts",
+            component: "OCPPCommCtrlr",
+            variable: "MessageAttempts",
+            instance: Some("TransactionEvent"),
+        },
+        // dm_components_vars.csv:234
+        StandardKeyAlias {
+            key: "TransactionMessageRetryInterval",
+            component: "OCPPCommCtrlr",
+            variable: "MessageAttemptInterval",
+            instance: Some("TransactionEvent"),
+        },
+        // dm_components_vars.csv:241
+        StandardKeyAlias {
+            key: "ResetRetries",
+            component: "OCPPCommCtrlr",
+            variable: "ResetRetries",
+            instance: None,
+        },
+        // dm_components_vars.csv:246
+        StandardKeyAlias {
+            key: "WebSocketPingInterval",
+            component: "OCPPCommCtrlr",
+            variable: "WebSocketPingInterval",
+            instance: None,
+        },
+    ];
+
+    /// Resolves a bare 1.6J standard configuration key name (e.g. `"HeartbeatInterval"`) to its
+    /// device model `(Component, Variable)` pair via [`STANDARD_KEY_ALIASES`], if it's in there.
+    fn decode_standard_key(key: &str) -> Option<(Component, Variable)> {
+        let alias = STANDARD_KEY_ALIASES.iter().find(|alias| alias.key == key)?;
+        Some((
+            Component {
+                name: alias.component.into(),
+                instance: None,
+                evse: None,
+            },
+            Variable {
+                name: alias.variable.into(),
+                instance: alias.instance.map(Into::into),
+            },
+        ))
+    }
+
+    /// The 1.6J standard key name for `(component, variable)`, if [`STANDARD_KEY_ALIASES`] has a
+    /// matching entry. Only ever matches an un-instanced `component` - every alias in the table
+    /// today is charge-point-wide, matching 1.6J's own lack of component-instance addressing.
+    fn encode_standard_key(component: &Component, variable: &Variable) -> Option<&'static str> {
+        STANDARD_KEY_ALIASES
+            .iter()
+            .find(|alias| {
+                component.instance.is_none()
+                    && component.name == alias.component
+                    && variable.name == alias.variable
+                    && variable.instance.as_deref() == alias.instance
+            })
+            .map(|alias| alias.key)
+    }
+
+    /// Encodes `(component, variable)` into a 1.6J key: [`STANDARD_KEY_ALIASES`]'s standard key
+    /// name if it has one (see the module docs), otherwise this module's own dotted flat-key
+    /// convention, truncated to fit 1.6J's 50-byte key bound. `None` for an EVSE/connector-scoped
     /// `component` - not representable under 1.6J at all.
     fn encode_key(component: &Component, variable: &Variable) -> Option<heapless::String<50>> {
         if component.evse.is_some() {
             return None;
+        }
+        if let Some(standard) = encode_standard_key(component, variable) {
+            return heapless::String::try_from(standard).ok();
         }
         let mut key = String::new();
         key.push_str(&component.name);
@@ -1191,11 +1354,15 @@ mod ocpp_1_6 {
         heapless::String::try_from(truncate_to_byte_boundary(&key, 50)).ok()
     }
 
-    /// Decodes a flat key back into `(Component, Variable)`, the reverse of [`encode_key`].
-    /// `None` if `key` has no `.` separator - any key not produced by this module's own
-    /// `encode_key` (including 1.6J's own standard key names) is simply unrepresentable under
-    /// this convention.
+    /// Decodes a flat key back into `(Component, Variable)`, the reverse of [`encode_key`]:
+    /// [`STANDARD_KEY_ALIASES`] first (see the module docs), then this module's own dotted
+    /// convention. `None` if `key` matches neither - any key not produced by this module's own
+    /// `encode_key` and not a known standard alias is simply unrepresentable under this
+    /// convention.
     fn decode_key(key: &str) -> Option<(Component, Variable)> {
+        if let Some(pair) = decode_standard_key(key) {
+            return Some(pair);
+        }
         let (component_part, variable_part) = key.split_once('.')?;
         let (component_name, component_instance) = split_instance(component_part);
         let (variable_name, variable_instance) = split_instance(variable_part);
@@ -1398,12 +1565,85 @@ mod ocpp_1_6 {
         }
 
         #[test]
-        fn a_key_with_no_dot_separator_does_not_decode() {
-            assert_eq!(decode_key("HeartbeatInterval"), None);
+        fn a_key_with_no_dot_separator_and_no_standard_alias_does_not_decode() {
+            assert_eq!(decode_key("TotallyUnknownVendorKey"), None);
         }
 
         #[test]
-        fn getting_every_key_lists_the_built_in_defaults() {
+        fn a_bare_standard_1_6_key_decodes_to_its_device_model_pair() {
+            let decoded = decode_key("HeartbeatInterval").unwrap();
+
+            assert_eq!(decoded.0, component("OCPPCommCtrlr"));
+            assert_eq!(decoded.1, variable("HeartbeatInterval"));
+        }
+
+        #[test]
+        fn a_renamed_standard_1_6_key_decodes_to_its_2_x_pair() {
+            // 1.6J calls this key "AuthorizeRemoteTxRequests"; 2.0.1 renamed the variable to
+            // "AuthorizeRemoteStart" on the "AuthCtrlr" component.
+            let decoded = decode_key("AuthorizeRemoteTxRequests").unwrap();
+
+            assert_eq!(decoded.0, component("AuthCtrlr"));
+            assert_eq!(decoded.1, variable("AuthorizeRemoteStart"));
+        }
+
+        #[test]
+        fn a_standard_key_with_a_variable_instance_decodes_it_too() {
+            let decoded = decode_key("TransactionMessageAttempts").unwrap();
+
+            assert_eq!(decoded.0, component("OCPPCommCtrlr"));
+            assert_eq!(
+                decoded.1,
+                Variable {
+                    name: "MessageAttempts".into(),
+                    instance: Some("TransactionEvent".into()),
+                }
+            );
+        }
+
+        #[test]
+        fn encoding_an_aliased_pair_emits_the_standard_key_name_not_the_dotted_form() {
+            let key =
+                encode_key(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval")).unwrap();
+
+            assert_eq!(key.as_str(), "HeartbeatInterval");
+        }
+
+        #[test]
+        fn an_aliased_pair_round_trips_through_encode_and_decode() {
+            let key =
+                encode_key(&component("AuthCtrlr"), &variable("AuthorizeRemoteStart")).unwrap();
+
+            let decoded = decode_key(key.as_str()).unwrap();
+
+            assert_eq!(decoded.0, component("AuthCtrlr"));
+            assert_eq!(decoded.1, variable("AuthorizeRemoteStart"));
+        }
+
+        #[test]
+        fn a_standard_alias_key_round_trips_back_to_the_same_key() {
+            // Decoding a real 1.6J standard key and re-encoding the resulting pair should
+            // reproduce the same standard key, not fall through to the dotted convention.
+            let (decoded_component, decoded_variable) =
+                decode_key("MeterValueSampleInterval").unwrap();
+
+            let re_encoded = encode_key(&decoded_component, &decoded_variable).unwrap();
+
+            assert_eq!(re_encoded.as_str(), "MeterValueSampleInterval");
+        }
+
+        #[test]
+        fn a_non_standard_component_is_unaffected_by_the_alias_table() {
+            // "OCPPCommCtrlr.SomethingElse" isn't a standard 1.6J key alias, so it still only
+            // decodes/encodes via the dotted convention.
+            assert_eq!(
+                encode_standard_key(&component("OCPPCommCtrlr"), &variable("SomethingElse")),
+                None
+            );
+        }
+
+        #[test]
+        fn getting_every_key_lists_the_built_in_defaults_under_their_standard_names() {
             let model = DeviceModel::new();
 
             let (configuration_key, unknown_key) = resolve_get_configuration(&model, None);
@@ -1411,11 +1651,19 @@ mod ocpp_1_6 {
             assert!(unknown_key.is_empty());
             assert!(configuration_key
                 .iter()
+                .any(|item| item.key.as_str() == "HeartbeatInterval"));
+            assert!(configuration_key
+                .iter()
+                .any(|item| item.key.as_str() == "AuthorizeRemoteTxRequests"));
+            // Neither built-in default is listed under the old dotted form now that it has a
+            // standard alias.
+            assert!(!configuration_key
+                .iter()
                 .any(|item| item.key.as_str() == "OCPPCommCtrlr.HeartbeatInterval"));
         }
 
         #[test]
-        fn requesting_a_known_key_returns_its_current_value_and_mutability() {
+        fn requesting_a_known_key_by_its_dotted_form_still_works() {
             let model = DeviceModel::new();
 
             let (configuration_key, unknown_key) = resolve_get_configuration(
@@ -1430,7 +1678,7 @@ mod ocpp_1_6 {
         }
 
         #[test]
-        fn requesting_an_unrecognized_key_reports_it_as_unknown() {
+        fn requesting_a_known_key_by_its_standard_alias_resolves_the_same_variable() {
             let model = DeviceModel::new();
 
             let (configuration_key, unknown_key) = resolve_get_configuration(
@@ -1438,8 +1686,54 @@ mod ocpp_1_6 {
                 Some(&[heapless::String::try_from("HeartbeatInterval").unwrap()]),
             );
 
+            assert!(unknown_key.is_empty());
+            assert_eq!(configuration_key.len(), 1);
+            assert_eq!(configuration_key[0].value.as_deref(), Some("60"));
+            assert!(!configuration_key[0].readonly);
+        }
+
+        #[test]
+        fn requesting_an_unrecognized_key_reports_it_as_unknown() {
+            let model = DeviceModel::new();
+
+            let (configuration_key, unknown_key) = resolve_get_configuration(
+                &model,
+                Some(&[heapless::String::try_from("TotallyUnknownVendorKey").unwrap()]),
+            );
+
             assert!(configuration_key.is_empty());
             assert_eq!(unknown_key.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn changing_configuration_by_a_standard_alias_key_updates_the_device_model() {
+            use crate::actor::ChargePointActor;
+            use crate::executor::TokioExecutor;
+
+            let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+            let outcome = match decode_key("HeartbeatInterval") {
+                Some((decoded_component, decoded_variable)) => handle_set_variables(
+                    &actor,
+                    alloc::vec![SetVariableRequest {
+                        component: decoded_component,
+                        variable: decoded_variable,
+                        attribute_type: VariableAttributeType::Actual,
+                        value: "120".into(),
+                    }],
+                )
+                .await
+                .remove(0),
+                None => panic!("standard alias key failed to decode"),
+            };
+
+            assert_eq!(outcome, SetVariableOutcome::Accepted);
+
+            let (configuration_key, _) = resolve_get_configuration(
+                &actor.state().device_model,
+                Some(&[heapless::String::try_from("HeartbeatInterval").unwrap()]),
+            );
+            assert_eq!(configuration_key[0].value.as_deref(), Some("120"));
         }
 
         #[test]
