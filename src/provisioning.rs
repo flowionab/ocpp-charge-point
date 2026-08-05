@@ -1,7 +1,8 @@
 //! Provisioning functional block: BootNotification and charge-point registration with the
 //! CSMS. See `docs/ROADMAP.md` §2.
 
-use crate::state::RegistrationStatus;
+use crate::actor::ChargePointActor;
+use crate::state::{ChargePointEvent, RegistrationStatus};
 use alloc::boxed::Box;
 #[cfg(feature = "tokio-runtime")]
 use core::time::Duration;
@@ -13,6 +14,7 @@ pub const DEFAULT_RETRY_INTERVAL_SECS: u32 = 30;
 /// The CSMS's answer to a BootNotification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootNotificationOutcome {
+    /// The CSMS's registration decision.
     pub status: RegistrationStatus,
     /// Seconds to wait: the heartbeat interval when `status` is `Accepted`, otherwise the
     /// minimum wait before the charge point may retry BootNotification.
@@ -26,8 +28,11 @@ pub struct BootNotificationOutcome {
 /// fake implementation without a live connection.
 #[async_trait::async_trait]
 pub trait BootNotifier {
+    /// The error type returned if the BootNotification request itself fails.
     type Error: core::error::Error + Send + Sync + 'static;
 
+    /// Sends a BootNotification identifying the charge point by `vendor_name`/`model_name` and
+    /// returns the CSMS's decision.
     async fn notify_boot(
         &self,
         vendor_name: &str,
@@ -39,6 +44,7 @@ pub trait BootNotifier {
 /// and so embedded targets without tokio can supply their own timer.
 #[async_trait::async_trait]
 pub trait Backoff {
+    /// Waits `seconds` before the caller retries.
     async fn wait(&self, seconds: u32);
 }
 
@@ -59,9 +65,61 @@ impl Backoff for TokioBackoff {
 /// protocol version (see the `ocpp_2_1` module), mirroring [`BootNotifier`].
 #[async_trait::async_trait]
 pub trait HeartbeatSender {
+    /// The error type returned if the Heartbeat request itself fails.
     type Error: core::error::Error + Send + Sync + 'static;
 
+    /// Sends a Heartbeat to the CSMS.
     async fn send_heartbeat(&self) -> Result<(), Self::Error>;
+}
+
+/// Runs the Provisioning functional block's BootNotification exchange against `actor`: sends a
+/// BootNotification via `notifier` and applies the CSMS's decision to the charge point's state
+/// (see `ChargePointEvent::RegistrationStatusReceived`).
+///
+/// This performs a single BootNotification attempt. On `Pending`/`Rejected`, callers are
+/// responsible for retrying after the returned outcome's interval, per the OCPP spec. See
+/// [`register_until_accepted`] for a version that retries automatically.
+pub async fn register<N: BootNotifier>(
+    actor: &ChargePointActor,
+    notifier: &N,
+    vendor_name: &str,
+    model_name: &str,
+) -> Result<RegistrationStatus, N::Error> {
+    let outcome = notifier.notify_boot(vendor_name, model_name).await?;
+    let _ = actor
+        .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
+        .await;
+    Ok(outcome.status)
+}
+
+/// Runs BootNotification against `actor` repeatedly until the CSMS accepts registration,
+/// applying every intermediate decision to the charge point's state. Per OCPP, a charge point
+/// does not give up: on `Pending`/`Rejected` it waits the response's `interval_secs` before
+/// retrying, and on a transport-level failure it waits [`DEFAULT_RETRY_INTERVAL_SECS`] instead.
+pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
+    actor: &ChargePointActor,
+    notifier: &N,
+    backoff: &B,
+    vendor_name: &str,
+    model_name: &str,
+) -> BootNotificationOutcome {
+    loop {
+        match notifier.notify_boot(vendor_name, model_name).await {
+            Ok(outcome) => {
+                let _ = actor
+                    .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
+                    .await;
+                if outcome.status == RegistrationStatus::Accepted {
+                    return outcome;
+                }
+                backoff.wait(outcome.interval_secs).await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "boot notification failed, retrying");
+                backoff.wait(DEFAULT_RETRY_INTERVAL_SECS).await;
+            }
+        }
+    }
 }
 
 /// Sends a Heartbeat every `interval_secs` (the interval an accepted BootNotification
@@ -171,6 +229,7 @@ pub(crate) mod test_support {
             _evse_id: usize,
             _connector_id: usize,
             _status: crate::state::ConnectorStatus,
+            _connector_state: crate::state::ConnectorState,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -269,6 +328,16 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::device_model::GetVariablesHandler for FixedBootNotifier {
+        async fn register_get_variables_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::device_model::SetVariablesHandler for FixedBootNotifier {
+        async fn register_set_variables_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
     impl crate::security::SecurityEventNotifier for FixedBootNotifier {
         type Error = core::convert::Infallible;
 
@@ -284,6 +353,16 @@ pub(crate) mod test_support {
     #[async_trait::async_trait]
     impl crate::cost::CostUpdatedHandler for FixedBootNotifier {
         async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connection::ReconnectHandler for FixedBootNotifier {
+        async fn register_reconnect_handler<F, FF>(&self, _callback: F)
+        where
+            F: FnMut() -> FF + Send + Sync + 'static,
+            FF: core::future::Future<Output = ()> + Send + 'static,
+        {
+        }
     }
 }
 
@@ -384,6 +463,216 @@ mod ocpp_2_1 {
             );
             assert_eq!(
                 map_status(RegistrationStatusEnum::Rejected),
+                RegistrationStatus::Rejected
+            );
+        }
+    }
+}
+
+/// The OCPP 2.0.1 projection of this functional block: identical wire shape to 2.1's (same
+/// `ChargingStation`/`BootReasonEnum`/`RegistrationStatusEnum`, since 2.1's Provisioning block
+/// didn't change this part of 2.0.1), just targeting `OCPP2_0_1Client` instead.
+#[cfg(feature = "ocpp_2_0_1")]
+mod ocpp_2_0_1 {
+    use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
+    use crate::state::RegistrationStatus;
+    use alloc::boxed::Box;
+    use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
+    use ocpp_client::ocpp_types::v201::common::{
+        BootReasonEnum, ChargingStation, RegistrationStatusEnum,
+    };
+    use ocpp_client::ocpp_types::v201::BootNotificationRequest;
+    use ocpp_client::ocpp_types::v201::HeartbeatRequest;
+    use ocpp_client::ClientError;
+
+    pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
+        BootNotificationRequest {
+            charging_station: ChargingStation {
+                custom_data: None,
+                firmware_version: None,
+                // Vendor/model names are integrator-supplied configuration, not runtime
+                // hardware readings - a name that doesn't fit the OCPP spec's bounded field
+                // is a configuration error, not something to recover from at this boundary.
+                model: heapless::String::try_from(model_name)
+                    .expect("model name must fit in OCPP's 20-character bound"),
+                modem: None,
+                serial_number: None,
+                vendor_name: heapless::String::try_from(vendor_name)
+                    .expect("vendor name must fit in OCPP's 50-character bound"),
+            },
+            custom_data: None,
+            reason: BootReasonEnum::PowerUp,
+        }
+    }
+
+    pub(super) fn map_status(status: RegistrationStatusEnum) -> RegistrationStatus {
+        match status {
+            RegistrationStatusEnum::Accepted => RegistrationStatus::Accepted,
+            RegistrationStatusEnum::Pending => RegistrationStatus::Pending,
+            RegistrationStatusEnum::Rejected => RegistrationStatus::Rejected,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BootNotifier for OCPP2_0_1Client {
+        type Error = ClientError<OCPP2_0_1Error>;
+
+        async fn notify_boot(
+            &self,
+            vendor_name: &str,
+            model_name: &str,
+        ) -> Result<BootNotificationOutcome, Self::Error> {
+            let response = self
+                .send_boot_notification(build_request(vendor_name, model_name))
+                .await?;
+
+            Ok(BootNotificationOutcome {
+                status: map_status(response.status),
+                interval_secs: response.interval.max(0) as u32,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HeartbeatSender for OCPP2_0_1Client {
+        type Error = ClientError<OCPP2_0_1Error>;
+
+        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
+            self.send_heartbeat(HeartbeatRequest { custom_data: None })
+                .await?;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn request_carries_the_vendor_and_model_as_a_power_up_boot() {
+            let request = build_request("Acme", "Charger 9000");
+
+            assert_eq!(request.charging_station.vendor_name, "Acme");
+            assert_eq!(request.charging_station.model, "Charger 9000");
+            assert_eq!(request.reason, BootReasonEnum::PowerUp);
+        }
+
+        #[test]
+        fn every_wire_registration_status_maps_to_our_internal_status() {
+            assert_eq!(
+                map_status(RegistrationStatusEnum::Accepted),
+                RegistrationStatus::Accepted
+            );
+            assert_eq!(
+                map_status(RegistrationStatusEnum::Pending),
+                RegistrationStatus::Pending
+            );
+            assert_eq!(
+                map_status(RegistrationStatusEnum::Rejected),
+                RegistrationStatus::Rejected
+            );
+        }
+    }
+}
+
+/// The OCPP 1.6J projection of this functional block: the same internal `RegistrationStatus`/
+/// `BootNotificationOutcome`/`HeartbeatSender` model §0's version-adapter goal calls for,
+/// targeting `OCPP1_6Client` instead of `OCPP2_1Client`. 1.6J's `BootNotification.req` has no
+/// `reason` field (that's a 2.x addition) and flattens `charging_station.vendor_name`/`model`
+/// into top-level `charge_point_vendor`/`charge_point_model` - otherwise the same shape and the
+/// same three-value registration status, so `map_status` differs only in its wire enum type.
+#[cfg(feature = "ocpp_1_6")]
+mod ocpp_1_6 {
+    use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
+    use crate::state::RegistrationStatus;
+    use alloc::boxed::Box;
+    use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
+    use ocpp_client::ocpp_types::v16::common::BootNotificationResponseStatus;
+    use ocpp_client::ocpp_types::v16::BootNotificationRequest;
+    use ocpp_client::ocpp_types::v16::HeartbeatRequest;
+    use ocpp_client::ClientError;
+
+    pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
+        BootNotificationRequest {
+            charge_box_serial_number: None,
+            // Vendor/model names are integrator-supplied configuration, not runtime hardware
+            // readings - a name that doesn't fit the OCPP spec's bounded field is a
+            // configuration error, not something to recover from at this boundary.
+            charge_point_model: heapless::String::try_from(model_name)
+                .expect("model name must fit in OCPP's 20-character bound"),
+            charge_point_serial_number: None,
+            charge_point_vendor: heapless::String::try_from(vendor_name)
+                .expect("vendor name must fit in OCPP's 20-character bound"),
+            firmware_version: None,
+            iccid: None,
+            imsi: None,
+            meter_serial_number: None,
+            meter_type: None,
+        }
+    }
+
+    pub(super) fn map_status(status: BootNotificationResponseStatus) -> RegistrationStatus {
+        match status {
+            BootNotificationResponseStatus::Accepted => RegistrationStatus::Accepted,
+            BootNotificationResponseStatus::Pending => RegistrationStatus::Pending,
+            BootNotificationResponseStatus::Rejected => RegistrationStatus::Rejected,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BootNotifier for OCPP1_6Client {
+        type Error = ClientError<OCPP1_6Error>;
+
+        async fn notify_boot(
+            &self,
+            vendor_name: &str,
+            model_name: &str,
+        ) -> Result<BootNotificationOutcome, Self::Error> {
+            let response = self
+                .send_boot_notification(build_request(vendor_name, model_name))
+                .await?;
+
+            Ok(BootNotificationOutcome {
+                status: map_status(response.status),
+                interval_secs: response.interval.max(0) as u32,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HeartbeatSender for OCPP1_6Client {
+        type Error = ClientError<OCPP1_6Error>;
+
+        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
+            self.send_heartbeat(HeartbeatRequest {}).await?;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn request_carries_the_vendor_and_model() {
+            let request = build_request("Acme", "Charger 9000");
+
+            assert_eq!(request.charge_point_vendor, "Acme");
+            assert_eq!(request.charge_point_model, "Charger 9000");
+        }
+
+        #[test]
+        fn every_wire_registration_status_maps_to_our_internal_status() {
+            assert_eq!(
+                map_status(BootNotificationResponseStatus::Accepted),
+                RegistrationStatus::Accepted
+            );
+            assert_eq!(
+                map_status(BootNotificationResponseStatus::Pending),
+                RegistrationStatus::Pending
+            );
+            assert_eq!(
+                map_status(BootNotificationResponseStatus::Rejected),
                 RegistrationStatus::Rejected
             );
         }

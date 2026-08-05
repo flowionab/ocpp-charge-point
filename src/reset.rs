@@ -65,6 +65,8 @@ fn target_exists(state: &ChargePointState, target: ResetTarget) -> bool {
 /// [`crate::reservation::ReserveNowHandler`].
 #[async_trait::async_trait]
 pub trait ResetHandler {
+    /// Registers a callback with the CSMS connection that answers every inbound `Reset` request
+    /// via [`handle_reset`], for as long as `actor` (and the underlying connection) lives.
     async fn register_reset_handler(&self, actor: ChargePointActor);
 }
 
@@ -74,10 +76,17 @@ mod tests {
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
     use crate::state::{
-        ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, HardwareCommand, ResetKind,
-        ResetTarget,
+        ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, HardwareCommand, IdToken,
+        IdTokenKind, ResetKind, ResetTarget,
     };
     use crate::sync::RecvError;
+
+    fn test_id_token() -> IdToken {
+        IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        }
+    }
 
     #[tokio::test]
     async fn an_immediate_reset_with_nothing_in_progress_reboots_right_away() {
@@ -115,7 +124,7 @@ mod tests {
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
-            ConnectorEvent::RemoteStartRequested,
+            ConnectorEvent::RemoteStartRequested(test_id_token()),
             ConnectorEvent::ContactorClosed,
         ] {
             actor
@@ -185,7 +194,7 @@ mod tests {
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
-            ConnectorEvent::RemoteStartRequested,
+            ConnectorEvent::RemoteStartRequested(test_id_token()),
             ConnectorEvent::ContactorClosed,
         ] {
             actor
@@ -303,7 +312,7 @@ mod tests {
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
-            ConnectorEvent::RemoteStartRequested,
+            ConnectorEvent::RemoteStartRequested(test_id_token()),
             ConnectorEvent::ContactorClosed,
         ] {
             actor

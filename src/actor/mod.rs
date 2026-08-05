@@ -38,6 +38,7 @@ mod tests {
                     evse_id: 0,
                     connector_id: 1,
                     status: ConnectorStatus::Occupied,
+                    connector_state: ConnectorState::Connected,
                 }),
             ]
         );
@@ -82,6 +83,7 @@ mod tests {
                     evse_id: 0,
                     connector_id: 0,
                     status: ConnectorStatus::Occupied,
+                    connector_state: ConnectorState::Connected,
                 }),
             ]
         );
@@ -110,10 +112,16 @@ mod tests {
             presentation_effects,
             vec![
                 ChargePointEffect::StateChanged,
+                ChargePointEffect::StatusNotification(ConnectorStatusChanged {
+                    evse_id: 0,
+                    connector_id: 0,
+                    status: ConnectorStatus::Occupied,
+                    connector_state: ConnectorState::Authorizing,
+                }),
                 ChargePointEffect::AuthorizationRequested(AuthorizationRequested {
                     evse_id: 0,
                     connector_id: 0,
-                    id_token,
+                    id_token: id_token.clone(),
                 }),
             ]
         );
@@ -122,7 +130,7 @@ mod tests {
             evse_id: 0,
             event: EvseEvent::Connector {
                 connector_id: 0,
-                event: ConnectorEvent::ChargingAuthorized,
+                event: ConnectorEvent::ChargingAuthorized(id_token.clone()),
             },
         });
 
@@ -135,12 +143,19 @@ mod tests {
                     evse_id: 0,
                     connector_id: 0,
                 }),
+                ChargePointEffect::StatusNotification(ConnectorStatusChanged {
+                    evse_id: 0,
+                    connector_id: 0,
+                    status: ConnectorStatus::Occupied,
+                    connector_state: ConnectorState::Starting,
+                }),
                 ChargePointEffect::TransactionEvent(TransactionEventOccurred {
                     evse_id: 0,
                     connector_id: 0,
                     kind: TransactionEventKind::Started,
                     transaction: Transaction {
                         id: TransactionId(0),
+                        id_token: Some(id_token),
                         charging_state: TransactionChargingState::EvConnected,
                         stop_reason: None,
                         seq_no: 0,
@@ -174,6 +189,7 @@ mod tests {
                     evse_id: 0,
                     connector_id: 0,
                     status: ConnectorStatus::Faulted,
+                    connector_state: ConnectorState::Faulted,
                 }),
             ]
         );
@@ -206,6 +222,7 @@ mod tests {
                     evse_id: 0,
                     connector_id: 0,
                     status: ConnectorStatus::Occupied,
+                    connector_state: ConnectorState::Unlocking,
                 }),
             ]
         );

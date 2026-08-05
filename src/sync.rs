@@ -161,6 +161,7 @@ impl<T: Clone> WatchSender<T> {
 }
 
 impl<T: Clone> WatchReceiver<T> {
+    /// The current value.
     pub fn borrow(&self) -> T {
         self.inner.state.lock(|state| state.borrow().1.clone())
     }
@@ -288,6 +289,8 @@ impl<T> Drop for BroadcastSender<T> {
 }
 
 impl<T> BroadcastReceiver<T> {
+    /// Waits for and returns the next broadcast value, or `Err(RecvError::Closed)` once every
+    /// [`BroadcastSender`] has been dropped and this receiver's own queue is drained.
     pub async fn recv(&mut self) -> Result<T, RecvError> {
         loop {
             if let Some(value) = self

@@ -1,21 +1,25 @@
 use crate::authorization::{run_authorization_requests, Authorizer};
-use crate::availability::{run_status_notifications, ChangeAvailabilityHandler, StatusNotifier};
+use crate::availability::{ChangeAvailabilityHandler, DedupedStatusNotifier, StatusNotifier};
+use crate::connection::{reregister_on_reconnect, ReconnectHandler};
 use crate::cost::CostUpdatedHandler;
+use crate::device_model::{GetVariablesHandler, SetVariablesHandler};
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
+use crate::offline_queue::{run_with_offline_queue, OfflineQueue};
 use crate::provisioning::{run_heartbeat, Backoff, BootNotifier, HeartbeatSender};
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::reset::ResetHandler;
-use crate::security::{run_security_events, SecurityEventNotifier};
-use crate::transactions::{run_transaction_events, TransactionNotifier};
+use crate::security::SecurityEventNotifier;
+use crate::transactions::TransactionNotifier;
 use crate::ChargePointRuntime;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// Starts the hardware, then runs the Provisioning functional block's BootNotification
@@ -55,8 +59,11 @@ where
         + ResetHandler
         + SendLocalListHandler
         + GetLocalListVersionHandler
+        + GetVariablesHandler
+        + SetVariablesHandler
         + SecurityEventNotifier
         + CostUpdatedHandler
+        + ReconnectHandler
         + Clone
         + Send
         + Sync
@@ -95,21 +102,118 @@ where
         .register_until_accepted(&csms, &backoff, vendor_name, model_name)
         .await;
 
+    reregister_on_reconnect(
+        runtime.actor(),
+        csms.clone(),
+        backoff.clone(),
+        vendor_name.into(),
+        model_name.into(),
+    )
+    .await;
+
     let heartbeat_sender = csms.clone();
     let heartbeat_backoff = backoff.clone();
     executor.spawn(Box::pin(async move {
         run_heartbeat(&heartbeat_sender, &heartbeat_backoff, outcome.interval_secs).await;
     }));
 
-    let status_notifier = csms.clone();
+    // Wrapped in `DedupedStatusNotifier` so `csms` only sees a wire-visible status change, not
+    // every internal `ConnectorState` transition `ChargePointState` now reports (see
+    // `docs/ROADMAP.md` §0) - restoring the cadence `setup()`'s csms types (2.1, 2.0.1) had
+    // before that change, since neither has a status richer than `ConnectorStatus` to justify
+    // seeing the extra calls. Wrapped again in `Arc` so the same dedup cache (and the same
+    // `OfflineQueue`, below) is shared between the live forwarder task and the reconnect-flush
+    // closure - cloning the `Arc` per call is cheap and keeps both paths consistent, unlike
+    // constructing a second `DedupedStatusNotifier` with its own empty cache would.
+    //
+    // Each of Status/Transaction/Security also goes through an `OfflineQueue`: a report that
+    // fails to send (e.g. the CSMS connection is currently down) is queued and retried, in
+    // order, rather than dropped - both whenever the next report comes in and, via
+    // `register_reconnect_handler` below, as soon as the connection itself comes back, so a
+    // queued report doesn't wait indefinitely for an unrelated event to trigger a retry.
+    let status_queue = Arc::new(OfflineQueue::new());
+    let status_notifier = Arc::new(DedupedStatusNotifier::new(csms.clone()));
+    let forwarder_queue = status_queue.clone();
+    let forwarder_notifier = status_notifier.clone();
     executor.spawn(Box::pin(async move {
-        run_status_notifications(status_changes, &status_notifier).await;
+        run_with_offline_queue(status_changes, &forwarder_queue, move |changed| {
+            let notifier = forwarder_notifier.clone();
+            async move {
+                notifier
+                    .notify_status(
+                        changed.evse_id,
+                        changed.connector_id,
+                        changed.status,
+                        changed.connector_state,
+                    )
+                    .await
+            }
+        })
+        .await;
     }));
+    csms.register_reconnect_handler(move || {
+        let queue = status_queue.clone();
+        let notifier = status_notifier.clone();
+        async move {
+            crate::offline_queue::flush_offline_queue(&queue, move |changed| {
+                let notifier = notifier.clone();
+                async move {
+                    notifier
+                        .notify_status(
+                            changed.evse_id,
+                            changed.connector_id,
+                            changed.status,
+                            changed.connector_state,
+                        )
+                        .await
+                }
+            })
+            .await;
+        }
+    })
+    .await;
 
-    let transaction_notifier = csms.clone();
+    let transaction_queue = Arc::new(OfflineQueue::new());
+    let forwarder_queue = transaction_queue.clone();
+    let forwarder_csms = csms.clone();
     executor.spawn(Box::pin(async move {
-        run_transaction_events(transaction_events, &transaction_notifier).await;
+        run_with_offline_queue(transaction_events, &forwarder_queue, move |occurred| {
+            let notifier = forwarder_csms.clone();
+            async move {
+                notifier
+                    .notify_transaction_event(
+                        occurred.evse_id,
+                        occurred.connector_id,
+                        occurred.kind,
+                        occurred.transaction,
+                    )
+                    .await
+            }
+        })
+        .await;
     }));
+    let reconnect_csms = csms.clone();
+    csms.register_reconnect_handler(move || {
+        let queue = transaction_queue.clone();
+        let csms = reconnect_csms.clone();
+        async move {
+            crate::offline_queue::flush_offline_queue(&queue, move |occurred| {
+                let notifier = csms.clone();
+                async move {
+                    notifier
+                        .notify_transaction_event(
+                            occurred.evse_id,
+                            occurred.connector_id,
+                            occurred.kind,
+                            occurred.transaction,
+                        )
+                        .await
+                }
+            })
+            .await;
+        }
+    })
+    .await;
 
     let authorizer = csms.clone();
     let actor = runtime.actor();
@@ -117,10 +221,37 @@ where
         run_authorization_requests(authorization_requests, &authorizer, actor).await;
     }));
 
-    let security_event_notifier = csms.clone();
+    let security_queue = Arc::new(OfflineQueue::new());
+    let forwarder_queue = security_queue.clone();
+    let forwarder_csms = csms.clone();
     executor.spawn(Box::pin(async move {
-        run_security_events(security_events, &security_event_notifier).await;
+        run_with_offline_queue(security_events, &forwarder_queue, move |event| {
+            let notifier = forwarder_csms.clone();
+            async move {
+                notifier
+                    .notify_security_event(&event.event_type, event.tech_info.as_deref())
+                    .await
+            }
+        })
+        .await;
     }));
+    let reconnect_csms = csms.clone();
+    csms.register_reconnect_handler(move || {
+        let queue = security_queue.clone();
+        let csms = reconnect_csms.clone();
+        async move {
+            crate::offline_queue::flush_offline_queue(&queue, move |event| {
+                let notifier = csms.clone();
+                async move {
+                    notifier
+                        .notify_security_event(&event.event_type, event.tech_info.as_deref())
+                        .await
+                }
+            })
+            .await;
+        }
+    })
+    .await;
 
     csms.register_unlock_connector_handler(runtime.actor())
         .await;
@@ -137,6 +268,8 @@ where
     csms.register_send_local_list_handler(runtime.actor()).await;
     csms.register_get_local_list_version_handler(runtime.actor())
         .await;
+    csms.register_get_variables_handler(runtime.actor()).await;
+    csms.register_set_variables_handler(runtime.actor()).await;
     csms.register_cost_updated_handler(runtime.actor()).await;
 
     Ok(runtime)

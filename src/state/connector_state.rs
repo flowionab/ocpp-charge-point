@@ -1,22 +1,35 @@
 use crate::state::{ConnectorEvent, ConnectorStatus};
 
+/// A connector's internal state machine, protocol-version-independent - version adapters project
+/// this down to each OCPP version's own status enum (see
+/// [`ConnectorState::availability_status`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectorState {
+    /// No cable connected, not reserved, no fault.
     Available,
+    /// A cable is physically plugged in; the connector is being locked.
     Connected,
+    /// The cable is locked in place, awaiting an identifier to be presented or a remote command.
     Locked,
     /// An identifier was presented and the CSMS's authorization decision is pending.
     Authorizing,
+    /// Authorization succeeded (or a remote start was requested); the contactor is closing.
     Starting,
+    /// The contactor is closed and energy is flowing.
     Charging,
     /// Charging has stopped and the contactor is opening; the cable is still locked.
     Stopping,
     /// The contactor is open and the connector has been unlocked; the cable may still be
     /// plugged in.
     Finishing,
+    /// Made unavailable (OCPP `ChangeAvailability`); not usable until made available again.
     Unavailable,
+    /// A hardware fault was detected; the contactor is being (or has been) forced open.
     Faulted,
+    /// A hardware fault was detected and the contactor has confirmed open - safe to unlock once
+    /// the fault clears.
     FaultedSafe,
+    /// The connector is unlocking, either after a normal session end or fault recovery.
     Unlocking,
     /// The CSMS has reserved this connector (OCPP `ReserveNow`) for a specific id token; no
     /// cable is connected yet. See `docs/ROADMAP.md` §8.
@@ -70,10 +83,10 @@ impl ConnectorState {
             (Self::Locked, ConnectorEvent::RemoteUnlockRequested) => {
                 (Self::Unlocking, Some(ConnectorCommand::Unlock))
             }
-            (Self::Locked, ConnectorEvent::RemoteStartRequested) => {
+            (Self::Locked, ConnectorEvent::RemoteStartRequested(_)) => {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))
             }
-            (Self::Authorizing, ConnectorEvent::ChargingAuthorized) => {
+            (Self::Authorizing, ConnectorEvent::ChargingAuthorized(_)) => {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))
             }
             (Self::Authorizing, ConnectorEvent::AuthorizationDenied) => (Self::Locked, None),

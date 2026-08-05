@@ -20,7 +20,10 @@ pub enum ResetTarget {
     /// Every EVSE on the charge point.
     ChargePoint,
     /// Just this one EVSE.
-    Evse { evse_id: usize },
+    Evse {
+        /// The targeted EVSE's index.
+        evse_id: usize,
+    },
 }
 
 /// A `Reset` request recorded against [`ChargePointState`](crate::state::ChargePointState) while
@@ -35,6 +38,9 @@ pub enum ResetTarget {
 /// - this crate does not queue reset requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingReset {
+    /// The scope this reset applies to.
     pub target: ResetTarget,
+    /// Whether to interrupt anything in progress right away, or wait for `target` to go idle
+    /// first.
     pub kind: ResetKind,
 }

@@ -2,6 +2,7 @@ mod authorization_status;
 mod charge_point_state;
 mod connector_state;
 mod connector_status;
+mod device_model;
 mod event;
 mod evse_state;
 mod id_token;
@@ -17,6 +18,10 @@ pub use self::authorization_status::AuthorizationStatus;
 pub use self::charge_point_state::{ChargePointState, LifecycleState};
 pub use self::connector_state::ConnectorState;
 pub use self::connector_status::ConnectorStatus;
+pub use self::device_model::{
+    Component, DeviceModel, DeviceModelEvent, Variable, VariableAttribute, VariableAttributeType,
+    VariableCharacteristics, VariableDataType, VariableDefinition, VariableMutability,
+};
 pub use self::event::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent,
     ConnectorStatusChanged, EvseEvent, HardwareCommand, TransactionEventKind,

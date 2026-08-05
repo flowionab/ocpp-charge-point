@@ -3,18 +3,23 @@ use alloc::vec::Vec;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, EvseEvent, EvseState, HardwareCommand, LocalAuthorizationList,
-    MeterSample, PendingReset, RegistrationStatus, ResetKind, ResetTarget, StopReason,
-    Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
-    TransactionId, TransactionUpdateReason,
+    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
+    IdToken, LocalAuthorizationList, MeterSample, PendingReset, RegistrationStatus, ResetKind,
+    ResetTarget, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason,
 };
 
+/// The protocol-version-independent internal state of the whole charge point: its lifecycle,
+/// registration with the CSMS, and every EVSE it owns. The single source of truth
+/// [`crate::actor::ChargePointActor`] owns and mutates via [`ChargePointState::apply`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChargePointState {
+    /// The charge point's own lifecycle state, independent of any individual EVSE/connector.
     pub lifecycle: LifecycleState,
     /// The CSMS's most recent BootNotification decision. `None` until the first
     /// BootNotification response arrives.
     pub registration: Option<RegistrationStatus>,
+    /// This charge point's EVSEs, indexed by `evse_id` as used throughout this crate and OCPP.
     pub evses: Vec<EvseState>,
     /// The id to assign to the next transaction that starts, incremented every time one does.
     pub next_transaction_id: u64,
@@ -24,17 +29,30 @@ pub struct ChargePointState {
     /// A CSMS-initiated `Reset` request waiting for its target to settle before rebooting. See
     /// `docs/ROADMAP.md` §2.
     pub pending_reset: Option<PendingReset>,
+    /// The Component/Variable device model (OCPP `GetVariables`/`SetVariables`). See
+    /// `docs/ROADMAP.md` §2 and `crate::device_model`.
+    pub device_model: DeviceModel,
 }
 
+/// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleState {
+    /// The charge point is starting up; no BootNotification response has been accepted yet.
     Booting,
+    /// The charge point is available for use.
     Available,
+    /// The charge point has been made unavailable (OCPP `ChangeAvailability`), or a
+    /// charge-point-wide hardware fault has cleared and is awaiting an explicit
+    /// `SetAvailable`/registration to resume.
     Unavailable,
+    /// A charge-point-wide hardware fault is active.
     Faulted,
 }
 
 impl ChargePointState {
+    /// Creates a fresh charge point with one EVSE per entry in `connector_counts` (each value is
+    /// that EVSE's connector count), starting in [`LifecycleState::Booting`] with no
+    /// registration, no transactions, and an empty local authorization list.
     pub fn new(connector_counts: impl IntoIterator<Item = usize>) -> Self {
         Self {
             lifecycle: LifecycleState::Booting,
@@ -43,20 +61,36 @@ impl ChargePointState {
             next_transaction_id: 0,
             local_authorization_list: LocalAuthorizationList::new(),
             pending_reset: None,
+            device_model: DeviceModel::new(),
         }
     }
 
+    /// Applies `event` to this charge point's state machine, mutating it in place and returning
+    /// the [`ChargePointEffect`]s that resulted (in order; a leading `StateChanged` first if
+    /// anything actually changed). Unrecognized event/state combinations (e.g. an event
+    /// addressing an EVSE/connector index that doesn't exist, or one that doesn't apply to the
+    /// current state) are no-ops that return no effects, rather than an error - this crate's
+    /// state machines are designed to tolerate being handed events that don't currently apply.
     pub fn apply(&mut self, event: ChargePointEvent) -> Vec<ChargePointEffect> {
         let mut effects = Vec::new();
         let changed = match event {
             ChargePointEvent::BootCompleted | ChargePointEvent::SetAvailable => {
                 set_if_changed(&mut self.lifecycle, LifecycleState::Available)
             }
-            ChargePointEvent::SetUnavailable | ChargePointEvent::FaultCleared => {
+            ChargePointEvent::SetUnavailable => {
                 set_if_changed(&mut self.lifecycle, LifecycleState::Unavailable)
             }
+            ChargePointEvent::FaultCleared => {
+                let lifecycle_changed =
+                    set_if_changed(&mut self.lifecycle, LifecycleState::Unavailable);
+                let cascade_changed = self.cascade_charge_point_fault(false, &mut effects);
+                lifecycle_changed || cascade_changed
+            }
             ChargePointEvent::HardwareFault => {
-                set_if_changed(&mut self.lifecycle, LifecycleState::Faulted)
+                let lifecycle_changed =
+                    set_if_changed(&mut self.lifecycle, LifecycleState::Faulted);
+                let cascade_changed = self.cascade_charge_point_fault(true, &mut effects);
+                lifecycle_changed || cascade_changed
             }
             ChargePointEvent::RegistrationStatusReceived(status) => {
                 let registration_changed = set_if_changed(&mut self.registration, Some(status));
@@ -91,11 +125,34 @@ impl ChargePointState {
                 }
                 true
             }
+            ChargePointEvent::DeviceModel(event) => match event {
+                DeviceModelEvent::VariableRegistered {
+                    component,
+                    variable,
+                    characteristics,
+                    attributes,
+                } => {
+                    self.device_model
+                        .register(component, variable, characteristics, attributes);
+                    true
+                }
+                DeviceModelEvent::AttributeValueSet {
+                    component,
+                    variable,
+                    attribute_type,
+                    value,
+                } => {
+                    self.device_model
+                        .set_attribute_value(&component, &variable, attribute_type, value)
+                }
+            },
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
                     connector_id,
                     event,
                 } => self.apply_connector_event(evse_id, connector_id, event, &mut effects),
+                EvseEvent::FaultDetected => self.cascade_evse_fault(evse_id, true, &mut effects),
+                EvseEvent::FaultCleared => self.cascade_evse_fault(evse_id, false, &mut effects),
                 _ => self
                     .evses
                     .get_mut(evse_id)
@@ -113,9 +170,11 @@ impl ChargePointState {
     /// Applies a [`ConnectorEvent`] to one `(evse_id, connector_id)`, pushing every resulting
     /// effect onto `effects` and returning whether anything actually changed. Shared by the
     /// normal per-connector event path (`ChargePointEvent::Evse { event: EvseEvent::Connector {
-    /// .. }, .. }`) and by an `Immediate` `Reset`'s fan-out to every connector in its target
-    /// scope (see `ChargePointEvent::ResetRequested`) - both need the exact same
-    /// transition/hardware-command/status/transaction bookkeeping.
+    /// .. }, .. }`), by an `Immediate` `Reset`'s fan-out to every connector in its target scope
+    /// (see `ChargePointEvent::ResetRequested`), and by fault cascading (below) - so a cascaded
+    /// `FaultDetected`/`FaultCleared` produces exactly the same effects a single-connector fault
+    /// would. All three need the exact same transition/hardware-command/status/transaction
+    /// bookkeeping.
     fn apply_connector_event(
         &mut self,
         evse_id: usize,
@@ -129,7 +188,6 @@ impl ChargePointState {
         let Some(connector) = evse.connectors.get_mut(connector_id) else {
             return false;
         };
-        let previous_status = connector.availability_status();
         let previous_state = *connector;
         let stop_reason = match &event {
             ConnectorEvent::ChargingStopped(reason) => Some(*reason),
@@ -138,6 +196,11 @@ impl ChargePointState {
         };
         let presented_id_token = match &event {
             ConnectorEvent::IdTokenPresented(id_token) => Some(id_token.clone()),
+            _ => None,
+        };
+        let authorized_id_token = match &event {
+            ConnectorEvent::ChargingAuthorized(id_token)
+            | ConnectorEvent::RemoteStartRequested(id_token) => Some(id_token.clone()),
             _ => None,
         };
         let meter_sample = match &event {
@@ -181,13 +244,22 @@ impl ChargePointState {
                 },
             }));
         }
-        let status = new_state.availability_status();
-        if status != previous_status {
+        // Fires on every actual `ConnectorState` transition, not just ones that cross a coarse
+        // `ConnectorStatus` boundary - so a version adapter with a richer wire status than
+        // `ConnectorStatus` (see `ConnectorStatusChanged::connector_state`'s docs) sees every
+        // transition it might need to report, not only the ones 2.x's coarser status cares
+        // about. Versions whose own status is no richer than `ConnectorStatus` (2.1, 2.0.1) now
+        // receive more calls than before for transitions that don't change their own wire status
+        // (e.g. `Locked` -> `Authorizing`, both `Occupied`) - those adapters are expected to
+        // dedup on `status` themselves if that redundancy matters to them; nothing in this crate
+        // currently needs them to.
+        if transition.changed {
             effects.push(ChargePointEffect::StatusNotification(
                 ConnectorStatusChanged {
                     evse_id,
                     connector_id,
-                    status,
+                    status: new_state.availability_status(),
+                    connector_state: new_state,
                 },
             ));
         }
@@ -209,9 +281,10 @@ impl ChargePointState {
                 previous_state,
                 new_state,
                 stop_reason,
+                authorized_id_token,
             ) {
-                // A new transaction must not inherit a previous one's running cost, and an
-                // ended transaction's cost is no longer meaningful.
+                // A new transaction must not inherit a previous one's running cost, and an ended
+                // transaction's cost is no longer meaningful.
                 if matches!(
                     kind,
                     TransactionEventKind::Started | TransactionEventKind::Ended
@@ -336,18 +409,76 @@ impl ChargePointState {
             }));
         }
     }
+
+    /// Cascades a hardware fault (`detected = true`) or its clearing (`detected = false`) from
+    /// one EVSE down to every connector it owns, via the same `apply_connector_event` path a
+    /// direct connector-level fault takes - so e.g. a shared-power-source failure forces every
+    /// connector on that EVSE into `Faulted` and opens its contactor (fail-safe, per
+    /// `CLAUDE.md`), and clearing it only recovers connectors whose contactor has actually
+    /// confirmed open (`FaultedSafe`); others stay `Faulted` since `ConnectorState::apply`
+    /// no-ops a `FaultCleared` it isn't ready for.
+    fn cascade_evse_fault(
+        &mut self,
+        evse_id: usize,
+        detected: bool,
+        effects: &mut Vec<ChargePointEffect>,
+    ) -> bool {
+        let evse_event = if detected {
+            EvseEvent::FaultDetected
+        } else {
+            EvseEvent::FaultCleared
+        };
+        let status_changed = self
+            .evses
+            .get_mut(evse_id)
+            .is_some_and(|evse| evse.apply(evse_event));
+        let connector_count = self
+            .evses
+            .get(evse_id)
+            .map_or(0, |evse| evse.connectors.len());
+        let mut connectors_changed = false;
+        for connector_id in 0..connector_count {
+            let connector_event = if detected {
+                ConnectorEvent::FaultDetected
+            } else {
+                ConnectorEvent::FaultCleared
+            };
+            connectors_changed |=
+                self.apply_connector_event(evse_id, connector_id, connector_event, effects);
+        }
+        status_changed || connectors_changed
+    }
+
+    /// Cascades a charge-point-wide hardware fault (or its clearing) to every EVSE - and, via
+    /// `cascade_evse_fault`, every connector on each of them. See `docs/ROADMAP.md` §0's
+    /// "erratic-hardware fault containment" item: a top-level fault must drive the whole charge
+    /// point fail-safe, not just flip `LifecycleState`.
+    fn cascade_charge_point_fault(
+        &mut self,
+        detected: bool,
+        effects: &mut Vec<ChargePointEffect>,
+    ) -> bool {
+        let mut changed = false;
+        for evse_id in 0..self.evses.len() {
+            changed |= self.cascade_evse_fault(evse_id, detected, effects);
+        }
+        changed
+    }
 }
 
 /// Advances a connector's transaction alongside its `previous_state` -> `new_state` transition,
 /// returning the TransactionEvent to report, if any. `event_stop_reason` is the `StopReason`
 /// carried by the triggering `ConnectorEvent::ChargingStopped`/`ConnectorEvent::ResetRequested`,
-/// if that's what caused this transition.
+/// if that's what caused this transition. `event_id_token` is the identifier carried by a
+/// triggering `ChargingAuthorized`/`RemoteStartRequested`, if that's what caused this transition
+/// - recorded on the new `Transaction`.
 fn advance_transaction(
     slot: &mut Option<Transaction>,
     next_transaction_id: &mut u64,
     previous_state: ConnectorState,
     new_state: ConnectorState,
     event_stop_reason: Option<StopReason>,
+    event_id_token: Option<IdToken>,
 ) -> Option<(TransactionEventKind, Transaction)> {
     match (previous_state, new_state) {
         // Reached from `Authorizing` (a physically presented id token was authorized) or
@@ -360,12 +491,13 @@ fn advance_transaction(
             *next_transaction_id += 1;
             let transaction = Transaction {
                 id,
+                id_token: event_id_token,
                 charging_state: TransactionChargingState::EvConnected,
                 stop_reason: None,
                 seq_no: 0,
                 last_meter_sample: None,
             };
-            *slot = Some(transaction);
+            *slot = Some(transaction.clone());
             Some((TransactionEventKind::Started, transaction))
         }
         (ConnectorState::Starting, ConnectorState::Charging) => {
@@ -374,7 +506,7 @@ fn advance_transaction(
             transaction.seq_no += 1;
             Some((
                 TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged),
-                *transaction,
+                transaction.clone(),
             ))
         }
         // Normally reached only from `Charging` (`ChargingStopped`). A CSMS-initiated `Reset`
@@ -416,7 +548,7 @@ fn apply_meter_sample(
     transaction.seq_no += 1;
     Some((
         TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic),
-        *transaction,
+        transaction.clone(),
     ))
 }
 
@@ -432,7 +564,9 @@ fn set_if_changed<T: PartialEq>(current: &mut T, next: T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ChargePointEffect, IdToken, IdTokenKind, TransactionUpdateReason};
+    use crate::state::{
+        ChargePointEffect, EvseStatus, IdToken, IdTokenKind, TransactionUpdateReason,
+    };
 
     #[test]
     fn accepted_registration_records_status_and_makes_the_charge_point_available() {
@@ -503,12 +637,13 @@ mod tests {
                 evse_id: 0,
                 connector_id: 0,
                 status: crate::state::ConnectorStatus::Occupied,
+                connector_state: ConnectorState::Connected,
             }
         )));
     }
 
     #[test]
-    fn an_internal_transition_that_keeps_the_same_ocpp_status_reports_no_status_notification() {
+    fn an_internal_transition_that_keeps_the_same_ocpp_status_still_reports_the_richer_connector_state() {
         let mut state = ChargePointState::new([1]);
         state.apply(ChargePointEvent::Evse {
             evse_id: 0,
@@ -526,9 +661,18 @@ mod tests {
             },
         });
 
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, ChargePointEffect::StatusNotification(_))));
+        // `Connected` -> `Locked` doesn't cross a coarse `ConnectorStatus` boundary (both
+        // `Occupied`), but it's still a real `ConnectorState` transition - a version adapter
+        // with a richer wire status than `ConnectorStatus` (see `docs/ROADMAP.md` §0's
+        // `Ocpp1_6StatusNotifier`) needs to see it even though `status` itself doesn't change.
+        assert!(effects.contains(&ChargePointEffect::StatusNotification(
+            ConnectorStatusChanged {
+                evse_id: 0,
+                connector_id: 0,
+                status: crate::state::ConnectorStatus::Occupied,
+                connector_state: ConnectorState::Locked,
+            }
+        )));
     }
 
     fn apply_connector_event(
@@ -585,12 +729,14 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::CableConnected);
         apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
 
-        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested);
+        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested(test_id_token()));
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, ChargePointEffect::AuthorizationRequested(_))));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::AuthorizationRequested(_)))
+        );
         assert!(effects.contains(&ChargePointEffect::HardwareCommand(
             HardwareCommand::CloseContactor {
                 evse_id: 0,
@@ -599,12 +745,13 @@ mod tests {
         )));
         let expected_transaction = Transaction {
             id: TransactionId(0),
+            id_token: Some(test_id_token()),
             charging_state: TransactionChargingState::EvConnected,
             stop_reason: None,
             seq_no: 0,
             last_meter_sample: None,
         };
-        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
+        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction.clone()));
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
             TransactionEventOccurred {
                 evse_id: 0,
@@ -619,7 +766,7 @@ mod tests {
     fn a_remote_start_request_is_ignored_outside_the_locked_state() {
         let mut state = ChargePointState::new([1]);
 
-        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested);
+        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested(test_id_token()));
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
         assert!(effects.is_empty());
@@ -679,9 +826,11 @@ mod tests {
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Locked);
         assert_eq!(state.evses[0].transactions[0], None);
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_))));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
     }
 
     #[test]
@@ -689,16 +838,17 @@ mod tests {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
 
-        let effects = apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
 
         let expected_transaction = Transaction {
             id: TransactionId(0),
+            id_token: Some(test_id_token()),
             charging_state: TransactionChargingState::EvConnected,
             stop_reason: None,
             seq_no: 0,
             last_meter_sample: None,
         };
-        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
+        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction.clone()));
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
             TransactionEventOccurred {
                 evse_id: 0,
@@ -713,18 +863,19 @@ mod tests {
     fn the_contactor_closing_updates_the_transaction_to_charging() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
 
         let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
         let expected_transaction = Transaction {
             id: TransactionId(0),
+            id_token: Some(test_id_token()),
             charging_state: TransactionChargingState::Charging,
             stop_reason: None,
             seq_no: 1,
             last_meter_sample: None,
         };
-        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
+        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction.clone()));
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
             TransactionEventOccurred {
                 evse_id: 0,
@@ -739,7 +890,7 @@ mod tests {
     fn a_meter_reading_while_charging_updates_the_transaction_and_is_reported() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
         let sample = MeterSample {
@@ -750,12 +901,13 @@ mod tests {
 
         let expected_transaction = Transaction {
             id: TransactionId(0),
+            id_token: Some(test_id_token()),
             charging_state: TransactionChargingState::Charging,
             stop_reason: None,
             seq_no: 2,
             last_meter_sample: Some(sample),
         };
-        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction));
+        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction.clone()));
         // A meter reading never changes the connector's physical state.
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
@@ -772,7 +924,7 @@ mod tests {
     fn a_meter_reading_while_not_charging_is_ignored() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
         // Still `Starting` (EvConnected) here, not yet `Charging`.
 
         let sample = MeterSample {
@@ -782,12 +934,16 @@ mod tests {
         let effects = apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample));
 
         assert_eq!(
-            state.evses[0].transactions[0].map(|transaction| transaction.last_meter_sample),
+            state.evses[0].transactions[0]
+                .as_ref()
+                .map(|transaction| transaction.last_meter_sample),
             Some(None)
         );
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_))));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
     }
 
     #[test]
@@ -809,7 +965,7 @@ mod tests {
     fn stopping_charging_ends_the_transaction_once_the_contactor_confirms_open() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
         let stop_effects = apply_connector_event(
@@ -828,6 +984,7 @@ mod tests {
 
         let expected_transaction = Transaction {
             id: TransactionId(0),
+            id_token: Some(test_id_token()),
             charging_state: TransactionChargingState::EvConnected,
             stop_reason: Some(StopReason::Local),
             seq_no: 2,
@@ -849,13 +1006,14 @@ mod tests {
     fn a_hardware_fault_during_charging_immediately_ends_the_transaction() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
         let effects = apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
 
         let expected_transaction = Transaction {
             id: TransactionId(0),
+            id_token: Some(test_id_token()),
             charging_state: TransactionChargingState::Charging,
             stop_reason: Some(StopReason::EmergencyStop),
             seq_no: 2,
@@ -878,9 +1036,147 @@ mod tests {
 
         let effects = apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
 
-        assert!(!effects
-            .iter()
-            .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_))));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
+    }
+
+    #[test]
+    fn an_evse_fault_forces_every_connector_under_it_into_a_faulted_safe_state() {
+        let mut state = ChargePointState::new([3]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+
+        let effects = state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::FaultDetected,
+        });
+
+        assert_eq!(state.evses[0].status, EvseStatus::Faulted);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Faulted);
+        assert_eq!(state.evses[0].connectors[1], ConnectorState::Faulted);
+        assert_eq!(state.evses[0].connectors[2], ConnectorState::Faulted);
+        for connector_id in 0..3 {
+            assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+                HardwareCommand::OpenContactor {
+                    evse_id: 0,
+                    connector_id,
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn an_evse_fault_ends_active_transactions_on_every_connector_it_covers() {
+        let mut state = ChargePointState::new([2]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        assert!(state.evses[0].transactions[0].is_some());
+
+        let effects = state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::FaultDetected,
+        });
+
+        assert_eq!(state.evses[0].transactions[0], None);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ChargePointEffect::TransactionEvent(TransactionEventOccurred {
+                kind: TransactionEventKind::Ended,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn an_evse_fault_clearing_only_recovers_connectors_that_confirmed_their_contactor_is_open() {
+        let mut state = ChargePointState::new([2]);
+        state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::FaultDetected,
+        });
+        // Only connector 0's contactor has actually confirmed open; connector 1's hasn't.
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+
+        let effects = state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::FaultCleared,
+        });
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Unlocking);
+        assert_eq!(state.evses[0].connectors[1], ConnectorState::Faulted);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::UnlockConnector {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            ChargePointEffect::HardwareCommand(HardwareCommand::UnlockConnector {
+                connector_id: 1,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn a_charge_point_wide_hardware_fault_cascades_to_every_evse_and_connector() {
+        let mut state = ChargePointState::new([1, 1]);
+
+        let effects = state.apply(ChargePointEvent::HardwareFault);
+
+        assert_eq!(state.lifecycle, LifecycleState::Faulted);
+        assert_eq!(state.evses[0].status, EvseStatus::Faulted);
+        assert_eq!(state.evses[1].status, EvseStatus::Faulted);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Faulted);
+        assert_eq!(state.evses[1].connectors[0], ConnectorState::Faulted);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::OpenContactor {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::OpenContactor {
+                evse_id: 1,
+                connector_id: 0,
+            }
+        )));
+    }
+
+    #[test]
+    fn a_charge_point_wide_fault_cleared_recovers_evses_whose_contactors_confirmed_open() {
+        let mut state = ChargePointState::new([1, 1]);
+        state.apply(ChargePointEvent::HardwareFault);
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        state.apply(ChargePointEvent::Evse {
+            evse_id: 1,
+            event: EvseEvent::Connector {
+                connector_id: 0,
+                event: ConnectorEvent::ContactorOpened,
+            },
+        });
+
+        let effects = state.apply(ChargePointEvent::FaultCleared);
+
+        assert_eq!(state.lifecycle, LifecycleState::Unavailable);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Unlocking);
+        assert_eq!(state.evses[1].connectors[0], ConnectorState::Unlocking);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::UnlockConnector {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::UnlockConnector {
+                evse_id: 1,
+                connector_id: 0,
+            }
+        )));
     }
 
     fn reservation(id: i64) -> crate::state::Reservation {
@@ -903,6 +1199,7 @@ mod tests {
                 evse_id: 0,
                 connector_id: 0,
                 status: crate::state::ConnectorStatus::Reserved,
+                connector_state: ConnectorState::Reserved,
             }
         )));
     }
@@ -933,6 +1230,7 @@ mod tests {
                 evse_id: 0,
                 connector_id: 0,
                 status: crate::state::ConnectorStatus::Available,
+                connector_state: ConnectorState::Available,
             }
         )));
     }
@@ -967,6 +1265,111 @@ mod tests {
     }
 
     #[test]
+    fn registering_a_device_model_variable_adds_it_and_reports_a_change() {
+        let mut state = ChargePointState::new([1]);
+        let component = crate::state::Component {
+            name: "Custom".into(),
+            instance: None,
+            evse: None,
+        };
+        let variable = crate::state::Variable {
+            name: "Setting".into(),
+            instance: None,
+        };
+
+        let effects = state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::VariableRegistered {
+                component: component.clone(),
+                variable: variable.clone(),
+                characteristics: crate::state::VariableCharacteristics {
+                    data_type: crate::state::VariableDataType::String,
+                    unit: None,
+                    min_limit: None,
+                    max_limit: None,
+                    values_list: None,
+                    supports_monitoring: false,
+                },
+                attributes: alloc::vec![crate::state::VariableAttribute {
+                    attribute_type: crate::state::VariableAttributeType::Actual,
+                    value: "hello".into(),
+                    mutability: crate::state::VariableMutability::ReadWrite,
+                    persistent: false,
+                    constant: false,
+                    requires_reboot: false,
+                }],
+            },
+        ));
+
+        assert!(state.device_model.has_component(&component));
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn setting_a_device_model_attribute_value_updates_it_and_reports_a_change() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::AttributeValueSet {
+                component: crate::state::Component {
+                    name: "OCPPCommCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: "HeartbeatInterval".into(),
+                    instance: None,
+                },
+                attribute_type: crate::state::VariableAttributeType::Actual,
+                value: "120".into(),
+            },
+        ));
+
+        let value = state
+            .device_model
+            .get(
+                &crate::state::Component {
+                    name: "OCPPCommCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                &crate::state::Variable {
+                    name: "HeartbeatInterval".into(),
+                    instance: None,
+                },
+            )
+            .unwrap()
+            .attribute(crate::state::VariableAttributeType::Actual)
+            .unwrap()
+            .value
+            .clone();
+        assert_eq!(value, "120");
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn setting_an_unregistered_device_model_attribute_is_a_no_op() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::AttributeValueSet {
+                component: crate::state::Component {
+                    name: "Nonexistent".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: "X".into(),
+                    instance: None,
+                },
+                attribute_type: crate::state::VariableAttributeType::Actual,
+                value: "1".into(),
+            },
+        ));
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
     fn a_security_event_is_reported_without_changing_state() {
         let mut state = ChargePointState::new([1]);
         let event = crate::state::SecurityEvent {
@@ -986,7 +1389,7 @@ mod tests {
     fn a_cost_update_is_recorded_while_a_transaction_is_active() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
 
         apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
 
@@ -1006,7 +1409,7 @@ mod tests {
     fn a_new_transaction_does_not_inherit_the_previous_ones_cost() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
         apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
         apply_connector_event(
@@ -1019,7 +1422,7 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
         apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
 
         assert_eq!(state.evses[0].running_costs[0], None);
     }
@@ -1028,7 +1431,7 @@ mod tests {
     fn transaction_ids_increment_across_separate_sessions() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
         apply_connector_event(
             &mut state,
@@ -1039,10 +1442,12 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
 
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
 
         assert_eq!(
-            state.evses[0].transactions[0].map(|transaction| transaction.id),
+            state.evses[0].transactions[0]
+                .as_ref()
+                .map(|transaction| transaction.id),
             Some(TransactionId(1))
         );
     }

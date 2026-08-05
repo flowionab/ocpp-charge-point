@@ -11,12 +11,122 @@ use crate::state::{ChargePointEvent, SecurityEvent, SecurityEventType};
 use crate::sync::{BroadcastReceiver, RecvError};
 use alloc::boxed::Box;
 
+/// The OCPP wire `type` string for `event_type` - the standardized values, or the raw
+/// vendor-specific string for `Other`. Only 2.1 has an adapter to use this today - `ocpp-client`
+/// 0.2.0 doesn't implement `SecurityEventNotification` for 2.0.1 at all (see the `ocpp_2_0_1`
+/// note below) - but it's defined at this module's top level, not inside `ocpp_2_1`, since the
+/// wire shape itself (a free-form string, unlike e.g. `IdToken.type`, which 2.0.1 keeps as a
+/// closed enum) is not actually 2.1-specific, and a 2.0.1 adapter should reuse this the moment
+/// upstream support exists rather than needing its own copy written from scratch.
+#[cfg(feature = "ocpp_2_1")]
+fn wire_type(event_type: &SecurityEventType) -> alloc::string::String {
+    use alloc::string::ToString;
+    match event_type {
+        SecurityEventType::FirmwareUpdated => "FirmwareUpdated".to_string(),
+        SecurityEventType::FailedToAuthenticateAtCsms => "FailedToAuthenticateAtCsms".to_string(),
+        SecurityEventType::CsmsFailedToAuthenticate => "CSMSFailedToAuthenticate".to_string(),
+        SecurityEventType::SettingSystemTime => "SettingSystemTime".to_string(),
+        SecurityEventType::StartupOfTheDevice => "StartupOfTheDevice".to_string(),
+        SecurityEventType::ResetOrReboot => "ResetOrReboot".to_string(),
+        SecurityEventType::SecurityLogWasCleared => "SecurityLogWasCleared".to_string(),
+        SecurityEventType::ReconfigurationOfSecurityParameters => {
+            "ReconfigurationOfSecurityParameters".to_string()
+        }
+        SecurityEventType::MemoryExhaustion => "MemoryExhaustion".to_string(),
+        SecurityEventType::InvalidMessages => "InvalidMessages".to_string(),
+        SecurityEventType::AttemptedReplayAttacks => "AttemptedReplayAttacks".to_string(),
+        SecurityEventType::TamperDetectionActivated => "TamperDetectionActivated".to_string(),
+        SecurityEventType::InvalidFirmwareSignature => "InvalidFirmwareSignature".to_string(),
+        SecurityEventType::InvalidFirmwareSigningCertificate => {
+            "InvalidFirmwareSigningCertificate".to_string()
+        }
+        SecurityEventType::InvalidCsmsCertificate => "InvalidCSMSCertificate".to_string(),
+        SecurityEventType::InvalidChargingStationCertificate => {
+            "InvalidChargingStationCertificate".to_string()
+        }
+        SecurityEventType::InvalidTlsVersion => "InvalidTLSVersion".to_string(),
+        SecurityEventType::InvalidTlsCipherSuite => "InvalidTLSCipherSuite".to_string(),
+        SecurityEventType::Other(value) => value.clone(),
+    }
+}
+
+#[cfg(all(test, feature = "ocpp_2_1"))]
+mod wire_type_tests {
+    use super::wire_type;
+    use crate::state::SecurityEventType;
+
+    #[test]
+    fn every_standardized_value_maps_to_its_wire_type_string() {
+        assert_eq!(
+            wire_type(&SecurityEventType::FirmwareUpdated),
+            "FirmwareUpdated"
+        );
+        assert_eq!(
+            wire_type(&SecurityEventType::FailedToAuthenticateAtCsms),
+            "FailedToAuthenticateAtCsms"
+        );
+        assert_eq!(
+            wire_type(&SecurityEventType::CsmsFailedToAuthenticate),
+            "CSMSFailedToAuthenticate"
+        );
+        assert_eq!(
+            wire_type(&SecurityEventType::TamperDetectionActivated),
+            "TamperDetectionActivated"
+        );
+        assert_eq!(
+            wire_type(&SecurityEventType::InvalidCsmsCertificate),
+            "InvalidCSMSCertificate"
+        );
+        assert_eq!(
+            wire_type(&SecurityEventType::InvalidTlsVersion),
+            "InvalidTLSVersion"
+        );
+    }
+
+    #[test]
+    fn other_carries_its_raw_string_through() {
+        assert_eq!(
+            wire_type(&SecurityEventType::Other("VendorSpecificThing".into())),
+            "VendorSpecificThing"
+        );
+    }
+
+    #[test]
+    fn every_standardized_value_fits_the_fifty_byte_wire_bound() {
+        let all = [
+            SecurityEventType::FirmwareUpdated,
+            SecurityEventType::FailedToAuthenticateAtCsms,
+            SecurityEventType::CsmsFailedToAuthenticate,
+            SecurityEventType::SettingSystemTime,
+            SecurityEventType::StartupOfTheDevice,
+            SecurityEventType::ResetOrReboot,
+            SecurityEventType::SecurityLogWasCleared,
+            SecurityEventType::ReconfigurationOfSecurityParameters,
+            SecurityEventType::MemoryExhaustion,
+            SecurityEventType::InvalidMessages,
+            SecurityEventType::AttemptedReplayAttacks,
+            SecurityEventType::TamperDetectionActivated,
+            SecurityEventType::InvalidFirmwareSignature,
+            SecurityEventType::InvalidFirmwareSigningCertificate,
+            SecurityEventType::InvalidCsmsCertificate,
+            SecurityEventType::InvalidChargingStationCertificate,
+            SecurityEventType::InvalidTlsVersion,
+            SecurityEventType::InvalidTlsCipherSuite,
+        ];
+        for event_type in all {
+            assert!(wire_type(&event_type).len() <= 50);
+        }
+    }
+}
+
 /// Reports a security event to the CSMS via SecurityEventNotification. Implemented per protocol
 /// version (see the `ocpp_2_1` module), mirroring [`crate::availability::StatusNotifier`].
 #[async_trait::async_trait]
 pub trait SecurityEventNotifier {
+    /// The error type returned if the SecurityEventNotification request itself fails.
     type Error: core::error::Error + Send + Sync + 'static;
 
+    /// Reports `event_type` (with optional `tech_info`) to the CSMS.
     async fn notify_security_event(
         &self,
         event_type: &SecurityEventType,
@@ -36,7 +146,10 @@ pub async fn report_security_event(actor: &ChargePointActor, event: SecurityEven
 
 /// Forwards every security event received on `events` to the CSMS via `notifier`, forever.
 /// Errors are logged and do not stop the loop - the actor already recorded the event; only the
-/// CSMS-facing report failed.
+/// CSMS-facing report failed and is not retried. [`setup`](crate::setup) uses
+/// [`crate::offline_queue::run_with_offline_queue`] instead, which queues and retries a failed
+/// report rather than just logging it; this simpler fire-and-forget version remains for callers
+/// who don't need retry.
 pub async fn run_security_events<N: SecurityEventNotifier>(
     mut events: BroadcastReceiver<SecurityEvent>,
     notifier: &N,
@@ -152,56 +265,19 @@ mod report_tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    use crate::state::SecurityEventType;
-    use alloc::string::{String, ToString};
-
-    /// The OCPP wire `type` string for `event_type` - the standardized values, or the raw
-    /// vendor-specific string for `Other`.
-    pub(super) fn wire_type(event_type: &SecurityEventType) -> String {
-        match event_type {
-            SecurityEventType::FirmwareUpdated => "FirmwareUpdated".to_string(),
-            SecurityEventType::FailedToAuthenticateAtCsms => {
-                "FailedToAuthenticateAtCsms".to_string()
-            }
-            SecurityEventType::CsmsFailedToAuthenticate => "CSMSFailedToAuthenticate".to_string(),
-            SecurityEventType::SettingSystemTime => "SettingSystemTime".to_string(),
-            SecurityEventType::StartupOfTheDevice => "StartupOfTheDevice".to_string(),
-            SecurityEventType::ResetOrReboot => "ResetOrReboot".to_string(),
-            SecurityEventType::SecurityLogWasCleared => "SecurityLogWasCleared".to_string(),
-            SecurityEventType::ReconfigurationOfSecurityParameters => {
-                "ReconfigurationOfSecurityParameters".to_string()
-            }
-            SecurityEventType::MemoryExhaustion => "MemoryExhaustion".to_string(),
-            SecurityEventType::InvalidMessages => "InvalidMessages".to_string(),
-            SecurityEventType::AttemptedReplayAttacks => "AttemptedReplayAttacks".to_string(),
-            SecurityEventType::TamperDetectionActivated => "TamperDetectionActivated".to_string(),
-            SecurityEventType::InvalidFirmwareSignature => "InvalidFirmwareSignature".to_string(),
-            SecurityEventType::InvalidFirmwareSigningCertificate => {
-                "InvalidFirmwareSigningCertificate".to_string()
-            }
-            SecurityEventType::InvalidCsmsCertificate => "InvalidCSMSCertificate".to_string(),
-            SecurityEventType::InvalidChargingStationCertificate => {
-                "InvalidChargingStationCertificate".to_string()
-            }
-            SecurityEventType::InvalidTlsVersion => "InvalidTLSVersion".to_string(),
-            SecurityEventType::InvalidTlsCipherSuite => "InvalidTLSCipherSuite".to_string(),
-            SecurityEventType::Other(value) => value.clone(),
-        }
-    }
-
     // `SecurityEventNotificationRequest` needs a timestamp; producing one without a
     // caller-supplied `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so
-    // this impl - unlike `wire_type` above - needs both `ocpp_2_1` and `std`.
+    // this impl needs both `ocpp_2_1` and `std`.
     #[cfg(feature = "std")]
     mod with_system_clock {
-        use super::wire_type;
         use crate::clock::{Clock, SystemClock};
         use crate::security::SecurityEventNotifier;
+        use crate::security::wire_type;
         use crate::state::SecurityEventType;
         use alloc::boxed::Box;
+        use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
         use ocpp_client::ocpp_types::v21::SecurityEventNotificationRequest;
-        use ocpp_client::ClientError;
 
         #[async_trait::async_trait]
         impl SecurityEventNotifier for OCPP2_1Client {
@@ -230,72 +306,14 @@ mod ocpp_2_1 {
             }
         }
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn every_standardized_value_maps_to_its_wire_type_string() {
-            assert_eq!(
-                wire_type(&SecurityEventType::FirmwareUpdated),
-                "FirmwareUpdated"
-            );
-            assert_eq!(
-                wire_type(&SecurityEventType::FailedToAuthenticateAtCsms),
-                "FailedToAuthenticateAtCsms"
-            );
-            assert_eq!(
-                wire_type(&SecurityEventType::CsmsFailedToAuthenticate),
-                "CSMSFailedToAuthenticate"
-            );
-            assert_eq!(
-                wire_type(&SecurityEventType::TamperDetectionActivated),
-                "TamperDetectionActivated"
-            );
-            assert_eq!(
-                wire_type(&SecurityEventType::InvalidCsmsCertificate),
-                "InvalidCSMSCertificate"
-            );
-            assert_eq!(
-                wire_type(&SecurityEventType::InvalidTlsVersion),
-                "InvalidTLSVersion"
-            );
-        }
-
-        #[test]
-        fn other_carries_its_raw_string_through() {
-            assert_eq!(
-                wire_type(&SecurityEventType::Other("VendorSpecificThing".into())),
-                "VendorSpecificThing"
-            );
-        }
-
-        #[test]
-        fn every_standardized_value_fits_the_fifty_byte_wire_bound() {
-            let all = [
-                SecurityEventType::FirmwareUpdated,
-                SecurityEventType::FailedToAuthenticateAtCsms,
-                SecurityEventType::CsmsFailedToAuthenticate,
-                SecurityEventType::SettingSystemTime,
-                SecurityEventType::StartupOfTheDevice,
-                SecurityEventType::ResetOrReboot,
-                SecurityEventType::SecurityLogWasCleared,
-                SecurityEventType::ReconfigurationOfSecurityParameters,
-                SecurityEventType::MemoryExhaustion,
-                SecurityEventType::InvalidMessages,
-                SecurityEventType::AttemptedReplayAttacks,
-                SecurityEventType::TamperDetectionActivated,
-                SecurityEventType::InvalidFirmwareSignature,
-                SecurityEventType::InvalidFirmwareSigningCertificate,
-                SecurityEventType::InvalidCsmsCertificate,
-                SecurityEventType::InvalidChargingStationCertificate,
-                SecurityEventType::InvalidTlsVersion,
-                SecurityEventType::InvalidTlsCipherSuite,
-            ];
-            for event_type in all {
-                assert!(wire_type(&event_type).len() <= 50);
-            }
-        }
-    }
 }
+
+// No `ocpp_2_0_1` module here (unlike every other functional block ported to 2.0.1 so far):
+// `ocpp-client` 0.2.0 simply doesn't implement `SecurityEventNotification` for
+// `OCPP2_0_1Client` at all - verified directly against the pinned dependency (grepped its full
+// `ocpp_2_0_1::actions` list: 66 actions covering every other 2.0.1 message including all of
+// Provisioning/Availability/Transactions/Remote control/Reservation/Local auth list, but no
+// `SecurityEventNotification`), not assumed from the absence of a `send_security_event_
+// notification` method alone. This is a real upstream gap this crate can't work around per
+// `CLAUDE.md`'s "delegate wire-protocol concerns to `ocpp-client`" - there is no `Action` type or
+// `send_*`/`on_*` method to call. See `docs/ROADMAP.md` §1.

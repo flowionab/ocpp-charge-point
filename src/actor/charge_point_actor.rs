@@ -16,11 +16,21 @@ enum Command {
     },
 }
 
+/// An error sending an event to a [`ChargePointActor`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorError {
+    /// The actor's run loop is no longer receiving events. Not expected in normal operation -
+    /// the actor lives for the process lifetime in practice - but callers should not treat it as
+    /// fatal; see [`crate::hardware::HardwareEventSender::send`].
     Stopped,
 }
 
+/// A cloneable handle onto the charge point's actor: the single owner of
+/// [`ChargePointState`], serializing every [`ChargePointEvent`] applied to it and publishing the
+/// resulting state and effects (hardware commands, status notifications, transaction events,
+/// authorization requests, security events) to subscribers. Every functional block in this crate
+/// is wired to the charge point through one of these handles rather than touching state
+/// directly.
 #[derive(Clone)]
 pub struct ChargePointActor {
     mailbox: Chan<Command>,
@@ -33,6 +43,11 @@ pub struct ChargePointActor {
 }
 
 impl ChargePointActor {
+    /// Creates a fresh [`ChargePointState`] with one EVSE per entry in `connector_counts` (each
+    /// value is that EVSE's connector count), and spawns its run loop via `executor`. The
+    /// returned handle is ready to use immediately - `spawn` does not wait for any state
+    /// transition, since a new charge point starts in [`crate::state::LifecycleState::Booting`]
+    /// with no transitions pending.
     pub fn spawn(
         connector_counts: impl IntoIterator<Item = usize>,
         executor: &dyn Executor,
@@ -67,6 +82,13 @@ impl ChargePointActor {
         }
     }
 
+    /// Feeds `event` into the charge point's state machine and waits for it to be fully applied
+    /// (state updated and every resulting effect published to subscribers) before returning.
+    /// Events from every sender are applied one at a time, in the order `send` is called, so
+    /// callers never observe a torn or partially-applied state.
+    ///
+    /// `Err(ActorError::Stopped)` is not expected in normal operation - see [`ActorError`] -
+    /// but callers should not treat it as fatal.
     pub async fn send(&self, event: ChargePointEvent) -> Result<(), ActorError> {
         let acknowledged = OneShot::new();
         self.mailbox.send(Command::Event {
@@ -77,30 +99,50 @@ impl ChargePointActor {
         Ok(())
     }
 
+    /// A snapshot of the charge point's current state. Cheap to call repeatedly - it reads the
+    /// latest value already published to the underlying watch channel rather than round-tripping
+    /// through the actor.
     pub fn state(&self) -> ChargePointState {
         self.state.borrow()
     }
 
+    /// Subscribes to every future state change. Unlike [`state`](Self::state), the returned
+    /// receiver can be awaited for the *next* change rather than only reading the latest value.
     pub fn subscribe(&self) -> WatchReceiver<ChargePointState> {
         self.state.clone()
     }
 
+    /// Subscribes to every [`HardwareCommand`] the state machine emits (lock/unlock a connector,
+    /// open/close a contactor). A hardware binding drains this via
+    /// [`HardwareCommandReceiver`](crate::hardware::HardwareCommandReceiver) rather than calling
+    /// this directly.
     pub fn subscribe_commands(&self) -> BroadcastReceiver<HardwareCommand> {
         self.commands.subscribe()
     }
 
+    /// Subscribes to every connector status change, reported to the CSMS via StatusNotification
+    /// by the Availability functional block (see [`crate::availability::run_status_notifications`]).
     pub fn subscribe_status_notifications(&self) -> BroadcastReceiver<ConnectorStatusChanged> {
         self.status_notifications.subscribe()
     }
 
+    /// Subscribes to every transaction lifecycle event (started/updated/ended), reported to the
+    /// CSMS via TransactionEvent by the Transactions functional block (see
+    /// [`crate::transactions::run_transaction_events`]).
     pub fn subscribe_transaction_events(&self) -> BroadcastReceiver<TransactionEventOccurred> {
         self.transaction_events.subscribe()
     }
 
+    /// Subscribes to every presented identifier awaiting an authorization decision, asked of the
+    /// CSMS via Authorize by the Authorization functional block (see
+    /// [`crate::authorization::run_authorization_requests`]).
     pub fn subscribe_authorization_requests(&self) -> BroadcastReceiver<AuthorizationRequested> {
         self.authorization_requests.subscribe()
     }
 
+    /// Subscribes to every security-relevant event, reported to the CSMS via
+    /// SecurityEventNotification by the Security functional block (see
+    /// [`crate::security::run_security_events`]).
     pub fn subscribe_security_events(&self) -> BroadcastReceiver<SecurityEvent> {
         self.security_events.subscribe()
     }

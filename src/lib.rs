@@ -1,18 +1,35 @@
+//! Firmware for an EV charge point: charge-point lifecycle and charging-state behaviour,
+//! presented to a central system (CSMS) as an OCPP-capable charge point.
+//!
+//! The primary target is a fully compliant OCPP 2.1 implementation; OCPP 2.0.1 and 1.6J are
+//! supported by projecting the same protocol-version-independent internal state down to each
+//! version's capabilities. Integrators only need to implement the hardware bindings exposed by
+//! [`hardware`] - protocol handling, state machines, transaction lifecycle, and networking are
+//! this crate's own responsibility. See the repository's `CLAUDE.md` for the full architectural
+//! guidance this crate follows.
 #![cfg_attr(not(feature = "std"), no_std)]
+#![warn(missing_docs)]
 
 extern crate alloc;
 
+/// The charge point's actor: owns [`state::ChargePointState`] and serializes every
+/// [`state::ChargePointEvent`] applied to it. See [`actor::ChargePointActor`].
 pub mod actor;
 pub mod authorization;
 pub mod availability;
 pub mod clock;
 #[cfg(all(feature = "std", feature = "websocket", feature = "ocpp_2_1"))]
 mod connect;
+pub mod connection;
 pub mod cost;
 pub mod data_transfer;
+pub mod device_model;
 pub mod executor;
 pub mod hardware;
+#[cfg(feature = "ocpp_1_6")]
+mod id_tag;
 pub mod local_authorization_list;
+pub mod offline_queue;
 pub mod provisioning;
 pub mod remote_control;
 pub mod reservation;
@@ -20,8 +37,12 @@ pub mod reset;
 mod runtime;
 pub mod security;
 mod setup;
+/// The protocol-version-independent internal state model: [`state::ChargePointState`], its
+/// per-EVSE/per-connector state machines, and the events/effects that drive and observe them.
 pub mod state;
 pub mod sync;
+#[cfg(feature = "ocpp_1_6")]
+mod topology;
 pub mod transactions;
 
 #[cfg(all(feature = "std", feature = "websocket", feature = "ocpp_2_1"))]

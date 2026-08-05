@@ -3,9 +3,13 @@ use alloc::vec::Vec;
 
 use crate::state::{ConnectorState, EvseEvent, Reservation, Transaction};
 
+/// The internal state of one EVSE (Electric Vehicle Supply Equipment): its own availability/
+/// fault status, plus one entry per connector it owns in each of the parallel `Vec`s below.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvseState {
+    /// This EVSE's own availability/fault status, independent of any individual connector.
     pub status: EvseStatus,
+    /// This EVSE's connectors, indexed by `connector_id` as used throughout this crate and OCPP.
     pub connectors: Vec<ConnectorState>,
     /// The active transaction for each connector, indexed the same as `connectors`. `None`
     /// when that connector has no transaction in progress.
@@ -21,14 +25,21 @@ pub struct EvseState {
     pub running_costs: Vec<Option<f64>>,
 }
 
+/// One EVSE's own availability/fault status, independent of any individual connector's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvseStatus {
+    /// The EVSE is available for use.
     Available,
+    /// The EVSE has been made unavailable (OCPP `ChangeAvailability`), or a fault on it has
+    /// cleared and is awaiting an explicit `SetAvailable` to resume.
     Unavailable,
+    /// A hardware fault affecting this whole EVSE is active.
     Faulted,
 }
 
 impl EvseState {
+    /// A fresh, available EVSE with `connector_count` connectors, each `Available` with no
+    /// transaction/reservation/running cost.
     pub fn new(connector_count: usize) -> Self {
         Self {
             status: EvseStatus::Available,
@@ -39,6 +50,9 @@ impl EvseState {
         }
     }
 
+    /// Applies an event addressed directly at this EVSE's own `status` (not one of its
+    /// connectors - see [`EvseEvent::Connector`], handled instead by
+    /// [`crate::state::ChargePointState::apply`]). Returns whether `status` actually changed.
     pub fn apply(&mut self, event: EvseEvent) -> bool {
         match event {
             EvseEvent::SetAvailable => set_if_changed(&mut self.status, EvseStatus::Available),
