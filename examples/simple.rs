@@ -2,6 +2,9 @@ use ocpp_charge_point::authorization::Authorizer;
 use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
 use ocpp_charge_point::executor::TokioExecutor;
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
+use ocpp_charge_point::local_authorization_list::{
+    GetLocalListVersionHandler, SendLocalListHandler,
+};
 use ocpp_charge_point::provisioning::{
     BootNotificationOutcome, BootNotifier, HeartbeatSender, TokioBackoff,
 };
@@ -133,6 +136,24 @@ impl ReserveNowHandler for AlwaysAcceptBootNotifier {
 #[async_trait::async_trait]
 impl CancelReservationHandler for AlwaysAcceptBootNotifier {
     async fn register_cancel_reservation_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl SendLocalListHandler for AlwaysAcceptBootNotifier {
+    async fn register_send_local_list_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetLocalListVersionHandler for AlwaysAcceptBootNotifier {
+    async fn register_get_local_list_version_handler(
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {

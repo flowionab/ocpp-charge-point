@@ -1,16 +1,17 @@
-use crate::ChargePointRuntime;
-use crate::authorization::{Authorizer, run_authorization_requests};
-use crate::availability::{ChangeAvailabilityHandler, StatusNotifier, run_status_notifications};
+use crate::authorization::{run_authorization_requests, Authorizer};
+use crate::availability::{run_status_notifications, ChangeAvailabilityHandler, StatusNotifier};
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
-use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
+use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
+use crate::provisioning::{run_heartbeat, Backoff, BootNotifier, HeartbeatSender};
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
-use crate::transactions::{TransactionNotifier, run_transaction_events};
+use crate::transactions::{run_transaction_events, TransactionNotifier};
+use crate::ChargePointRuntime;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -47,6 +48,8 @@ where
         + RequestStopTransactionHandler
         + ReserveNowHandler
         + CancelReservationHandler
+        + SendLocalListHandler
+        + GetLocalListVersionHandler
         + Clone
         + Send
         + Sync
@@ -117,6 +120,9 @@ where
     csms.register_reserve_now_handler(runtime.actor()).await;
     csms.register_cancel_reservation_handler(runtime.actor())
         .await;
+    csms.register_send_local_list_handler(runtime.actor()).await;
+    csms.register_get_local_list_version_handler(runtime.actor())
+        .await;
 
     Ok(runtime)
 }
@@ -126,12 +132,12 @@ mod tests {
     use super::setup;
     use crate::executor::TokioExecutor;
     use crate::hardware::{
-        ChargePoint, Connector, Evse, HardwareCommandReceiver, HardwareEventSender,
-        execute_hardware_command,
+        execute_hardware_command, ChargePoint, Connector, Evse, HardwareCommandReceiver,
+        HardwareEventSender,
     };
+    use crate::provisioning::test_support::FixedBootNotifier;
     use crate::provisioning::BootNotificationOutcome;
     use crate::provisioning::TokioBackoff;
-    use crate::provisioning::test_support::FixedBootNotifier;
     use crate::state::{
         ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, RegistrationStatus,
     };

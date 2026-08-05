@@ -242,7 +242,34 @@ Offline authorization without a CSMS round-trip.
 - Messages: `SendLocalList`, `GetLocalListVersion`.
 - Internal state needed: versioned local list storage, diffing
   (differential vs full updates).
-- Status: ⬜ not started.
+- Status: 🚧 partial — a `LocalAuthorizationList` (`version`, `entries: Vec<
+  LocalListEntry>`) lives on `ChargePointState`, alongside `registration` -
+  charge-point-wide, not per-connector. Each `LocalListEntry` collapses OCPP's
+  `IdTokenInfo` down to the same binary `AuthorizationStatus` the
+  Authorization functional block already uses (§3), for the same reason:
+  nothing downstream distinguishes richer decisions yet. Wired end-to-end via
+  a new `src/local_authorization_list.rs` module: a protocol-agnostic
+  `handle_send_local_list`/`handle_get_local_list_version`,
+  `SendLocalListHandler`/`GetLocalListVersionHandler` traits, implemented for
+  `ocpp-client`'s OCPP 2.1 client (`Client::on_send_local_list`/
+  `on_get_local_list_version`), wired in from `setup()`. `GetLocalListVersion`
+  needs no actor round trip - `handle_get_local_list_version` just reads
+  `actor.state()` directly, unlike every other handler in this crate.
+  `SendLocalList`'s `updateType` is resolved to one of two internal shapes
+  before it reaches the state machine: `Full` (replaces the list outright,
+  adopting the request's `versionNumber` unconditionally) or `Differential`
+  (a list of per-entry `Upsert`/`Remove` changes, computed from whether each
+  wire `AuthorizationData` carries an `idTokenInfo` or not). A `Differential`
+  update is only applied if its `versionNumber` is exactly the charge point's
+  current version + 1 - anything else means an earlier update was missed (or
+  the CSMS is out of sync) and reports `VersionMismatch` rather than risking
+  applying changes on top of an unknown base; `SendLocalListStatusEnum`'s
+  third value, `Failed`, isn't reachable, since the list is a plain in-memory
+  `Vec` with nothing else that can fail. Still missing: the list isn't
+  consulted anywhere yet - every presented id token still round-trips
+  through Authorize regardless of what's cached, online or not, since there
+  is no notion of "the CSMS is unreachable" anywhere in this crate today
+  (needs the connection-state tracking noted as unstarted in §0).
 - Version notes: present in both 1.6J and 2.0.1/2.1 with compatible
   semantics — low downgrade risk.
 

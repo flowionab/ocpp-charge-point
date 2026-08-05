@@ -10,6 +10,7 @@ pub mod clock;
 mod connect;
 pub mod executor;
 pub mod hardware;
+pub mod local_authorization_list;
 pub mod provisioning;
 pub mod remote_control;
 pub mod reservation;

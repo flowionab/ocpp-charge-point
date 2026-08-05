@@ -3,9 +3,9 @@ use alloc::vec::Vec;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, EvseEvent, EvseState, HardwareCommand, MeterSample, RegistrationStatus,
-    StopReason, Transaction, TransactionChargingState, TransactionEventKind,
-    TransactionEventOccurred, TransactionId, TransactionUpdateReason,
+    ConnectorStatusChanged, EvseEvent, EvseState, HardwareCommand, LocalAuthorizationList,
+    MeterSample, RegistrationStatus, StopReason, Transaction, TransactionChargingState,
+    TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,9 @@ pub struct ChargePointState {
     pub evses: Vec<EvseState>,
     /// The id to assign to the next transaction that starts, incremented every time one does.
     pub next_transaction_id: u64,
+    /// The offline authorization cache maintained via `SendLocalList`/`GetLocalListVersion`. See
+    /// `docs/ROADMAP.md` §4.
+    pub local_authorization_list: LocalAuthorizationList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +37,7 @@ impl ChargePointState {
             registration: None,
             evses: connector_counts.into_iter().map(EvseState::new).collect(),
             next_transaction_id: 0,
+            local_authorization_list: LocalAuthorizationList::new(),
         }
     }
 
@@ -54,6 +58,10 @@ impl ChargePointState {
                 let lifecycle_changed = status == RegistrationStatus::Accepted
                     && set_if_changed(&mut self.lifecycle, LifecycleState::Available);
                 registration_changed || lifecycle_changed
+            }
+            ChargePointEvent::LocalListUpdated { version, entries } => {
+                self.local_authorization_list = LocalAuthorizationList { version, entries };
+                true
             }
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
@@ -785,6 +793,24 @@ mod tests {
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Connected);
         assert_eq!(state.evses[0].reservations[0], None);
+    }
+
+    #[test]
+    fn a_local_list_update_replaces_the_list_and_records_the_version() {
+        let mut state = ChargePointState::new([1]);
+        let entry = crate::state::LocalListEntry {
+            id_token: test_id_token(),
+            status: crate::state::AuthorizationStatus::Accepted,
+        };
+
+        let effects = state.apply(ChargePointEvent::LocalListUpdated {
+            version: 1,
+            entries: alloc::vec![entry.clone()],
+        });
+
+        assert_eq!(state.local_authorization_list.version, 1);
+        assert_eq!(state.local_authorization_list.entries, alloc::vec![entry]);
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
     }
 
     #[test]

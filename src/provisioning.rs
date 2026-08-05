@@ -82,7 +82,7 @@ pub async fn run_heartbeat<H: HeartbeatSender, B: Backoff>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Backoff, HeartbeatSender, run_heartbeat};
+    use super::{run_heartbeat, Backoff, HeartbeatSender};
     use alloc::boxed::Box;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use core::time::Duration;
@@ -248,6 +248,20 @@ pub(crate) mod test_support {
         ) {
         }
     }
+
+    #[async_trait::async_trait]
+    impl crate::local_authorization_list::SendLocalListHandler for FixedBootNotifier {
+        async fn register_send_local_list_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::local_authorization_list::GetLocalListVersionHandler for FixedBootNotifier {
+        async fn register_get_local_list_version_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]
@@ -255,13 +269,13 @@ mod ocpp_2_1 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
     use crate::state::RegistrationStatus;
     use alloc::boxed::Box;
-    use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
     use ocpp_client::ocpp_types::v21::common::{
         BootReasonEnum, ChargingStation, RegistrationStatusEnum,
     };
     use ocpp_client::ocpp_types::v21::BootNotificationRequest;
     use ocpp_client::ocpp_types::v21::HeartbeatRequest;
+    use ocpp_client::ClientError;
 
     pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
         BootNotificationRequest {

@@ -1,6 +1,8 @@
+use alloc::vec::Vec;
+
 use crate::state::{
-    ConnectorStatus, IdToken, MeterSample, RegistrationStatus, Reservation, StopReason,
-    Transaction,
+    ConnectorStatus, IdToken, LocalListEntry, MeterSample, RegistrationStatus, Reservation,
+    StopReason, Transaction,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +14,14 @@ pub enum ChargePointEvent {
     FaultCleared,
     /// The CSMS answered a BootNotification with its registration decision.
     RegistrationStatusReceived(RegistrationStatus),
+    /// The CSMS replaced the local authorization list (OCPP `SendLocalList`). `entries` is
+    /// already resolved (by `local_authorization_list::handle_send_local_list`) to the full
+    /// resulting list for both full and differential updates - the state machine just stores
+    /// it. See `docs/ROADMAP.md` §4.
+    LocalListUpdated {
+        version: i64,
+        entries: Vec<LocalListEntry>,
+    },
     Evse {
         evse_id: usize,
         event: EvseEvent,

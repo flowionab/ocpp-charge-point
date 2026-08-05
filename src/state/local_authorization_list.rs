@@ -1,0 +1,39 @@
+use alloc::vec::Vec;
+
+use crate::state::{AuthorizationStatus, IdToken};
+
+/// One entry in the local authorization list (OCPP `AuthorizationData`), collapsed to what this
+/// crate's Authorization functional block already supports - a binary accept/reject decision,
+/// not the richer `IdTokenInfo` (cache expiry, `groupIdToken`, `evseId` scoping - see
+/// `docs/ROADMAP.md` §3/§4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalListEntry {
+    pub id_token: IdToken,
+    pub status: AuthorizationStatus,
+}
+
+/// The charge point's local authorization list (OCPP `SendLocalList`/`GetLocalListVersion`) - an
+/// offline cache of authorization decisions. Storing and versioning the list is implemented; it
+/// isn't yet consulted by the Authorization functional block itself (every presented id token
+/// still round-trips through Authorize, online or not - see `docs/ROADMAP.md` §4, which needs
+/// connection-state tracking from §0 first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAuthorizationList {
+    pub version: i64,
+    pub entries: Vec<LocalListEntry>,
+}
+
+impl LocalAuthorizationList {
+    pub fn new() -> Self {
+        Self {
+            version: 0,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl Default for LocalAuthorizationList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
