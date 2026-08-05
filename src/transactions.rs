@@ -50,7 +50,7 @@ pub async fn run_transaction_events<N: TransactionNotifier>(
 
 #[cfg(test)]
 mod tests {
-    use super::{TransactionNotifier, run_transaction_events};
+    use super::{run_transaction_events, TransactionNotifier};
     use crate::state::{
         Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
         TransactionId,
@@ -131,8 +131,8 @@ mod ocpp_2_1 {
     use alloc::vec::Vec;
     use chrono::{DateTime, Utc};
     use ocpp_client::ocpp_types::v21::common::{
-        ChargingStateEnum, MeasurandEnum, MeterValue, ReadingContextEnum, ReasonEnum,
-        SampledValue, TransactionEventEnum, TriggerReasonEnum,
+        ChargingStateEnum, MeasurandEnum, MeterValue, ReadingContextEnum, ReasonEnum, SampledValue,
+        TransactionEventEnum, TriggerReasonEnum,
     };
 
     // The four functions below are only consumed by `with_system_clock` (`std`-gated) and by
@@ -193,9 +193,52 @@ mod ocpp_2_1 {
         }
     }
 
+    /// Builds one `sampledValue` per measurand present in `sample` - always the energy register,
+    /// plus power/current/voltage/SoC when the hardware reported them.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    fn sampled_values(sample: MeterSample) -> Vec<SampledValue> {
+        let mut values = vec![sampled_value(
+            sample.energy_wh as f64,
+            MeasurandEnum::EnergyActiveImportRegister,
+        )];
+        if let Some(power_w) = sample.power_w {
+            values.push(sampled_value(
+                power_w as f64,
+                MeasurandEnum::PowerActiveImport,
+            ));
+        }
+        if let Some(current_ma) = sample.current_ma {
+            values.push(sampled_value(
+                current_ma as f64 / 1_000.0,
+                MeasurandEnum::CurrentImport,
+            ));
+        }
+        if let Some(voltage_v) = sample.voltage_v {
+            values.push(sampled_value(voltage_v as f64, MeasurandEnum::Voltage));
+        }
+        if let Some(soc_percent) = sample.soc_percent {
+            values.push(sampled_value(soc_percent as f64, MeasurandEnum::SoC));
+        }
+        values
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    fn sampled_value(value: f64, measurand: MeasurandEnum) -> SampledValue {
+        SampledValue {
+            value,
+            measurand: Some(measurand),
+            context: Some(ReadingContextEnum::SamplePeriodic),
+            phase: None,
+            location: None,
+            signed_meter_value: None,
+            unit_of_measure: None,
+            custom_data: None,
+        }
+    }
+
     /// Builds the TransactionEvent `meterValue` list from a transaction's most recent sample -
     /// empty if it never got one (e.g. `Started`, or a transaction that ended before charging
-    /// began). Only the energy register is modeled today; see `docs/ROADMAP.md` §10.
+    /// began). See `docs/ROADMAP.md` §10.
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn build_meter_values(
         sample: Option<MeterSample>,
@@ -206,16 +249,7 @@ mod ocpp_2_1 {
         };
         vec![MeterValue {
             timestamp: timestamp.to_rfc3339(),
-            sampled_value: vec![SampledValue {
-                value: sample.energy_wh as f64,
-                measurand: Some(MeasurandEnum::EnergyActiveImportRegister),
-                context: Some(ReadingContextEnum::SamplePeriodic),
-                phase: None,
-                location: None,
-                signed_meter_value: None,
-                unit_of_measure: None,
-                custom_data: None,
-            }],
+            sampled_value: sampled_values(sample),
             custom_data: None,
         }]
     }
@@ -233,10 +267,10 @@ mod ocpp_2_1 {
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::TransactionNotifier;
         use alloc::boxed::Box;
-        use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-        use ocpp_client::ocpp_types::v21::TransactionEventRequest;
         use ocpp_client::ocpp_types::v21::common::{Transaction as WireTransaction, EVSE};
+        use ocpp_client::ocpp_types::v21::TransactionEventRequest;
+        use ocpp_client::ClientError;
 
         #[async_trait::async_trait]
         impl TransactionNotifier for OCPP2_1Client {
@@ -299,6 +333,72 @@ mod ocpp_2_1 {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::state::MeterSample;
+
+        #[test]
+        fn a_sample_with_only_energy_reports_a_single_sampled_value() {
+            let sample = MeterSample {
+                energy_wh: 1_500,
+                ..Default::default()
+            };
+            let timestamp = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+            let values = build_meter_values(Some(sample), timestamp);
+
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].sampled_value.len(), 1);
+            assert_eq!(values[0].sampled_value[0].value, 1_500.0);
+            assert_eq!(
+                values[0].sampled_value[0].measurand,
+                Some(MeasurandEnum::EnergyActiveImportRegister)
+            );
+        }
+
+        #[test]
+        fn a_sample_with_every_measurand_reports_one_sampled_value_per_measurand() {
+            let sample = MeterSample {
+                energy_wh: 1_500,
+                power_w: Some(7_400),
+                current_ma: Some(32_000),
+                voltage_v: Some(230),
+                soc_percent: Some(42),
+            };
+            let timestamp = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+            let values = build_meter_values(Some(sample), timestamp);
+
+            assert_eq!(values.len(), 1);
+            let sampled = &values[0].sampled_value;
+            assert_eq!(sampled.len(), 5);
+            assert!(sampled.iter().any(|value| value.measurand
+                == Some(MeasurandEnum::EnergyActiveImportRegister)
+                && value.value == 1_500.0));
+            assert!(sampled.iter().any(|value| value.measurand
+                == Some(MeasurandEnum::PowerActiveImport)
+                && value.value == 7_400.0));
+            assert!(sampled.iter().any(|value| value.measurand
+                == Some(MeasurandEnum::CurrentImport)
+                && value.value == 32.0));
+            assert!(sampled.iter().any(
+                |value| value.measurand == Some(MeasurandEnum::Voltage) && value.value == 230.0
+            ));
+            assert!(sampled
+                .iter()
+                .any(|value| value.measurand == Some(MeasurandEnum::SoC) && value.value == 42.0));
+        }
+
+        #[test]
+        fn no_sample_reports_no_meter_values() {
+            let timestamp = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+            assert_eq!(build_meter_values(None, timestamp), Vec::new());
+        }
 
         #[test]
         fn every_kind_maps_to_the_matching_wire_event_type() {

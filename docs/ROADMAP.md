@@ -522,12 +522,25 @@ Energy/power measurement reporting.
   `TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic)`,
   which the 2.1 adapter (`transactions::ocpp_2_1::build_meter_values`)
   embeds as the `meterValue` of the next `TransactionEvent`.
-- Status: 🟨 in progress — energy register (Wh) sampling and reporting via
-  embedded `TransactionEvent.meterValue` is implemented and tested. Not yet
-  done: standalone `MeterValues` for 1.6J, additional measurands
-  (power, current, voltage, SoC), sampled-data configuration, and
+- Status: 🟨 in progress — `MeterSample` now carries the energy register plus
+  four optional measurands (`power_w`, `current_ma`, `voltage_v`,
+  `soc_percent`) - all `Option`, since a hardware integration that can't
+  measure a given quantity simply omits it rather than fabricating a value.
+  `transactions::ocpp_2_1::build_meter_values` emits one `sampledValue` per
+  measurand actually present (`EnergyActiveImportRegister`,
+  `PowerActiveImport`, `CurrentImport`, `Voltage`, `SoC`), still embedded in
+  `TransactionEvent.meterValue` the same way energy-only sampling was
+  wired. `current_ma` (milliamps) is the one field with a non-obvious unit -
+  chosen over whole amps for enough resolution at typical EV charging
+  currents; the wire adapter divides by 1000 before reporting. Not yet done:
+  standalone `MeterValues` for 1.6J (no 1.6J wire adapter of any kind exists
+  yet in this crate - see `docs/ROADMAP.md` §0/§2's "still missing" notes,
+  every adapter implemented so far targets `OCPP2_1Client` only), per-phase
+  measurements (`SampledValue.phase` is always `None`), sampled-data
+  configuration (needs the Provisioning device model, §2), and
   clock-aligned periodic scheduling (still requires an integrator-owned
-  timer today; the crate has no scheduling hook for it).
+  timer today; the crate has no scheduling hook for it - same gap noted
+  against §8's reservation expiry).
 - Version notes: measurand/unit enums are close to compatible across
   versions; sampling-context differs slightly. 1.6J needs a standalone
   `MeterValues` sender, not yet built.

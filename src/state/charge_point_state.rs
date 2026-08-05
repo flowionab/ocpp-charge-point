@@ -581,7 +581,10 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
-        let sample = MeterSample { energy_wh: 1_500 };
+        let sample = MeterSample {
+            energy_wh: 1_500,
+            ..Default::default()
+        };
         let effects = apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample));
 
         let expected_transaction = Transaction {
@@ -611,18 +614,19 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
         // Still `Starting` (EvConnected) here, not yet `Charging`.
 
-        let sample = MeterSample { energy_wh: 1_500 };
+        let sample = MeterSample {
+            energy_wh: 1_500,
+            ..Default::default()
+        };
         let effects = apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample));
 
         assert_eq!(
             state.evses[0].transactions[0].map(|transaction| transaction.last_meter_sample),
             Some(None)
         );
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
-        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_))));
     }
 
     #[test]
@@ -631,7 +635,10 @@ mod tests {
 
         let effects = apply_connector_event(
             &mut state,
-            ConnectorEvent::MeterValueSampled(MeterSample { energy_wh: 1_500 }),
+            ConnectorEvent::MeterValueSampled(MeterSample {
+                energy_wh: 1_500,
+                ..Default::default()
+            }),
         );
 
         assert!(effects.is_empty());
