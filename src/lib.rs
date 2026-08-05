@@ -32,6 +32,7 @@ pub mod local_authorization_list;
 pub mod offline_queue;
 pub mod provisioning;
 pub mod remote_control;
+pub mod reporting;
 pub mod reservation;
 pub mod reset;
 mod runtime;

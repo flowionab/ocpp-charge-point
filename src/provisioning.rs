@@ -533,6 +533,16 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::reporting::GetBaseReportHandler for FixedBootNotifier {
+        async fn register_get_base_report_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reporting::GetReportHandler for FixedBootNotifier {
+        async fn register_get_report_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
     impl crate::security::SecurityEventNotifier for FixedBootNotifier {
         type Error = core::convert::Infallible;
 
