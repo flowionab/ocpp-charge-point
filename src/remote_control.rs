@@ -979,43 +979,30 @@ mod ocpp_2_1 {
             }
         }
 
-        // `RequestStartTransactionRequest` embeds `Option<ChargingProfile>`, and `ocpp-types`
-        // 0.1.1 has a codegen defect where `ChargingProfile`/`ChargingSchedule` keep
-        // `heapless::Vec` (not `alloc::vec::Vec`) for `charging_schedule`/
-        // `charging_schedule_period` even in the `#[cfg(feature = "alloc")]` struct variant this
-        // crate builds with - inlining up to 3 * 1024 nested structs and making the type itself
-        // ~80MB, regardless of which fields are actually populated. Building or holding one on
-        // an ordinary thread's stack overflows it, so these tests run on a thread with a large
-        // stack reserved just for that. This is a real, not just test-only, concern: the same
-        // oversized type crosses `ocpp-client`'s `on_request_start_transaction` callback by
-        // value, so a live CSMS sending `RequestStartTransaction` (with or without a
-        // `chargingProfile`) risks the same overflow in production - see this migration's final
-        // report for follow-up.
-        fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-            std::thread::Builder::new()
-                .stack_size(200 * 1024 * 1024)
-                .spawn(f)
-                .expect("spawning the oversized-stack test thread must not fail")
-                .join()
-                .expect("the oversized-stack test thread must not panic")
-        }
-
+        // `RequestStartTransactionRequest` embeds `Option<ChargingProfile>`. `ocpp-types` 0.1.1
+        // had a codegen defect where `ChargingProfile`/`ChargingSchedule` kept `heapless::Vec`
+        // (not `alloc::vec::Vec`) for `charging_schedule`/`charging_schedule_period` even in the
+        // `#[cfg(feature = "alloc")]` struct variant this crate builds with, inlining up to
+        // 3 * 1024 nested structs and making the type itself ~80MB - enough to overflow an
+        // ordinary thread's stack just building or holding one. `ocpp-types` 0.1.2 (pulled in via
+        // `ocpp-client` 0.2) fixed the inner `charging_schedule_period` field to use
+        // `alloc::vec::Vec`; `ChargingProfile.charging_schedule` itself still inlines up to 3
+        // `ChargingSchedule`s via `heapless::Vec`, but that now measures ~56KB total (verified via
+        // `size_of::<RequestStartTransactionRequest>()`) - well within any normal thread's stack,
+        // so the oversized-stack workaround these tests used to need is gone.
         #[test]
         fn no_evse_id_parses_to_none() {
-            let result = with_big_stack(|| parse_evse_id(&start_request(None)));
-            assert_eq!(result, Ok(None));
+            assert_eq!(parse_evse_id(&start_request(None)), Ok(None));
         }
 
         #[test]
         fn a_valid_evse_id_parses() {
-            let result = with_big_stack(|| parse_evse_id(&start_request(Some(1))));
-            assert_eq!(result, Ok(Some(1)));
+            assert_eq!(parse_evse_id(&start_request(Some(1))), Ok(Some(1)));
         }
 
         #[test]
         fn a_negative_evse_id_fails_to_parse() {
-            let result = with_big_stack(|| parse_evse_id(&start_request(Some(-1))));
-            assert_eq!(result, Err(()));
+            assert_eq!(parse_evse_id(&start_request(Some(-1))), Err(()));
         }
 
         #[test]
