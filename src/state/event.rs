@@ -5,7 +5,7 @@ use crate::state::{
     SecurityEvent, StopReason, Transaction,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChargePointEvent {
     BootCompleted,
     SetAvailable,
@@ -32,7 +32,7 @@ pub enum ChargePointEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EvseEvent {
     SetAvailable,
     SetUnavailable,
@@ -44,7 +44,7 @@ pub enum EvseEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConnectorEvent {
     CableConnected,
     CableDisconnected,
@@ -81,6 +81,9 @@ pub enum ConnectorEvent {
     /// The CSMS cancelled this connector's reservation (OCPP `CancelReservation`) while it's
     /// `Reserved`. See `docs/ROADMAP.md` §8.
     ReservationCancelled,
+    /// The CSMS reported a new running total cost for this connector's active transaction (OCPP
+    /// `CostUpdated`). Ignored if there's no active transaction. See `docs/ROADMAP.md` §9.
+    CostUpdated(f64),
     SetAvailable,
     SetUnavailable,
     FaultDetected,

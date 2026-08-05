@@ -275,6 +275,11 @@ pub(crate) mod test_support {
             Ok(())
         }
     }
+
+    #[async_trait::async_trait]
+    impl crate::cost::CostUpdatedHandler for FixedBootNotifier {
+        async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]

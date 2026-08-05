@@ -552,7 +552,35 @@ Communicating price/cost to the driver.
 - Messages: `NotifyPriceSchedule` (2.1), `CostUpdated`, running cost in
   `TransactionEvent`.
 - Internal state needed: tariff model, running-cost accumulation hook.
-- Status: ⬜ not started.
+- Status: 🚧 partial — `CostUpdated` (inbound only) is implemented:
+  `EvseState` gained a `running_costs: Vec<Option<f64>>` side-table,
+  indexed the same as `connectors`/`transactions` - a `CostUpdated`'s
+  `totalCost` is recorded there via a new `ConnectorEvent::CostUpdated(f64)`,
+  applied only while a transaction is actually active on that connector, and
+  automatically cleared when that transaction starts or ends so a new
+  session on the same connector never inherits a stale cost. Wired via a
+  new `src/cost.rs` module: `handle_cost_updated` finds the connector
+  running the addressed `transactionId` (mirroring
+  `remote_control::handle_request_stop_transaction`'s `find_transaction`),
+  and `CostUpdatedHandler`, implemented for `ocpp-client`'s OCPP 2.1 client,
+  wired in from `setup()`. `CostUpdatedResponse` carries no status at all -
+  the CSMS is informing the charge point, not asking permission - so there
+  is no rejection to report; the internal `CostUpdateOutcome` exists purely
+  for this module's own tests. Building this exposed a real, now-fixed bug:
+  `ChargePointState`/`ChargePointEvent`/`EvseState`/`ConnectorEvent` all
+  dropped their `Eq` derive (now `PartialEq` only) since `f64` isn't `Eq`;
+  more importantly, a `CostUpdated` doesn't change `ConnectorState` itself,
+  so `ChargePointEffect::StateChanged` wasn't being emitted for it and the
+  actor's watch channel (what `ChargePointActor::state()` reads) never
+  picked up the new cost - fixed by folding "did a cost actually get
+  recorded" into the connector-event handler's `changed` result alongside
+  the connector's own state transition. Still missing: `NotifyPriceSchedule`
+  - **verified directly against the pinned `ocpp-client`/`ocpp-types`
+  (not assumed)**, it doesn't exist there at all yet, the same upstream gap
+  that blocks `TriggerMessage` (§6) - and outbound cost reporting via
+  `TransactionEvent.cost_details`, which needs an actual tariff/pricing
+  model (charging periods, dimensions) this crate has no reason to build
+  without a consumer for it yet.
 - Version notes: **(verify vs 2.1 spec)** — tariff/cost was extended
   significantly across 2.0.1 → 2.1; not present in 1.6J at all (block is
   a no-op under that adapter).

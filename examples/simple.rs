@@ -1,5 +1,6 @@
 use ocpp_charge_point::authorization::Authorizer;
 use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
+use ocpp_charge_point::cost::CostUpdatedHandler;
 use ocpp_charge_point::executor::TokioExecutor;
 use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
 use ocpp_charge_point::local_authorization_list::{
@@ -171,6 +172,15 @@ impl SecurityEventNotifier for AlwaysAcceptBootNotifier {
         _tech_info: Option<&str>,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl CostUpdatedHandler for AlwaysAcceptBootNotifier {
+    async fn register_cost_updated_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
     }
 }
 

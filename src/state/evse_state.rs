@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 
 use crate::state::{ConnectorState, EvseEvent, Reservation, Transaction};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvseState {
     pub status: EvseStatus,
     pub connectors: Vec<ConnectorState>,
@@ -13,6 +13,12 @@ pub struct EvseState {
     /// The active reservation for each connector, indexed the same as `connectors`. `None` when
     /// that connector isn't reserved. See `docs/ROADMAP.md` §8.
     pub reservations: Vec<Option<Reservation>>,
+    /// The most recent running cost the CSMS reported (OCPP `CostUpdated`) for each connector's
+    /// active transaction, indexed the same as `connectors`. `None` when the CSMS hasn't sent
+    /// one, or the transaction it was reported for has since ended - a new transaction starts
+    /// with no carried-over cost from a previous one on the same connector. See
+    /// `docs/ROADMAP.md` §9.
+    pub running_costs: Vec<Option<f64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +35,7 @@ impl EvseState {
             connectors: vec![ConnectorState::Available; connector_count],
             transactions: vec![None; connector_count],
             reservations: vec![None; connector_count],
+            running_costs: vec![None; connector_count],
         }
     }
 

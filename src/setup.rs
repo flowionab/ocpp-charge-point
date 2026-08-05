@@ -1,5 +1,6 @@
 use crate::authorization::{run_authorization_requests, Authorizer};
 use crate::availability::{run_status_notifications, ChangeAvailabilityHandler, StatusNotifier};
+use crate::cost::CostUpdatedHandler;
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
@@ -53,6 +54,7 @@ where
         + SendLocalListHandler
         + GetLocalListVersionHandler
         + SecurityEventNotifier
+        + CostUpdatedHandler
         + Clone
         + Send
         + Sync
@@ -132,6 +134,7 @@ where
     csms.register_send_local_list_handler(runtime.actor()).await;
     csms.register_get_local_list_version_handler(runtime.actor())
         .await;
+    csms.register_cost_updated_handler(runtime.actor()).await;
 
     Ok(runtime)
 }

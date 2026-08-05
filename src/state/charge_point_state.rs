@@ -8,7 +8,7 @@ use crate::state::{
     TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChargePointState {
     pub lifecycle: LifecycleState,
     /// The CSMS's most recent BootNotification decision. `None` until the first
@@ -96,6 +96,10 @@ impl ChargePointState {
                         ConnectorEvent::Reserved(reservation) => Some(reservation.clone()),
                         _ => None,
                     };
+                    let cost_update = match &event {
+                        ConnectorEvent::CostUpdated(total_cost) => Some(*total_cost),
+                        _ => None,
+                    };
                     let transition = connector.apply(event);
                     let new_state = *connector;
                     if let Some(slot) = evse.reservations.get_mut(connector_id) {
@@ -154,6 +158,16 @@ impl ChargePointState {
                             new_state,
                             stop_reason,
                         ) {
+                            // A new transaction must not inherit a previous one's running cost,
+                            // and an ended transaction's cost is no longer meaningful.
+                            if matches!(
+                                kind,
+                                TransactionEventKind::Started | TransactionEventKind::Ended
+                            ) {
+                                if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
+                                    *cost_slot = None;
+                                }
+                            }
                             effects.push(ChargePointEffect::TransactionEvent(
                                 TransactionEventOccurred {
                                     evse_id,
@@ -176,7 +190,25 @@ impl ChargePointState {
                             }
                         }
                     }
-                    transition.changed
+                    // Only recorded while a transaction is actually active on this connector -
+                    // there's nothing meaningful to attach a cost to otherwise. A recorded cost
+                    // doesn't change `ConnectorState` itself, so `transition.changed` alone
+                    // wouldn't notice it - without folding it into `changed` here, the actor's
+                    // watch channel would never publish it (see `ChargePointEffect::StateChanged`).
+                    let cost_recorded = cost_update.is_some_and(|total_cost| {
+                        if evse
+                            .transactions
+                            .get(connector_id)
+                            .is_some_and(Option::is_some)
+                        {
+                            if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
+                                *cost_slot = Some(total_cost);
+                                return true;
+                            }
+                        }
+                        false
+                    });
+                    transition.changed || cost_recorded
                 }
                 _ => self
                     .evses
@@ -831,6 +863,48 @@ mod tests {
             effects,
             alloc::vec![ChargePointEffect::SecurityEventOccurred(event)]
         );
+    }
+
+    #[test]
+    fn a_cost_update_is_recorded_while_a_transaction_is_active() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+
+        apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
+
+        assert_eq!(state.evses[0].running_costs[0], Some(4.5));
+    }
+
+    #[test]
+    fn a_cost_update_with_no_active_transaction_is_ignored() {
+        let mut state = ChargePointState::new([1]);
+
+        apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
+
+        assert_eq!(state.evses[0].running_costs[0], None);
+    }
+
+    #[test]
+    fn a_new_transaction_does_not_inherit_the_previous_ones_cost() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        assert_eq!(state.evses[0].running_costs[0], None);
+
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized);
+
+        assert_eq!(state.evses[0].running_costs[0], None);
     }
 
     #[test]
