@@ -16,7 +16,7 @@
 //! `GetBaseReport`/`GetReport`/`NotifyReport` messages at all - its flat `GetConfiguration` already
 //! covers the equivalent ground (dumping every configuration key at once in a single response, no
 //! chunking/report-base/criteria concept) and is handled entirely by
-//! [`crate::device_model::ocpp_1_6`]. There is nothing for this module to project onto for that
+//! `crate::device_model`'s own `ocpp_1_6` submodule. There is nothing for this module to project onto for that
 //! version.
 
 use crate::actor::ChargePointActor;
@@ -60,7 +60,7 @@ const SUMMARY_VARIABLE_NAMES: [&str; 5] =
 /// One component control-state criterion for `GetReport`'s `componentCriteria`, matching OCPP's
 /// `ComponentCriterionEnum`. Each criterion refers to a same-named `Boolean` variable on the
 /// *same* component (e.g. a component matches [`Active`](Self::Active) if it has a variable
-/// named `"Active"` with an `Actual` value of `"true"`) - see [`component_matches_criterion`] for
+/// named `"Active"` with an `Actual` value of `"true"`) - see each variant's own docs for
 /// the exact matching rules, which differ subtly per variant (per OCPP's own B08 requirements
 /// table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,7 +251,7 @@ fn filter_report_entries(
 }
 
 /// Handles a CSMS-initiated `GetReport` request against `actor`'s current device model, applying
-/// `criteria`/`component_variable` per [`filter_report_entries`]. `EmptyResultSet` if the
+/// `criteria`/`component_variable`, combined with OR semantics. `EmptyResultSet` if the
 /// combination matches nothing at all - the one case where this differs from
 /// [`handle_get_base_report`] (which never produces it).
 pub fn handle_get_report(

@@ -159,7 +159,7 @@ fn heartbeat_interval_secs(actor: &ChargePointActor) -> Option<u32> {
 }
 
 /// Sends a Heartbeat every cycle, forever, honouring `actor`'s current
-/// `OCPPCommCtrlr`/`HeartbeatInterval` device model value (see [`heartbeat_interval_secs`]) on
+/// `OCPPCommCtrlr`/`HeartbeatInterval` device model value (read fresh from `actor` on each cycle) on
 /// every iteration - so a CSMS that changes it via `SetVariables` (OCPP 2.x) or
 /// `ChangeConfiguration` (1.6J, projected onto the same variable - see
 /// `crate::device_model::ocpp_1_6`) takes effect on the very next heartbeat, without a reboot.

@@ -581,8 +581,117 @@ Boot, configuration, and the Component/Variable device model.
   under the `ocpp_2_1` feature). A live `ocpp-client` WebSocket connection
   is now wired end-to-end via `connect_and_setup` (see §0) for std/tokio
   users; embedded/no_std callers still supply their own connected
-  `BootNotifier`/`HeartbeatSender`. Still missing: the Component/Variable
-  device model, and `Reset`.
+  `BootNotifier`/`HeartbeatSender`.
+
+  The Component/Variable device model now exists. `state::DeviceModel` (a
+  `BTreeMap<Component, BTreeMap<Variable, VariableDefinition>>`, so iteration
+  order is stable - `GetBaseReport` depends on that) is owned by
+  `ChargePointState` and mutated only through
+  `ChargePointEvent::DeviceModel(DeviceModelEvent)`, like every other piece of
+  state here; nothing hands out a mutable handle to it. `Component` addresses
+  EVSEs with this crate's own `Option<(usize, Option<usize>)>`, never OCPP's
+  wire `EVSE` type, so the model stays protocol-version-independent by
+  construction. A hardware binding extends it by pushing
+  `DeviceModelEvent::VariableRegistered` through the same
+  `HardwareEventSender` it already uses for everything else - no new
+  integration surface. `VariableAttribute` carries one field OCPP's wire
+  attribute doesn't have, `requires_reboot`, so `SetVariableStatusEnum`'s
+  `RebootRequired` has something concrete to key off instead of being
+  permanently unreachable. The built-in default set is deliberately tiny
+  (`OCPPCommCtrlr`/`HeartbeatInterval`, `AuthCtrlr`/`AuthorizeRemoteStart`) -
+  integrators register what their hardware actually exposes.
+
+  `device_model::handle_get_variables`/`handle_set_variables` resolve each
+  item of a batch independently (a batch never fails outright), with adapters
+  for 2.1 and 2.0.1 - whose `GetVariables`/`SetVariables` wire shapes turned
+  out identical apart from `SetVariableData.attributeValue`'s bound (2500 vs
+  1000 bytes), which doesn't matter here since this crate only reads it.
+  1.6J has no device model at all, so its adapter projects onto flat
+  `GetConfiguration`/`ChangeConfiguration`. That projection needs a
+  key-naming convention, and the first cut - a dotted `Component.Variable`
+  form - was *not* interoperable: a real 1.6J CSMS asks for
+  `HeartbeatInterval`, not `OCPPCommCtrlr.HeartbeatInterval`, so every
+  standard key came back in `unknownKey` and every `ChangeConfiguration` on
+  one was rejected. There is now a `STANDARD_KEY_ALIASES` table consulted in
+  both directions, covering 12 standard 1.6J keys taken from
+  `docs/OCPP-2.0.1/Appendices_CSV_v1.5/dm_components_vars.csv` (row numbers
+  cited per entry in the source) - e.g. `HeartbeatInterval` ->
+  `OCPPCommCtrlr`/`HeartbeatInterval`, `MeterValueSampleInterval` ->
+  `SampledDataCtrlr`/`TxUpdatedInterval`, `AuthorizeRemoteTxRequests` ->
+  `AuthCtrlr`/`AuthorizeRemoteStart`. `encode_key` emits the real 1.6J name
+  when an alias exists, so an unfiltered `GetConfiguration` returns names a
+  1.6J CSMS recognises; anything unmapped still degrades to the dotted form
+  rather than breaking. The table is deliberately partial (12 of ~40 Core
+  keys) and documents how to extend it. `ConnectorPhaseRotation` is
+  explicitly excluded, not silently mismapped: 1.6 packs a per-connector list
+  into a single key while 2.0.1 models `PhaseRotation` per connector, and
+  that fan-out doesn't fit a static `key -> (Component, Variable)` entry.
+
+  `HeartbeatInterval` is a live variable, not a decorative one. The accepted
+  BootNotification interval is written into it after registration, and
+  `run_heartbeat` re-reads it from `actor.state()` on every cycle, so a CSMS
+  changing it via `SetVariables` (or 1.6J `ChangeConfiguration`) takes effect
+  without a reboot. A missing, unparseable, or zero value falls back to the
+  boot-notification interval - specifically so a bad value can't turn the
+  loop into a busy-spin. Without this the whole model would have been
+  cosmetic: a CSMS would have gotten `Accepted` and seen nothing change,
+  which is worse than a rejection.
+
+  Device-model *reporting* is in `reporting.rs`: `GetBaseReport`, `GetReport`
+  and the resulting multi-part `NotifyReport`s, for 2.1 and 2.0.1.
+  `chunk_report` is pure and wire-type-free, splitting a report into
+  `ReportChunk { seq_no, tbc, entries }` (16 entries per chunk, matching
+  `ocpp-types`' own non-`alloc` `NotifyReportRequest` default `heapless::Vec`
+  capacity) so `seqNo`/`tbc` correctness is unit-testable without touching
+  OCPP types. `ComponentCriterion` matching follows the spec's B08
+  requirements table, including its asymmetry: a missing
+  `Active`/`Available`/`Enabled` variable still counts as a match, a missing
+  `Problem` variable does not. `EmptyResultSet` is returned - and no
+  `NotifyReport` sent - when a `GetReport` filter matches nothing. Two
+  documented judgement calls: `SummaryInventory` is approximated by a fixed
+  list of well-known status variable names, since this crate's device model
+  has no general "abnormal state" concept to derive it from; and a `GetReport`
+  carrying both criteria and an explicit component/variable list is genuinely
+  ambiguous in the spec text, resolved here as a union. 1.6J gets no adapter
+  at all - it has no structured device model or report mechanism, and its flat
+  `GetConfiguration` already covers the same ground.
+
+  `Reset` is implemented for all three versions. `ResetKind`
+  (`Immediate`/`OnIdle`) and `ResetTarget` (whole charge point, or one EVSE)
+  are protocol-agnostic; a single `ChargePointState.pending_reset` tracks a
+  deferred one, re-evaluated at the end of every `apply()` so it can't be
+  silently lost, with a later request superseding a pending one rather than
+  queueing. An `Immediate` reset does *not* route through
+  `Faulted`/`FaultedSafe` - that would misreport a scheduled reboot as a
+  hardware fault to the CSMS. It instead drives any cable-engaged connector
+  into the existing `Stopping` (open contactor) -> `Finishing` (unlock)
+  pipeline a normal stop already uses, satisfying `CLAUDE.md`'s fail-safe
+  ordering by reusing that path rather than building a parallel one. A new
+  `StopReason::Reset` keeps the resulting `TransactionEvent(Ended)` from
+  misreporting `EmergencyStop`. Reboot reaches hardware as
+  `HardwareCommand::Reboot { evse_id }` through the existing
+  `execute_hardware_command` dispatch loop, backed by a new required
+  `Evse::reboot()` (plus an `Evse::Error` associated type) - **a breaking
+  change to the hardware trait**, chosen over a `ChargePoint`-level hook
+  because `execute_hardware_command` only ever receives `&[E]`, so a
+  charge-point-level reboot would have needed new plumbing through
+  `ChargePoint::start`'s contract; a charge-point-wide reset simply expands to
+  one `Reboot` per EVSE. A failed reboot surfaces as `EvseEvent::FaultDetected`,
+  never a panic. 1.6J's projection is the lossy one: it has no EVSE targeting
+  (always charge-point-wide) and no `Scheduled` status (collapses to
+  `Accepted`), and its `Hard`/`Soft` axis isn't literally
+  `Immediate`/`OnIdle` - neither 1.6J type waits for the station to go idle
+  on its own. `Hard` -> `Immediate` / `Soft` -> `OnIdle` is documented in
+  `reset.rs` as the closest match on the axis `ResetKind` actually models
+  (urgent-and-abrupt vs. graceful-and-deferred), not as an exact equivalence.
+  2.1's `ImmediateAndResume` projects down to `Immediate`, since nothing here
+  models resuming a transaction across a reboot.
+
+  Still missing: `SetNetworkProfile`, device-model persistence across
+  restarts (`VariableAttribute::persistent` is recorded but not acted on),
+  variable monitoring (`SetVariableMonitoring`/`GetMonitoringReport`/
+  `NotifyMonitoringReport`), and the remaining ~28 standard 1.6J
+  configuration keys.
 - Version notes: 1.6J's `Configuration` key/value model and 2.0.1's
   Component/Variable model both need to be projections of one internal
   config representation; 1.6J has no `GetBaseReport`/structured device
@@ -794,6 +903,15 @@ CSMS-initiated control of the charge point.
   the same way. Consequently `ocpp-client`'s OCPP 2.1 actions module has
   no `on_trigger_message`/`send_trigger_message` at all, and no
   `TriggerMessageHandler` trait or `setup()` wiring exists here either -
+  **but note the block is 2.1-only, narrower than the paragraph above
+  originally implied** (re-verified directly against `ocpp-client` 0.2.0's
+  vendored source, not assumed): `OCPP2_0_1Client` and `OCPP1_6Client` both
+  *do* have real `on_trigger_message`/`send_trigger_message` methods with
+  `TriggerMessageRequest`/`TriggerMessageResponse` types. So a 2.0.1 and a
+  1.6J adapter for the existing `handle_trigger_message` are buildable
+  today; only the 2.1 one has to wait for upstream. The reason nothing is
+  wired yet is the `setup()` bound problem described above, not a total
+  absence of upstream types -
   adding either now, ahead of something that could implement it, would
   just break every real caller of `setup()` (their `N` could never
   satisfy the bound). What does exist: `TriggerableMessage` covers the

@@ -171,7 +171,7 @@ pub struct DeviceModel {
 
 impl DeviceModel {
     /// A device model pre-populated with this crate's built-in default variables (see
-    /// [`register_defaults`](Self::register_defaults)'s docs) - deliberately a minimal,
+    /// this type's own docs) - deliberately a minimal,
     /// non-exhaustive set. Integrators extend it with
     /// [`DeviceModelEvent::VariableRegistered`](crate::state::DeviceModelEvent::VariableRegistered)
     /// for whatever components their hardware actually exposes.
