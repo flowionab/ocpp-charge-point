@@ -6,6 +6,7 @@ use crate::state::{
     ChargePointEvent, Component, RegistrationStatus, Variable, VariableAttributeType,
 };
 use alloc::boxed::Box;
+use chrono::{DateTime, Utc};
 #[cfg(feature = "tokio-runtime")]
 use core::time::Duration;
 
@@ -121,6 +122,209 @@ pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
                 backoff.wait(DEFAULT_RETRY_INTERVAL_SECS).await;
             }
         }
+    }
+}
+
+/// Minimum absolute difference, in seconds, between this charge point's own time estimate and a
+/// CSMS-supplied `currentTime` (from a BootNotification or Heartbeat response) for the
+/// difference to count as a deliberate clock *step* worth raising `SettingSystemTime`
+/// (`SecurityEventType::SettingSystemTime`) for - see [`evaluate_time_sync`]. Below this, the
+/// difference is treated as routine drift (RTC imprecision) or the request/response round trip's
+/// own latency, neither of which is security-relevant and both of which would otherwise raise a
+/// `SettingSystemTime` event on almost every single Heartbeat - defeating the point of a
+/// *security* event. Ten seconds is comfortably above realistic WebSocket round-trip latency
+/// (milliseconds to low seconds even on a poor connection) and low-cost RTC drift over a
+/// heartbeat interval (typically tens of PPM, i.e. sub-second over a minute), while still well
+/// below "someone/something moved the clock" territory.
+pub const CLOCK_STEP_THRESHOLD_SECS: i64 = 10;
+
+/// A CSMS-supplied `currentTime` that [`evaluate_time_sync`] judged worth reporting as a
+/// `SettingSystemTime` security event, carrying enough detail to build that report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSyncStep {
+    /// The CSMS's `currentTime`, i.e. the value the charge point's clock should be corrected to.
+    pub csms_time: DateTime<Utc>,
+    /// `csms_time` minus the charge point's prior estimate, in seconds - positive if the CSMS's
+    /// clock is ahead. `0` when there was no prior estimate to compare against (see this
+    /// function's docs).
+    pub delta_secs: i64,
+}
+
+/// Decides whether a CSMS's `currentTime` (from a BootNotification or Heartbeat response)
+/// represents a clock *step* worth raising `SettingSystemTime` for, as opposed to routine drift -
+/// see [`CLOCK_STEP_THRESHOLD_SECS`]. `local_estimate` is this charge point's own belief about
+/// the current time just before the response arrived (typically a [`crate::clock::Clock`]
+/// reading taken right before the request was sent).
+///
+/// Returns `Some` (worth reporting) when:
+/// - there was no local estimate at all (`None` - e.g. no `Clock` wired up yet), or
+/// - the local estimate itself was unsynchronized (see [`crate::clock::is_synchronized`]) - the
+///   very first time real time arrives is exactly the case `SettingSystemTime` exists for, or
+/// - `local_estimate` and `csms_time` differ by at least [`CLOCK_STEP_THRESHOLD_SECS`].
+///
+/// Returns `None` (routine, not reported) when the two are already within
+/// [`CLOCK_STEP_THRESHOLD_SECS`] of each other - critically, this means a CSMS that returns a
+/// `currentTime` on every single Heartbeat (as the spec allows) does *not* raise a security event
+/// on every heartbeat, only on a genuine step.
+///
+/// This is deliberately a pure decision function, not wired into [`register`],
+/// [`register_until_accepted`], or [`run_heartbeat`]: doing so requires threading a
+/// [`crate::clock::Clock`] reading through and reporting via
+/// [`crate::security::report_security_event`] (which needs the same `actor: &ChargePointActor`
+/// these functions already take, so it's a small addition) - but it also requires
+/// [`BootNotifier::notify_boot`]/[`HeartbeatSender::send_heartbeat`] to surface the wire
+/// response's `currentTime` field, which neither trait does today. Both traits' current shape,
+/// and [`BootNotificationOutcome`]'s fields, are consumed by fixed struct literals and trait
+/// impls in `src/builder.rs` and `src/setup.rs`; extending them without touching those two files
+/// isn't possible. See `docs/PRODUCTION-ROADMAP.md` §9.3 (G3.2).
+pub fn evaluate_time_sync(
+    local_estimate: Option<DateTime<Utc>>,
+    csms_time: DateTime<Utc>,
+) -> Option<TimeSyncStep> {
+    match local_estimate {
+        None => Some(TimeSyncStep {
+            csms_time,
+            delta_secs: 0,
+        }),
+        Some(local) if !crate::clock::is_synchronized(&local) => Some(TimeSyncStep {
+            csms_time,
+            delta_secs: (csms_time - local).num_seconds(),
+        }),
+        Some(local) => {
+            let delta_secs = (csms_time - local).num_seconds();
+            (delta_secs.abs() >= CLOCK_STEP_THRESHOLD_SECS).then_some(TimeSyncStep {
+                csms_time,
+                delta_secs,
+            })
+        }
+    }
+}
+
+/// Parses a wire `currentTime` string (as carried by a BootNotification or Heartbeat response)
+/// into a [`DateTime<Utc>`], for use with [`evaluate_time_sync`]. `None` if the CSMS sent
+/// something that doesn't parse as RFC 3339 - a malformed `currentTime` shouldn't be treated as
+/// "no sync available" silently swallowed further up; callers should log when this returns
+/// `None` for a non-empty input.
+pub fn parse_csms_current_time(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+impl TimeSyncStep {
+    /// Builds the [`crate::state::SecurityEvent`] this step implies, ready to pass to
+    /// [`crate::security::report_security_event`]. `tech_info` records both the corrected time
+    /// and the observed delta so an operator reading the CSMS's security log can tell a first-ever
+    /// sync (`delta_secs: 0`, no prior estimate) apart from a later step.
+    pub fn to_security_event(self) -> crate::state::SecurityEvent {
+        use alloc::format;
+
+        crate::state::SecurityEvent {
+            event_type: crate::state::SecurityEventType::SettingSystemTime,
+            tech_info: Some(format!(
+                "synced to {} (delta {}s)",
+                self.csms_time.to_rfc3339(),
+                self.delta_secs
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod time_sync_tests {
+    use super::{CLOCK_STEP_THRESHOLD_SECS, evaluate_time_sync, parse_csms_current_time};
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+
+    fn dt(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn no_local_estimate_is_always_worth_reporting_as_the_first_sync() {
+        let csms_time = dt("2026-06-01T12:00:00Z");
+
+        let step = evaluate_time_sync(None, csms_time).unwrap();
+
+        assert_eq!(step.csms_time, csms_time);
+        assert_eq!(step.delta_secs, 0);
+    }
+
+    #[test]
+    fn an_unsynchronized_local_clock_reports_the_first_real_sync() {
+        let unset_rtc = dt("1970-01-01T00:00:00Z");
+        let csms_time = dt("2026-06-01T12:00:00Z");
+
+        let step = evaluate_time_sync(Some(unset_rtc), csms_time).unwrap();
+
+        assert_eq!(step.csms_time, csms_time);
+        assert!(step.delta_secs > 0);
+    }
+
+    #[test]
+    fn a_small_difference_between_two_synchronized_clocks_is_routine_and_not_reported() {
+        let local = dt("2026-06-01T12:00:00Z");
+        let csms_time = local + ChronoDuration::seconds(CLOCK_STEP_THRESHOLD_SECS - 1);
+
+        assert_eq!(evaluate_time_sync(Some(local), csms_time), None);
+    }
+
+    #[test]
+    fn a_difference_at_or_above_the_threshold_is_a_step_worth_reporting() {
+        let local = dt("2026-06-01T12:00:00Z");
+        let csms_time = local + ChronoDuration::seconds(CLOCK_STEP_THRESHOLD_SECS);
+
+        let step = evaluate_time_sync(Some(local), csms_time).unwrap();
+
+        assert_eq!(step.delta_secs, CLOCK_STEP_THRESHOLD_SECS);
+    }
+
+    #[test]
+    fn a_backwards_step_is_also_detected_via_its_absolute_value() {
+        let local = dt("2026-06-01T12:00:00Z");
+        let csms_time = local - ChronoDuration::seconds(CLOCK_STEP_THRESHOLD_SECS + 5);
+
+        let step = evaluate_time_sync(Some(local), csms_time).unwrap();
+
+        assert_eq!(step.delta_secs, -(CLOCK_STEP_THRESHOLD_SECS + 5));
+    }
+
+    #[test]
+    fn a_heartbeat_that_repeats_the_same_time_every_cycle_never_re_reports() {
+        let local = dt("2026-06-01T12:00:00Z");
+
+        // Same behaviour a CSMS returning `currentTime` on every Heartbeat response would
+        // trigger - it must not raise `SettingSystemTime` every cycle.
+        for _ in 0..5 {
+            assert_eq!(evaluate_time_sync(Some(local), local), None);
+        }
+    }
+
+    #[test]
+    fn a_valid_rfc3339_current_time_parses() {
+        assert_eq!(
+            parse_csms_current_time("2026-06-01T12:00:00Z"),
+            Some(dt("2026-06-01T12:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn a_malformed_current_time_fails_to_parse_rather_than_panicking() {
+        assert_eq!(parse_csms_current_time("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn a_time_sync_step_builds_a_setting_system_time_security_event() {
+        use crate::state::SecurityEventType;
+
+        let csms_time = dt("2026-06-01T12:00:00Z");
+        let step = evaluate_time_sync(None, csms_time).unwrap();
+
+        let event = step.to_security_event();
+
+        assert_eq!(event.event_type, SecurityEventType::SettingSystemTime);
+        assert!(event.tech_info.unwrap().contains("2026-06-01"));
     }
 }
 
