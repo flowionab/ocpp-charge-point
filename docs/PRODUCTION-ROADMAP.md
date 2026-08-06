@@ -99,7 +99,7 @@ close — mostly missing one version each.
 | Actor model, version-independent state | ✅ | `ChargePointState` owns transactions, reservations, local auth list, cost, reset, device model — all mutated only via `ChargePointEvent`. |
 | Hardware abstraction | 🚧 | `ChargePoint` / `Evse` / `Connector`: lock, unlock, contactor, reboot. **No capability model, no current-limit hook, no file transfer, no display, no RTC.** |
 | `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. |
-| Offline queueing | 🚧 | `OfflineQueue` exists and is used by Availability / Transactions / Security. Unbounded and in-RAM — see [G2](#92-g2--bounded-memory). |
+| Offline queueing | 🚧 | `OfflineQueue` exists and is used by Availability / Transactions / Security. Bounded (G2.1) and in-RAM; the rest of the crate's collections aren't audited yet — see [G2](#92-g2--bounded-memory). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | ⬜ | **Nothing survives a restart.** `VariableAttribute::persistent` is recorded and ignored. |
 | Test suite | 🚧 | 668 test functions in `src/`, one integration test (`tests/connect_2_1_websocket.rs`). Strong unit coverage, near-zero end-to-end. |
@@ -653,14 +653,34 @@ mid-transaction currently loses the transaction.
 
 ### 7.3 E3 — Crash consistency
 
-- [ ] **E3.1** Write ordering / journaling so a power cut mid-write can't
-      produce a half-written transaction record. Partially addressed: a record
-      that decodes as anything other than a complete, current-schema
-      `PersistedTransaction` is discarded on load rather than half-applied, and
-      the counter is ordered ahead of the record it belongs to. What's still
-      missing is the *storage-level* guarantee — `Storage::set` is currently
-      assumed atomic, which no flash driver actually promises. Needs a
-      write-temp-then-rename (or A/B slot) protocol at the `Storage` boundary.
+- [x] **E3.1** Write ordering / journaling so a power cut mid-write can't
+      produce a half-written transaction record. The record-level defense
+      already existed (`PersistedTransaction` discarded on decode failure, the
+      counter ordered ahead of the record it belongs to). The remaining gap —
+      `Storage::set` being assumed atomic when no flash driver actually
+      promises that — is now closed at the `Storage` boundary itself:
+      `hardware::AtomicStorage<S>` wraps any `Storage` and turns it into one
+      whose `get` never observes a torn write, via an A/B-slot protocol built
+      entirely on the existing `get`/`set`/`remove` primitives (no new
+      required method, so it doesn't break existing `Storage` implementors).
+      Each logical key gets two physical slots (`"{key}.a"`/`"{key}.b"`); a
+      write always targets whichever slot *isn't* the current winner, leaving
+      the other — and therefore the previous value — untouched, and each
+      record carries a sequence number, a kind (value/tombstone, so `remove`
+      is a write like any other rather than an in-place delete), and a CRC32.
+      A torn write leaves its target slot failing the length check or the
+      checksum, so it's simply skipped in favour of the untouched slot with
+      the next-highest valid sequence number — `get` after a crash returns
+      either the pre-write or post-write value, never a mix.
+      `persistence::TransactionStore::new_atomic` wires it in ahead of
+      `TransactionStore::new` for real storage. What it still doesn't cover,
+      documented on `AtomicStorage` itself: a backend that can corrupt bytes
+      it wasn't asked to write (e.g. both slots sharing a flash erase block
+      that a power cut interrupts mid-erase — the protocol assumes per-key
+      write isolation, which a raw flash region doesn't automatically give
+      you), complete-but-wrong records that still checksum fine, and
+      concurrent writers to the same key (matches the rest of this crate's
+      single-writer-per-key assumption).
 - [x] **E3.2** Bound write frequency — `persistence_decision` in
       `src/persistence.rs`. Lifecycle transitions (started, charging-state
       change, ended) always write; a periodic meter reading only writes once the
@@ -773,10 +793,35 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
 
 ### 9.2 G2 — Bounded memory
 
-- [ ] **G2.1** `OfflineQueue` uses an unbounded `VecDeque` — a long outage
-      grows it until allocation fails. Bound it, with an explicit
-      drop-or-reject policy and a `MemoryExhaustion` security event on
-      overflow.
+- [x] **G2.1** `OfflineQueue` is now bounded: `DEFAULT_CAPACITY` (100
+      messages) unless a caller picks its own via `with_capacity`, with a
+      caller-configurable `OverflowPolicy` (`DropOldest` evicts the front
+      message to make room, `DropNewest` rejects the incoming one and
+      leaves the queue untouched) rather than one policy imposed on every
+      message kind. The two lose different things — spelled out in
+      `OverflowPolicy`'s rustdoc — so the status and security queues keep
+      the default `DropOldest` (a queued `StatusNotification` is superseded
+      by whatever the connector's status is once the connection recovers,
+      so keeping the newest is what matters) while the transaction queue
+      opts into `DropNewest` (a queued `TransactionEvent` carries a
+      billable energy reading, so evicting the oldest would permanently
+      lose billing data; rejecting the newest only delays fresh activity).
+      `OfflineQueue::push` returns whatever message overflow dropped, and
+      `run_with_offline_queue` takes an `on_overflow` callback fed that
+      message — kept as a plain callback rather than a hard dependency on
+      `crate::security` so the queue itself stays protocol/security-agnostic
+      and no_std-clean. `ChargePointBuilder` wires the status and
+      transaction queues' callbacks to raise a `MemoryExhaustion` security
+      event via `report_security_event`; the security-event queue's own
+      callback deliberately does *not* do that (it only logs) since raising
+      a security event from the security-event queue's own overflow would
+      feed back into the same queue and risk an unbounded loop the moment
+      that queue is also full. Still open: G2.2's audit of every other
+      unbounded collection (local auth list, transaction history, device
+      model, charging profiles) hasn't happened, so `OfflineQueue` is the
+      only bounded collection in the crate so far, and the 100-message
+      default is a documented estimate, not a measured RAM budget (that's
+      G2.3).
 - [ ] **G2.2** Audit every other unbounded collection in
       `ChargePointState` (local auth list, transaction history, device
       model, charging profiles) for a configured maximum.

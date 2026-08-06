@@ -30,7 +30,7 @@ use crate::hardware::Evse;
 use crate::hardware::{Capabilities, warn_on_feature_mismatches};
 #[cfg(feature = "local-auth-list")]
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
-use crate::offline_queue::{OfflineQueue, run_with_offline_queue};
+use crate::offline_queue::{OfflineQueue, OverflowPolicy, run_with_offline_queue};
 use crate::persistence::{TransactionStore, restore_transactions, run_transaction_persistence};
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
 use crate::remote_control::{
@@ -40,10 +40,10 @@ use crate::reporting::{GetBaseReportHandler, GetReportHandler};
 #[cfg(feature = "reservation")]
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::reset::ResetHandler;
-use crate::security::SecurityEventNotifier;
+use crate::security::{SecurityEventNotifier, report_security_event};
 use crate::state::{
     AuthorizationRequested, ChargePointEvent, Component, ConnectorStatusChanged, DeviceModelEvent,
-    SecurityEvent, TransactionEventOccurred, Variable, VariableAttributeType,
+    SecurityEvent, SecurityEventType, TransactionEventOccurred, Variable, VariableAttributeType,
 };
 use crate::sync::BroadcastReceiver;
 use crate::transactions::TransactionNotifier;
@@ -276,24 +276,36 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         // order, rather than dropped - both whenever the next report comes in and, via
         // `register_reconnect_handler` below, as soon as the connection itself comes back, so a
         // queued report doesn't wait indefinitely for an unrelated event to trigger a retry.
+        // `DropOldest` (the default): a queued status is superseded by whatever the connector's
+        // status actually is by the time the connection recovers, so keeping the newest is more
+        // useful than keeping the oldest - see `OverflowPolicy`'s docs.
         let status_queue = Arc::new(OfflineQueue::new());
         let status_notifier = Arc::new(DedupedStatusNotifier::new(csms.clone()));
         let forwarder_queue = status_queue.clone();
         let forwarder_notifier = status_notifier.clone();
+        let overflow_actor = self.runtime.actor();
         self.executor.spawn(Box::pin(async move {
-            run_with_offline_queue(status_changes, &forwarder_queue, move |changed| {
-                let notifier = forwarder_notifier.clone();
-                async move {
-                    notifier
-                        .notify_status(
-                            changed.evse_id,
-                            changed.connector_id,
-                            changed.status,
-                            changed.connector_state,
-                        )
-                        .await
-                }
-            })
+            run_with_offline_queue(
+                status_changes,
+                &forwarder_queue,
+                move |changed| {
+                    let notifier = forwarder_notifier.clone();
+                    async move {
+                        notifier
+                            .notify_status(
+                                changed.evse_id,
+                                changed.connector_id,
+                                changed.status,
+                                changed.connector_state,
+                            )
+                            .await
+                    }
+                },
+                move |_dropped| {
+                    let actor = overflow_actor.clone();
+                    async move { report_memory_exhaustion(&actor).await }
+                },
+            )
             .await;
         }));
         csms.register_reconnect_handler(move || {
@@ -332,23 +344,38 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             return self;
         };
 
-        let transaction_queue = Arc::new(OfflineQueue::new());
+        // `DropNewest`, unlike the status/security queues above: a queued `TransactionEvent`
+        // carries a billable energy reading, and evicting the oldest to make room for a new one
+        // would permanently lose that billing data. Rejecting the newest instead only delays
+        // fresh transaction activity - it never disturbs what's already queued - see
+        // `OverflowPolicy`'s docs.
+        let transaction_queue =
+            Arc::new(OfflineQueue::new().with_overflow_policy(OverflowPolicy::DropNewest));
         let forwarder_queue = transaction_queue.clone();
         let forwarder_csms = csms.clone();
+        let overflow_actor = self.runtime.actor();
         self.executor.spawn(Box::pin(async move {
-            run_with_offline_queue(transaction_events, &forwarder_queue, move |occurred| {
-                let notifier = forwarder_csms.clone();
-                async move {
-                    notifier
-                        .notify_transaction_event(
-                            occurred.evse_id,
-                            occurred.connector_id,
-                            occurred.kind,
-                            occurred.transaction,
-                        )
-                        .await
-                }
-            })
+            run_with_offline_queue(
+                transaction_events,
+                &forwarder_queue,
+                move |occurred| {
+                    let notifier = forwarder_csms.clone();
+                    async move {
+                        notifier
+                            .notify_transaction_event(
+                                occurred.evse_id,
+                                occurred.connector_id,
+                                occurred.kind,
+                                occurred.transaction,
+                            )
+                            .await
+                    }
+                },
+                move |_dropped| {
+                    let actor = overflow_actor.clone();
+                    async move { report_memory_exhaustion(&actor).await }
+                },
+            )
             .await;
         }));
         let reconnect_csms = csms.clone();
@@ -411,14 +438,32 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let forwarder_queue = security_queue.clone();
         let forwarder_csms = csms.clone();
         self.executor.spawn(Box::pin(async move {
-            run_with_offline_queue(security_events, &forwarder_queue, move |event| {
-                let notifier = forwarder_csms.clone();
-                async move {
-                    notifier
-                        .notify_security_event(&event.event_type, event.tech_info.as_deref())
-                        .await
-                }
-            })
+            run_with_offline_queue(
+                security_events,
+                &forwarder_queue,
+                move |event| {
+                    let notifier = forwarder_csms.clone();
+                    async move {
+                        notifier
+                            .notify_security_event(&event.event_type, event.tech_info.as_deref())
+                            .await
+                    }
+                },
+                // Deliberately does NOT call `report_memory_exhaustion` here, unlike the
+                // status/transaction queues above: that would raise a `SecurityEventOccurred`
+                // which is itself broadcast to this same forwarding loop and pushed into this
+                // same queue, and if the queue is already full that overflows again - an
+                // unbounded feedback loop. A dropped security event (this queue's overflow) is
+                // logged instead, once, without re-entering the reporting pipeline.
+                move |dropped: SecurityEvent| async move {
+                    tracing::error!(
+                        event_type = ?dropped.event_type,
+                        "offline security-event queue overflowed; dropping the oldest queued \
+                         security event notification rather than risk an unbounded feedback loop \
+                         by reporting MemoryExhaustion through this same queue"
+                    );
+                },
+            )
             .await;
         }));
         let reconnect_csms = csms.clone();
@@ -651,6 +696,25 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         }
         taken
     }
+}
+
+/// Raises a `MemoryExhaustion` security event on `actor` - the overflow handler wired to the
+/// status and transaction `OfflineQueue`s (see [`ChargePointBuilder::status_notifications`] /
+/// [`ChargePointBuilder::transaction_events`]) when their bound is hit
+/// (`docs/PRODUCTION-ROADMAP.md` §9.2, G2.1). Deliberately not used by the security-event queue
+/// itself - see the comment at its call site in [`ChargePointBuilder::security_events`] for why
+/// that would recurse.
+async fn report_memory_exhaustion(actor: &crate::actor::ChargePointActor) {
+    report_security_event(
+        actor,
+        SecurityEvent {
+            event_type: SecurityEventType::MemoryExhaustion,
+            tech_info: Some(String::from(
+                "an offline-report queue reached its configured capacity and dropped a message",
+            )),
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]
