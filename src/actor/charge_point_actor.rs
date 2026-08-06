@@ -4,8 +4,8 @@ use crate::state::{
     ConnectorStatusChanged, HardwareCommand, SecurityEvent, TransactionEventOccurred,
 };
 use crate::sync::{
-    broadcast_channel, watch_channel, BroadcastReceiver, BroadcastSender, Chan, OneShot,
-    WatchReceiver,
+    BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
+    watch_channel,
 };
 use alloc::boxed::Box;
 

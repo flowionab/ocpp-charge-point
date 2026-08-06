@@ -197,7 +197,7 @@ pub trait CancelReservationHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_cancel_reservation, handle_reserve_now, CancelReservationOutcome, ReserveNowOutcome,
+        CancelReservationOutcome, ReserveNowOutcome, handle_cancel_reservation, handle_reserve_now,
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
@@ -323,8 +323,8 @@ mod tests {
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
     use super::{
-        handle_cancel_reservation, handle_reserve_now, CancelReservationHandler,
-        CancelReservationOutcome, ReserveNowHandler, ReserveNowOutcome,
+        CancelReservationHandler, CancelReservationOutcome, ReserveNowHandler, ReserveNowOutcome,
+        handle_cancel_reservation, handle_reserve_now,
     };
     use crate::actor::ChargePointActor;
     use crate::state::{IdToken, IdTokenKind, ReservationId};
@@ -531,8 +531,8 @@ mod ocpp_2_1 {
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
     use super::{
-        handle_cancel_reservation, handle_reserve_now, CancelReservationHandler,
-        CancelReservationOutcome, ReserveNowHandler, ReserveNowOutcome,
+        CancelReservationHandler, CancelReservationOutcome, ReserveNowHandler, ReserveNowOutcome,
+        handle_cancel_reservation, handle_reserve_now,
     };
     use crate::actor::ChargePointActor;
     use crate::remote_control::ocpp_2_0_1::map_id_token_kind;
@@ -540,7 +540,9 @@ mod ocpp_2_0_1 {
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{CancelReservationStatusEnum, ReserveNowStatusEnum};
+    use ocpp_client::ocpp_types::v201::common::{
+        CancelReservationStatusEnum, ReserveNowStatusEnum,
+    };
     use ocpp_client::ocpp_types::v201::{
         CancelReservationResponse, ReserveNowRequest, ReserveNowResponse,
     };
@@ -735,8 +737,8 @@ mod ocpp_2_0_1 {
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
     use super::{
-        handle_cancel_reservation, handle_reserve_now, CancelReservationHandler,
-        CancelReservationOutcome, ReserveNowHandler, ReserveNowOutcome,
+        CancelReservationHandler, CancelReservationOutcome, ReserveNowHandler, ReserveNowOutcome,
+        handle_cancel_reservation, handle_reserve_now,
     };
     use crate::actor::ChargePointActor;
     use crate::id_tag::map_id_token;
@@ -798,7 +800,10 @@ mod ocpp_1_6 {
     impl Ocpp1_6ReserveNowHandler {
         /// Wraps `client`, capturing `connector_counts` (each EVSE's connector count, in
         /// `evse_id` order) for translating connector addresses on every request.
-        pub fn new(client: OCPP1_6Client, connector_counts: impl IntoIterator<Item = usize>) -> Self {
+        pub fn new(
+            client: OCPP1_6Client,
+            connector_counts: impl IntoIterator<Item = usize>,
+        ) -> Self {
             Self {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),
@@ -915,10 +920,7 @@ mod ocpp_1_6 {
         fn a_specific_connector_id_resolves_to_its_evse() {
             let connector_counts = [2, 1];
 
-            assert_eq!(
-                parse_evse_id(&connector_counts, &request(3)),
-                Ok(Some(1))
-            );
+            assert_eq!(parse_evse_id(&connector_counts, &request(3)), Ok(Some(1)));
         }
 
         #[test]

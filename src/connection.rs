@@ -16,7 +16,7 @@
 //! delivery once reconnected.
 
 use crate::actor::ChargePointActor;
-use crate::provisioning::{register_until_accepted, Backoff, BootNotifier};
+use crate::provisioning::{Backoff, BootNotifier, register_until_accepted};
 use alloc::boxed::Box;
 use alloc::string::String;
 use core::future::Future;
@@ -58,8 +58,14 @@ pub async fn reregister_on_reconnect<N, B>(
             let vendor_name = vendor_name.clone();
             let model_name = model_name.clone();
             async move {
-                register_until_accepted(&actor, &boot_notifier, &backoff, &vendor_name, &model_name)
-                    .await;
+                register_until_accepted(
+                    &actor,
+                    &boot_notifier,
+                    &backoff,
+                    &vendor_name,
+                    &model_name,
+                )
+                .await;
             }
         })
         .await;
@@ -131,7 +137,7 @@ mod ocpp_1_6 {
 
 #[cfg(test)]
 mod tests {
-    use super::{reregister_on_reconnect, ReconnectHandler};
+    use super::{ReconnectHandler, reregister_on_reconnect};
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
     use crate::provisioning::{Backoff, BootNotificationOutcome, BootNotifier};
@@ -144,7 +150,8 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
-    type BoxedReconnectCallback = Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+    type BoxedReconnectCallback =
+        Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
     /// A fake CSMS connection whose "reconnect" can be triggered manually from a test via
     /// `fire_reconnect`, standing in for `ocpp-client`'s real `Client::on_reconnect` (which only

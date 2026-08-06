@@ -159,7 +159,10 @@ async fn resolve_and_apply_set(
     request: &SetVariableRequest,
 ) -> SetVariableOutcome {
     let state = actor.state();
-    let Some(definition) = state.device_model.get(&request.component, &request.variable) else {
+    let Some(definition) = state
+        .device_model
+        .get(&request.component, &request.variable)
+    else {
         return if state.device_model.has_component(&request.component) {
             SetVariableOutcome::UnknownVariable
         } else {
@@ -205,8 +208,8 @@ pub trait SetVariablesHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_get_variables, handle_set_variables, GetVariableOutcome, GetVariableRequest,
-        SetVariableOutcome, SetVariableRequest,
+        GetVariableOutcome, GetVariableRequest, SetVariableOutcome, SetVariableRequest,
+        handle_get_variables, handle_set_variables,
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
@@ -507,8 +510,8 @@ mod tests {
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
     use super::{
-        handle_get_variables, handle_set_variables, GetVariableOutcome, GetVariableRequest,
-        GetVariablesHandler, SetVariableOutcome, SetVariableRequest, SetVariablesHandler,
+        GetVariableOutcome, GetVariableRequest, GetVariablesHandler, SetVariableOutcome,
+        SetVariableRequest, SetVariablesHandler, handle_get_variables, handle_set_variables,
     };
     use crate::actor::ChargePointActor;
     use crate::state::{Component, Variable, VariableAttributeType};
@@ -769,14 +772,18 @@ mod ocpp_2_1 {
             );
         }
 
-        fn wire_component(evse: Option<(i64, Option<i64>)>) -> ocpp_client::ocpp_types::v21::common::Component {
+        fn wire_component(
+            evse: Option<(i64, Option<i64>)>,
+        ) -> ocpp_client::ocpp_types::v21::common::Component {
             ocpp_client::ocpp_types::v21::common::Component {
                 custom_data: None,
-                evse: evse.map(|(id, connector_id)| ocpp_client::ocpp_types::v21::common::EVSE {
-                    connector_id,
-                    custom_data: None,
-                    id,
-                }),
+                evse: evse.map(
+                    |(id, connector_id)| ocpp_client::ocpp_types::v21::common::EVSE {
+                        connector_id,
+                        custom_data: None,
+                        id,
+                    },
+                ),
                 instance: None,
                 name: heapless::String::try_from("OCPPCommCtrlr").unwrap(),
             }
@@ -841,8 +848,8 @@ mod ocpp_2_1 {
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
     use super::{
-        handle_get_variables, handle_set_variables, GetVariableOutcome, GetVariableRequest,
-        GetVariablesHandler, SetVariableOutcome, SetVariableRequest, SetVariablesHandler,
+        GetVariableOutcome, GetVariableRequest, GetVariablesHandler, SetVariableOutcome,
+        SetVariableRequest, SetVariablesHandler, handle_get_variables, handle_set_variables,
     };
     use crate::actor::ChargePointActor;
     use crate::state::{Component, Variable, VariableAttributeType};
@@ -1148,7 +1155,10 @@ mod ocpp_2_0_1 {
 /// no equivalent of `UnknownComponent`/`UnknownVariable`/`NotSupportedAttributeType`).
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
-    use super::{handle_set_variables, GetVariablesHandler, SetVariableOutcome, SetVariableRequest, SetVariablesHandler};
+    use super::{
+        GetVariablesHandler, SetVariableOutcome, SetVariableRequest, SetVariablesHandler,
+        handle_set_variables,
+    };
     use crate::actor::ChargePointActor;
     use crate::state::{
         Component, DeviceModel, Variable, VariableAttributeType, VariableDefinition,
@@ -1526,7 +1536,8 @@ mod ocpp_1_6 {
 
         #[test]
         fn a_charge_point_wide_pair_round_trips_through_encode_and_decode() {
-            let key = encode_key(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval")).unwrap();
+            let key =
+                encode_key(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval")).unwrap();
 
             let decoded = decode_key(key.as_str()).unwrap();
 
@@ -1649,17 +1660,23 @@ mod ocpp_1_6 {
             let (configuration_key, unknown_key) = resolve_get_configuration(&model, None);
 
             assert!(unknown_key.is_empty());
-            assert!(configuration_key
-                .iter()
-                .any(|item| item.key.as_str() == "HeartbeatInterval"));
-            assert!(configuration_key
-                .iter()
-                .any(|item| item.key.as_str() == "AuthorizeRemoteTxRequests"));
+            assert!(
+                configuration_key
+                    .iter()
+                    .any(|item| item.key.as_str() == "HeartbeatInterval")
+            );
+            assert!(
+                configuration_key
+                    .iter()
+                    .any(|item| item.key.as_str() == "AuthorizeRemoteTxRequests")
+            );
             // Neither built-in default is listed under the old dotted form now that it has a
             // standard alias.
-            assert!(!configuration_key
-                .iter()
-                .any(|item| item.key.as_str() == "OCPPCommCtrlr.HeartbeatInterval"));
+            assert!(
+                !configuration_key
+                    .iter()
+                    .any(|item| item.key.as_str() == "OCPPCommCtrlr.HeartbeatInterval")
+            );
         }
 
         #[test]

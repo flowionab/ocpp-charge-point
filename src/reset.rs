@@ -72,7 +72,7 @@ pub trait ResetHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_reset, ResetOutcome};
+    use super::{ResetOutcome, handle_reset};
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
     use crate::state::{
@@ -93,8 +93,7 @@ mod tests {
         let actor = ChargePointActor::spawn([1], &TokioExecutor);
         let mut commands = actor.subscribe_commands();
 
-        let outcome =
-            handle_reset(&actor, ResetTarget::ChargePoint, ResetKind::Immediate).await;
+        let outcome = handle_reset(&actor, ResetTarget::ChargePoint, ResetKind::Immediate).await;
 
         assert_eq!(outcome, ResetOutcome::Accepted);
         assert_eq!(
@@ -210,8 +209,7 @@ mod tests {
         }
         let mut commands = actor.subscribe_commands();
 
-        let outcome =
-            handle_reset(&actor, ResetTarget::ChargePoint, ResetKind::Immediate).await;
+        let outcome = handle_reset(&actor, ResetTarget::ChargePoint, ResetKind::Immediate).await;
         assert_eq!(outcome, ResetOutcome::Accepted);
 
         // Fail-safe order: contactor opens before anything is unlocked.
@@ -336,12 +334,7 @@ mod tests {
             })
         );
 
-        handle_reset(
-            &actor,
-            ResetTarget::Evse { evse_id: 0 },
-            ResetKind::OnIdle,
-        )
-        .await;
+        handle_reset(&actor, ResetTarget::Evse { evse_id: 0 }, ResetKind::OnIdle).await;
 
         assert_eq!(
             actor.state().pending_reset,
@@ -387,7 +380,7 @@ mod tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    use super::{handle_reset, ResetHandler, ResetOutcome};
+    use super::{ResetHandler, ResetOutcome, handle_reset};
     use crate::actor::ChargePointActor;
     use crate::state::{ResetKind, ResetTarget};
     use alloc::boxed::Box;
@@ -513,7 +506,7 @@ mod ocpp_2_1 {
 
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
-    use super::{handle_reset, ResetHandler, ResetOutcome};
+    use super::{ResetHandler, ResetOutcome, handle_reset};
     use crate::actor::ChargePointActor;
     use crate::state::{ResetKind, ResetTarget};
     use alloc::boxed::Box;
@@ -628,13 +621,13 @@ mod ocpp_2_0_1 {
 
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
-    use super::{handle_reset, ResetHandler, ResetOutcome};
+    use super::{ResetHandler, ResetOutcome, handle_reset};
     use crate::actor::ChargePointActor;
     use crate::state::{ResetKind, ResetTarget};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::common::{ResetRequestType, ResetResponseStatus};
     use ocpp_client::ocpp_types::v16::ResetResponse;
+    use ocpp_client::ocpp_types::v16::common::{ResetRequestType, ResetResponseStatus};
 
     /// OCPP 1.6J's `Reset.req` has no `evseId` - a Reset always targets the whole charge point.
     /// Its `type` is `Hard`/`Soft` rather than 2.0.1/2.1's `Immediate`/`OnIdle`, with different

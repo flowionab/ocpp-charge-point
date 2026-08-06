@@ -123,8 +123,8 @@ pub trait GetLocalListVersionHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_get_local_list_version, handle_send_local_list, LocalListChange, LocalListUpdate,
-        SendLocalListOutcome,
+        LocalListChange, LocalListUpdate, SendLocalListOutcome, handle_get_local_list_version,
+        handle_send_local_list,
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
@@ -240,8 +240,8 @@ mod tests {
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
     use super::{
-        handle_get_local_list_version, handle_send_local_list, GetLocalListVersionHandler,
-        LocalListChange, LocalListUpdate, SendLocalListHandler, SendLocalListOutcome,
+        GetLocalListVersionHandler, LocalListChange, LocalListUpdate, SendLocalListHandler,
+        SendLocalListOutcome, handle_get_local_list_version, handle_send_local_list,
     };
     use crate::actor::ChargePointActor;
     use crate::state::{AuthorizationStatus, IdToken, IdTokenKind, LocalListEntry};
@@ -479,8 +479,8 @@ mod ocpp_2_1 {
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
     use super::{
-        handle_get_local_list_version, handle_send_local_list, GetLocalListVersionHandler,
-        LocalListChange, LocalListUpdate, SendLocalListHandler, SendLocalListOutcome,
+        GetLocalListVersionHandler, LocalListChange, LocalListUpdate, SendLocalListHandler,
+        SendLocalListOutcome, handle_get_local_list_version, handle_send_local_list,
     };
     use crate::actor::ChargePointActor;
     use crate::remote_control::ocpp_2_0_1::map_id_token_kind;
@@ -706,8 +706,8 @@ mod ocpp_2_0_1 {
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
     use super::{
-        handle_get_local_list_version, handle_send_local_list, GetLocalListVersionHandler,
-        LocalListChange, LocalListUpdate, SendLocalListHandler, SendLocalListOutcome,
+        GetLocalListVersionHandler, LocalListChange, LocalListUpdate, SendLocalListHandler,
+        SendLocalListOutcome, handle_get_local_list_version, handle_send_local_list,
     };
     use crate::actor::ChargePointActor;
     use crate::id_tag::map_id_token;
@@ -768,7 +768,8 @@ mod ocpp_1_6 {
                 let actor = actor.clone();
                 async move {
                     let update = parse_update(&request);
-                    let outcome = handle_send_local_list(&actor, request.list_version, update).await;
+                    let outcome =
+                        handle_send_local_list(&actor, request.list_version, update).await;
                     Ok(SendLocalListResponse {
                         status: map_outcome(outcome),
                     })
@@ -837,7 +838,10 @@ mod ocpp_1_6 {
             assert_eq!(map_entry(&item(None)), None);
         }
 
-        fn request(update_type: UpdateType, id_tag_info: Option<IdTagInfoStatus>) -> SendLocalListRequest {
+        fn request(
+            update_type: UpdateType,
+            id_tag_info: Option<IdTagInfoStatus>,
+        ) -> SendLocalListRequest {
             SendLocalListRequest {
                 list_version: 1,
                 local_authorization_list: Some(alloc::vec![item(id_tag_info)]),

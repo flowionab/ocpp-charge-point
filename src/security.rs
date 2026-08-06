@@ -166,7 +166,7 @@ pub async fn run_security_events<N: SecurityEventNotifier>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_security_events, SecurityEventNotifier};
+    use super::{SecurityEventNotifier, run_security_events};
     use crate::state::{SecurityEvent, SecurityEventType};
     use crate::sync::broadcast_channel;
     use alloc::boxed::Box;

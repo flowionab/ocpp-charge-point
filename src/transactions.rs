@@ -55,7 +55,7 @@ pub async fn run_transaction_events<N: TransactionNotifier>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_transaction_events, TransactionNotifier};
+    use super::{TransactionNotifier, run_transaction_events};
     use crate::state::{
         Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
         TransactionId,
@@ -275,10 +275,10 @@ mod ocpp_2_1 {
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::TransactionNotifier;
         use alloc::boxed::Box;
-        use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-        use ocpp_client::ocpp_types::v21::common::{Transaction as WireTransaction, EVSE};
-        use ocpp_client::ocpp_types::v21::TransactionEventRequest;
         use ocpp_client::ClientError;
+        use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
+        use ocpp_client::ocpp_types::v21::TransactionEventRequest;
+        use ocpp_client::ocpp_types::v21::common::{EVSE, Transaction as WireTransaction};
 
         #[async_trait::async_trait]
         impl TransactionNotifier for OCPP2_1Client {
@@ -686,7 +686,7 @@ mod ocpp_2_0_1 {
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
         use ocpp_client::ocpp_types::v201::TransactionEventRequest;
-        use ocpp_client::ocpp_types::v201::common::{Transaction as WireTransaction, EVSE};
+        use ocpp_client::ocpp_types::v201::common::{EVSE, Transaction as WireTransaction};
 
         #[async_trait::async_trait]
         impl TransactionNotifier for OCPP2_0_1Client {
@@ -962,7 +962,10 @@ mod ocpp_1_6 {
             Measurand::EnergyActiveImportRegister,
         )];
         if let Some(power_w) = sample.power_w {
-            values.push(sampled_value(power_w.to_string(), Measurand::PowerActiveImport));
+            values.push(sampled_value(
+                power_w.to_string(),
+                Measurand::PowerActiveImport,
+            ));
         }
         if let Some(current_ma) = sample.current_ma {
             values.push(sampled_value(
@@ -1004,7 +1007,10 @@ mod ocpp_1_6 {
         /// Wraps `client`, capturing `connector_counts` (each EVSE's connector count, in
         /// `evse_id` order) for translating connector addresses, starting with no cached
         /// CSMS-assigned transaction ids.
-        pub fn new(client: OCPP1_6Client, connector_counts: impl IntoIterator<Item = usize>) -> Self {
+        pub fn new(
+            client: OCPP1_6Client,
+            connector_counts: impl IntoIterator<Item = usize>,
+        ) -> Self {
             Self {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),
@@ -1018,7 +1024,7 @@ mod ocpp_1_6 {
     // this impl - unlike the rest of this file - needs both `ocpp_1_6` and `std`.
     #[cfg(feature = "std")]
     mod with_system_clock {
-        use super::{map_stop_reason, sampled_values, Ocpp1_6TransactionNotifier};
+        use super::{Ocpp1_6TransactionNotifier, map_stop_reason, sampled_values};
         use crate::clock::{Clock, SystemClock};
         use crate::id_tag::map_id_tag;
         use crate::state::{Transaction, TransactionEventKind};
@@ -1052,7 +1058,10 @@ mod ocpp_1_6 {
                     return Ok(());
                 };
                 let now = SystemClock.now();
-                let meter_reading = transaction.last_meter_sample.map(|s| s.energy_wh).unwrap_or(0);
+                let meter_reading = transaction
+                    .last_meter_sample
+                    .map(|s| s.energy_wh)
+                    .unwrap_or(0);
 
                 match kind {
                     TransactionEventKind::Started => {

@@ -67,7 +67,7 @@ pub trait CostUpdatedHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_cost_updated, CostUpdateOutcome};
+    use super::{CostUpdateOutcome, handle_cost_updated};
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
     use crate::state::{
@@ -125,7 +125,7 @@ mod tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    use super::{handle_cost_updated, CostUpdatedHandler};
+    use super::{CostUpdatedHandler, handle_cost_updated};
     use crate::actor::ChargePointActor;
     use crate::state::TransactionId;
     use alloc::boxed::Box;
@@ -188,7 +188,7 @@ mod ocpp_2_1 {
 /// 2.1's, so this is a copy of the 2.1 module, just targeting `OCPP2_0_1Client`.
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
-    use super::{handle_cost_updated, CostUpdatedHandler};
+    use super::{CostUpdatedHandler, handle_cost_updated};
     use crate::actor::ChargePointActor;
     use crate::state::TransactionId;
     use alloc::boxed::Box;

@@ -309,12 +309,7 @@ mod tests {
         assert_eq!(
             *seen_rx.borrow(),
             alloc::vec![
-                (
-                    0,
-                    0,
-                    ConnectorStatus::Occupied,
-                    ConnectorState::Connected
-                ),
+                (0, 0, ConnectorStatus::Occupied, ConnectorState::Connected),
                 (0, 1, ConnectorStatus::Faulted, ConnectorState::Faulted),
             ]
         );
@@ -606,10 +601,8 @@ mod ocpp_2_1 {
             self.on_change_availability(move |request, _client| {
                 let actor = actor.clone();
                 async move {
-                    let available = matches!(
-                        request.operational_status,
-                        OperationalStatusEnum::Operative
-                    );
+                    let available =
+                        matches!(request.operational_status, OperationalStatusEnum::Operative);
                     let outcome = match parse_target(&request) {
                         Some(target) => {
                             handle_change_availability_request(&actor, target, available).await
@@ -657,13 +650,13 @@ mod ocpp_2_1 {
 
         fn request(evse: Option<(i64, Option<i64>)>) -> ChangeAvailabilityRequest {
             ChangeAvailabilityRequest {
-                evse: evse.map(|(id, connector_id)| {
-                    ocpp_client::ocpp_types::v21::common::EVSE {
+                evse: evse.map(
+                    |(id, connector_id)| ocpp_client::ocpp_types::v21::common::EVSE {
                         id,
                         connector_id,
                         custom_data: None,
-                    }
-                }),
+                    },
+                ),
                 operational_status: OperationalStatusEnum::Inoperative,
                 custom_data: None,
             }
@@ -806,10 +799,8 @@ mod ocpp_2_0_1 {
             self.on_change_availability(move |request, _client| {
                 let actor = actor.clone();
                 async move {
-                    let available = matches!(
-                        request.operational_status,
-                        OperationalStatusEnum::Operative
-                    );
+                    let available =
+                        matches!(request.operational_status, OperationalStatusEnum::Operative);
                     let outcome = match parse_target(&request) {
                         Some(target) => {
                             handle_change_availability_request(&actor, target, available).await
@@ -857,13 +848,13 @@ mod ocpp_2_0_1 {
 
         fn request(evse: Option<(i64, Option<i64>)>) -> ChangeAvailabilityRequest {
             ChangeAvailabilityRequest {
-                evse: evse.map(|(id, connector_id)| {
-                    ocpp_client::ocpp_types::v201::common::EVSE {
+                evse: evse.map(
+                    |(id, connector_id)| ocpp_client::ocpp_types::v201::common::EVSE {
                         id,
                         connector_id,
                         custom_data: None,
-                    }
-                }),
+                    },
+                ),
                 operational_status: OperationalStatusEnum::Inoperative,
                 custom_data: None,
             }
@@ -955,9 +946,9 @@ mod ocpp_1_6 {
             | ConnectorState::Authorizing
             | ConnectorState::Starting => StatusNotificationRequestStatus::Preparing,
             ConnectorState::Charging => StatusNotificationRequestStatus::Charging,
-            ConnectorState::Stopping
-            | ConnectorState::Finishing
-            | ConnectorState::Unlocking => StatusNotificationRequestStatus::Finishing,
+            ConnectorState::Stopping | ConnectorState::Finishing | ConnectorState::Unlocking => {
+                StatusNotificationRequestStatus::Finishing
+            }
             ConnectorState::Unavailable => StatusNotificationRequestStatus::Unavailable,
             ConnectorState::Faulted | ConnectorState::FaultedSafe => {
                 StatusNotificationRequestStatus::Faulted
@@ -981,7 +972,10 @@ mod ocpp_1_6 {
     impl Ocpp1_6StatusNotifier {
         /// Wraps `client`, capturing `connector_counts` (each EVSE's connector count, in
         /// `evse_id` order) for translating connector addresses on every call.
-        pub fn new(client: OCPP1_6Client, connector_counts: impl IntoIterator<Item = usize>) -> Self {
+        pub fn new(
+            client: OCPP1_6Client,
+            connector_counts: impl IntoIterator<Item = usize>,
+        ) -> Self {
             Self {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),
@@ -1100,8 +1094,8 @@ mod ocpp_1_6 {
     // the wire) - only whole-station or one-specific-connector.
     use crate::actor::ChargePointActor;
     use crate::availability::{
-        handle_change_availability_request, AvailabilityTarget, ChangeAvailabilityHandler,
-        ChangeAvailabilityOutcome,
+        AvailabilityTarget, ChangeAvailabilityHandler, ChangeAvailabilityOutcome,
+        handle_change_availability_request,
     };
     use crate::topology::unflatten_ocpp_1_6_connector_id;
     use ocpp_client::ocpp_types::v16::common::{
@@ -1118,11 +1112,12 @@ mod ocpp_1_6 {
         if request.connector_id == 0 {
             return Some(AvailabilityTarget::ChargePoint);
         }
-        unflatten_ocpp_1_6_connector_id(connector_counts, request.connector_id)
-            .map(|(evse_id, connector_id)| AvailabilityTarget::Connector {
+        unflatten_ocpp_1_6_connector_id(connector_counts, request.connector_id).map(
+            |(evse_id, connector_id)| AvailabilityTarget::Connector {
                 evse_id,
                 connector_id,
-            })
+            },
+        )
     }
 
     fn map_outcome(outcome: ChangeAvailabilityOutcome) -> ChangeAvailabilityResponseStatus {
@@ -1143,7 +1138,10 @@ mod ocpp_1_6 {
     impl Ocpp1_6ChangeAvailabilityHandler {
         /// Wraps `client`, capturing `connector_counts` (each EVSE's connector count, in
         /// `evse_id` order) for translating connector addresses on every request.
-        pub fn new(client: OCPP1_6Client, connector_counts: impl IntoIterator<Item = usize>) -> Self {
+        pub fn new(
+            client: OCPP1_6Client,
+            connector_counts: impl IntoIterator<Item = usize>,
+        ) -> Self {
             Self {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),
@@ -1164,8 +1162,7 @@ mod ocpp_1_6 {
                             matches!(request.r#type, ChangeAvailabilityRequestType::Operative);
                         let outcome = match parse_target(&connector_counts, &request) {
                             Some(target) => {
-                                handle_change_availability_request(&actor, target, available)
-                                    .await
+                                handle_change_availability_request(&actor, target, available).await
                             }
                             None => ChangeAvailabilityOutcome::Rejected,
                         };

@@ -54,8 +54,13 @@ pub enum ReportBase {
 /// The variable names [`ReportBase::SummaryInventory`] includes, if registered on a component -
 /// see that variant's docs for why this is a fixed, deliberately non-exhaustive list rather than
 /// something this crate can derive automatically from the device model alone.
-const SUMMARY_VARIABLE_NAMES: [&str; 5] =
-    ["AvailabilityState", "Active", "Available", "Enabled", "Problem"];
+const SUMMARY_VARIABLE_NAMES: [&str; 5] = [
+    "AvailabilityState",
+    "Active",
+    "Available",
+    "Enabled",
+    "Problem",
+];
 
 /// One component control-state criterion for `GetReport`'s `componentCriteria`, matching OCPP's
 /// `ComponentCriterionEnum`. Each criterion refers to a same-named `Boolean` variable on the
@@ -345,10 +350,9 @@ pub trait GetReportHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        chunk_report, component_matches_criterion, filter_report_entries,
-        handle_get_base_report, handle_get_report, report_base_entries, ReportBase,
-        ReportComponentCriterion, ReportComponentVariable, ReportEntry, ReportOutcome,
-        REPORT_CHUNK_SIZE,
+        REPORT_CHUNK_SIZE, ReportBase, ReportComponentCriterion, ReportComponentVariable,
+        ReportEntry, ReportOutcome, chunk_report, component_matches_criterion,
+        filter_report_entries, handle_get_base_report, handle_get_report, report_base_entries,
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
@@ -426,9 +430,11 @@ mod tests {
         // Both built-in defaults are ReadWrite, so they're included; the freshly registered
         // ReadOnly-only variable is not.
         assert_eq!(entries.len(), 2);
-        assert!(entries
-            .iter()
-            .all(|entry| entry.variable.name != "ReadOnlyOnly"));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.variable.name != "ReadOnlyOnly")
+        );
     }
 
     #[test]
@@ -757,10 +763,10 @@ mod ocpp_2_1 {
     use alloc::string::ToString;
     use ocpp_client::ocpp_types::v21::common::{
         AttributeEnum, Component as WireComponent, ComponentCriterionEnum, ComponentVariable,
-        DataEnum, GenericDeviceModelStatusEnum, MutabilityEnum, ReportBaseEnum,
+        DataEnum, EVSE, GenericDeviceModelStatusEnum, MutabilityEnum, ReportBaseEnum,
         ReportData as WireReportData, Variable as WireVariable,
         VariableAttribute as WireVariableAttribute,
-        VariableCharacteristics as WireVariableCharacteristics, EVSE,
+        VariableCharacteristics as WireVariableCharacteristics,
     };
 
     /// Truncates/bounds `value` to fit a `heapless::String<N>` on the wire, matching this crate's
@@ -1102,8 +1108,8 @@ mod ocpp_2_1 {
         use crate::actor::ChargePointActor;
         use crate::clock::{Clock, SystemClock};
         use crate::reporting::{
-            chunk_report, handle_get_base_report, handle_get_report, GetBaseReportHandler,
-            GetReportHandler, ReportEntry, ReportOutcome,
+            GetBaseReportHandler, GetReportHandler, ReportEntry, ReportOutcome, chunk_report,
+            handle_get_base_report, handle_get_report,
         };
         use alloc::boxed::Box;
         use alloc::vec::Vec;
@@ -1226,10 +1232,10 @@ mod ocpp_2_0_1 {
     use alloc::string::ToString;
     use ocpp_client::ocpp_types::v201::common::{
         AttributeEnum, Component as WireComponent, ComponentCriterionEnum, ComponentVariable,
-        DataEnum, GenericDeviceModelStatusEnum, MutabilityEnum, ReportBaseEnum,
+        DataEnum, EVSE, GenericDeviceModelStatusEnum, MutabilityEnum, ReportBaseEnum,
         ReportData as WireReportData, Variable as WireVariable,
         VariableAttribute as WireVariableAttribute,
-        VariableCharacteristics as WireVariableCharacteristics, EVSE,
+        VariableCharacteristics as WireVariableCharacteristics,
     };
 
     fn bounded_string<const N: usize>(value: &str) -> heapless::String<N> {
@@ -1450,8 +1456,8 @@ mod ocpp_2_0_1 {
         use crate::actor::ChargePointActor;
         use crate::clock::{Clock, SystemClock};
         use crate::reporting::{
-            chunk_report, handle_get_base_report, handle_get_report, GetBaseReportHandler,
-            GetReportHandler, ReportEntry, ReportOutcome,
+            GetBaseReportHandler, GetReportHandler, ReportEntry, ReportOutcome, chunk_report,
+            handle_get_base_report, handle_get_report,
         };
         use alloc::boxed::Box;
         use alloc::vec::Vec;

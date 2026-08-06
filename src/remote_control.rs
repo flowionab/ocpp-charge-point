@@ -310,7 +310,12 @@ async fn trigger_status_notification<N: StatusNotifier>(
                     .iter()
                     .enumerate()
                     .map(move |(connector_id, connector)| {
-                        (evse_id, connector_id, connector.availability_status(), *connector)
+                        (
+                            evse_id,
+                            connector_id,
+                            connector.availability_status(),
+                            *connector,
+                        )
                     })
             })
             .collect::<Vec<_>>(),
@@ -322,7 +327,12 @@ async fn trigger_status_notification<N: StatusNotifier>(
                 .iter()
                 .enumerate()
                 .map(|(connector_id, connector)| {
-                    (evse_id, connector_id, connector.availability_status(), *connector)
+                    (
+                        evse_id,
+                        connector_id,
+                        connector.availability_status(),
+                        *connector,
+                    )
                 })
                 .collect()
         }
@@ -337,7 +347,12 @@ async fn trigger_status_notification<N: StatusNotifier>(
             else {
                 return TriggerMessageOutcome::Rejected;
             };
-            vec![(evse_id, connector_id, connector.availability_status(), *connector)]
+            vec![(
+                evse_id,
+                connector_id,
+                connector.availability_status(),
+                *connector,
+            )]
         }
     };
 
@@ -1405,7 +1420,10 @@ pub(crate) mod ocpp_2_0_1 {
 
         #[test]
         fn every_wire_variant_maps_to_its_matching_internal_kind() {
-            assert_eq!(map_id_token_kind(IdTokenEnum::Central), IdTokenKind::Central);
+            assert_eq!(
+                map_id_token_kind(IdTokenEnum::Central),
+                IdTokenKind::Central
+            );
             assert_eq!(map_id_token_kind(IdTokenEnum::EMAID), IdTokenKind::EMAID);
             assert_eq!(
                 map_id_token_kind(IdTokenEnum::ISO14443),
@@ -1498,8 +1516,12 @@ mod ocpp_1_6 {
         outcome: RequestStopTransactionOutcome,
     ) -> RemoteStopTransactionResponseStatus {
         match outcome {
-            RequestStopTransactionOutcome::Accepted => RemoteStopTransactionResponseStatus::Accepted,
-            RequestStopTransactionOutcome::Rejected => RemoteStopTransactionResponseStatus::Rejected,
+            RequestStopTransactionOutcome::Accepted => {
+                RemoteStopTransactionResponseStatus::Accepted
+            }
+            RequestStopTransactionOutcome::Rejected => {
+                RemoteStopTransactionResponseStatus::Rejected
+            }
         }
     }
 
@@ -1530,7 +1552,10 @@ mod ocpp_1_6 {
     impl Ocpp1_6RemoteControlHandler {
         /// Wraps `client`, capturing `connector_counts` (each EVSE's connector count, in
         /// `evse_id` order) for translating connector addresses on every request.
-        pub fn new(client: OCPP1_6Client, connector_counts: impl IntoIterator<Item = usize>) -> Self {
+        pub fn new(
+            client: OCPP1_6Client,
+            connector_counts: impl IntoIterator<Item = usize>,
+        ) -> Self {
             Self {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),

@@ -185,7 +185,7 @@ pub async fn run_heartbeat<H: HeartbeatSender, B: Backoff>(
 
 #[cfg(test)]
 mod tests {
-    use super::{heartbeat_interval_secs, run_heartbeat, Backoff, HeartbeatSender};
+    use super::{Backoff, HeartbeatSender, heartbeat_interval_secs, run_heartbeat};
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
     use crate::state::{
@@ -576,13 +576,13 @@ mod ocpp_2_1 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
     use crate::state::RegistrationStatus;
     use alloc::boxed::Box;
+    use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
+    use ocpp_client::ocpp_types::v21::BootNotificationRequest;
+    use ocpp_client::ocpp_types::v21::HeartbeatRequest;
     use ocpp_client::ocpp_types::v21::common::{
         BootReasonEnum, ChargingStation, RegistrationStatusEnum,
     };
-    use ocpp_client::ocpp_types::v21::BootNotificationRequest;
-    use ocpp_client::ocpp_types::v21::HeartbeatRequest;
-    use ocpp_client::ClientError;
 
     pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
         BootNotificationRequest {
@@ -682,13 +682,13 @@ mod ocpp_2_0_1 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
     use crate::state::RegistrationStatus;
     use alloc::boxed::Box;
+    use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
+    use ocpp_client::ocpp_types::v201::BootNotificationRequest;
+    use ocpp_client::ocpp_types::v201::HeartbeatRequest;
     use ocpp_client::ocpp_types::v201::common::{
         BootReasonEnum, ChargingStation, RegistrationStatusEnum,
     };
-    use ocpp_client::ocpp_types::v201::BootNotificationRequest;
-    use ocpp_client::ocpp_types::v201::HeartbeatRequest;
-    use ocpp_client::ClientError;
 
     pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
         BootNotificationRequest {
@@ -791,11 +791,11 @@ mod ocpp_1_6 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
     use crate::state::RegistrationStatus;
     use alloc::boxed::Box;
+    use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
-    use ocpp_client::ocpp_types::v16::common::BootNotificationResponseStatus;
     use ocpp_client::ocpp_types::v16::BootNotificationRequest;
     use ocpp_client::ocpp_types::v16::HeartbeatRequest;
-    use ocpp_client::ClientError;
+    use ocpp_client::ocpp_types::v16::common::BootNotificationResponseStatus;
 
     pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
         BootNotificationRequest {

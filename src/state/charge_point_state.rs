@@ -141,10 +141,12 @@ impl ChargePointState {
                     variable,
                     attribute_type,
                     value,
-                } => {
-                    self.device_model
-                        .set_attribute_value(&component, &variable, attribute_type, value)
-                }
+                } => self.device_model.set_attribute_value(
+                    &component,
+                    &variable,
+                    attribute_type,
+                    value,
+                ),
             },
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
@@ -402,9 +404,9 @@ impl ChargePointState {
         self.pending_reset = None;
         effects.push(ChargePointEffect::StateChanged);
         for evse_id in self.target_evse_ids(pending.target) {
-            effects.push(ChargePointEffect::HardwareCommand(HardwareCommand::Reboot {
-                evse_id,
-            }));
+            effects.push(ChargePointEffect::HardwareCommand(
+                HardwareCommand::Reboot { evse_id },
+            ));
         }
     }
 
@@ -641,7 +643,8 @@ mod tests {
     }
 
     #[test]
-    fn an_internal_transition_that_keeps_the_same_ocpp_status_still_reports_the_richer_connector_state() {
+    fn an_internal_transition_that_keeps_the_same_ocpp_status_still_reports_the_richer_connector_state()
+     {
         let mut state = ChargePointState::new([1]);
         state.apply(ChargePointEvent::Evse {
             evse_id: 0,
@@ -727,7 +730,10 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::CableConnected);
         apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
 
-        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested(test_id_token()));
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested(test_id_token()),
+        );
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
         assert!(
@@ -749,7 +755,10 @@ mod tests {
             seq_no: 0,
             last_meter_sample: None,
         };
-        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction.clone()));
+        assert_eq!(
+            state.evses[0].transactions[0],
+            Some(expected_transaction.clone())
+        );
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
             TransactionEventOccurred {
                 evse_id: 0,
@@ -764,7 +773,10 @@ mod tests {
     fn a_remote_start_request_is_ignored_outside_the_locked_state() {
         let mut state = ChargePointState::new([1]);
 
-        let effects = apply_connector_event(&mut state, ConnectorEvent::RemoteStartRequested(test_id_token()));
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested(test_id_token()),
+        );
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
         assert!(effects.is_empty());
@@ -836,7 +848,10 @@ mod tests {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
 
-        let effects = apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
 
         let expected_transaction = Transaction {
             id: TransactionId(0),
@@ -846,7 +861,10 @@ mod tests {
             seq_no: 0,
             last_meter_sample: None,
         };
-        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction.clone()));
+        assert_eq!(
+            state.evses[0].transactions[0],
+            Some(expected_transaction.clone())
+        );
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
             TransactionEventOccurred {
                 evse_id: 0,
@@ -861,7 +879,10 @@ mod tests {
     fn the_contactor_closing_updates_the_transaction_to_charging() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
 
         let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
@@ -873,7 +894,10 @@ mod tests {
             seq_no: 1,
             last_meter_sample: None,
         };
-        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction.clone()));
+        assert_eq!(
+            state.evses[0].transactions[0],
+            Some(expected_transaction.clone())
+        );
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
             TransactionEventOccurred {
                 evse_id: 0,
@@ -888,7 +912,10 @@ mod tests {
     fn a_meter_reading_while_charging_updates_the_transaction_and_is_reported() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
         let sample = MeterSample {
@@ -905,7 +932,10 @@ mod tests {
             seq_no: 2,
             last_meter_sample: Some(sample),
         };
-        assert_eq!(state.evses[0].transactions[0], Some(expected_transaction.clone()));
+        assert_eq!(
+            state.evses[0].transactions[0],
+            Some(expected_transaction.clone())
+        );
         // A meter reading never changes the connector's physical state.
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
@@ -922,7 +952,10 @@ mod tests {
     fn a_meter_reading_while_not_charging_is_ignored() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
         // Still `Starting` (EvConnected) here, not yet `Charging`.
 
         let sample = MeterSample {
@@ -963,7 +996,10 @@ mod tests {
     fn stopping_charging_ends_the_transaction_once_the_contactor_confirms_open() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
         let stop_effects = apply_connector_event(
@@ -1004,7 +1040,10 @@ mod tests {
     fn a_hardware_fault_during_charging_immediately_ends_the_transaction() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
 
         let effects = apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
@@ -1069,7 +1108,10 @@ mod tests {
     fn an_evse_fault_ends_active_transactions_on_every_connector_it_covers() {
         let mut state = ChargePointState::new([2]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
         assert!(state.evses[0].transactions[0].is_some());
 
@@ -1387,7 +1429,10 @@ mod tests {
     fn a_cost_update_is_recorded_while_a_transaction_is_active() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
 
         apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
 
@@ -1407,7 +1452,10 @@ mod tests {
     fn a_new_transaction_does_not_inherit_the_previous_ones_cost() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
         apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
         apply_connector_event(
@@ -1420,7 +1468,10 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
         apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
 
         assert_eq!(state.evses[0].running_costs[0], None);
     }
@@ -1429,7 +1480,10 @@ mod tests {
     fn transaction_ids_increment_across_separate_sessions() {
         let mut state = ChargePointState::new([1]);
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
         apply_connector_event(
             &mut state,
@@ -1440,7 +1494,10 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
 
         plug_in_and_authorize(&mut state);
-        apply_connector_event(&mut state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
 
         assert_eq!(
             state.evses[0].transactions[0]

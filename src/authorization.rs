@@ -298,9 +298,10 @@ mod ocpp_2_0_1 {
     /// logging/UX, not authorization logic itself.
     pub(super) fn map_id_token_kind(kind: IdTokenKind) -> IdTokenEnum {
         match kind {
-            IdTokenKind::Central | IdTokenKind::DirectPayment | IdTokenKind::EVCCID | IdTokenKind::Vin => {
-                IdTokenEnum::Central
-            }
+            IdTokenKind::Central
+            | IdTokenKind::DirectPayment
+            | IdTokenKind::EVCCID
+            | IdTokenKind::Vin => IdTokenEnum::Central,
             IdTokenKind::EMAID => IdTokenEnum::EMAID,
             IdTokenKind::ISO14443 => IdTokenEnum::ISO14443,
             IdTokenKind::ISO15693 => IdTokenEnum::ISO15693,
@@ -364,7 +365,10 @@ mod ocpp_2_0_1 {
 
         #[test]
         fn every_representable_kind_maps_to_its_own_wire_variant() {
-            assert_eq!(map_id_token_kind(IdTokenKind::Central), IdTokenEnum::Central);
+            assert_eq!(
+                map_id_token_kind(IdTokenKind::Central),
+                IdTokenEnum::Central
+            );
             assert_eq!(map_id_token_kind(IdTokenKind::EMAID), IdTokenEnum::EMAID);
             assert_eq!(
                 map_id_token_kind(IdTokenKind::ISO14443),
@@ -374,7 +378,10 @@ mod ocpp_2_0_1 {
                 map_id_token_kind(IdTokenKind::ISO15693),
                 IdTokenEnum::ISO15693
             );
-            assert_eq!(map_id_token_kind(IdTokenKind::KeyCode), IdTokenEnum::KeyCode);
+            assert_eq!(
+                map_id_token_kind(IdTokenKind::KeyCode),
+                IdTokenEnum::KeyCode
+            );
             assert_eq!(map_id_token_kind(IdTokenKind::Local), IdTokenEnum::Local);
             assert_eq!(
                 map_id_token_kind(IdTokenKind::MacAddress),

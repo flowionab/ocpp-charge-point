@@ -33,7 +33,8 @@ impl<M> OfflineQueue<M> {
     }
 
     fn push(&self, message: M) {
-        self.pending.lock(|queue| queue.borrow_mut().push_back(message));
+        self.pending
+            .lock(|queue| queue.borrow_mut().push_back(message));
     }
 }
 

@@ -77,20 +77,14 @@ mod tests {
     fn flattening_an_out_of_range_connector_id_is_none() {
         let connector_counts = [2, 1];
 
-        assert_eq!(
-            flatten_ocpp_1_6_connector_id(&connector_counts, 0, 2),
-            None
-        );
+        assert_eq!(flatten_ocpp_1_6_connector_id(&connector_counts, 0, 2), None);
     }
 
     #[test]
     fn flattening_an_out_of_range_evse_id_is_none() {
         let connector_counts = [2, 1];
 
-        assert_eq!(
-            flatten_ocpp_1_6_connector_id(&connector_counts, 5, 0),
-            None
-        );
+        assert_eq!(flatten_ocpp_1_6_connector_id(&connector_counts, 5, 0), None);
     }
 
     #[test]
@@ -99,9 +93,8 @@ mod tests {
 
         for evse_id in 0..connector_counts.len() {
             for connector_id in 0..connector_counts[evse_id] {
-                let flat =
-                    flatten_ocpp_1_6_connector_id(&connector_counts, evse_id, connector_id)
-                        .unwrap();
+                let flat = flatten_ocpp_1_6_connector_id(&connector_counts, evse_id, connector_id)
+                    .unwrap();
                 assert_eq!(
                     unflatten_ocpp_1_6_connector_id(&connector_counts, flat),
                     Some((evse_id, connector_id))

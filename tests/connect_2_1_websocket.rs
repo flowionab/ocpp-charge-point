@@ -192,7 +192,9 @@ async fn connect_and_setup_reports_an_unsupported_negotiated_version_instead_of_
         TokioBackoff,
     )
     .await;
-    let error = result.err().expect("expected connect_and_setup to reject the negotiated version");
+    let error = result
+        .err()
+        .expect("expected connect_and_setup to reject the negotiated version");
 
     assert!(matches!(
         error,

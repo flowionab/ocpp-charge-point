@@ -150,10 +150,10 @@ mod ocpp_2_1 {
     };
     use alloc::boxed::Box;
     use alloc::string::ToString;
+    use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
     use ocpp_client::ocpp_types::v21::common::DataTransferStatusEnum;
     use ocpp_client::ocpp_types::v21::{DataTransferRequest, DataTransferResponse};
-    use ocpp_client::ClientError;
 
     fn map_status_to_outcome(status: DataTransferStatusEnum) -> DataTransferOutcome {
         match status {
