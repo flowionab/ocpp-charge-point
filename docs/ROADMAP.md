@@ -1231,18 +1231,32 @@ Vendor-specific extension channel.
   own (cloned) CSMS client handle, supplying their own
   `DataTransferHandler` impl for inbound dispatch (the crate can't decide
   Accepted/Rejected/UnknownVendorId/UnknownMessageId on its own - that's
-  the whole point of the block). **Known limitation, verified directly
-  (not from a stale comment) against the pinned `ocpp-types` 0.1.2**:
-  `DataTransferRequest`/`DataTransferResponse.data` is typed `Option<()>` -
-  OCPP's schema allows `data` to be any JSON value, which upstream codegen
-  couldn't represent, so it collapsed to Rust's unit type, with no generic
-  escape hatch on `send_data_transfer`/`on_data_transfer` either. This
-  crate's own `DataTransferMessage`/`DataTransferResult.data` are real
-  `Option<String>` (raw JSON) fields, ready for a payload, but the OCPP 2.1
-  adapter can only ever send/receive `None` until `ocpp-types` is fixed
-  upstream - `vendor_id`/`message_id` routing and
-  Accepted/Rejected/Unknown* outcomes work today; the actual payload
-  doesn't yet.
+  the whole point of the block). **Known limitation - still real, but the
+  cause moved (re-verified against `ocpp-types` 0.1.3 / `ocpp-client` 0.2.1,
+  now that this crate has bumped to them):** the 2.x payload still can't
+  cross the wire, so `vendor_id`/`message_id` routing and
+  Accepted/Rejected/Unknown* outcomes work today while the actual payload
+  doesn't.
+
+  What changed is *why*. The old reading - "`ocpp-types` collapsed `data` to
+  `Option<()>` because codegen couldn't represent an arbitrary JSON value,
+  with no generic escape hatch" - was true of 0.1.2 and is now wrong. 0.1.3
+  makes the type generic in the payload with `()` merely as the default:
+  `pub struct DataTransferRequest<DataTransferRequestData = ()>`. The
+  escape hatch exists. The remaining blocker is one level down the stack:
+  `ocpp-client` 0.2.1's `ocpp_2_1_action!`/`ocpp_2_0_1_action!` entries
+  name `DataTransferRequest`/`DataTransferResponse` bare, so
+  `send_data_transfer`/`on_data_transfer` monomorphise to the `()` default
+  and there's no way to ask them for anything else.
+
+  So this is no longer "wait for upstream to model the type at all" - it's
+  a concrete, small piece of work: make `ocpp-client`'s DataTransfer action
+  generic over its payload (or add a `send_data_transfer_with`-style
+  variant), then have this crate's 2.x adapters pass their existing raw-JSON
+  `Option<String>`. This crate's own
+  `DataTransferMessage`/`DataTransferResult.data` are already real
+  `Option<String>` fields waiting for it. 1.6J is unaffected and has carried
+  a real payload all along.
 - Version notes: present and compatible across all three versions.
 
 ## 17. Bidirectional power / DER control (2.1)

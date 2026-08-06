@@ -11,12 +11,20 @@
 //! on that same handle - it needs no `ChargePointActor`/state involvement, since `DataTransfer`
 //! carries no state this crate understands.
 //!
-//! **Known limitation**: `ocpp-types`' `DataTransferRequest`/`DataTransferResponse.data` field is
-//! typed `Option<()>` - OCPP's schema allows `data` to be any JSON value, which the upstream
-//! codegen couldn't represent, so it collapsed to Rust's unit type. Until that's fixed upstream,
-//! no actual payload can cross the wire through this block: [`DataTransferMessage::data`]/
-//! [`DataTransferResult::data`] exist as real `Option<String>` fields (raw JSON) so the rest of
-//! this crate's API is ready for it, but the OCPP 2.1 adapter can only ever send/receive `None`.
+//! **Known limitation**: no actual payload can cross the wire through this block's 2.x adapters.
+//! [`DataTransferMessage::data`]/[`DataTransferResult::data`] are real `Option<String>` fields
+//! (raw JSON), so the rest of this crate's API is ready for one, but the 2.1/2.0.1 adapters can
+//! only ever send/receive `None`.
+//!
+//! The cause is *not* what it was: `ocpp-types` 0.1.2 typed `data` as a bare `Option<()>`, but
+//! 0.1.3 (what this crate now pins) makes it generic -
+//! `DataTransferRequest<DataTransferRequestData = ()>` - so the escape hatch exists. The blocker
+//! is now `ocpp-client` 0.2.1's action macros naming `DataTransferRequest`/`DataTransferResponse`
+//! bare, which monomorphises `send_data_transfer`/`on_data_transfer` to that `()` default with no
+//! way to ask for another payload type. Lifting it means making that action generic upstream (or
+//! adding a payload-carrying variant) and then threading these fields through - see
+//! `docs/ROADMAP.md` §16. 1.6J is unaffected: its `data` is a real `Option<String>` and this
+//! block's 1.6J adapter has always carried the payload.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -173,8 +181,10 @@ mod ocpp_2_1 {
         }
     }
 
-    /// `request.data` is always dropped - `ocpp-types`' `DataTransferRequest.data: Option<()>`
-    /// can't carry a payload at all (see this module's top-level docs).
+    /// `request.data` is always dropped: `ocpp-client`'s action wrapper monomorphises
+    /// `DataTransferRequest` to its default `()` payload, so there is nothing to read here
+    /// even though `ocpp-types` 0.1.3 makes the field generic (see this module's top-level
+    /// docs).
     fn map_request(request: &DataTransferRequest) -> DataTransferMessage {
         DataTransferMessage {
             vendor_id: request.vendor_id.to_string(),
@@ -311,9 +321,9 @@ mod ocpp_2_1 {
 }
 
 /// The OCPP 2.0.1 projection - identical `DataTransferRequest`/`DataTransferResponse`/
-/// `DataTransferStatusEnum` wire shape to 2.1's (including the same `data: Option<()>` codegen
-/// limitation noted in this module's top-level docs), so this is a copy of the 2.1 module, just
-/// targeting `OCPP2_0_1Client`.
+/// `DataTransferStatusEnum` wire shape to 2.1's (including the same dropped-payload limitation
+/// noted in this module's top-level docs), so this is a copy of the 2.1 module, just targeting
+/// `OCPP2_0_1Client`.
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
     use super::{
@@ -475,8 +485,9 @@ mod ocpp_2_0_1 {
 }
 
 /// The OCPP 1.6J projection - the one version whose `DataTransferRequest`/`DataTransferResponse.data`
-/// field is a real `Option<String>`, not the `Option<()>` every 2.x binding collapsed to (see this
-/// module's top-level docs) - so, unlike the `ocpp_2_1`/`ocpp_2_0_1` adapters, this one actually
+/// field is a real `Option<String>`, rather than the `()` payload the 2.x action wrappers
+/// monomorphise to (see this module's top-level docs) - so, unlike the `ocpp_2_1`/`ocpp_2_0_1`
+/// adapters, this one actually
 /// carries [`DataTransferMessage::data`]/[`DataTransferResult::data`] across the wire instead of
 /// silently dropping them. `DataTransferResponseStatus`/`vendorId`'s 255-byte bound/`messageId`'s
 /// 50-byte bound are otherwise identical to 2.x's, so [`map_status_to_outcome`]/
