@@ -485,12 +485,21 @@ exists).
       fake-transport test mirroring that crate's existing pattern; its full
       suite, fmt, clippy and per-version no_std builds are green. **Not
       pushed and no PR opened** — awaiting the go-ahead.
-- [ ] **D1.2** Bump the dependency and unblock [B1.4](#b1--core-spine-must-be-complete-for-any-production-deployment), [B6](#b6--display-message-r15), [B8.2](#b8--reservation-derv2x-battery-swap), [B2](#b2--smart-charging-r11), and 2.0.1 security events.
-      Blocked on D1.1 being released: this crate depends on `ocpp-client`
-      `"0.2"` from the registry, so the branch above does nothing here until
-      it ships. Worth bundling with an `ocpp-types` bump — 0.1.3 is already
-      out and fixes `DataTransfer.data` being generated as `Option<()>`,
-      which `ROADMAP.md` §16 still records as an open upstream limitation.
+- [x] **D1.2** Bump the dependency and unblock [B1.4](#b1--core-spine-must-be-complete-for-any-production-deployment), [B6](#b6--display-message-r15), [B8.2](#b8--reservation-derv2x-battery-swap), [B2](#b2--smart-charging-r11), and 2.0.1 security events.
+      Done: `ocpp-client = "0.2.1"`, which also pulls `ocpp-types` 0.1.2 →
+      0.1.3. Nothing in this crate needed changing to absorb either. The six
+      wrappers are now *available* here — actually wiring them is Workstream
+      B, and each one is now an ordinary `ChargePointBuilder` registration
+      method rather than a bound added to `setup()`'s signature.
+
+      The 0.1.3 bump also **partly retires `ROADMAP.md` §16's DataTransfer
+      blocker, and the old explanation for it was wrong** — corrected there
+      and in `src/data_transfer.rs`. `data` is no longer a bare `Option<()>`
+      that codegen couldn't represent: 0.1.3 makes the type generic in its
+      payload (`DataTransferRequest<DataTransferRequestData = ()>`). The
+      payload still can't cross the wire, but only because `ocpp-client`'s
+      action macros name the type bare and monomorphise to that `()`
+      default — a small, concrete upstream change now, not a modelling gap.
 - [x] **D1.3** Correct `ROADMAP.md` §0's `TriggerMessage` claim. Done — and
       the claim was wronger than this line implies: it blamed `rust-ocpp`,
       which isn't in this crate's dependency graph at all. Corrected in
