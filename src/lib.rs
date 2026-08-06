@@ -17,6 +17,7 @@ extern crate alloc;
 pub mod actor;
 pub mod authorization;
 pub mod availability;
+mod builder;
 pub mod clock;
 #[cfg(all(feature = "std", feature = "websocket", feature = "ocpp_2_1"))]
 mod connect;
@@ -46,6 +47,7 @@ pub mod sync;
 mod topology;
 pub mod transactions;
 
+pub use self::builder::ChargePointBuilder;
 #[cfg(all(feature = "std", feature = "websocket", feature = "ocpp_2_1"))]
 pub use self::connect::{ConnectAndSetupError, connect_and_setup};
 pub use self::runtime::ChargePointRuntime;

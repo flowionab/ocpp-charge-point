@@ -1,6 +1,7 @@
-use crate::authorization::{run_authorization_requests, Authorizer};
-use crate::availability::{ChangeAvailabilityHandler, DedupedStatusNotifier, StatusNotifier};
-use crate::connection::{reregister_on_reconnect, ReconnectHandler};
+use crate::ChargePointRuntime;
+use crate::availability::{ChangeAvailabilityHandler, StatusNotifier};
+use crate::builder::ChargePointBuilder;
+use crate::connection::ReconnectHandler;
 use crate::cost::CostUpdatedHandler;
 use crate::device_model::{GetVariablesHandler, SetVariablesHandler};
 use crate::executor::Executor;
@@ -8,8 +9,7 @@ use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
-use crate::offline_queue::{run_with_offline_queue, OfflineQueue};
-use crate::provisioning::{run_heartbeat, Backoff, BootNotifier, HeartbeatSender};
+use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender};
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
@@ -17,13 +17,7 @@ use crate::reporting::{GetBaseReportHandler, GetReportHandler};
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::reset::ResetHandler;
 use crate::security::SecurityEventNotifier;
-use crate::state::{ChargePointEvent, Component, DeviceModelEvent, Variable, VariableAttributeType};
 use crate::transactions::TransactionNotifier;
-use crate::ChargePointRuntime;
-use alloc::boxed::Box;
-use alloc::string::ToString;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 /// Starts the hardware, then runs the Provisioning functional block's BootNotification
 /// exchange (retrying with `backoff` on `Pending`/`Rejected` or a transport failure - see
@@ -38,6 +32,12 @@ use alloc::vec::Vec;
 /// doesn't hard-depend on an async runtime - std/tokio users can pass
 /// [`crate::executor::TokioExecutor`]/[`crate::provisioning::TokioBackoff`]; embedded targets
 /// supply their own.
+///
+/// This is a thin "everything on" wrapper around [`ChargePointBuilder`], registering every
+/// functional block it exposes in the same order this function has always used. Callers whose
+/// CSMS client only implements a subset of blocks - or who want to skip a block outright - should
+/// use [`ChargePointBuilder`] directly instead; `N`'s single 21-trait bound below is exactly the
+/// limitation the builder exists to remove.
 pub async fn setup<T, E, C, N, X, B>(
     charge_point: T,
     csms: N,
@@ -52,7 +52,7 @@ where
         + HeartbeatSender
         + StatusNotifier
         + TransactionNotifier
-        + Authorizer
+        + crate::authorization::Authorizer
         + UnlockConnectorHandler
         + ChangeAvailabilityHandler
         + RequestStartTransactionHandler
@@ -76,240 +76,33 @@ where
     X: Executor,
     B: Backoff + Clone + Send + Sync + 'static,
 {
-    tracing::info!(
-        vendor = charge_point.vendor_name().await,
-        model = charge_point.model_name().await,
-        "Initializing charger"
-    );
-
-    let mut connector_counts = Vec::new();
-    for evse in charge_point.evses().await {
-        connector_counts.push(evse.connectors().await.len());
-    }
-
-    let runtime = ChargePointRuntime::new(charge_point, connector_counts, &executor);
-    // Subscribe before starting the hardware so status/transaction/authorization events fired
-    // during `start()` (e.g. a connector that's already occupied at boot) are buffered rather
-    // than lost.
-    let status_changes = runtime.subscribe_status_notifications();
-    let transaction_events = runtime.subscribe_transaction_events();
-    let authorization_requests = runtime.subscribe_authorization_requests();
-    let security_events = runtime.subscribe_security_events();
-    runtime
-        .hardware()
-        .start(runtime.hardware_events(), runtime.hardware_commands())
-        .await?;
-
-    let hardware = runtime.hardware();
-    let vendor_name = hardware.vendor_name().await;
-    let model_name = hardware.model_name().await;
-    let outcome = runtime
-        .register_until_accepted(&csms, &backoff, vendor_name, model_name)
-        .await;
-
-    // The accepted BootNotification interval *is* the `OCPPCommCtrlr`/`HeartbeatInterval`
-    // device model variable (see `crate::state::DeviceModel::register_defaults`) - land it there
-    // so a CSMS reading it back via `GetVariables`/`GetConfiguration` sees the value actually in
-    // effect, and so `run_heartbeat` (which reads the device model on every cycle) starts from
-    // it rather than a value only known to this function.
-    let _ = runtime
-        .actor()
-        .send(ChargePointEvent::DeviceModel(
-            DeviceModelEvent::AttributeValueSet {
-                component: Component {
-                    name: "OCPPCommCtrlr".into(),
-                    instance: None,
-                    evse: None,
-                },
-                variable: Variable {
-                    name: "HeartbeatInterval".into(),
-                    instance: None,
-                },
-                attribute_type: VariableAttributeType::Actual,
-                value: outcome.interval_secs.to_string(),
-            },
-        ))
-        .await;
-
-    reregister_on_reconnect(
-        runtime.actor(),
-        csms.clone(),
-        backoff.clone(),
-        vendor_name.into(),
-        model_name.into(),
-    )
-    .await;
-
-    let heartbeat_sender = csms.clone();
-    let heartbeat_backoff = backoff.clone();
-    let heartbeat_actor = runtime.actor();
-    executor.spawn(Box::pin(async move {
-        run_heartbeat(
-            &heartbeat_sender,
-            &heartbeat_backoff,
-            &heartbeat_actor,
-            outcome.interval_secs,
-        )
-        .await;
-    }));
-
-    // Wrapped in `DedupedStatusNotifier` so `csms` only sees a wire-visible status change, not
-    // every internal `ConnectorState` transition `ChargePointState` now reports (see
-    // `docs/ROADMAP.md` §0) - restoring the cadence `setup()`'s csms types (2.1, 2.0.1) had
-    // before that change, since neither has a status richer than `ConnectorStatus` to justify
-    // seeing the extra calls. Wrapped again in `Arc` so the same dedup cache (and the same
-    // `OfflineQueue`, below) is shared between the live forwarder task and the reconnect-flush
-    // closure - cloning the `Arc` per call is cheap and keeps both paths consistent, unlike
-    // constructing a second `DedupedStatusNotifier` with its own empty cache would.
-    //
-    // Each of Status/Transaction/Security also goes through an `OfflineQueue`: a report that
-    // fails to send (e.g. the CSMS connection is currently down) is queued and retried, in
-    // order, rather than dropped - both whenever the next report comes in and, via
-    // `register_reconnect_handler` below, as soon as the connection itself comes back, so a
-    // queued report doesn't wait indefinitely for an unrelated event to trigger a retry.
-    let status_queue = Arc::new(OfflineQueue::new());
-    let status_notifier = Arc::new(DedupedStatusNotifier::new(csms.clone()));
-    let forwarder_queue = status_queue.clone();
-    let forwarder_notifier = status_notifier.clone();
-    executor.spawn(Box::pin(async move {
-        run_with_offline_queue(status_changes, &forwarder_queue, move |changed| {
-            let notifier = forwarder_notifier.clone();
-            async move {
-                notifier
-                    .notify_status(
-                        changed.evse_id,
-                        changed.connector_id,
-                        changed.status,
-                        changed.connector_state,
-                    )
-                    .await
-            }
-        })
-        .await;
-    }));
-    csms.register_reconnect_handler(move || {
-        let queue = status_queue.clone();
-        let notifier = status_notifier.clone();
-        async move {
-            crate::offline_queue::flush_offline_queue(&queue, move |changed| {
-                let notifier = notifier.clone();
-                async move {
-                    notifier
-                        .notify_status(
-                            changed.evse_id,
-                            changed.connector_id,
-                            changed.status,
-                            changed.connector_state,
-                        )
-                        .await
-                }
-            })
-            .await;
-        }
-    })
-    .await;
-
-    let transaction_queue = Arc::new(OfflineQueue::new());
-    let forwarder_queue = transaction_queue.clone();
-    let forwarder_csms = csms.clone();
-    executor.spawn(Box::pin(async move {
-        run_with_offline_queue(transaction_events, &forwarder_queue, move |occurred| {
-            let notifier = forwarder_csms.clone();
-            async move {
-                notifier
-                    .notify_transaction_event(
-                        occurred.evse_id,
-                        occurred.connector_id,
-                        occurred.kind,
-                        occurred.transaction,
-                    )
-                    .await
-            }
-        })
-        .await;
-    }));
-    let reconnect_csms = csms.clone();
-    csms.register_reconnect_handler(move || {
-        let queue = transaction_queue.clone();
-        let csms = reconnect_csms.clone();
-        async move {
-            crate::offline_queue::flush_offline_queue(&queue, move |occurred| {
-                let notifier = csms.clone();
-                async move {
-                    notifier
-                        .notify_transaction_event(
-                            occurred.evse_id,
-                            occurred.connector_id,
-                            occurred.kind,
-                            occurred.transaction,
-                        )
-                        .await
-                }
-            })
-            .await;
-        }
-    })
-    .await;
-
-    let authorizer = csms.clone();
-    let actor = runtime.actor();
-    executor.spawn(Box::pin(async move {
-        run_authorization_requests(authorization_requests, &authorizer, actor).await;
-    }));
-
-    let security_queue = Arc::new(OfflineQueue::new());
-    let forwarder_queue = security_queue.clone();
-    let forwarder_csms = csms.clone();
-    executor.spawn(Box::pin(async move {
-        run_with_offline_queue(security_events, &forwarder_queue, move |event| {
-            let notifier = forwarder_csms.clone();
-            async move {
-                notifier
-                    .notify_security_event(&event.event_type, event.tech_info.as_deref())
-                    .await
-            }
-        })
-        .await;
-    }));
-    let reconnect_csms = csms.clone();
-    csms.register_reconnect_handler(move || {
-        let queue = security_queue.clone();
-        let csms = reconnect_csms.clone();
-        async move {
-            crate::offline_queue::flush_offline_queue(&queue, move |event| {
-                let notifier = csms.clone();
-                async move {
-                    notifier
-                        .notify_security_event(&event.event_type, event.tech_info.as_deref())
-                        .await
-                }
-            })
-            .await;
-        }
-    })
-    .await;
-
-    csms.register_unlock_connector_handler(runtime.actor())
-        .await;
-    csms.register_change_availability_handler(runtime.actor())
-        .await;
-    csms.register_request_start_transaction_handler(runtime.actor())
-        .await;
-    csms.register_request_stop_transaction_handler(runtime.actor())
-        .await;
-    csms.register_reserve_now_handler(runtime.actor()).await;
-    csms.register_cancel_reservation_handler(runtime.actor())
-        .await;
-    csms.register_reset_handler(runtime.actor()).await;
-    csms.register_send_local_list_handler(runtime.actor()).await;
-    csms.register_get_local_list_version_handler(runtime.actor())
-        .await;
-    csms.register_get_variables_handler(runtime.actor()).await;
-    csms.register_set_variables_handler(runtime.actor()).await;
-    csms.register_get_base_report_handler(runtime.actor())
-        .await;
-    csms.register_get_report_handler(runtime.actor()).await;
-    csms.register_cost_updated_handler(runtime.actor()).await;
+    let runtime = ChargePointBuilder::start(charge_point, executor)
+        .await?
+        .provisioning(&csms, backoff)
+        .await
+        .status_notifications(&csms)
+        .await
+        .transaction_events(&csms)
+        .await
+        .authorization(&csms)
+        .await
+        .security_events(&csms)
+        .await
+        .remote_control(&csms)
+        .await
+        .availability_control(&csms)
+        .await
+        .reservation(&csms)
+        .await
+        .reset(&csms)
+        .await
+        .local_authorization_list(&csms)
+        .await
+        .device_model(&csms)
+        .await
+        .cost(&csms)
+        .await
+        .build();
 
     Ok(runtime)
 }
@@ -317,20 +110,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::setup;
+    use crate::builder::test_support::{TestChargePoint, TestConnector, TestEvse};
     use crate::executor::TokioExecutor;
-    use crate::hardware::{
-        execute_hardware_command, ChargePoint, Connector, Evse, HardwareCommandReceiver,
-        HardwareEventSender,
-    };
-    use crate::provisioning::test_support::FixedBootNotifier;
     use crate::provisioning::BootNotificationOutcome;
     use crate::provisioning::TokioBackoff;
-    use crate::state::{
-        ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, RegistrationStatus,
-    };
-    use alloc::boxed::Box;
+    use crate::provisioning::test_support::FixedBootNotifier;
+    use crate::state::{ConnectorState, RegistrationStatus};
     use alloc::sync::Arc;
-    use core::convert::Infallible;
     use core::sync::atomic::{AtomicBool, Ordering};
 
     fn accepted_boot_notifier() -> FixedBootNotifier {
@@ -338,105 +124,6 @@ mod tests {
             status: RegistrationStatus::Accepted,
             interval_secs: 60,
         })
-    }
-
-    struct TestChargePoint {
-        evses: [TestEvse; 1],
-    }
-
-    struct TestEvse {
-        connectors: [TestConnector; 1],
-    }
-
-    struct TestConnector {
-        locked: Arc<AtomicBool>,
-        lock_succeeds: bool,
-    }
-
-    #[derive(Debug)]
-    struct TestConnectorError;
-
-    impl core::fmt::Display for TestConnectorError {
-        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            formatter.write_str("test connector operation failed")
-        }
-    }
-
-    impl core::error::Error for TestConnectorError {}
-
-    #[async_trait::async_trait]
-    impl ChargePoint<TestEvse, TestConnector> for TestChargePoint {
-        type StartError = Infallible;
-
-        async fn vendor_name(&self) -> &str {
-            "Test vendor"
-        }
-
-        async fn model_name(&self) -> &str {
-            "Test model"
-        }
-
-        async fn evses(&self) -> &[TestEvse] {
-            &self.evses
-        }
-
-        async fn start(
-            &self,
-            events: HardwareEventSender,
-            mut commands: HardwareCommandReceiver,
-        ) -> Result<(), Self::StartError> {
-            events
-                .send(ChargePointEvent::Evse {
-                    evse_id: 0,
-                    event: EvseEvent::Connector {
-                        connector_id: 0,
-                        event: ConnectorEvent::CableConnected,
-                    },
-                })
-                .await
-                .unwrap();
-            execute_hardware_command(&self.evses, commands.recv().await.unwrap(), &events).await;
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Evse<TestConnector> for TestEvse {
-        type Error = TestConnectorError;
-
-        async fn connectors(&self) -> &[TestConnector] {
-            &self.connectors
-        }
-
-        async fn reboot(&self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Connector for TestConnector {
-        type Error = TestConnectorError;
-
-        async fn lock(&self) -> Result<(), Self::Error> {
-            if self.lock_succeeds {
-                self.locked.store(true, Ordering::SeqCst);
-                Ok(())
-            } else {
-                Err(TestConnectorError)
-            }
-        }
-
-        async fn unlock(&self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        async fn close_contactor(&self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        async fn open_contactor(&self) -> Result<(), Self::Error> {
-            Ok(())
-        }
     }
 
     #[tokio::test]

@@ -400,15 +400,45 @@ advertisement surface must be derived from **one** source of truth:
 `setup()`'s 21 protocol trait bounds (`src/setup.rs:51`) make it impossible
 to omit a handler, and unworkable at ~80.
 
-- [ ] **C4.1** Replace the monolithic bound list with a builder that
+- [x] **C4.1** Replace the monolithic bound list with a builder that
       registers handler groups independently — one registration call per
-      functional block, each with only that block's bounds.
+      functional block, each with only that block's bounds. Done:
+      `ChargePointBuilder` (`src/builder.rs`), with `start` (hardware +
+      subscriptions) then `provisioning` / `status_notifications` /
+      `transaction_events` / `authorization` / `security_events` /
+      `remote_control` / `availability_control` / `reservation` / `reset` /
+      `local_authorization_list` / `device_model` / `cost` / `build`. Each
+      method consumes and returns `Self` and carries only its own block's
+      bounds, so a client implementing one block compiles — proven by a test
+      driving a CSMS type that implements *only* `BootNotifier +
+      HeartbeatSender + ReconnectHandler` through to a working runtime, which
+      could not satisfy `setup()`'s bound at all.
+
+      Two design points worth recording. `start()` captures `vendor_name`/
+      `model_name` as owned `String`s because the later methods aren't generic
+      over `E`/`C` and so can't call the hardware traits themselves. And the
+      four event subscriptions are taken once, up front (preserving the
+      subscribe-before-hardware-start ordering `setup()` always had), which
+      makes a *repeat* registration of one of those four blocks a documented
+      no-op rather than a second forwarder — spawning a second one would
+      silently duplicate every StatusNotification/TransactionEvent/
+      SecurityEventNotification on the wire for the life of the process. A
+      test asserts exactly one report per status change after registering
+      `status_notifications` twice.
 - [ ] **C4.2** Feature-gate each registration call, so an excluded block
-      contributes no bounds and no code.
+      contributes no bounds and no code. *Unblocked, not done* — the split is
+      what makes gating possible, but the per-block Cargo features themselves
+      are [C1](#51-c1--cargo-feature-per-functional-block).
 - [ ] **C4.3** Gate registration on runtime capability too, so the same
-      image can register a handler on one unit and not another.
-- [ ] **C4.4** Keep `setup()` working as a thin "everything on" wrapper —
-      no break for existing users.
+      image can register a handler on one unit and not another. *Unblocked,
+      not done* — a caller can already skip any call conditionally; the
+      capability model that would drive that decision is
+      [C2](#52-c2--runtime-capability-declaration).
+- [x] **C4.4** Keep `setup()` working as a thin "everything on" wrapper —
+      no break for existing users. Done: `setup()` keeps its exact signature
+      and 21-trait bound, and is now just the builder chain with every block
+      registered. Its two original tests pass unchanged, and
+      `connect_and_setup` is untouched.
 
 ### 5.5 C5 — Unsupported response discipline
 
