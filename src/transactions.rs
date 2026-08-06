@@ -2,7 +2,7 @@
 //! TransactionEvent. See `docs/ROADMAP.md` §5.
 
 use crate::state::{TransactionEventKind, TransactionEventOccurred};
-use crate::sync::{BroadcastReceiver, RecvError};
+use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
 
 #[cfg(feature = "ocpp_1_6")]
@@ -38,22 +38,17 @@ pub async fn run_transaction_events<N: TransactionNotifier>(
     mut events: BroadcastReceiver<TransactionEventOccurred>,
     notifier: &N,
 ) {
-    loop {
-        match events.recv().await {
-            Ok(occurred) => {
-                if let Err(err) = notifier
-                    .notify_transaction_event(
-                        occurred.evse_id,
-                        occurred.connector_id,
-                        occurred.kind,
-                        occurred.transaction,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %err, "transaction event notification failed");
-                }
-            }
-            Err(RecvError::Closed) => break,
+    while let Ok(occurred) = events.recv().await {
+        if let Err(err) = notifier
+            .notify_transaction_event(
+                occurred.evse_id,
+                occurred.connector_id,
+                occurred.kind,
+                occurred.transaction,
+            )
+            .await
+        {
+            tracing::warn!(error = %err, "transaction event notification failed");
         }
     }
 }

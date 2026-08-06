@@ -263,16 +263,16 @@ impl ChargePointState {
                 },
             ));
         }
-        if new_state == ConnectorState::Authorizing {
-            if let Some(id_token) = presented_id_token {
-                effects.push(ChargePointEffect::AuthorizationRequested(
-                    AuthorizationRequested {
-                        evse_id,
-                        connector_id,
-                        id_token,
-                    },
-                ));
-            }
+        if new_state == ConnectorState::Authorizing
+            && let Some(id_token) = presented_id_token
+        {
+            effects.push(ChargePointEffect::AuthorizationRequested(
+                AuthorizationRequested {
+                    evse_id,
+                    connector_id,
+                    id_token,
+                },
+            ));
         }
         if let Some(slot) = evse.transactions.get_mut(connector_id) {
             if let Some((kind, transaction)) = advance_transaction(
@@ -288,10 +288,9 @@ impl ChargePointState {
                 if matches!(
                     kind,
                     TransactionEventKind::Started | TransactionEventKind::Ended
-                ) {
-                    if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
-                        *cost_slot = None;
-                    }
+                ) && let Some(cost_slot) = evse.running_costs.get_mut(connector_id)
+                {
+                    *cost_slot = None;
                 }
                 effects.push(ChargePointEffect::TransactionEvent(
                     TransactionEventOccurred {
@@ -302,17 +301,17 @@ impl ChargePointState {
                     },
                 ));
             }
-            if let Some(sample) = meter_sample {
-                if let Some((kind, transaction)) = apply_meter_sample(slot, sample) {
-                    effects.push(ChargePointEffect::TransactionEvent(
-                        TransactionEventOccurred {
-                            evse_id,
-                            connector_id,
-                            kind,
-                            transaction,
-                        },
-                    ));
-                }
+            if let Some(sample) = meter_sample
+                && let Some((kind, transaction)) = apply_meter_sample(slot, sample)
+            {
+                effects.push(ChargePointEffect::TransactionEvent(
+                    TransactionEventOccurred {
+                        evse_id,
+                        connector_id,
+                        kind,
+                        transaction,
+                    },
+                ));
             }
         }
         // Only recorded while a transaction is actually active on this connector - there's
@@ -325,11 +324,10 @@ impl ChargePointState {
                 .transactions
                 .get(connector_id)
                 .is_some_and(Option::is_some)
+                && let Some(cost_slot) = evse.running_costs.get_mut(connector_id)
             {
-                if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
-                    *cost_slot = Some(total_cost);
-                    return true;
-                }
+                *cost_slot = Some(total_cost);
+                return true;
             }
             false
         });

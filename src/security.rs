@@ -8,7 +8,7 @@
 
 use crate::actor::ChargePointActor;
 use crate::state::{ChargePointEvent, SecurityEvent, SecurityEventType};
-use crate::sync::{BroadcastReceiver, RecvError};
+use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
 
 /// The OCPP wire `type` string for `event_type` - the standardized values, or the raw
@@ -154,17 +154,12 @@ pub async fn run_security_events<N: SecurityEventNotifier>(
     mut events: BroadcastReceiver<SecurityEvent>,
     notifier: &N,
 ) {
-    loop {
-        match events.recv().await {
-            Ok(event) => {
-                if let Err(err) = notifier
-                    .notify_security_event(&event.event_type, event.tech_info.as_deref())
-                    .await
-                {
-                    tracing::warn!(error = %err, "security event notification failed");
-                }
-            }
-            Err(RecvError::Closed) => break,
+    while let Ok(event) = events.recv().await {
+        if let Err(err) = notifier
+            .notify_security_event(&event.event_type, event.tech_info.as_deref())
+            .await
+        {
+            tracing::warn!(error = %err, "security event notification failed");
         }
     }
 }

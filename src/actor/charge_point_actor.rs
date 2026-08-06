@@ -16,6 +16,17 @@ enum Command {
     },
 }
 
+/// The broadcast senders the actor's run loop publishes effects on, grouped so `run` takes one
+/// argument for them instead of one per effect kind.
+#[derive(Clone)]
+struct EffectSenders {
+    commands: BroadcastSender<HardwareCommand>,
+    status_notifications: BroadcastSender<ConnectorStatusChanged>,
+    transaction_events: BroadcastSender<TransactionEventOccurred>,
+    authorization_requests: BroadcastSender<AuthorizationRequested>,
+    security_events: BroadcastSender<SecurityEvent>,
+}
+
 /// An error sending an event to a [`ChargePointActor`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorError {
@@ -60,16 +71,14 @@ impl ChargePointActor {
         let transaction_events = broadcast_channel();
         let authorization_requests = broadcast_channel();
         let security_events = broadcast_channel();
-        executor.spawn(Box::pin(run(
-            state,
-            mailbox.clone(),
-            updates,
-            commands.clone(),
-            status_notifications.clone(),
-            transaction_events.clone(),
-            authorization_requests.clone(),
-            security_events.clone(),
-        )));
+        let effects = EffectSenders {
+            commands: commands.clone(),
+            status_notifications: status_notifications.clone(),
+            transaction_events: transaction_events.clone(),
+            authorization_requests: authorization_requests.clone(),
+            security_events: security_events.clone(),
+        };
+        executor.spawn(Box::pin(run(state, mailbox.clone(), updates, effects)));
 
         Self {
             mailbox,
@@ -152,11 +161,7 @@ async fn run(
     mut state: ChargePointState,
     mailbox: Chan<Command>,
     updates: crate::sync::WatchSender<ChargePointState>,
-    commands: BroadcastSender<HardwareCommand>,
-    status_notifications: BroadcastSender<ConnectorStatusChanged>,
-    transaction_events: BroadcastSender<TransactionEventOccurred>,
-    authorization_requests: BroadcastSender<AuthorizationRequested>,
-    security_events: BroadcastSender<SecurityEvent>,
+    effects: EffectSenders,
 ) {
     loop {
         let Command::Event {
@@ -172,19 +177,19 @@ async fn run(
                     updates.send_replace(state.clone());
                 }
                 ChargePointEffect::HardwareCommand(command) => {
-                    commands.send(command);
+                    effects.commands.send(command);
                 }
                 ChargePointEffect::StatusNotification(changed) => {
-                    status_notifications.send(changed);
+                    effects.status_notifications.send(changed);
                 }
                 ChargePointEffect::TransactionEvent(occurred) => {
-                    transaction_events.send(occurred);
+                    effects.transaction_events.send(occurred);
                 }
                 ChargePointEffect::AuthorizationRequested(requested) => {
-                    authorization_requests.send(requested);
+                    effects.authorization_requests.send(requested);
                 }
                 ChargePointEffect::SecurityEventOccurred(event) => {
-                    security_events.send(event);
+                    effects.security_events.send(event);
                 }
             }
         }

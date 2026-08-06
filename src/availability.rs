@@ -7,7 +7,7 @@ use crate::state::{
     ChargePointEvent, ConnectorEvent, ConnectorState, ConnectorStatus, ConnectorStatusChanged,
     EvseEvent,
 };
-use crate::sync::{BroadcastReceiver, RecvError};
+use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use core::cell::RefCell;
@@ -55,8 +55,12 @@ pub trait StatusNotifier {
 /// needs every call, including ones where `status` repeats but `connector_state` doesn't.
 pub struct DedupedStatusNotifier<N> {
     inner: N,
-    last_sent: BlockingMutex<CriticalSectionRawMutex, RefCell<BTreeMap<(usize, usize), ConnectorStatus>>>,
+    last_sent: LastSentStatuses,
 }
+
+/// Per-connector last-reported [`ConnectorStatus`], keyed by `(evse_id, connector_id)`.
+type LastSentStatuses =
+    BlockingMutex<CriticalSectionRawMutex, RefCell<BTreeMap<(usize, usize), ConnectorStatus>>>;
 
 impl<N> DedupedStatusNotifier<N> {
     /// Wraps `inner`, starting with no cached status for any connector - so the first call for
@@ -224,22 +228,17 @@ pub async fn run_status_notifications<N: StatusNotifier>(
     mut changes: BroadcastReceiver<ConnectorStatusChanged>,
     notifier: &N,
 ) {
-    loop {
-        match changes.recv().await {
-            Ok(changed) => {
-                if let Err(err) = notifier
-                    .notify_status(
-                        changed.evse_id,
-                        changed.connector_id,
-                        changed.status,
-                        changed.connector_state,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %err, "status notification failed");
-                }
-            }
-            Err(RecvError::Closed) => break,
+    while let Ok(changed) = changes.recv().await {
+        if let Err(err) = notifier
+            .notify_status(
+                changed.evse_id,
+                changed.connector_id,
+                changed.status,
+                changed.connector_state,
+            )
+            .await
+        {
+            tracing::warn!(error = %err, "status notification failed");
         }
     }
 }
@@ -330,10 +329,9 @@ mod deduped_status_notifier_tests {
     use alloc::vec::Vec;
     use tokio::sync::watch;
 
-    fn notifier() -> (
-        DedupedStatusNotifier<RecordingStatusNotifier>,
-        watch::Receiver<Vec<(usize, usize, ConnectorStatus, ConnectorState)>>,
-    ) {
+    type SeenReceiver = watch::Receiver<Vec<(usize, usize, ConnectorStatus, ConnectorState)>>;
+
+    fn notifier() -> (DedupedStatusNotifier<RecordingStatusNotifier>, SeenReceiver) {
         let (seen_tx, seen_rx) = watch::channel(Vec::new());
         (
             DedupedStatusNotifier::new(RecordingStatusNotifier { seen: seen_tx }),

@@ -7,7 +7,7 @@
 //! and Authorize needs a decision *now*, not eventually, so neither goes through this. See
 //! `docs/ROADMAP.md` §0.
 
-use crate::sync::{BroadcastReceiver, RecvError};
+use crate::sync::BroadcastReceiver;
 use alloc::collections::VecDeque;
 use core::cell::RefCell;
 use core::fmt;
@@ -90,14 +90,9 @@ pub async fn run_with_offline_queue<M, F, Fut, E>(
     Fut: Future<Output = Result<(), E>>,
     E: fmt::Display,
 {
-    loop {
-        match events.recv().await {
-            Ok(message) => {
-                queue.push(message);
-                flush_offline_queue(queue, &mut send).await;
-            }
-            Err(RecvError::Closed) => break,
-        }
+    while let Ok(message) = events.recv().await {
+        queue.push(message);
+        flush_offline_queue(queue, &mut send).await;
     }
 }
 

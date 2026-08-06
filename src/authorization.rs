@@ -6,7 +6,7 @@ use crate::state::{
     AuthorizationRequested, AuthorizationStatus, ChargePointEvent, ConnectorEvent, EvseEvent,
     IdToken,
 };
-use crate::sync::{BroadcastReceiver, RecvError};
+use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
 
 /// Decides whether an [`IdToken`] may start charging, via Authorize. Implemented per protocol
@@ -31,34 +31,29 @@ pub async fn run_authorization_requests<A: Authorizer>(
     authorizer: &A,
     actor: ChargePointActor,
 ) {
-    loop {
-        match requests.recv().await {
-            Ok(requested) => {
-                let decision = match authorizer.authorize(&requested.id_token).await {
-                    Ok(status) => status,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "authorization request failed, denying");
-                        AuthorizationStatus::Rejected
-                    }
-                };
-                let event = match decision {
-                    AuthorizationStatus::Accepted => {
-                        ConnectorEvent::ChargingAuthorized(requested.id_token.clone())
-                    }
-                    AuthorizationStatus::Rejected => ConnectorEvent::AuthorizationDenied,
-                };
-                let _ = actor
-                    .send(ChargePointEvent::Evse {
-                        evse_id: requested.evse_id,
-                        event: EvseEvent::Connector {
-                            connector_id: requested.connector_id,
-                            event,
-                        },
-                    })
-                    .await;
+    while let Ok(requested) = requests.recv().await {
+        let decision = match authorizer.authorize(&requested.id_token).await {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::warn!(error = %err, "authorization request failed, denying");
+                AuthorizationStatus::Rejected
             }
-            Err(RecvError::Closed) => break,
-        }
+        };
+        let event = match decision {
+            AuthorizationStatus::Accepted => {
+                ConnectorEvent::ChargingAuthorized(requested.id_token.clone())
+            }
+            AuthorizationStatus::Rejected => ConnectorEvent::AuthorizationDenied,
+        };
+        let _ = actor
+            .send(ChargePointEvent::Evse {
+                evse_id: requested.evse_id,
+                event: EvseEvent::Connector {
+                    connector_id: requested.connector_id,
+                    event,
+                },
+            })
+            .await;
     }
 }
 

@@ -90,6 +90,10 @@ async fn connect_and_setup_completes_boot_notification_over_a_real_websocket() {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_hdr_async(
             tcp,
+            // The closure's `Result` type is dictated by tungstenite's `Callback` trait, which
+            // we don't control - boxing the `Err` variant would require wrapping every call
+            // site instead of just this test helper, for no behavioural benefit.
+            #[allow(clippy::result_large_err)]
             |_req: &tokio_tungstenite::tungstenite::handshake::server::Request,
              mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                 response
@@ -159,6 +163,10 @@ async fn connect_and_setup_reports_an_unsupported_negotiated_version_instead_of_
         // crate can't yet drive a full session in (see `connect.rs`'s module docs).
         tokio_tungstenite::accept_hdr_async(
             tcp,
+            // The closure's `Result` type is dictated by tungstenite's `Callback` trait, which
+            // we don't control - boxing the `Err` variant would require wrapping every call
+            // site instead of just this test helper, for no behavioural benefit.
+            #[allow(clippy::result_large_err)]
             |_req: &tokio_tungstenite::tungstenite::handshake::server::Request,
              mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                 response
