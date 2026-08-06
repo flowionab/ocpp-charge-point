@@ -33,8 +33,8 @@ use crate::hardware::{Capabilities, warn_on_feature_mismatches};
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
 use crate::offline_queue::{OfflineQueue, OverflowPolicy, run_with_offline_queue};
 use crate::persistence::{
-    DeviceModelStore, LocalAuthorizationListStore, QueueStore, ReservationStore, TransactionStore,
-    flush_and_persist_transaction_event_queue, restore_device_model,
+    BootReasonStore, DeviceModelStore, LocalAuthorizationListStore, QueueStore, ReservationStore,
+    TransactionStore, flush_and_persist_transaction_event_queue, restore_device_model,
     restore_local_authorization_list, restore_reservations, restore_transaction_event_queue,
     restore_transactions, run_device_model_persistence, run_local_authorization_list_persistence,
     run_persisted_transaction_event_queue, run_reservation_persistence,
@@ -50,8 +50,9 @@ use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::reset::ResetHandler;
 use crate::security::{SecurityEventNotifier, report_security_event};
 use crate::state::{
-    AuthorizationRequested, ChargePointEvent, Component, ConnectorStatusChanged, DeviceModelEvent,
-    SecurityEvent, SecurityEventType, TransactionEventOccurred, Variable, VariableAttributeType,
+    AuthorizationRequested, BootReasonCause, ChargePointEvent, Component, ConnectorStatusChanged,
+    DeviceModelEvent, SecurityEvent, SecurityEventType, TransactionEventOccurred, Variable,
+    VariableAttributeType,
 };
 use crate::sync::BroadcastReceiver;
 use crate::transactions::TransactionNotifier;
@@ -101,6 +102,35 @@ pub struct ChargePointBuilder<T, X> {
     // for the same reason as the other four - so a transaction the hardware reports during
     // start-up is persisted rather than missed.
     transaction_persistence_events: Option<BroadcastReceiver<TransactionEventOccurred>>,
+    // Set by `boot_reason_persistence`, read by `provisioning`: the cause loaded from durable
+    // storage at build time (`None` - no `boot_reason_persistence` call, or nothing was
+    // persisted - reports an uncommanded restart, same as before this feature existed). Fixed for
+    // the life of the process once `provisioning` reads it, including every reconnect's resend -
+    // see `crate::connection::reregister_on_reconnect`'s docs for why it's never re-read.
+    boot_reason: Option<BootReasonCause>,
+    // Set by `boot_reason_persistence`, consumed by `provisioning` once the CSMS accepts
+    // registration - see `BootReasonClearer`'s docs for why this is type-erased rather than a
+    // generic `BootReasonStore<S>` field (which would force `S` onto `ChargePointBuilder` itself).
+    boot_reason_clearer: Option<Arc<dyn BootReasonClearer>>,
+}
+
+/// Type-erases a [`BootReasonStore<S>`]'s `clear` so [`ChargePointBuilder`] can hold one without
+/// becoming generic over `S` itself - the same reason `alloc::sync::Arc<dyn Trait>` gets reached
+/// for elsewhere once a concrete generic type would otherwise "infect" a struct that only needs
+/// one method off it. Only [`Self::clear`] is exposed; [`BootReasonStore::save`]/`load` stay
+/// reachable solely through [`crate::actor::ChargePointActor::set_boot_reason_recorder`]'s closure
+/// and `boot_reason_persistence`'s own local variable.
+#[async_trait::async_trait]
+trait BootReasonClearer: Send + Sync {
+    /// See [`BootReasonStore::clear`].
+    async fn clear(&self);
+}
+
+#[async_trait::async_trait]
+impl<S: crate::hardware::Storage + Send + Sync> BootReasonClearer for BootReasonStore<S> {
+    async fn clear(&self) {
+        BootReasonStore::clear(self).await;
+    }
 }
 
 impl<T, X: Executor> ChargePointBuilder<T, X> {
@@ -174,6 +204,8 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             authorization_requests: Some(authorization_requests),
             security_events: Some(security_events),
             transaction_persistence_events: Some(transaction_persistence_events),
+            boot_reason: None,
+            boot_reason_clearer: None,
         })
     }
 
@@ -184,6 +216,50 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
     pub fn capabilities(&self) -> Capabilities {
         self.capabilities
+    }
+
+    /// Registers durable boot-reason state (`docs/PRODUCTION-ROADMAP.md` §7.2/§7.4: the
+    /// boot-reason row of E2, and E4.2): loads whatever cause `crate::reset::handle_reset`
+    /// recorded before this boot (if any), so [`Self::provisioning`] sends the honest
+    /// `BootNotification.reason` for it, then installs a recorder on the actor so a *future*
+    /// commanded reboot gets the same treatment.
+    ///
+    /// Call this **before** [`Self::provisioning`] - the loaded cause has to be in hand before
+    /// that method sends the first BootNotification. `storage` may be
+    /// [`crate::hardware::NoStorage`], in which case this behaves exactly as if it were never
+    /// called: every boot reports an uncommanded restart, and no reset is ever recorded.
+    ///
+    /// # Timing this crate chose, and why
+    ///
+    /// The persisted cause is **not** cleared here, and not before the BootNotification is sent -
+    /// it is cleared by [`Self::provisioning`] only once the CSMS has *accepted* registration.
+    /// Clearing any earlier would mean a crash between the reboot and a successful registration
+    /// makes the *next* boot wrongly report an uncommanded restart, even though it's still really
+    /// recovering from the original commanded one - the same "don't lose information you don't
+    /// have to" stance `crate::persistence`'s other stores take. The cause is also not re-read
+    /// from storage on every reconnect - see `crate::connection::reregister_on_reconnect`'s docs
+    /// for why a fixed, once-loaded value is what every resend during this boot should send.
+    pub async fn boot_reason_persistence<S>(mut self, storage: S) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+    {
+        let store = Arc::new(BootReasonStore::new(storage));
+
+        self.boot_reason = store.load().await;
+        self.boot_reason_clearer = Some(store.clone());
+
+        let recorder_store = store.clone();
+        self.runtime.actor().set_boot_reason_recorder(Arc::new(
+            move |kind: crate::state::ResetKind| {
+                let recorder_store = recorder_store.clone();
+                Box::pin(async move {
+                    recorder_store.save(BootReasonCause::from(kind)).await;
+                })
+                    as core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>
+            },
+        ));
+
+        self
     }
 
     /// Registers the Provisioning functional block: retries BootNotification (via
@@ -208,10 +284,27 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     {
         let vendor_name = self.vendor_name.as_str();
         let model_name = self.model_name.as_str();
+        let boot_reason = self.boot_reason;
         let outcome = self
             .runtime
-            .register_until_accepted(csms, &backoff, &monotonic, vendor_name, model_name)
+            .register_until_accepted(
+                csms,
+                &backoff,
+                &monotonic,
+                vendor_name,
+                model_name,
+                boot_reason,
+            )
             .await;
+
+        // The BootNotification carrying `boot_reason` has now been accepted - clear the
+        // persisted cause (if `boot_reason_persistence` registered one) so a *future* uncommanded
+        // restart doesn't wrongly keep reporting it. See
+        // `crate::persistence::BootReasonStore::clear`'s docs for why this only happens now,
+        // after acceptance, rather than before sending.
+        if let Some(clearer) = &self.boot_reason_clearer {
+            clearer.clear().await;
+        }
 
         // The accepted BootNotification interval *is* the `OCPPCommCtrlr`/`HeartbeatInterval`
         // device model variable (see `crate::state::DeviceModel::register_defaults`) - land it
@@ -245,6 +338,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             monotonic.clone(),
             vendor_name.into(),
             model_name.into(),
+            boot_reason,
         )
         .await;
 
@@ -1119,7 +1213,7 @@ mod tests {
     use crate::provisioning::BootNotificationOutcome;
     use crate::provisioning::TokioBackoff;
     use crate::provisioning::test_support::FixedBootNotifier;
-    use crate::state::{ConnectorState, RegistrationStatus};
+    use crate::state::{BootReasonCause, ConnectorState, RegistrationStatus};
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -1161,8 +1255,9 @@ mod tests {
             &self,
             vendor_name: &str,
             model_name: &str,
+            reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
-            self.0.notify_boot(vendor_name, model_name).await
+            self.0.notify_boot(vendor_name, model_name, reason).await
         }
     }
 
@@ -1564,6 +1659,150 @@ mod tests {
                 .unwrap()
                 .value,
             "300"
+        );
+    }
+
+    /// A CSMS type that records the `reason` every `notify_boot` call carried, in order, so a
+    /// test can assert exactly what [`ChargePointBuilder::boot_reason_persistence`] fed into
+    /// [`ChargePointBuilder::provisioning`].
+    #[derive(Clone)]
+    struct RecordingReasonCsms {
+        outcome: BootNotificationOutcome,
+        seen_reasons: Arc<std::sync::Mutex<alloc::vec::Vec<Option<BootReasonCause>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::BootNotifier for RecordingReasonCsms {
+        type Error = core::convert::Infallible;
+
+        async fn notify_boot(
+            &self,
+            _vendor_name: &str,
+            _model_name: &str,
+            reason: Option<BootReasonCause>,
+        ) -> Result<BootNotificationOutcome, Self::Error> {
+            self.seen_reasons.lock().unwrap().push(reason);
+            Ok(self.outcome)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::HeartbeatSender for RecordingReasonCsms {
+        type Error = core::convert::Infallible;
+
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connection::ReconnectHandler for RecordingReasonCsms {
+        async fn register_reconnect_handler<F, FF>(&self, _callback: F)
+        where
+            F: FnMut() -> FF + Send + Sync + 'static,
+            FF: core::future::Future<Output = ()> + Send + 'static,
+        {
+            // No transport to reconnect in this fixture - nothing to register against.
+        }
+    }
+
+    #[tokio::test]
+    async fn without_boot_reason_persistence_every_boot_notification_reports_no_persisted_cause() {
+        let (charge_point, _locked) = test_charge_point(true);
+        let csms = RecordingReasonCsms {
+            outcome: BootNotificationOutcome {
+                status: RegistrationStatus::Accepted,
+                interval_secs: 60,
+                current_time: None,
+            },
+            seen_reasons: Arc::new(std::sync::Mutex::new(alloc::vec::Vec::new())),
+        };
+
+        ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
+            .await
+            .build();
+
+        assert_eq!(*csms.seen_reasons.lock().unwrap(), alloc::vec![None]);
+    }
+
+    #[tokio::test]
+    async fn registering_boot_reason_persistence_reports_a_persisted_cause_and_then_clears_it() {
+        use crate::persistence::BootReasonStore;
+
+        let storage = Arc::new(crate::hardware::InMemoryStorage::new());
+        // Storage as `crate::reset::handle_reset` left it before the reboot this boot follows: an
+        // `Immediate` `Reset` was accepted just before power was lost.
+        BootReasonStore::new(storage.clone())
+            .save(BootReasonCause::RemoteReset)
+            .await;
+
+        let (charge_point, _locked) = test_charge_point(true);
+        let csms = RecordingReasonCsms {
+            outcome: BootNotificationOutcome {
+                status: RegistrationStatus::Accepted,
+                interval_secs: 60,
+                current_time: None,
+            },
+            seen_reasons: Arc::new(std::sync::Mutex::new(alloc::vec::Vec::new())),
+        };
+
+        ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .boot_reason_persistence(storage.clone())
+            .await
+            .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
+            .await
+            .build();
+
+        assert_eq!(
+            *csms.seen_reasons.lock().unwrap(),
+            alloc::vec![Some(BootReasonCause::RemoteReset)]
+        );
+
+        // The BootNotification carrying that cause was accepted - the persisted record must now
+        // be gone, so an uncommanded restart before the *next* commanded reboot doesn't wrongly
+        // keep reporting this one.
+        assert_eq!(BootReasonStore::new(storage).load().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_reset_recorded_before_reboot_is_reported_as_the_cause_on_the_next_boot() {
+        use crate::persistence::BootReasonStore;
+        use crate::reset::handle_reset;
+        use crate::state::{ResetKind, ResetTarget};
+
+        let storage = Arc::new(crate::hardware::InMemoryStorage::new());
+        let (charge_point, _locked) = test_charge_point(true);
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .boot_reason_persistence(storage.clone())
+            .await
+            .build();
+
+        // Simulates a CSMS `Reset` (`OnIdle`, since the connector is available and nothing is in
+        // progress, this fires immediately) arriving and being accepted, in the same process this
+        // charge point is still running in - `handle_reset` is what
+        // `crate::actor::ChargePointActor::set_boot_reason_recorder`'s installed hook is called
+        // from.
+        handle_reset(
+            &runtime.actor(),
+            ResetTarget::ChargePoint,
+            ResetKind::OnIdle,
+        )
+        .await;
+
+        // "The next boot": a fresh charge point over the same storage, as if the reboot the
+        // above actually happened and this process restarted.
+        assert_eq!(
+            BootReasonStore::new(storage).load().await,
+            Some(BootReasonCause::ScheduledReset)
         );
     }
 }

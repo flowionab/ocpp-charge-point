@@ -1,6 +1,6 @@
 mod charge_point_actor;
 
-pub use self::charge_point_actor::{ActorError, ChargePointActor};
+pub use self::charge_point_actor::{ActorError, BootReasonRecorder, ChargePointActor};
 
 #[cfg(test)]
 mod tests {

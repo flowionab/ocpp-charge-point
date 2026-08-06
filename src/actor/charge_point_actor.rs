@@ -1,13 +1,24 @@
 use crate::executor::Executor;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
-    ConnectorStatusChanged, HardwareCommand, SecurityEvent, TransactionEventOccurred,
+    ConnectorStatusChanged, HardwareCommand, ResetKind, SecurityEvent, TransactionEventOccurred,
 };
 use crate::sync::{
     BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
     watch_channel,
 };
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::cell::RefCell;
+use core::future::Future;
+use core::pin::Pin;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+/// A boot-reason-recording hook, installed via [`ChargePointActor::set_boot_reason_recorder`] and
+/// called by [`crate::reset::handle_reset`] - see that method's docs for the full picture.
+pub type BootReasonRecorder =
+    Arc<dyn Fn(ResetKind) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 enum Command {
     Event {
@@ -51,6 +62,12 @@ pub struct ChargePointActor {
     transaction_events: BroadcastSender<TransactionEventOccurred>,
     authorization_requests: BroadcastSender<AuthorizationRequested>,
     security_events: BroadcastSender<SecurityEvent>,
+    // A plain shared cell rather than a `Watch` - this is a settable-once, read-many hook, not a
+    // stream of values anything needs to await a *change* in. See `set_boot_reason_recorder`'s
+    // docs for what it's for and why `crate::reset::handle_reset` needs a synchronous way to
+    // reach it that doesn't route through `ResetHandler`'s per-protocol-version implementations.
+    boot_reason_recorder:
+        Arc<BlockingMutex<CriticalSectionRawMutex, RefCell<Option<BootReasonRecorder>>>>,
 }
 
 impl ChargePointActor {
@@ -88,6 +105,7 @@ impl ChargePointActor {
             transaction_events,
             authorization_requests,
             security_events,
+            boot_reason_recorder: Arc::new(BlockingMutex::new(RefCell::new(None))),
         }
     }
 
@@ -154,6 +172,36 @@ impl ChargePointActor {
     /// [`crate::security::run_security_events`]).
     pub fn subscribe_security_events(&self) -> BroadcastReceiver<SecurityEvent> {
         self.security_events.subscribe()
+    }
+
+    /// Installs `recorder`, called by [`crate::reset::handle_reset`] with the accepted `Reset`'s
+    /// `ResetKind` synchronously *before* the `ResetRequested` event that may immediately produce
+    /// a `HardwareCommand::Reboot` is sent to this actor - so a durable-storage-backed `recorder`
+    /// (see [`crate::persistence::BootReasonStore`], wired up by
+    /// [`crate::builder::ChargePointBuilder::boot_reason_persistence`]) is guaranteed to have
+    /// finished writing before that reboot could possibly reach hardware. See
+    /// `docs/PRODUCTION-ROADMAP.md` §7.2/§7.4 (the boot-reason row of E2, and E4.2).
+    ///
+    /// This lives on the actor, rather than as a parameter threaded through
+    /// [`crate::reset::ResetHandler`] and its three per-protocol-version implementations, because
+    /// `handle_reset` is the single protocol-agnostic choke point every one of those already
+    /// calls - reaching it via the actor handle they already carry avoids widening that trait (and
+    /// every implementor, including test doubles) just to plumb an optional storage handle through.
+    ///
+    /// Only one recorder can be installed at a time - a second call replaces the first, exactly
+    /// like every other `*_persistence` builder method's "last registration wins" behaviour.
+    /// Never installing one (the default) makes `handle_reset` skip recording entirely - a charge
+    /// point that never calls `boot_reason_persistence` behaves exactly as if this hook didn't
+    /// exist.
+    pub fn set_boot_reason_recorder(&self, recorder: BootReasonRecorder) {
+        self.boot_reason_recorder
+            .lock(|cell| *cell.borrow_mut() = Some(recorder));
+    }
+
+    /// The recorder installed via [`Self::set_boot_reason_recorder`], if any. `pub(crate)` -
+    /// intended for [`crate::reset::handle_reset`] only.
+    pub(crate) fn boot_reason_recorder(&self) -> Option<BootReasonRecorder> {
+        self.boot_reason_recorder.lock(|cell| cell.borrow().clone())
     }
 }
 

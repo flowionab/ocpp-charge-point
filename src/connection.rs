@@ -18,6 +18,7 @@
 use crate::actor::ChargePointActor;
 use crate::clock::MonotonicClock;
 use crate::provisioning::{Backoff, BootNotifier, register_until_accepted};
+use crate::state::BootReasonCause;
 use alloc::boxed::Box;
 use alloc::string::String;
 use core::future::Future;
@@ -40,6 +41,15 @@ pub trait ReconnectHandler {
 /// dropped. OCPP doesn't mandate this, but it's the conventional way for a charge point to
 /// resynchronize its registration status after a communication interruption, and `ocpp-client`
 /// explicitly leaves it to the caller - see [`ReconnectHandler`]'s docs.
+///
+/// `reason` is sent with every reconnect's BootNotification, unchanged, for the lifetime of this
+/// task - it is *not* re-read from durable storage on each reconnect. A WS reconnect is a
+/// connectivity event, not a new boot: the reason this process's current boot is happening
+/// doesn't change just because the connection dropped and came back, so every resend during the
+/// same boot reports the same [`BootReasonCause`] the very first BootNotification did (`None` if
+/// that one reported an uncommanded restart). See
+/// [`crate::builder::ChargePointBuilder::boot_reason_persistence`] for where `reason` is computed
+/// once, at process start.
 pub async fn reregister_on_reconnect<N, B, M>(
     actor: ChargePointActor,
     notifier: N,
@@ -47,6 +57,7 @@ pub async fn reregister_on_reconnect<N, B, M>(
     monotonic: M,
     vendor_name: String,
     model_name: String,
+    reason: Option<BootReasonCause>,
 ) where
     N: ReconnectHandler + BootNotifier + Clone + Send + Sync + 'static,
     B: Backoff + Clone + Send + Sync + 'static,
@@ -69,6 +80,7 @@ pub async fn reregister_on_reconnect<N, B, M>(
                     &monotonic,
                     &vendor_name,
                     &model_name,
+                    reason,
                 )
                 .await;
             }
@@ -146,7 +158,7 @@ mod tests {
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
     use crate::provisioning::{Backoff, BootNotificationOutcome, BootNotifier};
-    use crate::state::RegistrationStatus;
+    use crate::state::{BootReasonCause, RegistrationStatus};
     use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::sync::Arc;
@@ -200,6 +212,7 @@ mod tests {
             &self,
             _vendor_name: &str,
             _model_name: &str,
+            _reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             self.boot_calls.fetch_add(1, Ordering::SeqCst);
             Ok(BootNotificationOutcome {
@@ -237,6 +250,7 @@ mod tests {
             crate::clock::SystemMonotonicClock,
             String::from("Acme"),
             String::from("Charger 9000"),
+            None,
         )
         .await;
 
@@ -261,6 +275,7 @@ mod tests {
             crate::clock::SystemMonotonicClock,
             String::from("Acme"),
             String::from("Charger 9000"),
+            None,
         )
         .await;
 
@@ -280,6 +295,7 @@ mod tests {
             crate::clock::SystemMonotonicClock,
             String::from("Acme"),
             String::from("Charger 9000"),
+            None,
         )
         .await;
 

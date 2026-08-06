@@ -4,7 +4,8 @@
 use crate::actor::ChargePointActor;
 use crate::clock::MonotonicClock;
 use crate::state::{
-    ChargePointEvent, Component, RegistrationStatus, Variable, VariableAttributeType,
+    BootReasonCause, ChargePointEvent, Component, RegistrationStatus, Variable,
+    VariableAttributeType,
 };
 use alloc::boxed::Box;
 use chrono::{DateTime, Utc};
@@ -42,11 +43,15 @@ pub trait BootNotifier {
     type Error: core::error::Error + Send + Sync + 'static;
 
     /// Sends a BootNotification identifying the charge point by `vendor_name`/`model_name` and
-    /// returns the CSMS's decision.
+    /// carrying `reason` (this crate's protocol-version-independent model of *why* - see
+    /// [`BootReasonCause`]'s docs; `None` means an uncommanded restart), and returns the CSMS's
+    /// decision. Each protocol adapter below maps `reason` onto its own wire `BootReasonEnum` (or
+    /// drops it - OCPP 1.6J's `BootNotification.req` has no `reason` field at all).
     async fn notify_boot(
         &self,
         vendor_name: &str,
         model_name: &str,
+        reason: Option<BootReasonCause>,
     ) -> Result<BootNotificationOutcome, Self::Error>;
 }
 
@@ -99,14 +104,23 @@ pub trait HeartbeatSender {
 /// This performs a single BootNotification attempt. On `Pending`/`Rejected`, callers are
 /// responsible for retrying after the returned outcome's interval, per the OCPP spec. See
 /// [`register_until_accepted`] for a version that retries automatically.
+///
+/// `reason` is this crate's protocol-version-independent model of why this BootNotification is
+/// being sent - see [`BootReasonCause`]'s docs. `None` means an uncommanded restart (no cause was
+/// persisted before this boot); pass whatever
+/// [`crate::persistence::BootReasonStore::load`] returned, unmodified - this function does not
+/// interpret `reason` itself, only forwards it to `notifier`.
 pub async fn register<N: BootNotifier, M: MonotonicClock>(
     actor: &ChargePointActor,
     notifier: &N,
     monotonic: &M,
     vendor_name: &str,
     model_name: &str,
+    reason: Option<BootReasonCause>,
 ) -> Result<RegistrationStatus, N::Error> {
-    let outcome = notifier.notify_boot(vendor_name, model_name).await?;
+    let outcome = notifier
+        .notify_boot(vendor_name, model_name, reason)
+        .await?;
     let _ = actor
         .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
         .await;
@@ -125,6 +139,12 @@ pub async fn register<N: BootNotifier, M: MonotonicClock>(
 /// `currentTime` is evaluated for a time-sync step, exactly as [`register`] does - see that
 /// function's docs for what "evaluated" means and what this crate does versus what the
 /// integrator's hardware must do.
+///
+/// `reason` is sent unchanged with every attempt, including retries - see [`register`]'s docs for
+/// what it means and where it comes from. It is *not* re-read from storage between attempts:
+/// clearing the persisted cause (once this function returns, having been accepted) is the
+/// caller's job - see [`crate::builder::ChargePointBuilder::boot_reason_persistence`] for the
+/// clear-after-acceptance timing this crate uses and why.
 pub async fn register_until_accepted<N: BootNotifier, B: Backoff, M: MonotonicClock>(
     actor: &ChargePointActor,
     notifier: &N,
@@ -132,9 +152,10 @@ pub async fn register_until_accepted<N: BootNotifier, B: Backoff, M: MonotonicCl
     monotonic: &M,
     vendor_name: &str,
     model_name: &str,
+    reason: Option<BootReasonCause>,
 ) -> BootNotificationOutcome {
     loop {
-        match notifier.notify_boot(vendor_name, model_name).await {
+        match notifier.notify_boot(vendor_name, model_name, reason).await {
             Ok(outcome) => {
                 let _ = actor
                     .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
@@ -493,7 +514,7 @@ mod time_sync_wiring_tests {
     use crate::actor::ChargePointActor;
     use crate::clock::{MonotonicClock, MonotonicInstant};
     use crate::executor::TokioExecutor;
-    use crate::state::{RegistrationStatus, SecurityEventType};
+    use crate::state::{BootReasonCause, RegistrationStatus, SecurityEventType};
     use alloc::boxed::Box;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -527,6 +548,7 @@ mod time_sync_wiring_tests {
             &self,
             _vendor_name: &str,
             _model_name: &str,
+            _reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             Ok(BootNotificationOutcome {
                 status: RegistrationStatus::Accepted,
@@ -559,7 +581,7 @@ mod time_sync_wiring_tests {
         let notifier = FixedTimeBootNotifier(dt("2026-06-01T12:00:00Z"));
         let monotonic = FakeMonotonicClock::default();
 
-        register(&actor, &notifier, &monotonic, "Acme", "Charger 9000")
+        register(&actor, &notifier, &monotonic, "Acme", "Charger 9000", None)
             .await
             .unwrap();
 
@@ -574,7 +596,7 @@ mod time_sync_wiring_tests {
         let monotonic = FakeMonotonicClock::default();
         let mut events = actor.subscribe_security_events();
 
-        register(&actor, &notifier, &monotonic, "Acme", "Charger 9000")
+        register(&actor, &notifier, &monotonic, "Acme", "Charger 9000", None)
             .await
             .unwrap();
 
@@ -593,6 +615,7 @@ mod time_sync_wiring_tests {
             &monotonic,
             "Acme",
             "Charger 9000",
+            None,
         )
         .await
         .unwrap();
@@ -608,6 +631,7 @@ mod time_sync_wiring_tests {
             &monotonic,
             "Acme",
             "Charger 9000",
+            None,
         )
         .await
         .unwrap();
@@ -631,6 +655,7 @@ mod time_sync_wiring_tests {
             &monotonic,
             "Acme",
             "Charger 9000",
+            None,
         )
         .await
         .unwrap();
@@ -646,6 +671,7 @@ mod time_sync_wiring_tests {
             &monotonic,
             "Acme",
             "Charger 9000",
+            None,
         )
         .await
         .unwrap();
@@ -901,6 +927,7 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
+    use crate::state::BootReasonCause;
     use alloc::boxed::Box;
 
     /// A `BootNotifier` that always returns the same outcome, regardless of vendor/model.
@@ -915,6 +942,7 @@ pub(crate) mod test_support {
             &self,
             _vendor_name: &str,
             _model_name: &str,
+            _reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             Ok(self.0)
         }
@@ -1095,7 +1123,7 @@ pub(crate) mod test_support {
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
-    use crate::state::RegistrationStatus;
+    use crate::state::{BootReasonCause, RegistrationStatus};
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
@@ -1105,7 +1133,27 @@ mod ocpp_2_1 {
         BootReasonEnum, ChargingStation, RegistrationStatusEnum,
     };
 
-    pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
+    /// This crate's internal [`BootReasonCause`] onto OCPP 2.1's `BootReasonEnum`. `None` -
+    /// no persisted cause found for this boot, i.e. an *uncommanded* restart (power cut, watchdog,
+    /// crash) - maps to `Unknown` rather than `PowerUp`: this crate cannot currently tell those
+    /// apart from a clean power-up without an explicit hardware-supplied signal (out of scope
+    /// here - see `docs/ROADMAP.md`), and `Unknown` is the only variant that doesn't overclaim
+    /// knowledge it doesn't have. `ApplicationReset`/`LocalReset`/`FirmwareUpdate`/`Watchdog`/
+    /// `Triggered` are likewise never produced - nothing in this crate today commands any of
+    /// those causes.
+    pub(super) fn map_reason(reason: Option<BootReasonCause>) -> BootReasonEnum {
+        match reason {
+            None => BootReasonEnum::Unknown,
+            Some(BootReasonCause::RemoteReset) => BootReasonEnum::RemoteReset,
+            Some(BootReasonCause::ScheduledReset) => BootReasonEnum::ScheduledReset,
+        }
+    }
+
+    pub(super) fn build_request(
+        vendor_name: &str,
+        model_name: &str,
+        reason: Option<BootReasonCause>,
+    ) -> BootNotificationRequest {
         BootNotificationRequest {
             charging_station: ChargingStation {
                 custom_data: None,
@@ -1121,7 +1169,7 @@ mod ocpp_2_1 {
                     .expect("vendor name must fit in OCPP's 50-character bound"),
             },
             custom_data: None,
-            reason: BootReasonEnum::PowerUp,
+            reason: map_reason(reason),
         }
     }
 
@@ -1141,9 +1189,10 @@ mod ocpp_2_1 {
             &self,
             vendor_name: &str,
             model_name: &str,
+            reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             let response = self
-                .send_boot_notification(build_request(vendor_name, model_name))
+                .send_boot_notification(build_request(vendor_name, model_name, reason))
                 .await?;
 
             Ok(BootNotificationOutcome {
@@ -1175,12 +1224,28 @@ mod ocpp_2_1 {
         use super::*;
 
         #[test]
-        fn request_carries_the_vendor_and_model_as_a_power_up_boot() {
-            let request = build_request("Acme", "Charger 9000");
+        fn request_carries_the_vendor_and_model() {
+            let request = build_request("Acme", "Charger 9000", None);
 
             assert_eq!(request.charging_station.vendor_name, "Acme");
             assert_eq!(request.charging_station.model, "Charger 9000");
-            assert_eq!(request.reason, BootReasonEnum::PowerUp);
+        }
+
+        #[test]
+        fn no_persisted_cause_reports_unknown_rather_than_power_up() {
+            assert_eq!(map_reason(None), BootReasonEnum::Unknown);
+        }
+
+        #[test]
+        fn every_persisted_cause_maps_to_its_matching_wire_reason() {
+            assert_eq!(
+                map_reason(Some(BootReasonCause::RemoteReset)),
+                BootReasonEnum::RemoteReset
+            );
+            assert_eq!(
+                map_reason(Some(BootReasonCause::ScheduledReset)),
+                BootReasonEnum::ScheduledReset
+            );
         }
 
         #[test]
@@ -1217,7 +1282,23 @@ mod ocpp_2_0_1 {
         BootReasonEnum, ChargingStation, RegistrationStatusEnum,
     };
 
-    pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
+    /// Same mapping as OCPP 2.1's `map_reason` - 2.0.1's `BootReasonEnum` has the identical
+    /// variant set - see that function's docs for why absence maps to `Unknown` rather than
+    /// `PowerUp`.
+    pub(super) fn map_reason(reason: Option<crate::state::BootReasonCause>) -> BootReasonEnum {
+        use crate::state::BootReasonCause;
+        match reason {
+            None => BootReasonEnum::Unknown,
+            Some(BootReasonCause::RemoteReset) => BootReasonEnum::RemoteReset,
+            Some(BootReasonCause::ScheduledReset) => BootReasonEnum::ScheduledReset,
+        }
+    }
+
+    pub(super) fn build_request(
+        vendor_name: &str,
+        model_name: &str,
+        reason: Option<crate::state::BootReasonCause>,
+    ) -> BootNotificationRequest {
         BootNotificationRequest {
             charging_station: ChargingStation {
                 custom_data: None,
@@ -1233,7 +1314,7 @@ mod ocpp_2_0_1 {
                     .expect("vendor name must fit in OCPP's 50-character bound"),
             },
             custom_data: None,
-            reason: BootReasonEnum::PowerUp,
+            reason: map_reason(reason),
         }
     }
 
@@ -1253,9 +1334,10 @@ mod ocpp_2_0_1 {
             &self,
             vendor_name: &str,
             model_name: &str,
+            reason: Option<crate::state::BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             let response = self
-                .send_boot_notification(build_request(vendor_name, model_name))
+                .send_boot_notification(build_request(vendor_name, model_name, reason))
                 .await?;
 
             Ok(BootNotificationOutcome {
@@ -1285,14 +1367,31 @@ mod ocpp_2_0_1 {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::state::BootReasonCause;
 
         #[test]
-        fn request_carries_the_vendor_and_model_as_a_power_up_boot() {
-            let request = build_request("Acme", "Charger 9000");
+        fn request_carries_the_vendor_and_model() {
+            let request = build_request("Acme", "Charger 9000", None);
 
             assert_eq!(request.charging_station.vendor_name, "Acme");
             assert_eq!(request.charging_station.model, "Charger 9000");
-            assert_eq!(request.reason, BootReasonEnum::PowerUp);
+        }
+
+        #[test]
+        fn no_persisted_cause_reports_unknown_rather_than_power_up() {
+            assert_eq!(map_reason(None), BootReasonEnum::Unknown);
+        }
+
+        #[test]
+        fn every_persisted_cause_maps_to_its_matching_wire_reason() {
+            assert_eq!(
+                map_reason(Some(BootReasonCause::RemoteReset)),
+                BootReasonEnum::RemoteReset
+            );
+            assert_eq!(
+                map_reason(Some(BootReasonCause::ScheduledReset)),
+                BootReasonEnum::ScheduledReset
+            );
         }
 
         #[test]
@@ -1319,10 +1418,15 @@ mod ocpp_2_0_1 {
 /// `reason` field (that's a 2.x addition) and flattens `charging_station.vendor_name`/`model`
 /// into top-level `charge_point_vendor`/`charge_point_model` - otherwise the same shape and the
 /// same three-value registration status, so `map_status` differs only in its wire enum type.
+///
+/// `notify_boot`'s `reason` parameter (this crate's [`crate::state::BootReasonCause`]) is
+/// accepted, for `BootNotifier` trait uniformity across versions, but has nowhere to go on the
+/// wire and is silently dropped - this whole workstream (the boot-reason row of E2, and E4.2 in
+/// `docs/PRODUCTION-ROADMAP.md`) is a no-op for 1.6J.
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
-    use crate::state::RegistrationStatus;
+    use crate::state::{BootReasonCause, RegistrationStatus};
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
@@ -1365,6 +1469,7 @@ mod ocpp_1_6 {
             &self,
             vendor_name: &str,
             model_name: &str,
+            _reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             let response = self
                 .send_boot_notification(build_request(vendor_name, model_name))

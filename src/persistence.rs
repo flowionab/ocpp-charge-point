@@ -47,7 +47,7 @@ use crate::clock::Clock;
 use crate::hardware::{AtomicStorage, Storage};
 use crate::offline_queue::{OfflineQueue, flush_offline_queue};
 use crate::state::{
-    ChargePointEvent, ChargePointState, Component, LocalListEntry, MeterSample,
+    BootReasonCause, ChargePointEvent, ChargePointState, Component, LocalListEntry, MeterSample,
     RecoveredDeviceModelAttribute, RecoveredReservation, RecoveredTransaction, Reservation,
     Transaction, TransactionEventKind, TransactionEventOccurred, TransactionUpdateReason, Variable,
     VariableAttributeType,
@@ -1699,6 +1699,142 @@ fn persistent_attributes(state: &ChargePointState) -> Vec<PersistedDeviceModelAt
         .collect()
 }
 
+// --- boot reason persistence (E2/E4.2, docs/PRODUCTION-ROADMAP.md §7.2) ---
+//
+// What must survive a *commanded* reboot, so the next boot's `BootNotification.reason` is
+// honest: not a durable log of every reboot, just the single cause of the *next* one, written by
+// `crate::reset::handle_reset` before `HardwareCommand::Reboot` can reach hardware - see
+// `BootReasonStore`'s docs for exactly why that ordering (rather than persisting reactively off a
+// state-change subscription, the pattern every other store here uses) is the one case where it
+// matters enough to write synchronously inline instead.
+//
+// Absence of a record - nothing was ever written, or `restore_boot_reason` cleared it after a
+// prior boot's `BootNotification` was accepted - is not an error case to route around; it is
+// itself the honest signal that this boot follows an *uncommanded* restart (power cut, watchdog,
+// crash), which is exactly what `crate::provisioning`'s adapters map to `BootReasonEnum::Unknown`
+// rather than `PowerUp` - see those adapters' docs for why `Unknown` is the honest choice.
+
+/// The version stamped into every [`PersistedBootReason`] record. Independent of
+/// [`SCHEMA_VERSION`]/other `*_SCHEMA_VERSION`s for the same reason [`RESERVATION_SCHEMA_VERSION`]
+/// is - each store's record shape evolves on its own schedule.
+pub const BOOT_REASON_SCHEMA_VERSION: u32 = 1;
+
+/// The key the persisted boot-reason cause is written under - one record, not one per reset,
+/// since only the *next* boot's reason is ever relevant; a second `Reset` superseding a first
+/// (see `crate::reset::handle_reset`'s docs on that) simply overwrites it.
+const BOOT_REASON_KEY: &str = "ocpp-cp/boot-reason";
+
+/// The cause of the next commanded reboot, as written to durable storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedBootReason {
+    /// The [`BOOT_REASON_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// Why the next boot is happening.
+    pub cause: BootReasonCause,
+}
+
+/// Reads and writes the persisted boot-reason cause through a [`Storage`].
+///
+/// Write policy: unlike every other store in this module, a write here is not debounced or
+/// gated by a change-detection pass over [`ChargePointState`] - it is issued exactly once, by
+/// [`crate::reset::handle_reset`], synchronously before the `ResetRequested` event that may cause
+/// an immediate `HardwareCommand::Reboot` is even sent to the actor. That ordering is the entire
+/// point: once a reboot command has reached hardware there is no "after" in which to still write
+/// the reason it happened, so the write must happen strictly before, not "soon after" via a
+/// state-change subscription racing the hardware's own command consumer - see
+/// `crate::actor::ChargePointActor::set_boot_reason_recorder`'s docs for how `handle_reset` gets a
+/// synchronous hook into a store registered here without the state machine itself doing I/O.
+#[derive(Debug, Clone)]
+pub struct BootReasonStore<S> {
+    storage: S,
+}
+
+impl<S: Storage> BootReasonStore<S> {
+    /// Creates a store over `storage`.
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Writes `cause`, replacing whatever was previously recorded. Returns whether the write
+    /// actually reached storage - `false` means a crash before the next `BootNotification` is
+    /// accepted would report an uncommanded restart instead of `cause`, already logged.
+    pub async fn save(&self, cause: BootReasonCause) -> bool {
+        let record = PersistedBootReason {
+            schema_version: BOOT_REASON_SCHEMA_VERSION,
+            cause,
+        };
+        let Ok(encoded) = serde_json::to_vec(&record) else {
+            tracing::error!("failed to encode the boot reason for storage");
+            return false;
+        };
+        match self.storage.set(BOOT_REASON_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist the boot reason; the next boot will report an \
+                     uncommanded restart instead"
+                );
+                false
+            }
+        }
+    }
+
+    /// Removes the stored cause, if any. A missing record is not an error. Call this once the
+    /// `BootNotification` carrying the recorded cause has been *accepted* by the CSMS, not
+    /// before - see the module docs and [`restore_boot_reason`] for why clearing early would lose
+    /// the reason across a crash that happens between the reboot and a successful registration.
+    pub async fn clear(&self) {
+        if let Err(err) = self.storage.remove(BOOT_REASON_KEY).await {
+            tracing::warn!(error = %err, "failed to clear the persisted boot reason");
+        }
+    }
+
+    /// Reads back the persisted cause, or `None` if there isn't one, it can't be read, or it was
+    /// written by an incompatible [`BOOT_REASON_SCHEMA_VERSION`]. Does not clear it - see
+    /// [`Self::clear`]'s docs for why that is a separate, later step.
+    pub async fn load(&self) -> Option<BootReasonCause> {
+        let encoded = match self.storage.get(BOOT_REASON_KEY).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read the persisted boot reason; treating it as absent"
+                );
+                return None;
+            }
+        };
+        let record: PersistedBootReason = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "a persisted boot reason could not be decoded; discarding it"
+                );
+                return None;
+            }
+        };
+        if record.schema_version != BOOT_REASON_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = BOOT_REASON_SCHEMA_VERSION,
+                "discarding a persisted boot reason written by an incompatible schema version"
+            );
+            return None;
+        }
+        Some(record.cause)
+    }
+}
+
+impl<S: Storage + Send + Sync> BootReasonStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does.
+    pub fn new_atomic(storage: S) -> Self {
+        BootReasonStore::new(AtomicStorage::new(storage))
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
@@ -2726,5 +2862,51 @@ mod tests {
                 },
             ))
             .await;
+    }
+
+    #[tokio::test]
+    async fn a_boot_reason_round_trips_through_storage() {
+        let store = BootReasonStore::new(InMemoryStorage::new());
+        assert_eq!(store.load().await, None);
+
+        assert!(store.save(BootReasonCause::RemoteReset).await);
+        assert_eq!(store.load().await, Some(BootReasonCause::RemoteReset));
+
+        // A second cause supersedes the first, rather than accumulating.
+        assert!(store.save(BootReasonCause::ScheduledReset).await);
+        assert_eq!(store.load().await, Some(BootReasonCause::ScheduledReset));
+
+        store.clear().await;
+        assert_eq!(store.load().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_boot_reason_from_an_incompatible_schema_version_is_discarded() {
+        let storage = InMemoryStorage::new();
+        storage
+            .set(
+                BOOT_REASON_KEY,
+                &serde_json::to_vec(&PersistedBootReason {
+                    schema_version: BOOT_REASON_SCHEMA_VERSION + 1,
+                    cause: BootReasonCause::RemoteReset,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let store = BootReasonStore::new(storage);
+        assert_eq!(store.load().await, None);
+    }
+
+    #[tokio::test]
+    async fn no_storage_reports_no_persisted_boot_reason() {
+        let store = BootReasonStore::new(NoStorage);
+        assert_eq!(store.load().await, None);
+        // A charge point with no durable storage must behave exactly as before this store
+        // existed: `NoStorage::set` reports success without remembering anything, so a write
+        // still "succeeds" but a subsequent read always comes back empty.
+        assert!(store.save(BootReasonCause::RemoteReset).await);
+        assert_eq!(store.load().await, None);
     }
 }

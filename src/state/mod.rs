@@ -1,4 +1,5 @@
 mod authorization_status;
+mod boot_reason;
 mod charge_point_state;
 mod connector_state;
 mod connector_status;
@@ -15,6 +16,7 @@ mod security_event;
 mod transaction;
 
 pub use self::authorization_status::AuthorizationStatus;
+pub use self::boot_reason::BootReasonCause;
 pub use self::charge_point_state::{ChargePointState, LifecycleState, TimeSyncAnchor};
 pub use self::connector_state::ConnectorState;
 pub use self::connector_status::ConnectorStatus;

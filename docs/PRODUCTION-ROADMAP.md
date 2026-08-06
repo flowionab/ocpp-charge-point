@@ -744,16 +744,26 @@ mid-transaction currently loses the transaction.
       whole active set (at most one reservation per connector) is written as one JSON snapshot
       (`ocpp-cp/reservations`), for the same per-entry-addressing reasoning as E2.4. This slice
       also gave `Reservation` a real `expires_at: Option<DateTime<Utc>>` field (previously absent
-      entirely — `ReserveNow`'s wire `expiryDateTime` isn't threaded through to it yet, still
-      future work, tracked below), needed for the expired-reservation decision.
+      entirely), needed for the expired-reservation decision. `ReserveNow`'s wire
+      `expiryDateTime` (2.x)/`expiryDate` (1.6J) is now threaded through to it —
+      `reservation::handle_reserve_now` takes the parsed value and every version adapter in
+      `src/reservation.rs` parses it from the wire request (`None` if it doesn't parse as RFC
+      3339, treated as "never expires" like any other `None`).
 
       The expired-reservation decision: a reservation whose `expires_at` had already passed while
       the charge point was off is **not** resurrected as active. `restore_reservations` drops it,
       logs a warning, and never raises
-      `ChargePointEvent::PersistedReservationsRestored` for it at all — this crate has no live
-      expiry sweep yet (a reservation still only ends via `CancelReservation` or being superseded
-      by a cable connection while the process runs), so restoring an expired reservation anyway
-      would leave the connector wrongly `Reserved` with nothing left to ever clear it. The check
+      `ChargePointEvent::PersistedReservationsRestored` for it at all. This crate still has no
+      *live* expiry sweep (a reservation still only ends via `CancelReservation` or being
+      superseded by a cable connection while the process runs) — a reservation created and
+      expiring within a single boot does not expire on its own yet. A periodic sweep task shaped
+      like `provisioning::run_heartbeat` (driving a new `ChargePointEvent` through the actor on an
+      `Executor`/`Backoff`-driven interval) is the natural next step, but needs a new event variant
+      on `ChargePointEvent`/`ChargePointState` — tracked as follow-up, not done in this slice. Note
+      also that reporting an expiry to the CSMS would go over OCPP's `ReservationStatusUpdate`
+      message, which is separately not wired at all (see B8.1). Restoring an expired reservation
+      anyway would leave the connector wrongly `Reserved` with nothing left to ever clear it. The
+      check
       itself only fires when the supplied `Clock` looks synchronized
       (`crate::clock::is_synchronized`) — hardware with no RTC yet must not have every restored
       reservation discarded as "expired" purely because its unset clock reads before any real
@@ -768,7 +778,42 @@ mid-transaction currently loses the transaction.
       debouncing rather than writing on every tick, flagged here so that addition doesn't
       silently inherit an unconditional write policy that was only ever justified for discrete
       CSMS-initiated events.
-- [ ] **E2.5, E2.7, E2.9–E2.12** One task per remaining row above.
+- [x] **E2.12** Boot reason — `persistence::BootReasonStore` (`ocpp-cp/boot-reason`, one
+      whole-record snapshot, same shape as E2.4/E2.6). What's persisted is not a log of every
+      reboot, just the single cause of the *next* one: `crate::reset::handle_reset` writes it
+      *before* the `ResetRequested` event that may produce an immediate `HardwareCommand::Reboot`
+      is even sent to the actor, via a synchronous hook
+      (`ChargePointActor::set_boot_reason_recorder`) installed by
+      `ChargePointBuilder::boot_reason_persistence` — the one store in this module written inline
+      rather than off a state-change subscription, specifically because "soon after" isn't good
+      enough here: once `HardwareCommand::Reboot` reaches hardware there is no "after" left to
+      still record why.
+
+      The internal model (`state::BootReasonCause`, protocol-version-independent per `CLAUDE.md`)
+      has exactly two variants — `RemoteReset` (from `ResetKind::Immediate`) and `ScheduledReset`
+      (from `ResetKind::OnIdle`) — since a CSMS `Reset` is the only cause this crate can currently
+      produce. Absence of a persisted record (nothing ever written, or a prior boot's cause
+      already cleared after acceptance) is itself information: an *uncommanded* restart (power
+      cut, watchdog, crash), which every version adapter maps to `BootReasonEnum::Unknown` rather
+      than `PowerUp` — this crate cannot tell a clean power-up apart from a crash/watchdog reset
+      without a hardware-supplied signal it doesn't have, and `Unknown` is the only variant that
+      doesn't overclaim that knowledge. `ApplicationReset`/`LocalReset`/`FirmwareUpdate`/
+      `Watchdog`/`Triggered` are never produced — nothing in this crate commands any of those
+      today. OCPP 1.6J's `BootNotification.req` has no `reason` field at all (a 2.x addition), so
+      this whole slice is a no-op there, by spec, not by omission.
+
+      Clearing timing: the persisted cause is cleared by `ChargePointBuilder::provisioning` only
+      once the CSMS has *accepted* the BootNotification carrying it — not before sending, and not
+      immediately on boot. A crash between the reboot and a successful registration therefore
+      still reports the same commanded cause on the *next* boot too, rather than wrongly falling
+      back to "uncommanded" while still mid-recovery. The loaded cause is also fixed for the whole
+      process's life once read — a later WS reconnect's resent BootNotification
+      (`connection::reregister_on_reconnect`) reports the same reason, not a fresh storage read,
+      since a reconnect is a connectivity event, not a new boot. A storage-less charge point (no
+      `boot_reason_persistence` call, or `hardware::NoStorage`) now always reports the honest
+      uncommanded-restart variant (`Unknown`) instead of the previously-hardcoded `PowerUp` —
+      itself a small behavior change, but a strictly more honest one.
+- [ ] **E2.5, E2.7, E2.9–E2.11** One task per remaining row above.
 
 ### 7.3 E3 — Crash consistency
 
@@ -828,9 +873,18 @@ mid-transaction currently loses the transaction.
       the firmware was not running, which nothing in `crate::hardware` can
       currently attest to. Resume needs a hardware hook that can report
       contactor/cable state at boot — worth revisiting alongside M3.
-- [ ] **E4.2** Send the correct `BootNotification.reason`
-      (`PowerUp`/`RemoteReset`/`ScheduledReset`/…) from persisted context.
-      Untouched — needs the boot-reason row of E2 (E2.12) first.
+- [x] **E4.2** Send the correct `BootNotification.reason`
+      (`RemoteReset`/`ScheduledReset`/`Unknown`) from persisted context —
+      built on E2.12. `ChargePointBuilder::boot_reason_persistence` loads the
+      persisted cause at build time and `ChargePointBuilder::provisioning`
+      feeds it through `provisioning::register_until_accepted` into
+      `BootNotifier::notify_boot`'s new `reason: Option<state::BootReasonCause>`
+      parameter, which every 2.x version adapter's `build_request` maps onto
+      the wire `BootReasonEnum` (`map_reason` in `src/provisioning.rs`'s
+      `ocpp_2_1`/`ocpp_2_0_1` modules). `PowerUp` is deliberately never sent —
+      see E2.12 for why an uncommanded restart honestly maps to `Unknown`
+      instead. OCPP 1.6J's adapter accepts and drops `reason` — that
+      protocol's `BootNotification.req` has no such field.
 - [x] **E4.3** (partial) Replay the offline queue after reboot, preserving
       order — `persistence::restore_transaction_event_queue`, called from
       `ChargePointBuilder::transaction_events_persisted` before the live

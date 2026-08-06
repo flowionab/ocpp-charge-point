@@ -230,8 +230,9 @@ mod tests {
             &self,
             vendor_name: &str,
             model_name: &str,
+            reason: Option<crate::state::BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
-            self.boot.notify_boot(vendor_name, model_name).await
+            self.boot.notify_boot(vendor_name, model_name, reason).await
         }
     }
 

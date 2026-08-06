@@ -20,8 +20,8 @@ use ocpp_charge_point::reset::ResetHandler;
 use ocpp_charge_point::security::SecurityEventNotifier;
 use ocpp_charge_point::setup;
 use ocpp_charge_point::state::{
-    AuthorizationStatus, ChargePointEvent, ConnectorEvent, ConnectorStatus, EvseEvent, IdToken,
-    RegistrationStatus, Transaction, TransactionEventKind,
+    AuthorizationStatus, BootReasonCause, ChargePointEvent, ConnectorEvent, ConnectorStatus,
+    EvseEvent, IdToken, RegistrationStatus, Transaction, TransactionEventKind,
 };
 use ocpp_charge_point::transactions::TransactionNotifier;
 
@@ -39,6 +39,7 @@ impl BootNotifier for AlwaysAcceptBootNotifier {
         &self,
         _vendor_name: &str,
         _model_name: &str,
+        _reason: Option<BootReasonCause>,
     ) -> Result<BootNotificationOutcome, Self::Error> {
         Ok(BootNotificationOutcome {
             status: RegistrationStatus::Accepted,

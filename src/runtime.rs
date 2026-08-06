@@ -4,8 +4,8 @@ use crate::executor::Executor;
 use crate::hardware::{HardwareCommandReceiver, HardwareEventSender};
 use crate::provisioning::{Backoff, BootNotificationOutcome, BootNotifier};
 use crate::state::{
-    AuthorizationRequested, ChargePointEvent, ChargePointState, ConnectorStatusChanged,
-    RegistrationStatus, SecurityEvent, TransactionEventOccurred,
+    AuthorizationRequested, BootReasonCause, ChargePointEvent, ChargePointState,
+    ConnectorStatusChanged, RegistrationStatus, SecurityEvent, TransactionEventOccurred,
 };
 use crate::sync::{BroadcastReceiver, WatchReceiver};
 
@@ -39,20 +39,30 @@ impl<T> ChargePointRuntime<T> {
     }
 
     /// Runs the Provisioning functional block's BootNotification exchange. See
-    /// [`crate::provisioning::register`].
+    /// [`crate::provisioning::register`] - `reason` is forwarded unchanged; see that function's
+    /// docs for what it means.
     pub async fn register<N: BootNotifier, M: MonotonicClock>(
         &self,
         notifier: &N,
         monotonic: &M,
         vendor_name: &str,
         model_name: &str,
+        reason: Option<BootReasonCause>,
     ) -> Result<RegistrationStatus, N::Error> {
-        crate::provisioning::register(&self.actor, notifier, monotonic, vendor_name, model_name)
-            .await
+        crate::provisioning::register(
+            &self.actor,
+            notifier,
+            monotonic,
+            vendor_name,
+            model_name,
+            reason,
+        )
+        .await
     }
 
     /// Runs BootNotification repeatedly until the CSMS accepts registration. See
-    /// [`crate::provisioning::register_until_accepted`].
+    /// [`crate::provisioning::register_until_accepted`] - `reason` is forwarded unchanged; see
+    /// that function's docs for what it means.
     pub async fn register_until_accepted<N: BootNotifier, B: Backoff, M: MonotonicClock>(
         &self,
         notifier: &N,
@@ -60,6 +70,7 @@ impl<T> ChargePointRuntime<T> {
         monotonic: &M,
         vendor_name: &str,
         model_name: &str,
+        reason: Option<BootReasonCause>,
     ) -> BootNotificationOutcome {
         crate::provisioning::register_until_accepted(
             &self.actor,
@@ -68,6 +79,7 @@ impl<T> ChargePointRuntime<T> {
             monotonic,
             vendor_name,
             model_name,
+            reason,
         )
         .await
     }
@@ -139,8 +151,8 @@ mod tests {
     use crate::executor::TokioExecutor;
     use crate::provisioning::{BootNotificationOutcome, BootNotifier};
     use crate::state::{
-        ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, LifecycleState,
-        RegistrationStatus,
+        BootReasonCause, ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent,
+        LifecycleState, RegistrationStatus,
     };
     use alloc::boxed::Box;
 
@@ -156,6 +168,7 @@ mod tests {
             &self,
             vendor_name: &str,
             model_name: &str,
+            _reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             assert_eq!(vendor_name, "Acme");
             assert_eq!(model_name, "Charger 9000");
@@ -181,6 +194,7 @@ mod tests {
                 &crate::clock::SystemMonotonicClock,
                 "Acme",
                 "Charger 9000",
+                None,
             )
             .await
             .unwrap();
@@ -212,6 +226,7 @@ mod tests {
                 &crate::clock::SystemMonotonicClock,
                 "Acme",
                 "Charger 9000",
+                None,
             )
             .await
             .unwrap();
@@ -238,6 +253,7 @@ mod tests {
             &self,
             _vendor_name: &str,
             _model_name: &str,
+            _reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             let index = self
                 .calls
@@ -269,6 +285,7 @@ mod tests {
             &self,
             _vendor_name: &str,
             _model_name: &str,
+            _reason: Option<BootReasonCause>,
         ) -> Result<BootNotificationOutcome, Self::Error> {
             if self
                 .remaining_failures
@@ -336,6 +353,7 @@ mod tests {
                 &crate::clock::SystemMonotonicClock,
                 "Acme",
                 "Charger 9000",
+                None,
             )
             .await;
 
@@ -367,6 +385,7 @@ mod tests {
                 &crate::clock::SystemMonotonicClock,
                 "Acme",
                 "Charger 9000",
+                None,
             )
             .await;
 

@@ -33,6 +33,15 @@ pub enum ResetOutcome {
 /// reboots - the fail-safe stop and/or the wait for idle, and the reboot that follows, all
 /// happen asynchronously in the actor (see [`crate::state::ChargePointState`] for how the
 /// reboot is eventually dispatched as a [`HardwareCommand::Reboot`](crate::state::HardwareCommand::Reboot)).
+///
+/// Before recording the request, this calls `actor`'s installed
+/// [`crate::actor::ChargePointActor::set_boot_reason_recorder`] hook (if any) with `kind`, and
+/// *awaits it to completion* before sending `ResetRequested` - the only way to guarantee a
+/// durable-storage-backed recorder (see [`crate::persistence::BootReasonStore`], wired up by
+/// [`crate::builder::ChargePointBuilder::boot_reason_persistence`]) has finished writing before
+/// `ResetRequested`'s processing can produce an immediate [`HardwareCommand::Reboot`] - see
+/// `docs/PRODUCTION-ROADMAP.md` §7.2/§7.4 (the boot-reason row of E2, and E4.2). No recorder
+/// installed (the default) makes this a no-op, exactly as if this hook didn't exist.
 pub async fn handle_reset(
     actor: &ChargePointActor,
     target: ResetTarget,
@@ -40,6 +49,10 @@ pub async fn handle_reset(
 ) -> ResetOutcome {
     if !target_exists(&actor.state(), target) {
         return ResetOutcome::Rejected;
+    }
+
+    if let Some(recorder) = actor.boot_reason_recorder() {
+        recorder(kind).await;
     }
 
     let _ = actor
@@ -343,6 +356,43 @@ mod tests {
                 kind: ResetKind::OnIdle,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_boot_reason_recorder_is_awaited_before_reset_requested_is_applied() {
+        use alloc::boxed::Box;
+        use alloc::sync::Arc;
+        use core::future::Future;
+        use core::pin::Pin;
+        use std::sync::Mutex;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let recorded: Arc<Mutex<Option<ResetKind>>> = Arc::new(Mutex::new(None));
+        let recorded_writer = recorded.clone();
+        actor.set_boot_reason_recorder(Arc::new(move |kind: ResetKind| {
+            let recorded_writer = recorded_writer.clone();
+            Box::pin(async move {
+                *recorded_writer.lock().unwrap() = Some(kind);
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        }));
+
+        // Immediate + nothing in progress reboots within this same call - by the time
+        // `handle_reset` returns, `ResetRequested` (and any `HardwareCommand::Reboot` it
+        // produced) has already been fully applied, since `recorder(kind).await` is on the
+        // critical path *before* `actor.send(ResetRequested)` is even issued.
+        handle_reset(&actor, ResetTarget::ChargePoint, ResetKind::Immediate).await;
+
+        assert_eq!(*recorded.lock().unwrap(), Some(ResetKind::Immediate));
+        assert!(actor.state().pending_reset.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_recorder_installed_is_a_no_op() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_reset(&actor, ResetTarget::ChargePoint, ResetKind::Immediate).await;
+
+        assert_eq!(outcome, ResetOutcome::Accepted);
     }
 
     #[tokio::test]
