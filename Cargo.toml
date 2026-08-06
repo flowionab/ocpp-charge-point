@@ -153,11 +153,11 @@ critical-section = { version = "1" }
 # Matches the version `ocpp-types` (via `ocpp-client`) is built against - needed directly here
 # to construct its `heapless::String<N>`-bounded wire fields (e.g. transaction/id-token ids)
 # via `heapless::String::try_from`.
-heapless = { version = "0.8", default-features = false }
+heapless = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.39", features = ["full"]}
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 serde_json = "1"
