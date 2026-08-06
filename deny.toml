@@ -1,0 +1,57 @@
+# cargo-deny configuration (PRODUCTION-ROADMAP.md D3.3 / H1.5).
+#
+# This crate ships as firmware inside third-party hardware, so the licence
+# question is not academic: an integrator flashing this onto a product they
+# sell inherits every transitive licence obligation in the tree. The allow-list
+# below is deliberately permissive-only - no copyleft - and every entry was
+# taken from a licence actually present in the tree today (`cargo tree
+# --all-features --format "{l}"`), not from a generic template.
+
+[graph]
+all-features = true
+# The targets this crate is expected to build for: a host (integration tests,
+# the tokio runtime path) and a representative bare-metal MCU (CLAUDE.md's
+# actual deployment target).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "thumbv7em-none-eabihf",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Zlib",
+    # `unicode-ident`, reached via `syn`. Permissive; the Unicode licence has
+    # been SPDX-recognised since Unicode-3.0.
+    "Unicode-3.0",
+    # `webpki-roots`, reached via the WebSocket transport - it packages
+    # Mozilla's CA bundle, which is data rather than code.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+version = 2
+yanked = "deny"
+# No blanket ignores. An advisory that genuinely doesn't apply gets an entry
+# here with a comment saying why - never a silent exception.
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

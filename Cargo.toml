@@ -7,6 +7,11 @@ repository = "https://github.com/flowionab/ocpp-charge-point"
 license = "MIT OR Apache-2.0"
 authors = ["Joatin Granlund <joatin@granlund.io>"]
 keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
+# Verified, not guessed: 1.87 fails to compile this crate (`src/state/` uses
+# let-chains, stable only from 1.88), and several transitive dependencies
+# already require 1.86/1.87. CI enforces this on every push - see the `msrv`
+# job in `.github/workflows/ci.yaml`.
+rust-version = "1.88"
 
 [features]
 # Forwards to ocpp-client's own `std` feature (validator/regex-based payload validation), to
@@ -15,7 +20,7 @@ keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
 # `CriticalSectionRawMutex` - without a backend registered, linking any binary that touches the
 # actor's channels fails). Does NOT imply `tokio-runtime`: `std` alone is a real configuration
 # (e.g. a std binary using a non-tokio async executor, supplying its own `Executor`/`Backoff`).
-std = ["ocpp-client/std", "chrono/clock", "critical-section/std"]
+std = ["ocpp-client/std", "chrono/clock", "critical-section/std", "tracing/std"]
 # `TokioExecutor`/`TokioBackoff` (the tokio-backed `Executor`/`Backoff` impls). Implies `std`.
 # Mirrors ocpp-client's own `tokio-runtime` feature/convention.
 tokio-runtime = ["std", "dep:tokio"]
@@ -38,7 +43,13 @@ websocket = ["tokio-runtime", "ocpp-client/websocket"]
 tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
 ocpp-client = { version = "0.2", default-features = false }
 async-trait = "^0.1"
-tracing = "0.1"
+# `default-features = false` drops `tracing`'s (really `tracing-core`'s) `std` feature, which
+# pulls in `once_cell` - and `once_cell`'s default build does not compile for a bare-metal
+# target at all. Without this, `cargo check --target thumbv7em-none-eabihf
+# --no-default-features` fails in `once_cell` before it ever reaches this crate's own code, so
+# the `#![no_std]` support CLAUDE.md calls for was only ever verified on a host target. The
+# macros (`tracing::info!` etc.) are unaffected; `std` re-enables the feature for host builds.
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 # `alloc` is unconditional (not tied to this crate's own `std` feature): this crate is
 # alloc-always per CLAUDE.md's no_std+alloc stance, and the OCPP 2.1 TransactionEvent/
 # StatusNotification wire timestamps are plain `String`s (ocpp-types doesn't depend on chrono),
