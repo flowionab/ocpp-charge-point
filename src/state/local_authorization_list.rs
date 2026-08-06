@@ -6,7 +6,7 @@ use crate::state::{AuthorizationStatus, IdToken};
 /// crate's Authorization functional block already supports - a binary accept/reject decision,
 /// not the richer `IdTokenInfo` (cache expiry, `groupIdToken`, `evseId` scoping - see
 /// `docs/ROADMAP.md` §3/§4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocalListEntry {
     /// The identifier this entry decides.
     pub id_token: IdToken,

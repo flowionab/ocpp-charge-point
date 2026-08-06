@@ -47,10 +47,12 @@ use crate::clock::Clock;
 use crate::hardware::{AtomicStorage, Storage};
 use crate::offline_queue::{OfflineQueue, flush_offline_queue};
 use crate::state::{
-    ChargePointEvent, MeterSample, RecoveredTransaction, Transaction, TransactionEventKind,
-    TransactionEventOccurred, TransactionUpdateReason,
+    ChargePointEvent, ChargePointState, Component, LocalListEntry, MeterSample,
+    RecoveredDeviceModelAttribute, RecoveredReservation, RecoveredTransaction, Reservation,
+    Transaction, TransactionEventKind, TransactionEventOccurred, TransactionUpdateReason, Variable,
+    VariableAttributeType,
 };
-use crate::sync::BroadcastReceiver;
+use crate::sync::{BroadcastReceiver, WatchReceiver};
 
 /// The version stamped into every record this module writes, and the only version it reads back.
 ///
@@ -1002,6 +1004,701 @@ pub async fn flush_and_persist_transaction_event_queue<S, F, Fut, E>(
     .await
 }
 
+// --- local authorization list persistence (E2.4, docs/PRODUCTION-ROADMAP.md §7.2) ---
+
+/// The version stamped into every [`PersistedLocalAuthorizationList`] record. Independent of
+/// [`SCHEMA_VERSION`]/[`QUEUE_SCHEMA_VERSION`] - see those constants' docs for why each concern
+/// versions on its own schedule.
+pub const LOCAL_AUTH_LIST_SCHEMA_VERSION: u32 = 1;
+
+/// The key the whole local authorization list is written under. A single whole-list snapshot,
+/// not one record per entry: the list only ever changes via one `SendLocalList` call replacing
+/// or patching the entire thing at once (never a single entry in isolation from the CSMS's own
+/// perspective - even a differential update is resolved to the full resulting list before
+/// [`crate::state::ChargePointEvent::LocalListUpdated`] is even raised, see
+/// `crate::local_authorization_list::handle_send_local_list`), so there is no per-entry
+/// addressing to gain the way [`TransactionStore`] needs per-connector keys.
+const LOCAL_AUTH_LIST_KEY: &str = "ocpp-cp/local-auth-list";
+
+/// The local authorization list as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedLocalAuthorizationList {
+    /// The [`LOCAL_AUTH_LIST_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// The list's version number.
+    pub version: i64,
+    /// The list's entries.
+    pub entries: Vec<LocalListEntry>,
+}
+
+/// Reads and writes the local authorization list through a [`Storage`], mirroring
+/// [`TransactionStore`]'s degrade-rather-than-fail behaviour.
+///
+/// Write policy: unlike a periodic meter reading, `SendLocalList` is a rare, CSMS-initiated,
+/// operator-driven event (provisioning or updating an offline authorization cache), not
+/// something that fires on a hot path - so this writes on every change, no threshold. Bounding
+/// writes here the way [`persistence_decision`] bounds meter-reading writes would be
+/// over-engineering a knob nothing exercises: a charge point does not receive `SendLocalList`
+/// calls often enough for flash wear to be a realistic concern.
+#[derive(Debug, Clone)]
+pub struct LocalAuthorizationListStore<S> {
+    storage: S,
+}
+
+impl<S: Storage> LocalAuthorizationListStore<S> {
+    /// Creates a store over `storage`.
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Writes the list outright, replacing whatever was there before. Returns whether the write
+    /// actually reached storage.
+    pub async fn save(&self, version: i64, entries: &[LocalListEntry]) -> bool {
+        let record = PersistedLocalAuthorizationList {
+            schema_version: LOCAL_AUTH_LIST_SCHEMA_VERSION,
+            version,
+            entries: entries.to_vec(),
+        };
+        let Ok(encoded) = serde_json::to_vec(&record) else {
+            tracing::error!("failed to encode the local authorization list for storage");
+            return false;
+        };
+        match self.storage.set(LOCAL_AUTH_LIST_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist the local authorization list; continuing without \
+                     durability for it"
+                );
+                false
+            }
+        }
+    }
+
+    /// Reads back the persisted list, or `None` if there isn't one, it can't be read, or it was
+    /// written by an incompatible [`LOCAL_AUTH_LIST_SCHEMA_VERSION`] - discarded rather than
+    /// guessed at, exactly like [`TransactionStore::load`].
+    pub async fn load(&self) -> Option<PersistedLocalAuthorizationList> {
+        let encoded = match self.storage.get(LOCAL_AUTH_LIST_KEY).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read the persisted local authorization list; treating it as absent"
+                );
+                return None;
+            }
+        };
+        let record: PersistedLocalAuthorizationList = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "a persisted local authorization list could not be decoded; discarding it"
+                );
+                return None;
+            }
+        };
+        if record.schema_version != LOCAL_AUTH_LIST_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = LOCAL_AUTH_LIST_SCHEMA_VERSION,
+                "discarding a persisted local authorization list written by an incompatible \
+                 schema version"
+            );
+            return None;
+        }
+        Some(record)
+    }
+}
+
+impl<S: Storage + Send + Sync> LocalAuthorizationListStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does.
+    pub fn new_atomic(storage: S) -> Self {
+        LocalAuthorizationListStore::new(AtomicStorage::new(storage))
+    }
+}
+
+/// Recovers the local authorization list from durable storage, if any, and hands it to the state
+/// machine as one [`ChargePointEvent::PersistedLocalAuthorizationListRestored`].
+///
+/// Call this once at boot, before [`crate::local_authorization_list::handle_send_local_list`]/
+/// `handle_get_local_list_version` can be reached by a CSMS request - see
+/// `crate::builder::ChargePointBuilder::local_authorization_list_persistence`.
+///
+/// Returns whether a list was actually recovered.
+pub async fn restore_local_authorization_list<S: Storage>(
+    actor: &ChargePointActor,
+    store: &LocalAuthorizationListStore<S>,
+) -> bool {
+    let Some(record) = store.load().await else {
+        return false;
+    };
+    tracing::info!(
+        version = record.version,
+        entries = record.entries.len(),
+        "recovering the local authorization list from durable storage"
+    );
+    let _ = actor
+        .send(ChargePointEvent::PersistedLocalAuthorizationListRestored {
+            version: record.version,
+            entries: record.entries,
+        })
+        .await;
+    true
+}
+
+/// Persists the local authorization list through `store` for as long as `state_changes` keeps
+/// producing new values, writing whenever the list's version changes - see
+/// [`LocalAuthorizationListStore`]'s docs for why no debounce is applied.
+pub async fn run_local_authorization_list_persistence<S: Storage>(
+    mut state_changes: WatchReceiver<ChargePointState>,
+    store: &LocalAuthorizationListStore<S>,
+) {
+    let mut last_version: Option<i64> = None;
+    loop {
+        state_changes.changed().await;
+        let state = state_changes.borrow();
+        if last_version != Some(state.local_authorization_list.version) {
+            last_version = Some(state.local_authorization_list.version);
+            store
+                .save(
+                    state.local_authorization_list.version,
+                    &state.local_authorization_list.entries,
+                )
+                .await;
+        }
+    }
+}
+
+// --- reservation persistence (E2.6, docs/PRODUCTION-ROADMAP.md §7.2) ---
+
+/// The version stamped into every [`PersistedReservations`] record.
+pub const RESERVATION_SCHEMA_VERSION: u32 = 1;
+
+/// The key the whole set of active reservations is written under - one whole-set snapshot, not
+/// one record per reservation, mirroring [`LocalAuthorizationListStore`]'s reasoning: the bounded
+/// set (at most one reservation per connector) changes in small discrete steps (create/cancel/
+/// used/expire), so there's no meaningful per-entry addressing to gain, and a single key keeps
+/// reads and the expiry-filtering pass in [`restore_reservations`] a single round trip.
+const RESERVATION_KEY: &str = "ocpp-cp/reservations";
+
+/// One active reservation as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedReservationEntry {
+    /// The reservation's connector's EVSE index.
+    pub evse_id: usize,
+    /// The reservation's connector's index within its EVSE.
+    pub connector_id: usize,
+    /// The reservation itself.
+    pub reservation: Reservation,
+}
+
+/// The whole set of active reservations as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedReservations {
+    /// The [`RESERVATION_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// Every currently active reservation.
+    pub reservations: Vec<PersistedReservationEntry>,
+}
+
+/// Reads and writes the whole set of active reservations through a [`Storage`].
+///
+/// Write policy: like [`LocalAuthorizationListStore`], every change is written unconditionally -
+/// no debounce. A tick-driven expiry sweep might look like the kind of steady drumbeat
+/// [`QueueStore`]'s write-threshold exists to throttle, but this crate doesn't run one (see
+/// [`Reservation`]'s docs: expiry isn't enforced live by a background timer today, only checked
+/// at [`restore_reservations`] time) - every write this store actually issues today comes from a
+/// discrete CSMS-initiated `ReserveNow`/`CancelReservation`, or a reservation being consumed by a
+/// cable connection, all of which are already rare relative to a charging session's meter
+/// cadence. If a live expiry sweep is added later, it should reuse
+/// [`queue_persistence_decision`]-style debouncing rather than writing on every tick - flagged
+/// here rather than silently decided against, since this store's write policy would need
+/// revisiting at that point.
+#[derive(Debug, Clone)]
+pub struct ReservationStore<S> {
+    storage: S,
+}
+
+impl<S: Storage> ReservationStore<S> {
+    /// Creates a store over `storage`.
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Writes `reservations` as the whole active set, replacing whatever was there before -
+    /// clearing storage outright if `reservations` is empty. Returns whether the write actually
+    /// reached storage.
+    pub async fn save(&self, reservations: &[PersistedReservationEntry]) -> bool {
+        if reservations.is_empty() {
+            self.clear().await;
+            return true;
+        }
+        let record = PersistedReservations {
+            schema_version: RESERVATION_SCHEMA_VERSION,
+            reservations: reservations.to_vec(),
+        };
+        let Ok(encoded) = serde_json::to_vec(&record) else {
+            tracing::error!("failed to encode the active reservation set for storage");
+            return false;
+        };
+        match self.storage.set(RESERVATION_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist the active reservation set; continuing without \
+                     durability for it"
+                );
+                false
+            }
+        }
+    }
+
+    /// Removes the stored snapshot, if any. A missing snapshot is not an error.
+    pub async fn clear(&self) {
+        if let Err(err) = self.storage.remove(RESERVATION_KEY).await {
+            tracing::warn!(
+                error = %err,
+                "failed to clear the persisted active reservation set"
+            );
+        }
+    }
+
+    /// Reads back every persisted reservation, or an empty `Vec` if there isn't a record, it
+    /// can't be read, or it was written by an incompatible [`RESERVATION_SCHEMA_VERSION`].
+    pub async fn load(&self) -> Vec<PersistedReservationEntry> {
+        let encoded = match self.storage.get(RESERVATION_KEY).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read the persisted active reservation set; treating it as absent"
+                );
+                return Vec::new();
+            }
+        };
+        let record: PersistedReservations = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "a persisted active reservation set could not be decoded; discarding it"
+                );
+                return Vec::new();
+            }
+        };
+        if record.schema_version != RESERVATION_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = RESERVATION_SCHEMA_VERSION,
+                "discarding a persisted active reservation set written by an incompatible \
+                 schema version"
+            );
+            return Vec::new();
+        }
+        record.reservations
+    }
+}
+
+impl<S: Storage + Send + Sync> ReservationStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does.
+    pub fn new_atomic(storage: S) -> Self {
+        ReservationStore::new(AtomicStorage::new(storage))
+    }
+}
+
+/// Recovers active reservations from durable storage, filters out any whose
+/// [`Reservation::expires_at`] has already passed, and hands the rest to the state machine as one
+/// [`ChargePointEvent::PersistedReservationsRestored`].
+///
+/// # The expired-reservation decision
+///
+/// A reservation whose expiry passed while the charge point was powered off is **not**
+/// resurrected as active: it is dropped here, logged, and never reaches
+/// [`ChargePointEvent::PersistedReservationsRestored`] at all, so the state machine never has to
+/// reason about an already-invalid reservation. The alternative - restoring it anyway and relying
+/// on a live expiry check to immediately cancel it - was rejected because this crate doesn't
+/// have a live expiry check yet (see [`Reservation`]'s and [`ReservationStore`]'s docs); silently
+/// restoring an expired reservation as `Reserved` with nothing to ever clear it would leave the
+/// connector wrongly unusable indefinitely, exactly the "resurrect an expired reservation as
+/// active" outcome this function must not produce.
+///
+/// The expiry check itself only fires when `clock` looks synchronized (see
+/// [`crate::clock::is_synchronized`]): hardware with no RTC yet must not have every restored
+/// reservation dropped as "expired" just because its unset clock reads before any real
+/// `expires_at` - the same G3.1 stance [`next_record`] already takes for `started_at`, applied
+/// here as "don't discard based on a clock reading we don't trust" rather than "don't record a
+/// timestamp we don't trust". A reservation with `expires_at: None` (see that field's docs on the
+/// wire value not being wired through yet) is likewise never treated as expired.
+///
+/// Storage is reconciled to hold only the entries actually restored, once the recovery event has
+/// been handed to the state machine, so a stale expired entry doesn't keep getting re-loaded and
+/// re-filtered on every subsequent boot.
+pub async fn restore_reservations<S: Storage, C: Clock>(
+    actor: &ChargePointActor,
+    store: &ReservationStore<S>,
+    clock: &C,
+) -> usize {
+    let entries = store.load().await;
+    let now = clock.now();
+    let clock_trustworthy = crate::clock::is_synchronized(&now);
+    let mut kept = Vec::new();
+    for entry in entries {
+        let expired = clock_trustworthy
+            && entry
+                .reservation
+                .expires_at
+                .is_some_and(|expires_at| now >= expires_at);
+        if expired {
+            tracing::warn!(
+                evse_id = entry.evse_id,
+                connector_id = entry.connector_id,
+                "discarding a reservation that expired while the charge point was powered off"
+            );
+            continue;
+        }
+        kept.push(entry);
+    }
+    let recovered = kept.len();
+    if recovered > 0 {
+        tracing::info!(
+            count = recovered,
+            "recovering reservations from durable storage"
+        );
+    }
+    let reservations = kept
+        .iter()
+        .map(|entry| RecoveredReservation {
+            evse_id: entry.evse_id,
+            connector_id: entry.connector_id,
+            reservation: entry.reservation.clone(),
+        })
+        .collect();
+    let _ = actor
+        .send(ChargePointEvent::PersistedReservationsRestored { reservations })
+        .await;
+    store.save(&kept).await;
+    recovered
+}
+
+/// Persists the active reservation set through `store` for as long as `state_changes` keeps
+/// producing new values, writing whenever the set actually changes - see [`ReservationStore`]'s
+/// docs for the write policy.
+pub async fn run_reservation_persistence<S: Storage>(
+    mut state_changes: WatchReceiver<ChargePointState>,
+    store: &ReservationStore<S>,
+) {
+    let mut last: Vec<PersistedReservationEntry> = Vec::new();
+    loop {
+        state_changes.changed().await;
+        let snapshot = active_reservations(&state_changes.borrow());
+        if snapshot != last {
+            store.save(&snapshot).await;
+            last = snapshot;
+        }
+    }
+}
+
+/// Every currently active reservation across `state`'s EVSEs, as [`PersistedReservationEntry`]
+/// records in `(evse_id, connector_id)` order.
+fn active_reservations(state: &ChargePointState) -> Vec<PersistedReservationEntry> {
+    let mut entries = Vec::new();
+    for (evse_id, evse) in state.evses.iter().enumerate() {
+        for (connector_id, reservation) in evse.reservations.iter().enumerate() {
+            if let Some(reservation) = reservation {
+                entries.push(PersistedReservationEntry {
+                    evse_id,
+                    connector_id,
+                    reservation: reservation.clone(),
+                });
+            }
+        }
+    }
+    entries
+}
+
+// --- device model attribute persistence (E2.3, docs/PRODUCTION-ROADMAP.md §7.2) ---
+
+/// The version stamped into every [`PersistedDeviceModel`] record.
+pub const DEVICE_MODEL_SCHEMA_VERSION: u32 = 1;
+
+/// The key the whole set of persistent device model attribute values is written under.
+const DEVICE_MODEL_KEY: &str = "ocpp-cp/device-model";
+
+/// The default number of skipped writes between whole-snapshot writes for persistent device
+/// model attributes - see [`DeviceModelStore::with_write_threshold`] for the trade-off this sets.
+///
+/// `1` writes on every change, same as [`LocalAuthorizationListStore`] and [`ReservationStore`].
+/// Unlike those two, `SetVariables` genuinely *can* be bursty - a single CSMS request may set
+/// several variables at once, and nothing stops a script issuing several `SetVariables` calls
+/// back to back. That argues for a threshold the way [`QueueStore`] has one. This crate still
+/// defaults to `1` rather than a higher value, though: `SetVariables` is an operator/CSMS
+/// configuration action, not a hot path driven by charging telemetry (unlike periodic meter
+/// values, which is the one write this crate already debounces by *magnitude* via
+/// [`TransactionStore::meter_write_threshold_wh`]) - a burst of a handful of variables in one
+/// request is at most a handful of small JSON snapshot writes, not the sustained per-sample
+/// cadence meter values produce. Integrators who do expect frequent bulk `SetVariables` traffic
+/// (e.g. a provisioning tool that reconfigures many variables in a scripted loop) can raise this
+/// via [`DeviceModelStore::with_write_threshold`] and accept losing up to that many of the most
+/// recent attribute writes to a power cut - the same trade [`QueueStore::with_write_threshold`]
+/// documents.
+pub const DEFAULT_DEVICE_MODEL_WRITE_THRESHOLD: usize = 1;
+
+/// One persistent device model attribute value as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedDeviceModelAttribute {
+    /// The attribute's component.
+    pub component: Component,
+    /// The attribute's variable.
+    pub variable: Variable,
+    /// Which attribute of `variable` this is.
+    pub attribute_type: VariableAttributeType,
+    /// The persisted value.
+    pub value: String,
+}
+
+/// The whole set of persistent device model attribute values as written to durable storage - only
+/// attributes flagged [`crate::state::VariableAttribute::persistent`], never the rest of the
+/// model (every other variable is re-registered by the hardware binding on every boot - see
+/// `crate::hardware::ChargePoint::start` - so persisting it too would just be redundant writes of
+/// data that's about to be overwritten anyway).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedDeviceModel {
+    /// The [`DEVICE_MODEL_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// Every currently registered attribute flagged `persistent`.
+    pub attributes: Vec<PersistedDeviceModelAttribute>,
+}
+
+/// What [`run_device_model_persistence`]'s write policy concluded, as a pure function of how many
+/// writes have been skipped since the last one actually reached storage. Mirrors
+/// [`QueuePersistenceDecision`] without its `Clear` case - a `PersistedDeviceModel` with no
+/// persistent attributes registered is a legitimate (if unusual) snapshot to write, not a signal
+/// to remove the key the way an emptied offline queue is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceModelPersistenceDecision {
+    /// Write a fresh whole-snapshot.
+    Write,
+    /// Leave storage untouched - not enough writes have been skipped yet to be worth one.
+    Skip,
+}
+
+/// The write policy used by [`run_device_model_persistence`] - see
+/// [`DEFAULT_DEVICE_MODEL_WRITE_THRESHOLD`] for the reasoning. `write_threshold` is clamped to at
+/// least `1`, exactly like [`queue_persistence_decision`].
+pub fn device_model_persistence_decision(
+    mutations_since_write: usize,
+    write_threshold: usize,
+) -> DeviceModelPersistenceDecision {
+    if mutations_since_write + 1 >= write_threshold.max(1) {
+        DeviceModelPersistenceDecision::Write
+    } else {
+        DeviceModelPersistenceDecision::Skip
+    }
+}
+
+/// Reads and writes the whole set of persistent device model attribute values through a
+/// [`Storage`].
+#[derive(Debug, Clone)]
+pub struct DeviceModelStore<S> {
+    storage: S,
+    write_threshold: usize,
+}
+
+impl<S: Storage> DeviceModelStore<S> {
+    /// Creates a store over `storage` with [`DEFAULT_DEVICE_MODEL_WRITE_THRESHOLD`].
+    pub fn new(storage: S) -> Self {
+        Self {
+            storage,
+            write_threshold: DEFAULT_DEVICE_MODEL_WRITE_THRESHOLD,
+        }
+    }
+
+    /// Overrides how many skipped writes must accumulate between whole-snapshot writes - see
+    /// [`DEFAULT_DEVICE_MODEL_WRITE_THRESHOLD`].
+    pub fn with_write_threshold(mut self, write_threshold: usize) -> Self {
+        self.write_threshold = write_threshold;
+        self
+    }
+
+    /// The configured write threshold.
+    pub fn write_threshold(&self) -> usize {
+        self.write_threshold
+    }
+
+    /// Writes `attributes` as the whole persistent-attribute snapshot, replacing whatever was
+    /// there before. Returns whether the write actually reached storage.
+    pub async fn save(&self, attributes: &[PersistedDeviceModelAttribute]) -> bool {
+        let record = PersistedDeviceModel {
+            schema_version: DEVICE_MODEL_SCHEMA_VERSION,
+            attributes: attributes.to_vec(),
+        };
+        let Ok(encoded) = serde_json::to_vec(&record) else {
+            tracing::error!("failed to encode the persistent device model attributes for storage");
+            return false;
+        };
+        match self.storage.set(DEVICE_MODEL_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist device model attribute values; continuing without \
+                     durability for them"
+                );
+                false
+            }
+        }
+    }
+
+    /// Reads back every persisted attribute, or an empty `Vec` if there isn't a record, it can't
+    /// be read, or it was written by an incompatible [`DEVICE_MODEL_SCHEMA_VERSION`].
+    pub async fn load(&self) -> Vec<PersistedDeviceModelAttribute> {
+        let encoded = match self.storage.get(DEVICE_MODEL_KEY).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read the persisted device model attribute values; treating them \
+                     as absent"
+                );
+                return Vec::new();
+            }
+        };
+        let record: PersistedDeviceModel = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "persisted device model attribute values could not be decoded; discarding \
+                     them"
+                );
+                return Vec::new();
+            }
+        };
+        if record.schema_version != DEVICE_MODEL_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = DEVICE_MODEL_SCHEMA_VERSION,
+                "discarding persisted device model attribute values written by an incompatible \
+                 schema version"
+            );
+            return Vec::new();
+        }
+        record.attributes
+    }
+}
+
+impl<S: Storage + Send + Sync> DeviceModelStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does.
+    pub fn new_atomic(storage: S) -> Self {
+        DeviceModelStore::new(AtomicStorage::new(storage))
+    }
+}
+
+/// Recovers persistent device model attribute values from durable storage and hands them to the
+/// state machine as one [`ChargePointEvent::PersistedDeviceModelAttributesRestored`].
+///
+/// # Ordering vs the hardware binding's own registration
+///
+/// Call this **after** the hardware binding has finished registering its own variables (i.e.
+/// after `crate::hardware::ChargePoint::start` has returned, the same point
+/// `crate::builder::ChargePointBuilder::start` already waits for) - never before. The device
+/// model's registered set is empty until the binding declares it, and
+/// [`ChargePointEvent::PersistedDeviceModelAttributesRestored`] only applies a persisted value
+/// onto a component/variable/attribute-type that's already registered (see that variant's docs) -
+/// restoring first against an empty model would discard every persisted value as "unregistered",
+/// which is exactly wrong on every normal boot. Restoring after registration means a variable the
+/// binding still declares this boot gets its persisted value back; one it no longer declares is
+/// left dormant and logged rather than silently applied to a variable that, as far as this boot's
+/// hardware is concerned, doesn't exist.
+///
+/// Returns the number of attribute records read back from storage (not the number actually
+/// applied - some may be left dormant per the above).
+pub async fn restore_device_model<S: Storage>(
+    actor: &ChargePointActor,
+    store: &DeviceModelStore<S>,
+) -> usize {
+    let attributes = store.load().await;
+    let recovered = attributes.len();
+    if recovered > 0 {
+        tracing::info!(
+            count = recovered,
+            "recovering persistent device model attribute values from durable storage"
+        );
+    }
+    let attributes = attributes
+        .into_iter()
+        .map(|attribute| RecoveredDeviceModelAttribute {
+            component: attribute.component,
+            variable: attribute.variable,
+            attribute_type: attribute.attribute_type,
+            value: attribute.value,
+        })
+        .collect();
+    let _ = actor
+        .send(ChargePointEvent::PersistedDeviceModelAttributesRestored { attributes })
+        .await;
+    recovered
+}
+
+/// Persists every currently registered `persistent`-flagged device model attribute through
+/// `store` for as long as `state_changes` keeps producing new values, applying
+/// [`device_model_persistence_decision`]'s write policy.
+pub async fn run_device_model_persistence<S: Storage>(
+    mut state_changes: WatchReceiver<ChargePointState>,
+    store: &DeviceModelStore<S>,
+) {
+    let mut last_written: Vec<PersistedDeviceModelAttribute> = store.load().await;
+    let mut mutations_since_write: usize = 0;
+    loop {
+        state_changes.changed().await;
+        let snapshot = persistent_attributes(&state_changes.borrow());
+        if snapshot == last_written {
+            continue;
+        }
+        match device_model_persistence_decision(mutations_since_write, store.write_threshold()) {
+            DeviceModelPersistenceDecision::Write => {
+                store.save(&snapshot).await;
+                last_written = snapshot;
+                mutations_since_write = 0;
+            }
+            DeviceModelPersistenceDecision::Skip => {
+                mutations_since_write += 1;
+            }
+        }
+    }
+}
+
+/// Every currently registered attribute flagged `persistent` across `state`'s device model, as
+/// [`PersistedDeviceModelAttribute`] records in the device model's own stable iteration order.
+fn persistent_attributes(state: &ChargePointState) -> Vec<PersistedDeviceModelAttribute> {
+    state
+        .device_model
+        .iter()
+        .flat_map(|(component, variable, definition)| {
+            definition
+                .attributes
+                .iter()
+                .filter(|attribute| attribute.persistent)
+                .map(move |attribute| PersistedDeviceModelAttribute {
+                    component: component.clone(),
+                    variable: variable.clone(),
+                    attribute_type: attribute.attribute_type,
+                    value: attribute.value.clone(),
+                })
+        })
+        .collect()
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
@@ -1550,5 +2247,484 @@ mod tests {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.write_str("send failed")
         }
+    }
+
+    // --- local authorization list persistence (E2.4) ---
+
+    use crate::state::{
+        AuthorizationStatus, Component, ConnectorEvent, ConnectorState, DeviceModelEvent,
+        EvseEvent, ReservationId, Variable, VariableCharacteristics, VariableDataType,
+        VariableMutability,
+    };
+
+    fn local_list_entry() -> LocalListEntry {
+        LocalListEntry {
+            id_token: IdToken {
+                value: "04A224B2".into(),
+                kind: IdTokenKind::ISO14443,
+            },
+            status: AuthorizationStatus::Accepted,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_local_authorization_list_round_trips_through_storage() {
+        let store = LocalAuthorizationListStore::new(InMemoryStorage::new());
+        assert_eq!(store.load().await, None);
+
+        assert!(store.save(3, &[local_list_entry()]).await);
+        let loaded = store.load().await.unwrap();
+        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.entries, alloc::vec![local_list_entry()]);
+    }
+
+    #[tokio::test]
+    async fn a_local_authorization_list_from_an_incompatible_schema_version_is_discarded() {
+        let storage = InMemoryStorage::new();
+        storage
+            .set(
+                LOCAL_AUTH_LIST_KEY,
+                &serde_json::to_vec(&PersistedLocalAuthorizationList {
+                    schema_version: LOCAL_AUTH_LIST_SCHEMA_VERSION + 1,
+                    version: 1,
+                    entries: alloc::vec![local_list_entry()],
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let store = LocalAuthorizationListStore::new(storage);
+        assert_eq!(store.load().await, None);
+    }
+
+    /// The end-to-end guarantee E2.4 exists for: a local authorization list already installed by
+    /// `SendLocalList` survives a power cut, without re-downloading it from the CSMS.
+    #[tokio::test]
+    async fn a_local_authorization_list_interrupted_by_a_power_cut_is_recovered_after_reboot() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = LocalAuthorizationListStore::new(storage.clone());
+
+        let executor = crate::executor::TokioExecutor;
+        let before = ChargePointActor::spawn([1], &executor);
+        let state_changes = before.subscribe();
+        let persistence_store = LocalAuthorizationListStore::new(storage.clone());
+        tokio::spawn(async move {
+            run_local_authorization_list_persistence(state_changes, &persistence_store).await;
+        });
+        let _ = before
+            .send(ChargePointEvent::LocalListUpdated {
+                version: 7,
+                entries: alloc::vec![local_list_entry()],
+            })
+            .await;
+        for _ in 0..20 {
+            if store.load().await.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.load().await.unwrap().version, 7);
+
+        // --- the cut: the actor (and all its RAM state) simply vanishes.
+        drop(before);
+
+        // --- after the reboot: a fresh charge point recovers from storage alone.
+        let after = ChargePointActor::spawn([1], &executor);
+        assert!(restore_local_authorization_list(&after, &store).await);
+        assert_eq!(after.state().local_authorization_list.version, 7);
+        assert_eq!(
+            after.state().local_authorization_list.entries,
+            alloc::vec![local_list_entry()]
+        );
+    }
+
+    // --- reservation persistence (E2.6) ---
+
+    fn test_id_token() -> IdToken {
+        IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        }
+    }
+
+    fn reservation_entry(expires_at: Option<DateTime<Utc>>) -> PersistedReservationEntry {
+        PersistedReservationEntry {
+            evse_id: 0,
+            connector_id: 0,
+            reservation: Reservation {
+                id: ReservationId(1),
+                id_token: test_id_token(),
+                expires_at,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reservation_set_round_trips_through_storage() {
+        let store = ReservationStore::new(InMemoryStorage::new());
+        assert_eq!(store.load().await, Vec::new());
+
+        assert!(store.save(&[reservation_entry(None)]).await);
+        assert_eq!(store.load().await, alloc::vec![reservation_entry(None)]);
+
+        assert!(store.save(&[]).await);
+        assert_eq!(store.load().await, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_reservation_set_from_an_incompatible_schema_version_is_discarded() {
+        let storage = InMemoryStorage::new();
+        storage
+            .set(
+                RESERVATION_KEY,
+                &serde_json::to_vec(&PersistedReservations {
+                    schema_version: RESERVATION_SCHEMA_VERSION + 1,
+                    reservations: alloc::vec![reservation_entry(None)],
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let store = ReservationStore::new(storage);
+        assert_eq!(store.load().await, Vec::new());
+    }
+
+    /// The expired-reservation decision: a reservation whose `expires_at` has already passed
+    /// while the charge point was off is dropped, not restored as active.
+    #[tokio::test]
+    async fn restoring_an_expired_reservation_discards_it_rather_than_reactivating_it() {
+        let storage = InMemoryStorage::new();
+        let store = ReservationStore::new(storage);
+        let synchronized_now =
+            crate::clock::unsynchronized_before() + ChronoDuration::days(365 * 5);
+        let already_expired = synchronized_now - ChronoDuration::hours(1);
+        store
+            .save(&[reservation_entry(Some(already_expired))])
+            .await;
+
+        let executor = crate::executor::TokioExecutor;
+        let actor = ChargePointActor::spawn([1], &executor);
+        let clock = FixedClock(synchronized_now);
+
+        let recovered = restore_reservations(&actor, &store, &clock).await;
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Available,
+            "an expired reservation must not resurrect the connector as Reserved"
+        );
+        // Storage is reconciled too, so a later boot doesn't keep re-discovering the same
+        // expired entry.
+        assert_eq!(store.load().await, Vec::new());
+    }
+
+    /// A reservation that hasn't expired yet is restored as an active `Reserved` connector.
+    #[tokio::test]
+    async fn restoring_an_unexpired_reservation_reactivates_the_connector() {
+        let storage = InMemoryStorage::new();
+        let store = ReservationStore::new(storage);
+        let synchronized_now =
+            crate::clock::unsynchronized_before() + ChronoDuration::days(365 * 5);
+        let not_yet_expired = synchronized_now + ChronoDuration::hours(1);
+        store
+            .save(&[reservation_entry(Some(not_yet_expired))])
+            .await;
+
+        let executor = crate::executor::TokioExecutor;
+        let actor = ChargePointActor::spawn([1], &executor);
+        let clock = FixedClock(synchronized_now);
+
+        let recovered = restore_reservations(&actor, &store, &clock).await;
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Reserved
+        );
+    }
+
+    /// An unsynchronized clock (no RTC yet) must not cause every restored reservation to look
+    /// expired - the same G3.1 "don't act on a clock reading we don't trust" stance
+    /// `next_record` already takes for `started_at`.
+    #[tokio::test]
+    async fn restoring_a_reservation_with_an_unsynchronized_clock_does_not_discard_it_as_expired() {
+        let storage = InMemoryStorage::new();
+        let store = ReservationStore::new(storage);
+        // An expiry far in the "past" relative to a synchronized clock, but the clock reading at
+        // restore time is itself unsynchronized (before the sentinel) - so this must not be
+        // treated as expired.
+        let plausible_expiry =
+            crate::clock::unsynchronized_before() + ChronoDuration::days(365 * 5);
+        store
+            .save(&[reservation_entry(Some(plausible_expiry))])
+            .await;
+
+        let executor = crate::executor::TokioExecutor;
+        let actor = ChargePointActor::spawn([1], &executor);
+        let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+
+        let recovered = restore_reservations(&actor, &store, &unset_rtc).await;
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Reserved
+        );
+    }
+
+    /// The end-to-end guarantee E2.6 exists for: an active reservation survives a power cut and
+    /// is restored, so the reserved connector doesn't come back `Available` for anyone else to
+    /// grab.
+    #[tokio::test]
+    async fn a_reservation_interrupted_by_a_power_cut_is_recovered_after_reboot() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = ReservationStore::new(storage.clone());
+
+        let executor = crate::executor::TokioExecutor;
+        let before = ChargePointActor::spawn([1], &executor);
+        let state_changes = before.subscribe();
+        let persistence_store = ReservationStore::new(storage.clone());
+        tokio::spawn(async move {
+            run_reservation_persistence(state_changes, &persistence_store).await;
+        });
+        let _ = before
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::Reserved(Reservation {
+                        id: ReservationId(9),
+                        id_token: test_id_token(),
+                        expires_at: None,
+                    }),
+                },
+            })
+            .await;
+        for _ in 0..20 {
+            if !store.load().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.load().await.len(), 1);
+
+        // --- the cut.
+        drop(before);
+
+        // --- after the reboot.
+        let after = ChargePointActor::spawn([1], &executor);
+        let clock = SystemClock;
+        let recovered = restore_reservations(&after, &store, &clock).await;
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            after.state().evses[0].connectors[0],
+            ConnectorState::Reserved
+        );
+    }
+
+    // --- device model attribute persistence (E2.3) ---
+
+    fn persistent_component() -> Component {
+        Component {
+            name: "TestCtrlr".into(),
+            instance: None,
+            evse: None,
+        }
+    }
+
+    fn persistent_variable() -> Variable {
+        Variable {
+            name: "Setting".into(),
+            instance: None,
+        }
+    }
+
+    fn persisted_attribute(value: &str) -> PersistedDeviceModelAttribute {
+        PersistedDeviceModelAttribute {
+            component: persistent_component(),
+            variable: persistent_variable(),
+            attribute_type: VariableAttributeType::Actual,
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn a_write_below_the_threshold_is_skipped() {
+        assert_eq!(
+            device_model_persistence_decision(2, 5),
+            DeviceModelPersistenceDecision::Skip
+        );
+    }
+
+    #[test]
+    fn a_write_reaching_the_threshold_is_written() {
+        assert_eq!(
+            device_model_persistence_decision(4, 5),
+            DeviceModelPersistenceDecision::Write
+        );
+    }
+
+    #[test]
+    fn a_zero_threshold_behaves_like_one() {
+        assert_eq!(
+            device_model_persistence_decision(0, 0),
+            DeviceModelPersistenceDecision::Write
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_model_snapshot_round_trips_through_storage() {
+        let store = DeviceModelStore::new(InMemoryStorage::new());
+        assert_eq!(store.load().await, Vec::new());
+
+        assert!(store.save(&[persisted_attribute("hello")]).await);
+        assert_eq!(
+            store.load().await,
+            alloc::vec![persisted_attribute("hello")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_model_snapshot_from_an_incompatible_schema_version_is_discarded() {
+        let storage = InMemoryStorage::new();
+        storage
+            .set(
+                DEVICE_MODEL_KEY,
+                &serde_json::to_vec(&PersistedDeviceModel {
+                    schema_version: DEVICE_MODEL_SCHEMA_VERSION + 1,
+                    attributes: alloc::vec![persisted_attribute("hello")],
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let store = DeviceModelStore::new(storage);
+        assert_eq!(store.load().await, Vec::new());
+    }
+
+    /// The unregistered-variable decision: a persisted value for a variable the hardware binding
+    /// did not re-register this boot is left dormant, not applied.
+    #[tokio::test]
+    async fn a_persisted_attribute_for_an_unregistered_variable_is_left_dormant() {
+        let storage = InMemoryStorage::new();
+        let store = DeviceModelStore::new(storage);
+        store.save(&[persisted_attribute("restored-value")]).await;
+
+        let executor = crate::executor::TokioExecutor;
+        // A fresh actor whose device model never registered `TestCtrlr`/`Setting` this boot.
+        let actor = ChargePointActor::spawn([1], &executor);
+
+        let recovered = restore_device_model(&actor, &store).await;
+
+        assert_eq!(recovered, 1, "the record was read back from storage");
+        assert_eq!(
+            actor
+                .state()
+                .device_model
+                .get(&persistent_component(), &persistent_variable()),
+            None,
+            "a variable the binding never registered this boot must not appear in the model"
+        );
+    }
+
+    /// The end-to-end guarantee E2.3 exists for: a `persistent`-flagged attribute's value
+    /// survives a power cut, applied back onto the variable once the hardware binding has
+    /// re-registered it this boot.
+    #[tokio::test]
+    async fn a_persistent_device_model_attribute_interrupted_by_a_power_cut_is_recovered_after_reboot()
+     {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = DeviceModelStore::new(storage.clone());
+
+        let executor = crate::executor::TokioExecutor;
+        let before = ChargePointActor::spawn([1], &executor);
+        register_persistent_variable(&before).await;
+        let state_changes = before.subscribe();
+        let persistence_store = DeviceModelStore::new(storage.clone());
+        tokio::spawn(async move {
+            run_device_model_persistence(state_changes, &persistence_store).await;
+        });
+        let _ = before
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: persistent_component(),
+                    variable: persistent_variable(),
+                    attribute_type: VariableAttributeType::Actual,
+                    value: "42".into(),
+                },
+            ))
+            .await;
+        for _ in 0..20 {
+            if !store.load().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            store.load().await.contains(&persisted_attribute("42")),
+            "the newly-set persistent attribute must be in the snapshot, alongside this crate's \
+             own built-in persistent defaults (OCPPCommCtrlr/HeartbeatInterval, \
+             AuthCtrlr/AuthorizeRemoteStart)"
+        );
+
+        // --- the cut.
+        drop(before);
+
+        // --- after the reboot: the binding re-registers the variable (as `crate::hardware`
+        // bindings do on every boot) *before* the persisted value is restored onto it.
+        let after = ChargePointActor::spawn([1], &executor);
+        register_persistent_variable(&after).await;
+        let recovered = restore_device_model(&after, &store).await;
+
+        assert_eq!(
+            recovered, 3,
+            "the test attribute plus this crate's own built-in persistent defaults"
+        );
+        assert_eq!(
+            after
+                .state()
+                .device_model
+                .get(&persistent_component(), &persistent_variable())
+                .unwrap()
+                .attribute(VariableAttributeType::Actual)
+                .unwrap()
+                .value,
+            "42"
+        );
+    }
+
+    /// Registers `persistent_component()`/`persistent_variable()` on `actor`'s device model,
+    /// flagged `persistent: true` - simulating what a hardware binding does during
+    /// `ChargePoint::start`.
+    async fn register_persistent_variable(actor: &ChargePointActor) {
+        let _ = actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::VariableRegistered {
+                    component: persistent_component(),
+                    variable: persistent_variable(),
+                    characteristics: VariableCharacteristics {
+                        data_type: VariableDataType::String,
+                        unit: None,
+                        min_limit: None,
+                        max_limit: None,
+                        values_list: None,
+                        supports_monitoring: false,
+                    },
+                    attributes: alloc::vec![crate::state::VariableAttribute {
+                        attribute_type: VariableAttributeType::Actual,
+                        value: "0".into(),
+                        mutability: VariableMutability::ReadWrite,
+                        persistent: true,
+                        constant: false,
+                        requires_reboot: false,
+                    }],
+                },
+            ))
+            .await;
     }
 }

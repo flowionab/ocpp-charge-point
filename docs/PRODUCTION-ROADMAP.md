@@ -627,7 +627,7 @@ mid-transaction currently loses the transaction.
 |-------|-----|-------|
 | In-flight transaction (id, meter start, id token, start time) | Billable energy; resume-or-close on boot | R§5 |
 | Transaction sequence numbers / `seqNo` | 2.x `TransactionEvent` ordering | R§5 |
-| Device model attributes marked `persistent` | Already flagged in the model, currently ignored | R§2 |
+| Device model attributes marked `persistent` | Already flagged in the model, now acted on | R§2 |
 | Local authorization list + version number | Re-download after every boot is unacceptable offline | R§4 |
 | Authorization cache | Offline authorization | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
 | Reservations | Survive a reboot inside the reservation window | R§8 |
@@ -697,7 +697,78 @@ mid-transaction currently loses the transaction.
       that no longer fits (e.g. capacity was lowered since the snapshot was
       written) is trimmed by the same policy live traffic would be, logged
       rather than silently dropped.
-- [ ] **E2.3–E2.7, E2.9–E2.12** One task per remaining row above.
+- [x] **E2.3** Device model attributes marked `persistent` — `persistence::DeviceModelStore`/
+      `restore_device_model`/`run_device_model_persistence` in `src/persistence.rs`, wired via
+      `ChargePointBuilder::device_model_persistence`. Only attributes with
+      `VariableAttribute::persistent == true` are written, as one whole-snapshot JSON record
+      (`ocpp-cp/device-model`) rather than one key per attribute — the rest of the model is
+      re-registered by the hardware binding on every boot (`ChargePoint::start`), so persisting it
+      too would just be redundant writes of data about to be overwritten anyway.
+
+      Write policy: `device_model_persistence_decision`, a skip-count threshold defaulting to `1`
+      (write on every change), overridable via `DeviceModelStore::with_write_threshold`.
+      `SetVariables` genuinely can be bursty (a single request may set several variables, or a
+      script may issue several requests back to back) in a way `SendLocalList` and
+      `ReserveNow`/`CancelReservation` aren't, which is why this concern gets a threshold knob and
+      those two don't — but the default stays at `1` rather than defaulting higher: `SetVariables`
+      is operator/CSMS configuration traffic, not a hot path driven by charging telemetry the way
+      periodic meter values are (the one write this crate already debounces by *magnitude*, via
+      `TransactionStore::meter_write_threshold_wh`), so a burst of a handful of variables is at
+      most a handful of small JSON writes, not a sustained per-sample cadence.
+
+      Ordering vs the hardware binding's own registration (the unregistered-variable decision):
+      `restore_device_model` must run *after* the binding has finished registering its variables
+      — `ChargePointBuilder::start` already waits for `ChargePoint::start` to return before any
+      `*_persistence` method can be called, which is exactly that ordering. A persisted value only
+      lands on a component/variable/attribute-type that's already registered this boot
+      (`ChargePointEvent::PersistedDeviceModelAttributesRestored`'s handler reuses
+      `DeviceModel::set_attribute_value`, which already no-ops for an unregistered target); one
+      that isn't — e.g. a firmware downgrade or hardware reconfiguration that removed a variable —
+      is left dormant and logged (`tracing::warn!`) rather than either applied blind or silently
+      dropped with no trace. The binding is the source of truth for which variables exist this
+      boot, never the persisted record.
+- [x] **E2.4** Local authorization list + version number —
+      `persistence::LocalAuthorizationListStore`/`restore_local_authorization_list`/
+      `run_local_authorization_list_persistence`, wired via
+      `ChargePointBuilder::local_authorization_list_persistence`. The whole list is written as one
+      JSON snapshot (`ocpp-cp/local-auth-list`) — `SendLocalList` always replaces or resolves to
+      the full resulting list in one call (`crate::local_authorization_list::handle_send_local_list`
+      resolves a differential update before the state machine ever sees it), so there is no
+      per-entry addressing to gain the way `TransactionStore` needs per-connector keys.
+
+      Write policy: unconditional, on every version change — no threshold. `SendLocalList` is a
+      rare, CSMS-initiated, operator-driven event, not a hot path; bounding writes here the way
+      `persistence_decision` bounds meter-reading writes would be a knob nothing exercises.
+- [x] **E2.6** Reservations — `persistence::ReservationStore`/`restore_reservations`/
+      `run_reservation_persistence`, wired via `ChargePointBuilder::reservation_persistence`. The
+      whole active set (at most one reservation per connector) is written as one JSON snapshot
+      (`ocpp-cp/reservations`), for the same per-entry-addressing reasoning as E2.4. This slice
+      also gave `Reservation` a real `expires_at: Option<DateTime<Utc>>` field (previously absent
+      entirely — `ReserveNow`'s wire `expiryDateTime` isn't threaded through to it yet, still
+      future work, tracked below), needed for the expired-reservation decision.
+
+      The expired-reservation decision: a reservation whose `expires_at` had already passed while
+      the charge point was off is **not** resurrected as active. `restore_reservations` drops it,
+      logs a warning, and never raises
+      `ChargePointEvent::PersistedReservationsRestored` for it at all — this crate has no live
+      expiry sweep yet (a reservation still only ends via `CancelReservation` or being superseded
+      by a cable connection while the process runs), so restoring an expired reservation anyway
+      would leave the connector wrongly `Reserved` with nothing left to ever clear it. The check
+      itself only fires when the supplied `Clock` looks synchronized
+      (`crate::clock::is_synchronized`) — hardware with no RTC yet must not have every restored
+      reservation discarded as "expired" purely because its unset clock reads before any real
+      `expires_at`, the same G3.1 stance `persistence::next_record` already takes for
+      `started_at`, applied here as "don't act on a clock reading we don't trust" instead of
+      "don't record one". Storage is reconciled to hold only what was actually restored, so a
+      stale expired entry isn't re-loaded and re-filtered on every subsequent boot.
+
+      Write policy: unconditional, on every change to the active set — no threshold, for the same
+      reasoning as E2.4. There is deliberately no tick-driven live expiry sweep to debounce
+      against yet; if one is added later it should reuse `queue_persistence_decision`-style
+      debouncing rather than writing on every tick, flagged here so that addition doesn't
+      silently inherit an unconditional write policy that was only ever justified for discrete
+      CSMS-initiated events.
+- [ ] **E2.5, E2.7, E2.9–E2.12** One task per remaining row above.
 
 ### 7.3 E3 — Crash consistency
 

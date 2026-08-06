@@ -223,6 +223,69 @@ impl ChargePointState {
                 }
                 counter_changed || recovered_any
             }
+            ChargePointEvent::PersistedLocalAuthorizationListRestored { version, entries } => {
+                self.local_authorization_list = LocalAuthorizationList { version, entries };
+                true
+            }
+            ChargePointEvent::PersistedReservationsRestored { reservations } => {
+                let mut restored_any = false;
+                for recovered in reservations {
+                    let addressable = self
+                        .evses
+                        .get(recovered.evse_id)
+                        .is_some_and(|evse| recovered.connector_id < evse.connectors.len());
+                    if !addressable {
+                        tracing::warn!(
+                            evse_id = recovered.evse_id,
+                            connector_id = recovered.connector_id,
+                            "discarding a recovered reservation for a connector this charge point no longer has"
+                        );
+                        continue;
+                    }
+                    let current = self.evses[recovered.evse_id].connectors[recovered.connector_id];
+                    if current != ConnectorState::Available {
+                        tracing::warn!(
+                            evse_id = recovered.evse_id,
+                            connector_id = recovered.connector_id,
+                            ?current,
+                            "discarding a recovered reservation for a connector that isn't Available at boot"
+                        );
+                        continue;
+                    }
+                    restored_any |= self.apply_connector_event(
+                        recovered.evse_id,
+                        recovered.connector_id,
+                        ConnectorEvent::Reserved(recovered.reservation),
+                        &mut effects,
+                    );
+                }
+                restored_any
+            }
+            ChargePointEvent::PersistedDeviceModelAttributesRestored { attributes } => {
+                let mut restored_any = false;
+                for recovered in attributes {
+                    let applied = self.device_model.set_attribute_value(
+                        &recovered.component,
+                        &recovered.variable,
+                        recovered.attribute_type,
+                        recovered.value,
+                    );
+                    if !applied {
+                        // The binding is the source of truth for which variables exist this boot
+                        // (see the event's docs) - a persisted value for one it didn't
+                        // re-register is left dormant, not applied, and not silently dropped
+                        // either: logged so an integrator can notice a variable disappeared.
+                        tracing::warn!(
+                            component = recovered.component.name.as_str(),
+                            variable = recovered.variable.name.as_str(),
+                            "discarding a persisted device model attribute for a variable this \
+                             firmware/hardware combination did not register this boot"
+                        );
+                    }
+                    restored_any |= applied;
+                }
+                restored_any
+            }
             ChargePointEvent::CapabilitiesDeclared(capabilities) => {
                 set_if_changed(&mut self.capabilities, capabilities)
             }
@@ -1322,6 +1385,7 @@ mod tests {
         crate::state::Reservation {
             id: crate::state::ReservationId(id),
             id_token: test_id_token(),
+            expires_at: None,
         }
     }
 

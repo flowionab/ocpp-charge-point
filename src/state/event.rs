@@ -1,12 +1,13 @@
+use alloc::string::String;
 use alloc::vec::Vec;
 use chrono::{DateTime, Utc};
 
 use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::{
-    ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry, MeterSample,
-    RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent, StopReason,
-    Transaction,
+    Component, ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry,
+    MeterSample, RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent,
+    StopReason, Transaction, Variable, VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -102,6 +103,50 @@ pub enum ChargePointEvent {
         /// later comparison can advance `csms_time` by elapsed monotonic time rather than reusing
         /// it unmodified - see [`crate::state::TimeSyncAnchor`].
         recorded_at: MonotonicInstant,
+    },
+    /// The local authorization list recovered from durable storage at boot, applied as one atomic
+    /// event before the `SendLocalList`/`GetLocalListVersion` handlers can race it - see
+    /// [`crate::persistence::restore_local_authorization_list`] and
+    /// `docs/PRODUCTION-ROADMAP.md` §7.2 (E2.4). Replaces the list outright, exactly like
+    /// [`ChargePointEvent::LocalListUpdated`] (a fresh boot's in-memory list is always empty, so
+    /// there's nothing to merge with).
+    PersistedLocalAuthorizationListRestored {
+        /// The persisted list's version number.
+        version: i64,
+        /// The persisted list's full contents.
+        entries: Vec<LocalListEntry>,
+    },
+    /// Reservations recovered from durable storage at boot, applied as one atomic event before
+    /// `ReserveNow`/`CancelReservation` can race it - see
+    /// [`crate::persistence::restore_reservations`] and `docs/PRODUCTION-ROADMAP.md` §7.2 (E2.6).
+    ///
+    /// Each entry is only restored onto a connector that is currently [`ConnectorState::Available`]
+    /// (the state every connector boots into) - anything else (a connector this firmware no
+    /// longer has, or one that's somehow not `Available` this early) is skipped and logged,
+    /// mirroring [`ChargePointEvent::PersistedTransactionsRestored`]'s tolerance. A reservation
+    /// whose `expires_at` had already passed while the charge point was off is filtered out
+    /// *before* this event is even raised - see [`crate::persistence::restore_reservations`]'s
+    /// docs for why that decision belongs to the persistence layer rather than the state machine.
+    PersistedReservationsRestored {
+        /// The reservations to restore, in no particular order.
+        reservations: Vec<RecoveredReservation>,
+    },
+    /// Device model attribute values recovered from durable storage at boot, applied as one
+    /// atomic event *after* the hardware binding has finished registering its own variables (see
+    /// [`crate::builder::ChargePointBuilder::device_model_persistence`]'s docs for the ordering
+    /// rationale) - `docs/PRODUCTION-ROADMAP.md` §7.2 (E2.3).
+    ///
+    /// A persisted attribute is only applied if `component`/`variable`/`attribute_type` are
+    /// already registered in the device model this boot - i.e. the hardware binding re-declared
+    /// the variable exists on this firmware/hardware combination. One that isn't (e.g. a firmware
+    /// downgrade that removed a variable, or hardware that was reconfigured) is left dormant
+    /// rather than applied: [`crate::state::DeviceModel::set_attribute_value`] already returns
+    /// `false` for an unregistered target and this event logs that case rather than treating it
+    /// as an ordinary no-op, so the binding is unambiguously the source of truth for which
+    /// variables exist this boot, never the persisted record.
+    PersistedDeviceModelAttributesRestored {
+        /// The attribute values to restore, in no particular order.
+        attributes: Vec<RecoveredDeviceModelAttribute>,
     },
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {
@@ -306,6 +351,33 @@ pub struct RecoveredTransaction {
     pub connector_id: usize,
     /// The transaction as it was last persisted before power was lost.
     pub transaction: Transaction,
+}
+
+/// One reservation read back from durable storage at boot, carried by
+/// [`ChargePointEvent::PersistedReservationsRestored`]. Already filtered for expiry - see that
+/// variant's docs and [`crate::persistence::restore_reservations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredReservation {
+    /// The reservation's connector's EVSE index.
+    pub evse_id: usize,
+    /// The reservation's connector's index within its EVSE.
+    pub connector_id: usize,
+    /// The reservation as it was last persisted before power was lost.
+    pub reservation: Reservation,
+}
+
+/// One device model attribute value read back from durable storage at boot, carried by
+/// [`ChargePointEvent::PersistedDeviceModelAttributesRestored`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredDeviceModelAttribute {
+    /// The attribute's component.
+    pub component: Component,
+    /// The attribute's variable.
+    pub variable: Variable,
+    /// Which attribute of `variable` this is.
+    pub attribute_type: VariableAttributeType,
+    /// The persisted value.
+    pub value: String,
 }
 
 /// A transaction lifecycle event, reported to the CSMS via TransactionEvent.

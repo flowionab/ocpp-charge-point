@@ -33,8 +33,11 @@ use crate::hardware::{Capabilities, warn_on_feature_mismatches};
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
 use crate::offline_queue::{OfflineQueue, OverflowPolicy, run_with_offline_queue};
 use crate::persistence::{
-    QueueStore, TransactionStore, flush_and_persist_transaction_event_queue,
-    restore_transaction_event_queue, restore_transactions, run_persisted_transaction_event_queue,
+    DeviceModelStore, LocalAuthorizationListStore, QueueStore, ReservationStore, TransactionStore,
+    flush_and_persist_transaction_event_queue, restore_device_model,
+    restore_local_authorization_list, restore_reservations, restore_transaction_event_queue,
+    restore_transactions, run_device_model_persistence, run_local_authorization_list_persistence,
+    run_persisted_transaction_event_queue, run_reservation_persistence,
     run_transaction_persistence,
 };
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
@@ -745,6 +748,100 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers durable local authorization list state (`docs/PRODUCTION-ROADMAP.md` §7.2,
+    /// E2.4): recovers whatever list `SendLocalList` last installed before the charge point last
+    /// lost power, then persists every subsequent change through `storage` for the life of the
+    /// process.
+    ///
+    /// Independent of every other `*_persistence` method - a charge point may enable this alone,
+    /// none of them, or any combination, and each behaves correctly on its own. `storage` may be
+    /// [`crate::hardware::NoStorage`], in which case this behaves exactly as if it were never
+    /// called.
+    ///
+    /// Register this before [`Self::local_authorization_list`] is reachable by a CSMS request -
+    /// i.e. before that block's `SendLocalList`/`GetLocalListVersion` handlers are registered, or
+    /// before the connection that would deliver such a request is established - so a request
+    /// can't race the restore. In practice this just means calling this method during the same
+    /// build chain, before `.build()`.
+    pub async fn local_authorization_list_persistence<S>(self, storage: S) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+    {
+        let store = Arc::new(LocalAuthorizationListStore::new(storage));
+        restore_local_authorization_list(&self.runtime.actor(), &store).await;
+
+        let state_changes = self.runtime.actor().subscribe();
+        self.executor.spawn(Box::pin(async move {
+            run_local_authorization_list_persistence(state_changes, &store).await;
+        }));
+
+        self
+    }
+
+    /// Registers durable reservation state (`docs/PRODUCTION-ROADMAP.md` §7.2, E2.6): recovers
+    /// whatever reservations were active before the charge point last lost power - dropping any
+    /// whose expiry passed while it was off, see [`crate::persistence::restore_reservations`]'s
+    /// docs for that decision - then persists every subsequent reservation change through
+    /// `storage` for the life of the process.
+    ///
+    /// Independent of every other `*_persistence` method, same as
+    /// [`Self::local_authorization_list_persistence`]. `storage` may be
+    /// [`crate::hardware::NoStorage`].
+    ///
+    /// `clock` decides whether a persisted reservation's `expires_at` is trustworthy to compare
+    /// against - [`crate::clock::SystemClock`] on std, an RTC-backed
+    /// [`crate::clock::Clock`] on embedded.
+    ///
+    /// Register this before [`Self::reservation`] is reachable by a CSMS request, for the same
+    /// race-avoidance reason as [`Self::local_authorization_list_persistence`].
+    pub async fn reservation_persistence<S, K>(self, storage: S, clock: K) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+    {
+        let store = Arc::new(ReservationStore::new(storage));
+        restore_reservations(&self.runtime.actor(), &store, &clock).await;
+
+        let state_changes = self.runtime.actor().subscribe();
+        self.executor.spawn(Box::pin(async move {
+            run_reservation_persistence(state_changes, &store).await;
+        }));
+
+        self
+    }
+
+    /// Registers durable device model attribute state (`docs/PRODUCTION-ROADMAP.md` §7.2, E2.3):
+    /// recovers whatever `persistent`-flagged attribute values survived from before the charge
+    /// point last lost power, then persists every subsequent change through `storage` for the
+    /// life of the process.
+    ///
+    /// Independent of every other `*_persistence` method, same as
+    /// [`Self::local_authorization_list_persistence`]. `storage` may be
+    /// [`crate::hardware::NoStorage`].
+    ///
+    /// **Ordering**: call this *after* [`Self::start`] (which is unavoidable - there is no
+    /// `ChargePointBuilder` to call this on beforehand) - `Self::start` already waits for the
+    /// hardware binding's own `ChargePoint::start` to finish registering its variables before
+    /// returning, which is exactly the ordering [`crate::persistence::restore_device_model`]'s
+    /// docs require: a persisted value only lands on a variable the binding has already declared
+    /// exists this boot. Call this before [`Self::device_model`] is reachable by a CSMS
+    /// `SetVariables`/`GetVariables` request, for the same race-avoidance reason as
+    /// [`Self::local_authorization_list_persistence`].
+    pub async fn device_model_persistence<S>(self, storage: S) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+    {
+        let store = Arc::new(DeviceModelStore::new(storage));
+        restore_device_model(&self.runtime.actor(), &store).await;
+
+        let state_changes = self.runtime.actor().subscribe();
+        self.executor.spawn(Box::pin(async move {
+            run_device_model_persistence(state_changes, &store).await;
+        }));
+
+        self
+    }
+
     /// Finishes building, handing back the [`ChargePointRuntime`] every registered block is now
     /// wired to.
     pub fn build(self) -> ChargePointRuntime<T> {
@@ -942,6 +1039,42 @@ pub(crate) mod test_support {
         }
 
         async fn reboot(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Like [`TestChargePoint`], but doesn't connect a cable on start - every connector boots
+    /// `Available`. Used by tests that need a connector free to reserve (or otherwise act on
+    /// while idle), rather than `TestChargePoint`'s always-occupied fixture.
+    pub(crate) struct IdleTestChargePoint {
+        pub(crate) evses: [TestEvse; 1],
+    }
+
+    #[async_trait::async_trait]
+    impl ChargePoint<TestEvse, TestConnector> for IdleTestChargePoint {
+        type StartError = Infallible;
+
+        async fn vendor_name(&self) -> &str {
+            "Test vendor"
+        }
+
+        async fn model_name(&self) -> &str {
+            "Test model"
+        }
+
+        async fn evses(&self) -> &[TestEvse] {
+            &self.evses
+        }
+
+        async fn capabilities(&self) -> crate::hardware::Capabilities {
+            crate::hardware::Capabilities::default()
+        }
+
+        async fn start(
+            &self,
+            _events: HardwareEventSender,
+            _commands: HardwareCommandReceiver,
+        ) -> Result<(), Self::StartError> {
             Ok(())
         }
     }
@@ -1302,5 +1435,135 @@ mod tests {
         assert_eq!(runtime.state().next_transaction_id, 4);
         // The record is consumed, so a second boot doesn't report the same session again.
         assert_eq!(seeding_store.load(0, 0).await, None);
+    }
+
+    #[tokio::test]
+    async fn registering_local_authorization_list_persistence_recovers_the_list_at_boot() {
+        use crate::persistence::LocalAuthorizationListStore;
+        use crate::state::{AuthorizationStatus, IdToken, IdTokenKind, LocalListEntry};
+
+        let entry = LocalListEntry {
+            id_token: IdToken {
+                value: "04A224B2".into(),
+                kind: IdTokenKind::ISO14443,
+            },
+            status: AuthorizationStatus::Accepted,
+        };
+        let storage = Arc::new(crate::hardware::InMemoryStorage::new());
+        LocalAuthorizationListStore::new(storage.clone())
+            .save(5, core::slice::from_ref(&entry))
+            .await;
+
+        let (charge_point, _locked) = test_charge_point(true);
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .local_authorization_list_persistence(storage)
+            .await
+            .build();
+
+        assert_eq!(runtime.state().local_authorization_list.version, 5);
+        assert_eq!(
+            runtime.state().local_authorization_list.entries,
+            vec![entry]
+        );
+    }
+
+    #[tokio::test]
+    async fn registering_reservation_persistence_recovers_an_active_reservation_at_boot() {
+        use crate::persistence::{PersistedReservationEntry, ReservationStore};
+        use crate::state::{ConnectorState, IdToken, IdTokenKind, Reservation, ReservationId};
+
+        let storage = Arc::new(crate::hardware::InMemoryStorage::new());
+        ReservationStore::new(storage.clone())
+            .save(&[PersistedReservationEntry {
+                evse_id: 0,
+                connector_id: 0,
+                reservation: Reservation {
+                    id: ReservationId(1),
+                    id_token: IdToken {
+                        value: "04A224B2".into(),
+                        kind: IdTokenKind::ISO14443,
+                    },
+                    expires_at: None,
+                },
+            }])
+            .await;
+
+        let charge_point = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .reservation_persistence(storage, crate::clock::SystemClock)
+            .await
+            .build();
+
+        assert_eq!(
+            runtime.state().evses[0].connectors[0],
+            ConnectorState::Reserved
+        );
+    }
+
+    #[tokio::test]
+    async fn registering_device_model_persistence_recovers_a_persistent_attribute_at_boot() {
+        use crate::persistence::{DeviceModelStore, PersistedDeviceModelAttribute};
+        use crate::state::{Component, Variable, VariableAttributeType};
+
+        // The built-in default `OCPPCommCtrlr`/`HeartbeatInterval` variable is already registered
+        // by every fresh device model (`crate::state::DeviceModel::new`) and flagged
+        // `persistent`, so a persisted override for it is exactly the case
+        // `restore_device_model` is meant to apply.
+        let storage = Arc::new(crate::hardware::InMemoryStorage::new());
+        DeviceModelStore::new(storage.clone())
+            .save(&[PersistedDeviceModelAttribute {
+                component: Component {
+                    name: "OCPPCommCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: Variable {
+                    name: "HeartbeatInterval".into(),
+                    instance: None,
+                },
+                attribute_type: VariableAttributeType::Actual,
+                value: "300".into(),
+            }])
+            .await;
+
+        let (charge_point, _locked) = test_charge_point(true);
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .device_model_persistence(storage)
+            .await
+            .build();
+
+        let component = Component {
+            name: "OCPPCommCtrlr".into(),
+            instance: None,
+            evse: None,
+        };
+        let variable = Variable {
+            name: "HeartbeatInterval".into(),
+            instance: None,
+        };
+        assert_eq!(
+            runtime
+                .state()
+                .device_model
+                .get(&component, &variable)
+                .unwrap()
+                .attribute(VariableAttributeType::Actual)
+                .unwrap()
+                .value,
+            "300"
+        );
     }
 }

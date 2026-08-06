@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 /// scoped to a specific EVSE (`Some((evse_id, None))`) or a specific connector on that EVSE
 /// (`Some((evse_id, Some(connector_id)))`) - mirroring OCPP's own `EVSE.connectorId` being
 /// optional under a mandatory `EVSE.id`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Component {
     /// The component's name. Should be taken from OCPP's standardized component names whenever
     /// possible (e.g. `"OCPPCommCtrlr"`), but this crate doesn't enforce that.
@@ -24,7 +24,7 @@ pub struct Component {
 }
 
 /// A variable on a [`Component`] in the device model (OCPP `VariableType`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Variable {
     /// The variable's name. Should be taken from OCPP's standardized variable names whenever
     /// possible (e.g. `"HeartbeatInterval"`), but this crate doesn't enforce that.
@@ -36,7 +36,7 @@ pub struct Variable {
 /// Which attribute of a [`Variable`] a [`VariableAttribute`] describes (OCPP `AttributeEnum`).
 /// Most variables only ever have an `Actual` attribute; `Target`/`MinSet`/`MaxSet` exist for
 /// variables representing a setpoint with configurable bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VariableAttributeType {
     /// The attribute's actual, current value.
     Actual,

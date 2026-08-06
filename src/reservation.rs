@@ -74,6 +74,12 @@ pub async fn handle_reserve_now(
                 event: ConnectorEvent::Reserved(Reservation {
                     id: reservation_id,
                     id_token,
+                    // Wiring the wire `expiryDateTime`/`expiry_date` through to here is future
+                    // work (see `crate::state::Reservation`'s docs) - `expires_at` today is only
+                    // consulted by `persistence::restore_reservations`, so a reservation created
+                    // through this handler never expires on its own within a single boot, exactly
+                    // as before this field existed.
+                    expires_at: None,
                 }),
             },
         })
