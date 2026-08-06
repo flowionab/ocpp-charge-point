@@ -632,7 +632,7 @@ mid-transaction currently loses the transaction.
 | Authorization cache | Offline authorization | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
 | Reservations | Survive a reboot inside the reservation window | R§8 |
 | Charging profiles | Load limits must not vanish on reboot | [B2.1](#b2--smart-charging-r11) |
-| Offline message queue | Currently RAM-only — a reboot while offline loses every queued report | [G2](#92-g2--bounded-memory) |
+| Offline message queue | Transaction-event queue now durable (`src/persistence.rs`, `ChargePointBuilder::transaction_events_persisted`); status and security queues still RAM-only | [G2](#92-g2--bounded-memory) |
 | Certificates and keys | Security profile 2/3 | [B4.1](#b4--certificates-and-iso-15118-r1-r13) |
 | Security event log | `SecurityLogWasCleared` is only meaningful against a durable log | [F4](#84-f4--security-events) |
 | Network profiles | Recover connectivity after a bad profile switch | [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) |
@@ -649,7 +649,55 @@ mid-transaction currently loses the transaction.
       instead of restarting it. The transaction-id counter is persisted
       separately (`ocpp-cp/txn/next-id`), written *before* the transaction that
       consumed it, so a cut between the two can only skip an id, never reuse one.
-- [ ] **E2.3–E2.12** One task per remaining row above.
+- [x] **E2.8** (partial) Offline message queue — `QueueStore`/
+      `run_persisted_offline_queue` in `src/persistence.rs`, built on top of
+      `offline_queue::OfflineQueue`'s new `snapshot`/`restore_backlog`. A
+      queue's backlog is written as one whole-queue JSON snapshot per storage
+      key (not one record per message — an `OfflineQueue` has a single logical
+      owner, so there's no per-entry addressing to gain the way
+      `TransactionStore` needs per-connector keys), versioned with its own
+      `persistence::QUEUE_SCHEMA_VERSION`, discarded on decode failure or a
+      mismatched version exactly like `PersistedTransaction`. Only the
+      **transaction-event queue** is actually wired up
+      (`ChargePointBuilder::transaction_events_persisted`) — that's the one
+      E4.3 and the CSMS's `TransactionEvent` ordering guarantee care about
+      most, and the only one whose message type (`TransactionEventOccurred`)
+      this module has a `serde`-able mirror for
+      (`PersistedQueuedTransactionEvent`, converting `TransactionEventKind`
+      losslessly by hand since that enum lives in `crate::state` and isn't
+      `serde`-derived). The status and security queues remain RAM-only: their
+      message types carry `crate::state` enums (`ConnectorState`,
+      `ConnectorStatus`, `SecurityEventType`) with far more variants, and
+      hand-mirroring those wasn't justified for this pass — the underlying
+      `QueueStore`/`run_persisted_offline_queue`/`restore_offline_queue`
+      machinery is generic over any message type with a `serde`-able
+      representation (`P: From<M> + Serialize + DeserializeOwned`, `M:
+      From<P>`), so wiring the other two is a follow-up in the same shape as
+      `transaction_events_persisted`, not a redesign.
+
+      Write policy: a whole-queue snapshot write is not free (its cost scales
+      with the queue's current depth, unlike `TransactionStore`'s
+      one-record-per-connector writes), so writes are debounced by mutation
+      count rather than unconditional — `queue_persistence_decision` writes
+      immediately on the queue's first message (a single queued message must
+      never depend on a debounce window to become durable) and on draining
+      back to empty (so a stale snapshot never "recovers" messages that were
+      actually delivered), and otherwise only once
+      `QueueStore::write_threshold` mutations (pushes or deliveries) have
+      accumulated since the last write (default 1 — write on every mutation —
+      overridable via `QueueStore::with_write_threshold` for integrators who'd
+      rather trade a wider loss window for less flash wear during long,
+      message-heavy outages, e.g. periodic-meter-reading `TransactionEvent`s
+      queued back-to-back). A reconnect-triggered flush reconciles storage
+      unconditionally rather than through the threshold, since a reconnect is
+      a rare event, not the steady drumbeat the threshold exists to throttle.
+      Capacity interaction (G2.1): a restored backlog is replayed through
+      `OfflineQueue::restore_backlog`, which pushes each message through the
+      queue's normal capacity/`OverflowPolicy` check — a persisted backlog
+      that no longer fits (e.g. capacity was lowered since the snapshot was
+      written) is trimmed by the same policy live traffic would be, logged
+      rather than silently dropped.
+- [ ] **E2.3–E2.7, E2.9–E2.12** One task per remaining row above.
 
 ### 7.3 E3 — Crash consistency
 
@@ -712,8 +760,18 @@ mid-transaction currently loses the transaction.
 - [ ] **E4.2** Send the correct `BootNotification.reason`
       (`PowerUp`/`RemoteReset`/`ScheduledReset`/…) from persisted context.
       Untouched — needs the boot-reason row of E2 (E2.12) first.
-- [ ] **E4.3** Replay the offline queue after reboot, preserving order.
-      Untouched — the offline queue is still RAM-only (E2.8/G2).
+- [x] **E4.3** (partial) Replay the offline queue after reboot, preserving
+      order — `persistence::restore_transaction_event_queue`, called from
+      `ChargePointBuilder::transaction_events_persisted` before the live
+      forwarder/subscription is wired up, so a message that arrives during
+      start-up can never be delivered ahead of an older one the restored
+      backlog contains. Restoration goes through
+      `OfflineQueue::restore_backlog`, which pushes the persisted messages
+      one at a time in their stored order, preserving `TransactionEvent`
+      sequencing exactly. Covered end-to-end by
+      `persistence::tests::a_queue_interrupted_by_a_power_cut_replays_its_backlog_in_order_after_reboot`.
+      Scoped to the transaction-event queue only, matching E2.8's partial
+      status above — status/security queue replay is still open.
 - [ ] **E4.4** Power-cut test harness — kill the process at N points across
       a transaction lifecycle and assert recovery at each. Partially covered:
       `persistence::tests` has one end-to-end cut (drop the actor mid-charge,
@@ -833,11 +891,61 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
 ### 9.3 G3 — Time
 
 - [ ] **G3.1** Behaviour with no RTC and no CSMS time yet — transactions
-      must still be recordable.
+      must still be recordable. `crate::clock::is_synchronized` (plus the
+      `unsynchronized_before` sentinel it's built on) now lets a caller tell
+      a plausible wall-clock reading apart from an unset RTC's default one
+      (Unix epoch or similar) without changing `Clock`'s signature — a
+      `Clock` impl on hardware without an RTC is documented to return such a
+      value rather than fabricate a plausible-looking date. What's still
+      missing: nothing in the transaction pipeline (`src/transactions.rs`,
+      `src/persistence.rs`) actually calls it yet, so an unsynchronized
+      clock still produces an honest-looking-but-wrong 1970-ish timestamp on
+      the wire and in persisted records today. `Transaction` itself
+      (`src/state/transaction.rs`) carries no timestamp at all — the state
+      machine stays clock-free as designed — so a transaction *is* already
+      recordable with no RTC/no CSMS time; only the timestamp attached at
+      the reporting/persistence boundary is currently untrustworthy rather
+      than honestly flagged.
 - [ ] **G3.2** Clock sync from `BootNotification`/`Heartbeat` responses,
-      raising `SettingSystemTime`.
+      raising `SettingSystemTime`. The decision logic landed and is unit
+      tested: `crate::provisioning::evaluate_time_sync` compares a local
+      time estimate against a CSMS's `currentTime` and returns a
+      `TimeSyncStep` (→ `SecurityEventType::SettingSystemTime` via
+      `TimeSyncStep::to_security_event`) only when there was no prior
+      estimate, the prior estimate was unsynchronized (first real sync), or
+      the two differ by at least `CLOCK_STEP_THRESHOLD_SECS` (10s, chosen to
+      sit above normal WebSocket round-trip latency and RTC drift over one
+      heartbeat interval) — so a CSMS returning `currentTime` on every
+      Heartbeat does not raise the event every cycle. `SettingSystemTime`
+      was already modelled in `SecurityEventType` (not one of F4.1's three
+      missing values), so no new variant was needed. **Not wired into the
+      live path**: `register`/`register_until_accepted`/`run_heartbeat`
+      still don't call this, because doing so needs
+      `BootNotifier::notify_boot`/`HeartbeatSender::send_heartbeat` to
+      surface the wire response's `currentTime`, and both traits plus
+      `BootNotificationOutcome`'s fields are consumed by fixed struct
+      literals and trait impls in `src/builder.rs`/`src/setup.rs` — outside
+      this change's file ownership. Next step for whoever owns those files:
+      add `current_time: Option<DateTime<Utc>>` to `BootNotificationOutcome`
+      / a `HeartbeatOutcome`, update every construction site, then call
+      `evaluate_time_sync` + `report_security_event` from `register`/
+      `run_heartbeat` using a `Clock` reading taken just before the request.
 - [ ] **G3.3** Correct handling of a clock jump mid-transaction (monotonic
-      durations, not wall-clock subtraction).
+      durations, not wall-clock subtraction). `crate::clock::MonotonicClock`
+      / `MonotonicInstant` now exist as the primitive: an opaque,
+      saturating-subtraction tick reading (`SystemMonotonicClock` backed by
+      `std::time::Instant` under `std`; embedded targets supply their own
+      free-running-timer impl), kept as a trait distinct from `Clock` so the
+      two can never be accidentally mixed. Nothing in the crate computes a
+      transaction *duration* today (`Transaction` carries no timestamps and
+      every `TransactionEvent`/`StartTransaction`/`StopTransaction` adapter
+      in `src/transactions.rs` independently samples `SystemClock.now()` per
+      message rather than subtracting two stored wall-clock readings), so
+      there is currently no live wall-clock-subtraction bug to fix — this is
+      groundwork for whenever elapsed-duration reporting (e.g. session
+      duration, meter-value sampling intervals under a clock correction) is
+      added, at which point it should use `MonotonicInstant::duration_since`
+      rather than subtracting two `DateTime<Utc>` values.
 
 ### 9.4 G4 — Failure containment
 
@@ -1002,8 +1110,10 @@ persistence into `ChargePointState`/the offline queue) remain untouched in M3
 and M2 respectively. `set_current_limit` therefore has a dispatch path and a
 fail-safe error path, but nothing yet *calls* it. (Since updated by M2's first
 slice: E2.1/E2.2, E3.2, E3.3 and E4.1 are now done — the in-flight transaction
-is persisted and recovered. The rest of E2's table, and the offline queue, are
-still RAM-only.)
+is persisted and recovered. A later slice added E2.8/E4.3 for the
+transaction-event offline queue specifically — see those entries for what's
+covered and what isn't. The rest of E2's table, and the status/security
+offline queues, are still RAM-only.)
 
 The single source of truth is `CAPABILITY_GATES` in
 `src/hardware/capabilities.rs`: capability field ↔ Cargo feature ↔ 2.1

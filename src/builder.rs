@@ -31,7 +31,11 @@ use crate::hardware::{Capabilities, warn_on_feature_mismatches};
 #[cfg(feature = "local-auth-list")]
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
 use crate::offline_queue::{OfflineQueue, OverflowPolicy, run_with_offline_queue};
-use crate::persistence::{TransactionStore, restore_transactions, run_transaction_persistence};
+use crate::persistence::{
+    QueueStore, TransactionStore, flush_and_persist_transaction_event_queue,
+    restore_transaction_event_queue, restore_transactions, run_persisted_transaction_event_queue,
+    run_transaction_persistence,
+};
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
@@ -384,6 +388,88 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             let csms = reconnect_csms.clone();
             async move {
                 crate::offline_queue::flush_offline_queue(&queue, move |occurred| {
+                    let notifier = csms.clone();
+                    async move {
+                        notifier
+                            .notify_transaction_event(
+                                occurred.evse_id,
+                                occurred.connector_id,
+                                occurred.kind,
+                                occurred.transaction,
+                            )
+                            .await
+                    }
+                })
+                .await;
+            }
+        })
+        .await;
+
+        self
+    }
+
+    /// Like [`Self::transaction_events`], but the offline queue is durable: whatever's still
+    /// queued when the process loses power is restored, **in order**, from `store` at the next
+    /// boot - `docs/PRODUCTION-ROADMAP.md` §7.2/§7.4 (E2, E4.3). This is the queue ordering
+    /// matters most for: the CSMS relies on `TransactionEvent`s arriving in sequence. `store` may
+    /// be built over [`crate::hardware::NoStorage`], in which case this behaves exactly like
+    /// [`Self::transaction_events`].
+    pub async fn transaction_events_persisted<N, S>(
+        mut self,
+        csms: &N,
+        store: QueueStore<S>,
+    ) -> Self
+    where
+        N: TransactionNotifier + ReconnectHandler + Clone + Send + Sync + 'static,
+        S: crate::hardware::Storage + Send + Sync + 'static,
+    {
+        let Some(transaction_events) = self.take_transaction_events() else {
+            return self;
+        };
+
+        // `DropNewest`, same reasoning as `Self::transaction_events`.
+        let transaction_queue =
+            Arc::new(OfflineQueue::new().with_overflow_policy(OverflowPolicy::DropNewest));
+        // Restore before any live traffic is wired up - so an event that arrives during start-up
+        // can never be delivered ahead of an older one the backlog restores.
+        restore_transaction_event_queue(&transaction_queue, &store).await;
+        let store = Arc::new(store);
+        let forwarder_queue = transaction_queue.clone();
+        let forwarder_store = store.clone();
+        let forwarder_csms = csms.clone();
+        let overflow_actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            run_persisted_transaction_event_queue(
+                transaction_events,
+                &forwarder_queue,
+                &forwarder_store,
+                move |occurred| {
+                    let notifier = forwarder_csms.clone();
+                    async move {
+                        notifier
+                            .notify_transaction_event(
+                                occurred.evse_id,
+                                occurred.connector_id,
+                                occurred.kind,
+                                occurred.transaction,
+                            )
+                            .await
+                    }
+                },
+                move |_dropped| {
+                    let actor = overflow_actor.clone();
+                    async move { report_memory_exhaustion(&actor).await }
+                },
+            )
+            .await;
+        }));
+        let reconnect_csms = csms.clone();
+        csms.register_reconnect_handler(move || {
+            let queue = transaction_queue.clone();
+            let store = store.clone();
+            let csms = reconnect_csms.clone();
+            async move {
+                flush_and_persist_transaction_event_queue(&queue, &store, move |occurred| {
                     let notifier = csms.clone();
                     async move {
                         notifier

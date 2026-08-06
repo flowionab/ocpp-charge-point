@@ -102,7 +102,7 @@ impl<M> OfflineQueue<M> {
     /// [`OverflowPolicy::DropNewest`], or the previously-oldest queued message under
     /// [`OverflowPolicy::DropOldest`] - or `None` if `message` was queued without dropping
     /// anything.
-    fn push(&self, message: M) -> Option<M> {
+    pub(crate) fn push(&self, message: M) -> Option<M> {
         self.pending.lock(|queue| {
             let mut queue = queue.borrow_mut();
             if queue.len() >= self.capacity {
@@ -137,6 +137,43 @@ impl<M: Clone> OfflineQueue<M> {
         self.pending.lock(|queue| {
             queue.borrow_mut().pop_front();
         });
+    }
+
+    /// How many messages are currently queued. Used by [`crate::persistence`]'s queue-persistence
+    /// write policy to decide whether a change is worth a flash write, without needing to clone
+    /// the whole backlog just to measure it.
+    pub fn len(&self) -> usize {
+        self.pending.lock(|queue| queue.borrow().len())
+    }
+
+    /// Whether the queue currently holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every currently queued message, oldest first - the exact order [`flush_offline_queue`]
+    /// would deliver them in. Used to snapshot the backlog for durable storage
+    /// (`docs/PRODUCTION-ROADMAP.md` §7.4, E4.3); not used on the hot delivery path, which uses
+    /// [`Self::peek_front`]/[`Self::pop_front`] instead to avoid cloning the whole queue on every
+    /// message.
+    pub fn snapshot(&self) -> alloc::vec::Vec<M> {
+        self.pending
+            .lock(|queue| queue.borrow().iter().cloned().collect())
+    }
+
+    /// Pushes every message from `messages`, in order, through [`Self::push`] - so a backlog
+    /// restored from durable storage after a reboot still respects this queue's capacity and
+    /// [`OverflowPolicy`] exactly as if the messages had arrived one at a time while running.
+    /// Returns every message the overflow policy dropped while restoring (in the order they were
+    /// dropped), so a caller can log or report on a backlog that didn't fully fit.
+    pub fn restore_backlog(&self, messages: alloc::vec::Vec<M>) -> alloc::vec::Vec<M> {
+        let mut dropped = alloc::vec::Vec::new();
+        for message in messages {
+            if let Some(evicted) = self.push(message) {
+                dropped.push(evicted);
+            }
+        }
+        dropped
     }
 }
 
@@ -342,6 +379,27 @@ mod tests {
         assert_eq!(queue.push(1), None);
         // Capacity-0 was clamped to 1, so a second push overflows immediately.
         assert_eq!(queue.push(2), Some(1));
+    }
+
+    #[test]
+    fn snapshot_returns_every_queued_message_oldest_first() {
+        let queue = OfflineQueue::new();
+        assert_eq!(queue.snapshot(), Vec::<i32>::new());
+        queue.push(1);
+        queue.push(2);
+        queue.push(3);
+        assert_eq!(queue.snapshot(), alloc::vec![1, 2, 3]);
+        assert_eq!(queue.len(), 3);
+        assert!(!queue.is_empty());
+    }
+
+    #[test]
+    fn restore_backlog_pushes_every_message_in_order_respecting_capacity_and_policy() {
+        let queue = OfflineQueue::with_capacity(2);
+        let dropped = queue.restore_backlog(alloc::vec![1, 2, 3]);
+        // Capacity 2, DropOldest: restoring [1, 2, 3] evicts 1 to make room for 3.
+        assert_eq!(dropped, alloc::vec![1]);
+        assert_eq!(queue.snapshot(), alloc::vec![2, 3]);
     }
 
     #[tokio::test]

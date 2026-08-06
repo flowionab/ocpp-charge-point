@@ -39,10 +39,13 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use chrono::{DateTime, Utc};
+use core::fmt;
+use core::future::Future;
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::hardware::{AtomicStorage, Storage};
+use crate::offline_queue::{OfflineQueue, flush_offline_queue};
 use crate::state::{
     ChargePointEvent, MeterSample, RecoveredTransaction, Transaction, TransactionEventKind,
     TransactionEventOccurred, TransactionUpdateReason,
@@ -451,6 +454,527 @@ pub async fn restore_transactions<S: Storage>(
     recovered
 }
 
+/// The version stamped into every [`PersistedQueue`] record. Independent of [`SCHEMA_VERSION`]
+/// (the transaction-record schema) since the two record shapes evolve on their own schedules; a
+/// record carrying any other version is discarded on load, exactly as [`SCHEMA_VERSION`] is - see
+/// that constant's docs for the reasoning.
+pub const QUEUE_SCHEMA_VERSION: u32 = 1;
+
+/// The prefix every key [`QueueStore`] owns starts with - see [`TransactionStore`]'s `KEY_PREFIX`
+/// for why this exists.
+const QUEUE_KEY_PREFIX: &str = "ocpp-cp/queue";
+
+/// The default number of queue mutations (pushes or deliveries) between whole-queue snapshot
+/// writes - see [`QueueStore::with_write_threshold`] for the wear/loss trade-off this sets.
+///
+/// Unlike [`DEFAULT_METER_WRITE_THRESHOLD_WH`], which throttles by how far a value moved, an
+/// [`crate::offline_queue::OfflineQueue`] has no natural distance metric between states - only a
+/// count of how many messages have come and gone since the backlog was last durable. `1` writes on
+/// every mutation, favouring "recover everything queued" over flash wear; an integrator with a
+/// battery-backed RTC-grade outage budget and flash wear to spare should keep it, one that expects
+/// long, message-heavy outages (in particular `TransactionEvent`s carrying periodic meter
+/// readings, which flow through this same queue) should raise it via
+/// [`QueueStore::with_write_threshold`] and accept losing up to that many of the most recently
+/// queued/delivered messages to a power cut mid-outage.
+pub const DEFAULT_QUEUE_WRITE_THRESHOLD: usize = 1;
+
+/// One [`crate::offline_queue::OfflineQueue`]'s entire backlog as written to durable storage.
+///
+/// Written and read as a single whole-queue snapshot rather than per-message records: an
+/// `OfflineQueue` only ever has one logical owner (the forwarding task for one functional block),
+/// so there's no benefit to per-entry keys the way [`TransactionStore`] needs per-connector ones,
+/// and a snapshot is what lets [`restore_offline_queue`] replay the backlog **in order** with a
+/// single read - order is exactly what matters for `TransactionEvent`s (`docs/PRODUCTION-ROADMAP.md`
+/// §7.4, E4.3).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedQueue<M> {
+    /// The [`QUEUE_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// The queue's backlog, oldest message first - the exact order
+    /// [`crate::offline_queue::flush_offline_queue`] would deliver them in.
+    pub messages: Vec<M>,
+}
+
+/// What [`QueueStore`]'s write policy concluded should happen to durable storage in response to a
+/// queue mutation. Mirrors [`PersistenceDecision`]; kept as a separate, smaller type (no `Skip`
+/// distinction needed beyond count-based debouncing, and an explicit `Clear` for "the queue
+/// drained back to empty") because a queue snapshot's write policy is measured in message count,
+/// not an application-specific magnitude like energy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePersistenceDecision {
+    /// Write a fresh whole-queue snapshot.
+    Write,
+    /// Leave storage untouched - not enough has changed since the last write to be worth a flash
+    /// write yet.
+    Skip,
+    /// Remove the stored snapshot: the queue is empty, so there is nothing left to recover.
+    Clear,
+}
+
+/// The write policy used by [`run_persisted_offline_queue`], as a pure function of the queue's
+/// length before and after the mutation. `mutations_since_write` is how many mutations have been
+/// skipped since the last write reached storage; `write_threshold` is
+/// [`QueueStore::write_threshold`].
+///
+/// Two cases always write/clear regardless of the threshold: the queue going from empty to
+/// non-empty (the first message queued during an outage must be durable immediately - waiting for
+/// the threshold could lose the *only* queued message to a cut moments later) and the queue
+/// draining back to empty (nothing left to lose, and leaving a stale snapshot in storage would
+/// make the next boot "recover" messages that were actually delivered).
+pub fn queue_persistence_decision(
+    previous_len: usize,
+    new_len: usize,
+    mutations_since_write: usize,
+    write_threshold: usize,
+) -> QueuePersistenceDecision {
+    if new_len == previous_len {
+        return QueuePersistenceDecision::Skip;
+    }
+    if new_len == 0 {
+        return QueuePersistenceDecision::Clear;
+    }
+    if previous_len == 0 {
+        return QueuePersistenceDecision::Write;
+    }
+    if mutations_since_write + 1 >= write_threshold.max(1) {
+        QueuePersistenceDecision::Write
+    } else {
+        QueuePersistenceDecision::Skip
+    }
+}
+
+/// Reads and writes a single [`crate::offline_queue::OfflineQueue`]'s backlog, as a whole-queue
+/// [`PersistedQueue`] snapshot, through a [`Storage`].
+///
+/// Every method degrades rather than failing, exactly like [`TransactionStore`] - see the module
+/// docs and `CLAUDE.md`'s error-handling stance.
+#[derive(Debug, Clone)]
+pub struct QueueStore<S> {
+    storage: S,
+    key: String,
+    write_threshold: usize,
+}
+
+impl<S: Storage> QueueStore<S> {
+    /// Creates a store over `storage` for the queue named `name` (e.g. `"transaction"`,
+    /// `"status"`, `"security"`), with [`DEFAULT_QUEUE_WRITE_THRESHOLD`]. `name` becomes part of
+    /// the storage key, so it must be unique among the queues sharing this `storage`.
+    pub fn new(storage: S, name: &str) -> Self {
+        Self {
+            storage,
+            key: format!("{QUEUE_KEY_PREFIX}/{name}"),
+            write_threshold: DEFAULT_QUEUE_WRITE_THRESHOLD,
+        }
+    }
+
+    /// Overrides how many mutations must accumulate between whole-queue snapshot writes - see
+    /// [`DEFAULT_QUEUE_WRITE_THRESHOLD`] for the trade-off this sets. Clamped to at least `1` by
+    /// every read site ([`queue_persistence_decision`]), so `0` behaves the same as `1`.
+    pub fn with_write_threshold(mut self, write_threshold: usize) -> Self {
+        self.write_threshold = write_threshold;
+        self
+    }
+
+    /// The configured write threshold - see [`Self::with_write_threshold`].
+    pub fn write_threshold(&self) -> usize {
+        self.write_threshold
+    }
+
+    /// Writes `messages` as the queue's whole backlog, replacing whatever snapshot was there
+    /// before. Returns whether the write actually reached storage.
+    pub async fn save<M: serde::Serialize + Send + Sync>(&self, messages: &[M]) -> bool {
+        let Ok(encoded) = serde_json::to_vec(&SerializablePersistedQueue {
+            schema_version: QUEUE_SCHEMA_VERSION,
+            messages,
+        }) else {
+            tracing::error!("failed to encode an offline-queue snapshot for storage");
+            return false;
+        };
+        match self.storage.set(&self.key, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = self.key.as_str(),
+                    "failed to persist an offline-queue snapshot; continuing without durability \
+                     for this queue"
+                );
+                false
+            }
+        }
+    }
+
+    /// Removes the stored snapshot, if any. A missing snapshot is not an error.
+    pub async fn clear(&self) {
+        if let Err(err) = self.storage.remove(&self.key).await {
+            tracing::warn!(
+                error = %err,
+                key = self.key.as_str(),
+                "failed to clear a persisted offline-queue snapshot"
+            );
+        }
+    }
+
+    /// Reads back the queue's backlog, oldest message first, or an empty `Vec` if there isn't one,
+    /// it can't be read, or it was written by an incompatible [`QUEUE_SCHEMA_VERSION`] - discarded
+    /// rather than guessed at, exactly like [`TransactionStore::load`].
+    pub async fn load<M: serde::de::DeserializeOwned>(&self) -> Vec<M> {
+        let encoded = match self.storage.get(&self.key).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = self.key.as_str(),
+                    "failed to read a persisted offline-queue snapshot; treating it as absent"
+                );
+                return Vec::new();
+            }
+        };
+        let record: PersistedQueue<M> = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = self.key.as_str(),
+                    "a persisted offline-queue snapshot could not be decoded; discarding it"
+                );
+                return Vec::new();
+            }
+        };
+        if record.schema_version != QUEUE_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = QUEUE_SCHEMA_VERSION,
+                key = self.key.as_str(),
+                "discarding a persisted offline-queue snapshot written by an incompatible schema \
+                 version"
+            );
+            return Vec::new();
+        }
+        record.messages
+    }
+}
+
+/// A borrowing twin of [`PersistedQueue`] used only to encode a snapshot without requiring
+/// [`QueueStore::save`]'s caller to hand over ownership of `messages`.
+#[derive(serde::Serialize)]
+struct SerializablePersistedQueue<'a, M> {
+    schema_version: u32,
+    messages: &'a [M],
+}
+
+impl<S: Storage + Send + Sync> QueueStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does - see that method's docs.
+    pub fn new_atomic(storage: S, name: &str) -> Self {
+        QueueStore::new(AtomicStorage::new(storage), name)
+    }
+}
+
+/// Restores a queue's persisted backlog into `queue` at boot, in order, **before** any live
+/// traffic starts flowing through it - call this before spawning
+/// [`run_persisted_offline_queue`]/[`crate::offline_queue::run_with_offline_queue`] for the same
+/// queue, or a message that arrives first could be delivered ahead of older ones the backlog
+/// restores, breaking ordering (E4.3's whole point for `TransactionEvent`s).
+///
+/// Generic over both the queue's message type `M` and its on-disk representation `P` so a message
+/// type that can't (or shouldn't) derive `serde` traits directly - `TransactionEventOccurred`, for
+/// instance, carries enums owned by `crate::state` that this module has no license to add
+/// `#[derive(Serialize)]` to - can still be persisted through a small mirror type instead; see
+/// [`restore_transaction_event_queue`] for that case. A message type that already derives both
+/// `Serialize`/`Deserialize` can just set `P = M` and lean on the reflexive `From<T> for T` impl.
+///
+/// The restored backlog goes through [`crate::offline_queue::OfflineQueue::restore_backlog`], so
+/// it still respects the queue's capacity and [`crate::offline_queue::OverflowPolicy`] exactly as
+/// if the messages had arrived one at a time - see that method's docs. If the persisted backlog
+/// is larger than the queue's capacity (e.g. the capacity was lowered since the snapshot was
+/// written), the overflow policy decides what's dropped, exactly as it would for live traffic;
+/// this is logged, not silently swallowed.
+///
+/// Returns the number of messages read back from storage (not the number actually kept, if any
+/// were dropped by the capacity/overflow check above).
+pub async fn restore_offline_queue<M, P, S>(queue: &OfflineQueue<M>, store: &QueueStore<S>) -> usize
+where
+    M: Clone + From<P>,
+    P: serde::de::DeserializeOwned,
+    S: Storage,
+{
+    let messages: Vec<M> = store.load::<P>().await.into_iter().map(M::from).collect();
+    let recovered = messages.len();
+    if recovered > 0 {
+        tracing::info!(
+            count = recovered,
+            "replaying a persisted offline-message-queue backlog after reboot"
+        );
+    }
+    let dropped = queue.restore_backlog(messages);
+    if !dropped.is_empty() {
+        tracing::warn!(
+            dropped = dropped.len(),
+            "a restored offline-queue backlog exceeded the queue's capacity; the overflow policy \
+             dropped the excess exactly as it would for live traffic"
+        );
+    }
+    recovered
+}
+
+/// Snapshots `queue` into `store` (converting each message to `P` first) if its length actually
+/// changed since `*previous_len`, applying [`queue_persistence_decision`]. Updates `*previous_len`
+/// and `*mutations_since_write` in place so the caller can thread them through repeated calls (one
+/// per mutation) without re-deriving them from storage.
+async fn persist_queue_change<M, P, S>(
+    store: &QueueStore<S>,
+    queue: &OfflineQueue<M>,
+    previous_len: &mut usize,
+    mutations_since_write: &mut usize,
+) where
+    M: Clone,
+    P: From<M> + serde::Serialize + Send + Sync,
+    S: Storage,
+{
+    let new_len = queue.len();
+    match queue_persistence_decision(
+        *previous_len,
+        new_len,
+        *mutations_since_write,
+        store.write_threshold(),
+    ) {
+        QueuePersistenceDecision::Write => {
+            let snapshot: Vec<P> = queue.snapshot().into_iter().map(P::from).collect();
+            store.save(&snapshot).await;
+            *mutations_since_write = 0;
+        }
+        QueuePersistenceDecision::Clear => {
+            store.clear().await;
+            *mutations_since_write = 0;
+        }
+        QueuePersistenceDecision::Skip => {
+            if new_len != *previous_len {
+                *mutations_since_write += 1;
+            }
+        }
+    }
+    *previous_len = new_len;
+}
+
+/// [`crate::offline_queue::run_with_offline_queue`], plus durability: every push and every
+/// successful delivery is reflected into `store` (via the `M` -> `P` conversion - see
+/// [`restore_offline_queue`]) per [`queue_persistence_decision`]'s write policy, so a reboot
+/// mid-outage can replay whatever didn't make it out.
+///
+/// Call [`restore_offline_queue`] on `queue` before spawning this, so a persisted backlog is
+/// already in place (and already counted in the length this function starts tracking from) rather
+/// than being overwritten by an empty starting state.
+pub async fn run_persisted_offline_queue<M, P, S, F, Fut, E, H, HFut>(
+    mut events: BroadcastReceiver<M>,
+    queue: &OfflineQueue<M>,
+    store: &QueueStore<S>,
+    mut send: F,
+    mut on_overflow: H,
+) where
+    M: Clone,
+    P: From<M> + serde::Serialize + Send + Sync,
+    S: Storage,
+    F: FnMut(M) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+    H: FnMut(M) -> HFut,
+    HFut: Future<Output = ()>,
+{
+    let mut previous_len = queue.len();
+    let mut mutations_since_write: usize = 0;
+    while let Ok(message) = events.recv().await {
+        if let Some(dropped) = queue.push(message) {
+            on_overflow(dropped).await;
+        }
+        persist_queue_change::<M, P, S>(
+            store,
+            queue,
+            &mut previous_len,
+            &mut mutations_since_write,
+        )
+        .await;
+
+        flush_offline_queue(queue, &mut send).await;
+        persist_queue_change::<M, P, S>(
+            store,
+            queue,
+            &mut previous_len,
+            &mut mutations_since_write,
+        )
+        .await;
+    }
+}
+
+/// Flushes `queue` (exactly like [`crate::offline_queue::flush_offline_queue`]) and then
+/// unconditionally reconciles `store` with whatever's left - used from a
+/// [`crate::connection::ReconnectHandler`] callback, where a flush is a rare event (a reconnect),
+/// not the steady per-message drumbeat [`run_persisted_offline_queue`]'s write-threshold exists to
+/// throttle, so there's no reason to debounce this write.
+pub async fn flush_and_persist_offline_queue<M, P, S, F, Fut, E>(
+    queue: &OfflineQueue<M>,
+    store: &QueueStore<S>,
+    send: F,
+) where
+    M: Clone,
+    P: From<M> + serde::Serialize + Send + Sync,
+    S: Storage,
+    F: FnMut(M) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+{
+    flush_offline_queue(queue, send).await;
+    let snapshot: Vec<P> = queue.snapshot().into_iter().map(P::from).collect();
+    if snapshot.is_empty() {
+        store.clear().await;
+    } else {
+        store.save(&snapshot).await;
+    }
+}
+
+/// A `serde`-able mirror of [`TransactionEventKind`], since the original enum lives in
+/// `crate::state` and isn't (and, per its module's ownership, shouldn't need to be) `serde`-
+/// derived just for this module's benefit. Exhaustively matched both ways below, so the
+/// conversion can never fail or silently reinterpret a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedTransactionEventKind {
+    Started,
+    UpdatedChargingStateChanged,
+    UpdatedMeterValuePeriodic,
+    Ended,
+}
+
+impl From<TransactionEventKind> for PersistedTransactionEventKind {
+    fn from(kind: TransactionEventKind) -> Self {
+        match kind {
+            TransactionEventKind::Started => Self::Started,
+            TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged) => {
+                Self::UpdatedChargingStateChanged
+            }
+            TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic) => {
+                Self::UpdatedMeterValuePeriodic
+            }
+            TransactionEventKind::Ended => Self::Ended,
+        }
+    }
+}
+
+impl From<PersistedTransactionEventKind> for TransactionEventKind {
+    fn from(kind: PersistedTransactionEventKind) -> Self {
+        match kind {
+            PersistedTransactionEventKind::Started => Self::Started,
+            PersistedTransactionEventKind::UpdatedChargingStateChanged => {
+                Self::Updated(TransactionUpdateReason::ChargingStateChanged)
+            }
+            PersistedTransactionEventKind::UpdatedMeterValuePeriodic => {
+                Self::Updated(TransactionUpdateReason::MeterValuePeriodic)
+            }
+            PersistedTransactionEventKind::Ended => Self::Ended,
+        }
+    }
+}
+
+/// The on-disk representation of one queued [`TransactionEventOccurred`] - the `P` type parameter
+/// [`restore_offline_queue`]/[`run_persisted_offline_queue`]/[`flush_and_persist_offline_queue`]
+/// are instantiated with for the offline transaction-event queue (E2/E4.3). `transaction` reuses
+/// [`Transaction`]'s own `Serialize`/`Deserialize` impl (already relied on by
+/// [`PersistedTransaction`]); `kind` goes through [`PersistedTransactionEventKind`] for the reason
+/// documented there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PersistedQueuedTransactionEvent {
+    evse_id: usize,
+    connector_id: usize,
+    kind: PersistedTransactionEventKind,
+    transaction: Transaction,
+}
+
+impl From<TransactionEventOccurred> for PersistedQueuedTransactionEvent {
+    fn from(occurred: TransactionEventOccurred) -> Self {
+        Self {
+            evse_id: occurred.evse_id,
+            connector_id: occurred.connector_id,
+            kind: occurred.kind.into(),
+            transaction: occurred.transaction,
+        }
+    }
+}
+
+impl From<PersistedQueuedTransactionEvent> for TransactionEventOccurred {
+    fn from(persisted: PersistedQueuedTransactionEvent) -> Self {
+        Self {
+            evse_id: persisted.evse_id,
+            connector_id: persisted.connector_id,
+            kind: persisted.kind.into(),
+            transaction: persisted.transaction,
+        }
+    }
+}
+
+/// [`restore_offline_queue`], specialized to the offline transaction-event queue - see
+/// [`crate::builder::ChargePointBuilder::transaction_events_persisted`].
+pub async fn restore_transaction_event_queue<S: Storage>(
+    queue: &OfflineQueue<TransactionEventOccurred>,
+    store: &QueueStore<S>,
+) -> usize {
+    restore_offline_queue::<TransactionEventOccurred, PersistedQueuedTransactionEvent, S>(
+        queue, store,
+    )
+    .await
+}
+
+/// [`run_persisted_offline_queue`], specialized to the offline transaction-event queue - see
+/// [`crate::builder::ChargePointBuilder::transaction_events_persisted`].
+pub async fn run_persisted_transaction_event_queue<S, F, Fut, E, H, HFut>(
+    events: BroadcastReceiver<TransactionEventOccurred>,
+    queue: &OfflineQueue<TransactionEventOccurred>,
+    store: &QueueStore<S>,
+    send: F,
+    on_overflow: H,
+) where
+    S: Storage,
+    F: FnMut(TransactionEventOccurred) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+    H: FnMut(TransactionEventOccurred) -> HFut,
+    HFut: Future<Output = ()>,
+{
+    run_persisted_offline_queue::<
+        TransactionEventOccurred,
+        PersistedQueuedTransactionEvent,
+        S,
+        F,
+        Fut,
+        E,
+        H,
+        HFut,
+    >(events, queue, store, send, on_overflow)
+    .await
+}
+
+/// [`flush_and_persist_offline_queue`], specialized to the offline transaction-event queue - see
+/// [`crate::builder::ChargePointBuilder::transaction_events_persisted`].
+pub async fn flush_and_persist_transaction_event_queue<S, F, Fut, E>(
+    queue: &OfflineQueue<TransactionEventOccurred>,
+    store: &QueueStore<S>,
+    send: F,
+) where
+    S: Storage,
+    F: FnMut(TransactionEventOccurred) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+{
+    flush_and_persist_offline_queue::<
+        TransactionEventOccurred,
+        PersistedQueuedTransactionEvent,
+        S,
+        F,
+        Fut,
+        E,
+    >(queue, store, send)
+    .await
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
@@ -742,6 +1266,195 @@ mod tests {
                     },
                 })
                 .await;
+        }
+    }
+
+    // --- offline-queue persistence (E2/E4.3) ---
+
+    #[test]
+    fn the_first_message_queued_during_an_outage_is_always_written_immediately() {
+        assert_eq!(
+            queue_persistence_decision(0, 1, 0, 100),
+            QueuePersistenceDecision::Write
+        );
+    }
+
+    #[test]
+    fn the_queue_draining_back_to_empty_always_clears_storage() {
+        assert_eq!(
+            queue_persistence_decision(1, 0, 0, 100),
+            QueuePersistenceDecision::Clear
+        );
+    }
+
+    #[test]
+    fn a_mutation_below_the_write_threshold_is_skipped() {
+        assert_eq!(
+            queue_persistence_decision(3, 4, 0, 5),
+            QueuePersistenceDecision::Skip
+        );
+    }
+
+    #[test]
+    fn a_mutation_reaching_the_write_threshold_is_written() {
+        assert_eq!(
+            queue_persistence_decision(3, 4, 4, 5),
+            QueuePersistenceDecision::Write
+        );
+    }
+
+    #[test]
+    fn no_length_change_is_always_skipped_regardless_of_threshold() {
+        assert_eq!(
+            queue_persistence_decision(5, 5, 999, 1),
+            QueuePersistenceDecision::Skip
+        );
+    }
+
+    #[test]
+    fn a_zero_write_threshold_behaves_like_one() {
+        assert_eq!(
+            queue_persistence_decision(3, 4, 0, 0),
+            QueuePersistenceDecision::Write
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queue_snapshot_round_trips_through_storage() {
+        let store = QueueStore::new(InMemoryStorage::new(), "test");
+        assert_eq!(store.load::<i32>().await, Vec::<i32>::new());
+
+        store.save(&[1, 2, 3]).await;
+        assert_eq!(store.load::<i32>().await, alloc::vec![1, 2, 3]);
+
+        store.clear().await;
+        assert_eq!(store.load::<i32>().await, Vec::<i32>::new());
+    }
+
+    #[tokio::test]
+    async fn a_queue_snapshot_from_an_incompatible_schema_version_is_discarded() {
+        let storage = InMemoryStorage::new();
+        storage
+            .set(
+                "ocpp-cp/queue/test",
+                &serde_json::to_vec(&PersistedQueue {
+                    schema_version: QUEUE_SCHEMA_VERSION + 1,
+                    messages: alloc::vec![1, 2, 3],
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let store = QueueStore::new(storage, "test");
+        assert_eq!(store.load::<i32>().await, Vec::<i32>::new());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_queue_snapshot_is_discarded_rather_than_panicking() {
+        let storage = InMemoryStorage::new();
+        storage
+            .set("ocpp-cp/queue/test", b"{ half-written")
+            .await
+            .unwrap();
+
+        let store = QueueStore::new(storage, "test");
+        assert_eq!(store.load::<i32>().await, Vec::<i32>::new());
+    }
+
+    #[tokio::test]
+    async fn restoring_an_empty_store_is_a_no_op() {
+        use crate::offline_queue::OfflineQueue;
+
+        let queue: OfflineQueue<i32> = OfflineQueue::new();
+        let store = QueueStore::new(InMemoryStorage::new(), "test");
+        assert_eq!(
+            restore_offline_queue::<i32, i32, _>(&queue, &store).await,
+            0
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restoring_a_backlog_replays_it_in_order_and_respects_capacity() {
+        use crate::offline_queue::OfflineQueue;
+
+        let store = QueueStore::new(InMemoryStorage::new(), "test");
+        store.save(&[1, 2, 3]).await;
+
+        // Capacity 2: the restored backlog of 3 doesn't fit, so DropOldest evicts 1.
+        let queue: OfflineQueue<i32> = OfflineQueue::with_capacity(2);
+        assert_eq!(
+            restore_offline_queue::<i32, i32, _>(&queue, &store).await,
+            3
+        );
+        assert_eq!(queue.snapshot(), alloc::vec![2, 3]);
+    }
+
+    /// The end-to-end guarantee E4.3 exists for: a message queued while offline survives a power
+    /// cut and is replayed, in order, once the process restarts and the connection recovers.
+    #[tokio::test]
+    async fn a_queue_interrupted_by_a_power_cut_replays_its_backlog_in_order_after_reboot() {
+        use crate::offline_queue::OfflineQueue;
+        use crate::sync::broadcast_channel;
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = QueueStore::new(storage.clone(), "test");
+
+        // --- before the cut: two messages queued while "offline" (every send fails).
+        let queue: OfflineQueue<i32> = OfflineQueue::new();
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        let forwarder = tokio::spawn(async move {
+            run_persisted_offline_queue::<i32, i32, _, _, _, _, _, _>(
+                receiver,
+                &queue,
+                &store,
+                |_message: i32| async { Err::<(), _>(TestSendError) },
+                |_dropped| async {},
+            )
+            .await;
+        });
+        sender.send(1);
+        sender.send(2);
+        // Let the persisted forwarder task process both pushes.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        forwarder.await.unwrap();
+
+        // --- the cut: nothing but `storage` survives.
+        let persisted_store = QueueStore::new(storage.clone(), "test");
+        assert_eq!(persisted_store.load::<i32>().await, alloc::vec![1, 2]);
+
+        // --- after the reboot: a fresh queue restores the backlog, in order, and delivers it once
+        // the connection is back up.
+        let restored_queue: OfflineQueue<i32> = OfflineQueue::new();
+        assert_eq!(
+            restore_offline_queue::<i32, i32, _>(&restored_queue, &persisted_store).await,
+            2
+        );
+        let delivered = alloc::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flush_delivered = delivered.clone();
+        flush_offline_queue(&restored_queue, move |message: i32| {
+            let delivered = flush_delivered.clone();
+            async move {
+                delivered.lock().unwrap().push(message);
+                Ok::<(), TestSendError>(())
+            }
+        })
+        .await;
+
+        assert_eq!(*delivered.lock().unwrap(), alloc::vec![1, 2]);
+    }
+
+    #[derive(Debug)]
+    struct TestSendError;
+
+    impl core::fmt::Display for TestSendError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("send failed")
         }
     }
 }
