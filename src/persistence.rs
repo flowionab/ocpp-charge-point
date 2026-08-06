@@ -42,7 +42,7 @@ use chrono::{DateTime, Utc};
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
-use crate::hardware::Storage;
+use crate::hardware::{AtomicStorage, Storage};
 use crate::state::{
     ChargePointEvent, MeterSample, RecoveredTransaction, Transaction, TransactionEventKind,
     TransactionEventOccurred, TransactionUpdateReason,
@@ -293,6 +293,22 @@ impl<S: Storage> TransactionStore<S> {
                 );
                 0
             })
+    }
+}
+
+impl<S: Storage + Send + Sync> TransactionStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] so a power cut mid-write can
+    /// never leave a *torn* (partially written) record in place of the previous complete one -
+    /// `docs/PRODUCTION-ROADMAP.md` §7.3's E3.1. [`load`](TransactionStore::load) already
+    /// discards a record that fails to decode; this closes the remaining gap, where the raw
+    /// [`Storage::set`] call itself isn't guaranteed atomic by the underlying hardware.
+    ///
+    /// Prefer this over [`TransactionStore::new`] whenever `storage` is real hardware rather than
+    /// [`crate::hardware::NoStorage`] or a test double already known to be atomic (e.g.
+    /// [`crate::hardware::InMemoryStorage`]) - see [`AtomicStorage`]'s docs for exactly what
+    /// guarantee it does and doesn't add, including what it still can't protect against.
+    pub fn new_atomic(storage: S) -> Self {
+        TransactionStore::new(AtomicStorage::new(storage))
     }
 }
 

@@ -25,6 +25,6 @@ pub use self::command_receiver::HardwareCommandReceiver;
 pub use self::connector::Connector;
 pub use self::event_sender::HardwareEventSender;
 pub use self::evse::Evse;
+pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]
 pub use self::storage::{InMemoryStorage, InMemoryStorageError};
-pub use self::storage::{NoStorage, NoStorageError, Storage};
