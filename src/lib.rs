@@ -43,6 +43,7 @@ mod id_tag;
 #[cfg(feature = "local-auth-list")]
 pub mod local_authorization_list;
 pub mod offline_queue;
+pub mod persistence;
 pub mod provisioning;
 pub mod refusal;
 pub mod remote_control;

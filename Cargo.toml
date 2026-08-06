@@ -135,7 +135,15 @@ tracing = { version = "0.1", default-features = false, features = ["attributes"]
 # StatusNotification wire timestamps are plain `String`s (ocpp-types doesn't depend on chrono),
 # so producing them from a `chrono::DateTime<Utc>` via `to_rfc3339()` needs chrono's `alloc`
 # feature regardless of whether `std` is enabled.
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
+
+# Persistence (docs/PRODUCTION-ROADMAP.md §7, workstream E): the state that must survive a power
+# cut is serialized through `hardware::Storage` as JSON. Both are `no_std`+`alloc`-clean with
+# default features off, so this doesn't cost the embedded build an `std` dependency. JSON rather
+# than a compact binary format on purpose: a persisted transaction record is the evidence behind a
+# billing dispute, and being able to read it off a device with `cat` is worth the extra bytes.
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 # no_std+alloc-friendly Mutex/Signal primitives backing src/sync.rs - used unconditionally by
 # the actor regardless of the `std` feature. Mirrors ocpp-client's own use of these.

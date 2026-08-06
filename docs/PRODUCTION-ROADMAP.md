@@ -638,27 +638,68 @@ mid-transaction currently loses the transaction.
 | Network profiles | Recover connectivity after a bad profile switch | [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) |
 | Boot reason | `BootNotification.reason` must distinguish power-up from a commanded reset | R§2 |
 
-- [ ] **E2.1–E2.12** One task per row above.
+- [x] **E2.1** In-flight transaction — `src/persistence.rs`. Each connector's
+      transaction is written through `hardware::Storage` as a versioned JSON
+      record (id, id token, charging state, `seqNo`, last meter reading, plus a
+      `started_at` stamp and `meter_start` baseline that live on the record
+      rather than on `Transaction`, so the state machine stays clock-free).
+      Wired via `ChargePointBuilder::transaction_persistence`.
+- [x] **E2.2** Transaction sequence numbers / `seqNo` — carried on the same
+      record, so a recovered transaction's closing event continues the sequence
+      instead of restarting it. The transaction-id counter is persisted
+      separately (`ocpp-cp/txn/next-id`), written *before* the transaction that
+      consumed it, so a cut between the two can only skip an id, never reuse one.
+- [ ] **E2.3–E2.12** One task per remaining row above.
 
 ### 7.3 E3 — Crash consistency
 
 - [ ] **E3.1** Write ordering / journaling so a power cut mid-write can't
-      produce a half-written transaction record.
-- [ ] **E3.2** Bound write frequency — flash has finite erase cycles, and a
-      meter sample every few seconds will wear it out. Only checkpoint what
-      must be recovered, at the cadence it must be recovered at.
-- [ ] **E3.3** Schema versioning, so a firmware update can read the previous
-      version's state.
+      produce a half-written transaction record. Partially addressed: a record
+      that decodes as anything other than a complete, current-schema
+      `PersistedTransaction` is discarded on load rather than half-applied, and
+      the counter is ordered ahead of the record it belongs to. What's still
+      missing is the *storage-level* guarantee — `Storage::set` is currently
+      assumed atomic, which no flash driver actually promises. Needs a
+      write-temp-then-rename (or A/B slot) protocol at the `Storage` boundary.
+- [x] **E3.2** Bound write frequency — `persistence_decision` in
+      `src/persistence.rs`. Lifecycle transitions (started, charging-state
+      change, ended) always write; a periodic meter reading only writes once the
+      energy register has moved `meter_write_threshold_wh` (default 100 Wh) from
+      the last reading that reached storage. That bound is exactly the maximum
+      billable energy a power cut can lose, and is the knob integrators trade
+      against flash wear.
+- [x] **E3.3** Schema versioning — every record carries
+      `persistence::SCHEMA_VERSION`; a record written by any other version is
+      logged and discarded rather than guessed at, so a firmware update reads
+      the previous version's state or nothing, never something in between.
 
 ### 7.4 E4 — Recovery
 
-- [ ] **E4.1** On boot: reload state, then decide per transaction whether to
-      resume or close it out, and report accordingly.
+- [x] **E4.1** On boot: `persistence::restore_transactions` reloads every
+      persisted transaction and hands them to the state machine as a single
+      atomic `ChargePointEvent::PersistedTransactionsRestored`, which closes
+      each one out as a `TransactionEvent(Ended)` with the new
+      `StopReason::PowerLoss` (→ `ReasonEnum::PowerLoss` on all three versions),
+      carrying the last meter reading that reached storage so the energy is
+      still billable. Records are cleared only *after* the state machine has
+      taken ownership, so a cut during recovery re-reports rather than loses.
+
+      The decision is deliberately always *close out*, never *resume*: resuming
+      would assert that the EV stayed connected and energy kept flowing while
+      the firmware was not running, which nothing in `crate::hardware` can
+      currently attest to. Resume needs a hardware hook that can report
+      contactor/cable state at boot — worth revisiting alongside M3.
 - [ ] **E4.2** Send the correct `BootNotification.reason`
       (`PowerUp`/`RemoteReset`/`ScheduledReset`/…) from persisted context.
+      Untouched — needs the boot-reason row of E2 (E2.12) first.
 - [ ] **E4.3** Replay the offline queue after reboot, preserving order.
+      Untouched — the offline queue is still RAM-only (E2.8/G2).
 - [ ] **E4.4** Power-cut test harness — kill the process at N points across
-      a transaction lifecycle and assert recovery at each.
+      a transaction lifecycle and assert recovery at each. Partially covered:
+      `persistence::tests` has one end-to-end cut (drop the actor mid-charge,
+      spawn a fresh one, assert the energy is still reported) plus unit coverage
+      of the write policy, corrupt/stale records and a storage-less charge
+      point. The systematic N-point sweep is still open.
 
 ---
 
@@ -914,7 +955,10 @@ change. Only the *hardware surface* of the latter two is done — B2.1/B2.2/B2.4
 (profile store, schedule composition, limit projection) and E2–E4 (wiring
 persistence into `ChargePointState`/the offline queue) remain untouched in M3
 and M2 respectively. `set_current_limit` therefore has a dispatch path and a
-fail-safe error path, but nothing yet *calls* it.
+fail-safe error path, but nothing yet *calls* it. (Since updated by M2's first
+slice: E2.1/E2.2, E3.2, E3.3 and E4.1 are now done — the in-flight transaction
+is persisted and recovered. The rest of E2's table, and the offline queue, are
+still RAM-only.)
 
 The single source of truth is `CAPABILITY_GATES` in
 `src/hardware/capabilities.rs`: capability field ↔ Cargo feature ↔ 2.1

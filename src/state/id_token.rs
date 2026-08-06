@@ -2,7 +2,7 @@ use alloc::string::String;
 
 /// An identifier presented to authorize charging (OCPP `IdTokenType`) - the hidden id of an
 /// RFID tag, an app-generated UUID, a vehicle's PnC identity, etc.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IdToken {
     /// Case-insensitive identifier value.
     pub value: String,
@@ -11,7 +11,7 @@ pub struct IdToken {
 }
 
 /// How an [`IdToken`] was obtained, matching OCPP's `IdTokenType.type` values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IdTokenKind {
     /// Assigned centrally by the CSMS rather than read from a physical medium.
     Central,

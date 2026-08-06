@@ -172,6 +172,7 @@ mod ocpp_2_1 {
             StopReason::EVDisconnected => ReasonEnum::EVDisconnected,
             StopReason::EmergencyStop => ReasonEnum::EmergencyStop,
             StopReason::Reset => ReasonEnum::ImmediateReset,
+            StopReason::PowerLoss => ReasonEnum::PowerLoss,
         }
     }
 
@@ -196,6 +197,11 @@ mod ocpp_2_1 {
                 Some(StopReason::Remote) => TriggerReasonEnum::RemoteStop,
                 Some(StopReason::EVDisconnected) => TriggerReasonEnum::EVDeparted,
                 Some(StopReason::Reset) => TriggerReasonEnum::ResetCommand,
+                // No `PowerLoss` trigger reason exists in 2.x - a transaction closed out from
+                // its persisted record on the next boot is exactly the "something went wrong
+                // outside the normal flow" case `AbnormalCondition` covers. The precise cause
+                // still reaches the CSMS in `stoppedReason` (`ReasonEnum::PowerLoss`).
+                Some(StopReason::PowerLoss) => TriggerReasonEnum::AbnormalCondition,
                 Some(StopReason::Local) | None => TriggerReasonEnum::StopAuthorized,
             },
         }
@@ -590,6 +596,7 @@ mod ocpp_2_0_1 {
             StopReason::EVDisconnected => ReasonEnum::EVDisconnected,
             StopReason::EmergencyStop => ReasonEnum::EmergencyStop,
             StopReason::Reset => ReasonEnum::ImmediateReset,
+            StopReason::PowerLoss => ReasonEnum::PowerLoss,
         }
     }
 
@@ -612,6 +619,11 @@ mod ocpp_2_0_1 {
                 Some(StopReason::Remote) => TriggerReasonEnum::RemoteStop,
                 Some(StopReason::EVDisconnected) => TriggerReasonEnum::EVDeparted,
                 Some(StopReason::Reset) => TriggerReasonEnum::ResetCommand,
+                // No `PowerLoss` trigger reason exists in 2.x - a transaction closed out from
+                // its persisted record on the next boot is exactly the "something went wrong
+                // outside the normal flow" case `AbnormalCondition` covers. The precise cause
+                // still reaches the CSMS in `stoppedReason` (`ReasonEnum::PowerLoss`).
+                Some(StopReason::PowerLoss) => TriggerReasonEnum::AbnormalCondition,
                 Some(StopReason::Local) | None => TriggerReasonEnum::StopAuthorized,
             },
         }
@@ -951,6 +963,7 @@ mod ocpp_1_6 {
             // point restarted" stop - 1.6J's `Reason` enum's closest match is `HardReset`
             // (mirroring the `Hard`/`Immediate` pairing `crate::reset::ocpp_1_6` uses).
             StopReason::Reset => Reason::HardReset,
+            StopReason::PowerLoss => Reason::PowerLoss,
         }
     }
 

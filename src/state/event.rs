@@ -66,6 +66,25 @@ pub enum ChargePointEvent {
     /// variables, 1.6J `SupportedFeatureProfiles`) ultimately derives from - see
     /// `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
     CapabilitiesDeclared(Capabilities),
+    /// In-flight transactions recovered from durable storage at boot, applied as one atomic
+    /// event so recovery can never be observed half-done. See
+    /// [`crate::persistence::restore_transactions`] and `docs/PRODUCTION-ROADMAP.md` §7.4 (E4.1).
+    ///
+    /// Each entry is *closed out* rather than resumed: a `TransactionEvent(Ended)` with
+    /// [`StopReason::PowerLoss`] is emitted per recovered transaction, carrying the last meter
+    /// reading that reached storage before the power cut, so the CSMS can still bill the energy
+    /// delivered. Resuming across a reboot would require asserting that the EV stayed connected
+    /// and energy kept flowing while the firmware was not running, which no hardware binding in
+    /// [`crate::hardware`] can currently attest to.
+    PersistedTransactionsRestored {
+        /// The transaction-id counter as of the last persisted transaction start, so a recovered
+        /// charge point never reissues an id the CSMS has already seen. Applied as a floor, not
+        /// an assignment - a counter that has already advanced further in this process is left
+        /// alone.
+        next_transaction_id: u64,
+        /// The transactions that were in flight when power was lost, in no particular order.
+        transactions: Vec<RecoveredTransaction>,
+    },
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {
         /// The addressed EVSE's index.
@@ -257,6 +276,18 @@ pub enum TransactionUpdateReason {
     ChargingStateChanged,
     /// A periodic meter reading was reported while charging.
     MeterValuePeriodic,
+}
+
+/// One in-flight transaction read back from durable storage at boot, carried by
+/// [`ChargePointEvent::PersistedTransactionsRestored`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredTransaction {
+    /// The transaction's connector's EVSE index.
+    pub evse_id: usize,
+    /// The transaction's connector's index within its EVSE.
+    pub connector_id: usize,
+    /// The transaction as it was last persisted before power was lost.
+    pub transaction: Transaction,
 }
 
 /// A transaction lifecycle event, reported to the CSMS via TransactionEvent.

@@ -1,7 +1,10 @@
 //! An optional persistent key-value store an integrator can supply so state that should survive
-//! a power cycle (offline transaction queue, cached configuration, etc.) actually does. Wiring
-//! that state through [`Storage`] is future work (`docs/PRODUCTION-ROADMAP.md` §7.2 E2 onward) -
-//! this module only defines the trait surface and a couple of implementations, per E1.
+//! a power cycle (offline transaction queue, cached configuration, etc.) actually does.
+//!
+//! The first state actually wired through this is the in-flight transaction - see
+//! [`crate::persistence`], which persists and recovers it (E2.1/E4.1). The remaining rows of
+//! `docs/PRODUCTION-ROADMAP.md` §7.2's table (the offline queue, the local authorization list,
+//! reservations, certificates, ...) are still RAM-only.
 //!
 //! A charge point is not required to have persistent storage at all - [`NoStorage`] is a no-op
 //! implementation an integrator without durable hardware can pass through so everything still
@@ -39,6 +42,26 @@ pub trait Storage {
 
     /// Removes any value stored under `key`. Removing a key that isn't present is not an error.
     async fn remove(&self, key: &str) -> Result<(), Self::Error>;
+}
+
+/// Forwards to the wrapped store, so one [`Storage`] can be shared between the several
+/// independent tasks that persist state (see [`crate::persistence`]) without each needing its
+/// own handle onto the hardware.
+#[async_trait::async_trait]
+impl<S: Storage + Send + Sync> Storage for alloc::sync::Arc<S> {
+    type Error = S::Error;
+
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).get(key).await
+    }
+
+    async fn set(&self, key: &str, value: &[u8]) -> Result<(), Self::Error> {
+        (**self).set(key, value).await
+    }
+
+    async fn remove(&self, key: &str) -> Result<(), Self::Error> {
+        (**self).remove(key).await
+    }
 }
 
 /// A no-op [`Storage`] implementation for charge points with no durable storage hardware at

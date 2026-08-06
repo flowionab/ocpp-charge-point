@@ -2,7 +2,7 @@
 /// `ConnectorEvent::MeterValueSampled`. Only `energy_wh` is required - a hardware integration
 /// that can't measure a given quantity simply leaves it `None`, and the wire adapter (see
 /// `docs/ROADMAP.md` §10) omits it from the reported `meterValue` rather than fabricating one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct MeterSample {
     /// Cumulative active energy imported by the EV, in Wh (OCPP `Energy.Active.Import.Register`).
     pub energy_wh: i64,

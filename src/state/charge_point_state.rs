@@ -154,6 +154,46 @@ impl ChargePointState {
                     value,
                 ),
             },
+            ChargePointEvent::PersistedTransactionsRestored {
+                next_transaction_id,
+                transactions,
+            } => {
+                // A floor, never an assignment - see the event's docs. Reissuing a transaction id
+                // the CSMS has already seen is worse than skipping a few.
+                let counter_changed =
+                    set_if_changed_max(&mut self.next_transaction_id, next_transaction_id);
+                let mut recovered_any = false;
+                for recovered in transactions {
+                    // Silently skipping an entry that addresses a connector this firmware no
+                    // longer has (a topology change across the update that caused the reboot)
+                    // matches `apply`'s documented tolerance for events that don't apply.
+                    let addressable = self
+                        .evses
+                        .get(recovered.evse_id)
+                        .is_some_and(|evse| recovered.connector_id < evse.connectors.len());
+                    if !addressable {
+                        tracing::warn!(
+                            evse_id = recovered.evse_id,
+                            connector_id = recovered.connector_id,
+                            "discarding a recovered transaction for a connector this charge point no longer has"
+                        );
+                        continue;
+                    }
+                    let mut transaction = recovered.transaction;
+                    transaction.stop_reason = Some(StopReason::PowerLoss);
+                    transaction.seq_no += 1;
+                    recovered_any = true;
+                    effects.push(ChargePointEffect::TransactionEvent(
+                        TransactionEventOccurred {
+                            evse_id: recovered.evse_id,
+                            connector_id: recovered.connector_id,
+                            kind: TransactionEventKind::Ended,
+                            transaction,
+                        },
+                    ));
+                }
+                counter_changed || recovered_any
+            }
             ChargePointEvent::CapabilitiesDeclared(capabilities) => {
                 set_if_changed(&mut self.capabilities, capabilities)
             }
@@ -559,6 +599,17 @@ fn apply_meter_sample(
         TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic),
         transaction.clone(),
     ))
+}
+
+/// Raises `current` to `next` if `next` is larger, reporting whether it moved. Used for
+/// monotonic counters that recovery may only ever advance, never rewind.
+fn set_if_changed_max(current: &mut u64, next: u64) -> bool {
+    if next > *current {
+        *current = next;
+        true
+    } else {
+        false
+    }
 }
 
 fn set_if_changed<T: PartialEq>(current: &mut T, next: T) -> bool {
@@ -1483,6 +1534,125 @@ mod tests {
         );
 
         assert_eq!(state.evses[0].running_costs[0], None);
+    }
+
+    /// A transaction as it would have been persisted mid-charge: `Charging`, with the last meter
+    /// reading that reached storage before the power cut.
+    fn interrupted_transaction() -> Transaction {
+        Transaction {
+            id: TransactionId(7),
+            id_token: Some(test_id_token()),
+            charging_state: TransactionChargingState::Charging,
+            stop_reason: None,
+            seq_no: 12,
+            last_meter_sample: Some(MeterSample {
+                energy_wh: 4_200,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn a_recovered_transaction_is_closed_out_as_ended_with_power_loss() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::PersistedTransactionsRestored {
+            next_transaction_id: 8,
+            transactions: alloc::vec![crate::state::RecoveredTransaction {
+                evse_id: 0,
+                connector_id: 0,
+                transaction: interrupted_transaction(),
+            }],
+        });
+
+        // The billable energy must survive: the last persisted meter reading is still attached to
+        // the closing event, and the `seqNo` continues where the interrupted transaction left off
+        // rather than restarting.
+        let expected = Transaction {
+            stop_reason: Some(StopReason::PowerLoss),
+            seq_no: 13,
+            ..interrupted_transaction()
+        };
+        assert!(effects.contains(&ChargePointEffect::TransactionEvent(
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Ended,
+                transaction: expected,
+            }
+        )));
+        // Closed out, not resumed - nothing is left occupying the connector's transaction slot.
+        assert_eq!(state.evses[0].transactions[0], None);
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn recovery_restores_the_transaction_id_counter_so_ids_are_never_reused() {
+        let mut state = ChargePointState::new([1]);
+
+        state.apply(ChargePointEvent::PersistedTransactionsRestored {
+            next_transaction_id: 8,
+            transactions: Vec::new(),
+        });
+
+        assert_eq!(state.next_transaction_id, 8);
+
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .map(|transaction| transaction.id),
+            Some(TransactionId(8))
+        );
+    }
+
+    #[test]
+    fn recovery_never_rewinds_a_counter_that_has_already_advanced_further() {
+        let mut state = ChargePointState::new([1]);
+        state.next_transaction_id = 20;
+
+        state.apply(ChargePointEvent::PersistedTransactionsRestored {
+            next_transaction_id: 8,
+            transactions: Vec::new(),
+        });
+
+        assert_eq!(state.next_transaction_id, 20);
+    }
+
+    #[test]
+    fn recovering_nothing_changes_nothing() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::PersistedTransactionsRestored {
+            next_transaction_id: 0,
+            transactions: Vec::new(),
+        });
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn a_recovered_transaction_addressing_a_connector_that_does_not_exist_is_ignored() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::PersistedTransactionsRestored {
+            next_transaction_id: 0,
+            transactions: alloc::vec![crate::state::RecoveredTransaction {
+                evse_id: 4,
+                connector_id: 9,
+                transaction: interrupted_transaction(),
+            }],
+        });
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
     }
 
     #[test]

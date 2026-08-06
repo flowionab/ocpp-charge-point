@@ -1,11 +1,13 @@
 /// Identifies a transaction. Assigned by the charge point when a transaction starts
 /// (`ChargePointState.next_transaction_id`, incremented monotonically).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct TransactionId(pub u64);
 
 /// The transaction's charging state, reported via TransactionEvent (OCPP
 /// `ChargingStateEnumType`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransactionChargingState {
     /// The EV is connected but energy is not (yet, or no longer) flowing.
     EvConnected,
@@ -22,7 +24,7 @@ pub enum TransactionChargingState {
 /// Why a transaction stopped, reported via TransactionEvent (OCPP `ReasonEnumType`) - a subset
 /// of the full spec enum, covering what this crate can currently detect. Extend as
 /// RemoteControl/Authorization land and can supply richer reasons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopReason {
     /// Stopped locally (e.g. a stop button, or the EV/driver ending the session).
     Local,
@@ -35,12 +37,18 @@ pub enum StopReason {
     /// Stopped because a CSMS-initiated `Reset` (`Immediate`) interrupted it. See
     /// `docs/ROADMAP.md` §2.
     Reset,
+    /// The charge point lost power (or otherwise restarted) while this transaction was in
+    /// flight, and it was closed out from its persisted record on the next boot rather than
+    /// resumed. Never produced by a live connector transition - only by
+    /// [`crate::state::ChargePointEvent::PersistedTransactionsRestored`]. See
+    /// `docs/PRODUCTION-ROADMAP.md` §7.4 (E4.1).
+    PowerLoss,
 }
 
 /// A charging session tied to one connector, distinct from [`crate::state::ConnectorState`] -
 /// several connector states (e.g. `Starting`, `Charging`, `Stopping`) share one active
 /// transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Transaction {
     /// This transaction's identifier.
     pub id: TransactionId,

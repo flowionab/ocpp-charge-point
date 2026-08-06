@@ -31,6 +31,7 @@ use crate::hardware::{Capabilities, warn_on_feature_mismatches};
 #[cfg(feature = "local-auth-list")]
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
 use crate::offline_queue::{OfflineQueue, run_with_offline_queue};
+use crate::persistence::{TransactionStore, restore_transactions, run_transaction_persistence};
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
@@ -86,6 +87,12 @@ pub struct ChargePointBuilder<T, X> {
     transaction_events: Option<BroadcastReceiver<TransactionEventOccurred>>,
     authorization_requests: Option<BroadcastReceiver<AuthorizationRequested>>,
     security_events: Option<BroadcastReceiver<SecurityEvent>>,
+    // A second transaction-event subscription, independent of the one the Transactions block
+    // consumes: durability and CSMS reporting are separate concerns that must not starve each
+    // other, and persistence has to see every event the CSMS forwarder does. Taken in `start()`
+    // for the same reason as the other four - so a transaction the hardware reports during
+    // start-up is persisted rather than missed.
+    transaction_persistence_events: Option<BroadcastReceiver<TransactionEventOccurred>>,
 }
 
 impl<T, X: Executor> ChargePointBuilder<T, X> {
@@ -126,6 +133,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let transaction_events = runtime.subscribe_transaction_events();
         let authorization_requests = runtime.subscribe_authorization_requests();
         let security_events = runtime.subscribe_security_events();
+        let transaction_persistence_events = runtime.subscribe_transaction_events();
 
         // C3 (docs/PRODUCTION-ROADMAP.md §5.3): land the hardware-declared capabilities into state
         // itself first - the single source of truth `crate::hardware::supported_feature_profiles_1_6`
@@ -157,6 +165,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             transaction_events: Some(transaction_events),
             authorization_requests: Some(authorization_requests),
             security_events: Some(security_events),
+            transaction_persistence_events: Some(transaction_persistence_events),
         })
     }
 
@@ -550,6 +559,48 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     {
         csms.register_cost_updated_handler(self.runtime.actor())
             .await;
+
+        self
+    }
+
+    /// Registers durable transaction state (`docs/PRODUCTION-ROADMAP.md` §7, workstream E):
+    /// recovers whatever was in flight when the charge point last lost power, then persists every
+    /// subsequent transaction event through `storage` for the life of the process.
+    ///
+    /// Register this **first**, before [`Self::transaction_events`]: recovery closes each
+    /// interrupted transaction out as a `TransactionEvent(Ended)`, and while that event is
+    /// buffered either way (the CSMS-facing subscription is taken up front in [`Self::start`]),
+    /// registering persistence first also guarantees the restored transaction-id counter lands
+    /// before any new transaction can consume an id.
+    ///
+    /// `storage` may be [`crate::hardware::NoStorage`], in which case this registers a
+    /// persistence task that durably stores nothing and a recovery that finds nothing - the
+    /// charge point runs exactly as it would without this call. Anything else needs the hardware
+    /// binding to declare [`Capabilities::has_persistent_storage`]; callers driving this builder
+    /// from declared capabilities (e.g. [`crate::setup::setup`]) should skip this call when it is
+    /// `false`.
+    ///
+    /// `clock` stamps each record's start time - [`crate::clock::SystemClock`] on std, an
+    /// RTC-backed [`crate::clock::Clock`] on embedded.
+    pub async fn transaction_persistence<S, K>(mut self, storage: S, clock: K) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+    {
+        let Some(events) = Self::warn_if_taken(
+            self.transaction_persistence_events.take(),
+            "transaction_persistence",
+        ) else {
+            return self;
+        };
+
+        let store = Arc::new(TransactionStore::new(storage));
+        // Before spawning the writer: recovery must not race a live write against the same keys.
+        restore_transactions(&self.runtime.actor(), &store).await;
+
+        self.executor.spawn(Box::pin(async move {
+            run_transaction_persistence(events, &store, &clock).await;
+        }));
 
         self
     }
@@ -1023,5 +1074,71 @@ mod tests {
             ConnectorState::Faulted
         );
         assert!(!locked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn registering_transaction_persistence_recovers_an_interrupted_transaction_at_boot() {
+        use crate::persistence::{PersistedTransaction, SCHEMA_VERSION, TransactionStore};
+        use crate::state::{
+            IdToken, IdTokenKind, StopReason, Transaction, TransactionChargingState,
+            TransactionEventKind, TransactionId,
+        };
+
+        // Storage as a previous run left it: a transaction was in flight, 4.2 kWh delivered, when
+        // the power was cut.
+        let storage = Arc::new(crate::hardware::InMemoryStorage::new());
+        let seeding_store = TransactionStore::new(storage.clone());
+        seeding_store
+            .save(&PersistedTransaction {
+                schema_version: SCHEMA_VERSION,
+                evse_id: 0,
+                connector_id: 0,
+                transaction: Transaction {
+                    id: TransactionId(3),
+                    id_token: Some(IdToken {
+                        value: "04A224B2".into(),
+                        kind: IdTokenKind::ISO14443,
+                    }),
+                    charging_state: TransactionChargingState::Charging,
+                    stop_reason: None,
+                    seq_no: 9,
+                    last_meter_sample: Some(crate::state::MeterSample {
+                        energy_wh: 4_200,
+                        ..Default::default()
+                    }),
+                },
+                started_at: None,
+                meter_start: None,
+            })
+            .await;
+        seeding_store.save_next_transaction_id(4).await;
+
+        let (charge_point, _locked) = test_charge_point(true);
+        let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap();
+        // Subscribe before the recovery runs, exactly as a registered Transactions block would
+        // have (its subscription is taken up front in `start`).
+        let mut reported = builder.runtime.subscribe_transaction_events();
+
+        let runtime = builder
+            .transaction_persistence(storage.clone(), crate::clock::SystemClock)
+            .await
+            .build();
+
+        let closing = reported.recv().await.expect("a closing transaction event");
+        assert_eq!(closing.kind, TransactionEventKind::Ended);
+        assert_eq!(closing.transaction.id, TransactionId(3));
+        assert_eq!(closing.transaction.stop_reason, Some(StopReason::PowerLoss));
+        assert_eq!(
+            closing
+                .transaction
+                .last_meter_sample
+                .map(|sample| sample.energy_wh),
+            Some(4_200)
+        );
+        assert_eq!(runtime.state().next_transaction_id, 4);
+        // The record is consumed, so a second boot doesn't report the same session again.
+        assert_eq!(seeding_store.load(0, 0).await, None);
     }
 }
