@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
+use chrono::{DateTime, Utc};
 
+use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
@@ -9,6 +11,27 @@ use crate::state::{
     ResetTarget, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
     TransactionEventOccurred, TransactionId, TransactionUpdateReason,
 };
+
+/// This charge point's best current estimate of the CSMS's clock, anchored to a
+/// [`MonotonicInstant`] so it can be advanced by elapsed real time without ever consulting a
+/// (possibly absent or unsynchronized) wall clock - see `crate::clock` and
+/// `crate::provisioning::evaluate_time_sync`. Stored on [`ChargePointState`] (mutated only via
+/// [`ChargePointEvent::TimeSynced`]) rather than kept local to the Provisioning functional
+/// block's heartbeat loop, because both [`crate::provisioning::register`]/
+/// [`crate::provisioning::register_until_accepted`] (BootNotification) and
+/// [`crate::provisioning::run_heartbeat`] (Heartbeat) need to compare against the *same* anchor
+/// for drift detection to mean anything - a reconnect's fresh BootNotification must see the
+/// heartbeat loop's last sync, and vice versa, or every exchange looks like a first-ever sync.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeSyncAnchor {
+    /// The CSMS's `currentTime` as of `recorded_at`.
+    pub csms_time: DateTime<Utc>,
+    /// The [`MonotonicInstant`] reading taken when `csms_time` was accepted. A later estimate is
+    /// `csms_time + (now - recorded_at)`, using the same [`crate::clock::MonotonicClock`]
+    /// instance throughout a process's lifetime (see [`MonotonicInstant`]'s docs on why readings
+    /// from different clock instances cannot be compared).
+    pub recorded_at: MonotonicInstant,
+}
 
 /// The protocol-version-independent internal state of the whole charge point: its lifecycle,
 /// registration with the CSMS, and every EVSE it owns. The single source of truth
@@ -37,6 +60,11 @@ pub struct ChargePointState {
     /// Conservatively empty ([`Capabilities::default`]) until `ChargePointBuilder::start` captures
     /// the real value - see `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
     pub capabilities: Capabilities,
+    /// This charge point's best current estimate of the CSMS's clock, established by
+    /// BootNotification/Heartbeat's `currentTime` - see [`TimeSyncAnchor`] and
+    /// [`ChargePointEvent::TimeSynced`]. `None` until the first exchange that carried a
+    /// parseable `currentTime`.
+    pub time_sync: Option<TimeSyncAnchor>,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -68,6 +96,7 @@ impl ChargePointState {
             pending_reset: None,
             device_model: DeviceModel::new(),
             capabilities: Capabilities::default(),
+            time_sync: None,
         }
     }
 
@@ -197,6 +226,16 @@ impl ChargePointState {
             ChargePointEvent::CapabilitiesDeclared(capabilities) => {
                 set_if_changed(&mut self.capabilities, capabilities)
             }
+            ChargePointEvent::TimeSynced {
+                csms_time,
+                recorded_at,
+            } => set_if_changed(
+                &mut self.time_sync,
+                Some(TimeSyncAnchor {
+                    csms_time,
+                    recorded_at,
+                }),
+            ),
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
                     connector_id,

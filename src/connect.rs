@@ -96,7 +96,17 @@ where
         }
     };
 
-    setup(charge_point, client, executor, backoff)
-        .await
-        .map_err(ConnectAndSetupError::Start)
+    // `SystemMonotonicClock` (std-backed) rather than a caller-supplied parameter - this
+    // function is already std/tokio-only "batteries included" (it dials a real WebSocket), so
+    // there is no embedded-target caller for whom a different `MonotonicClock` would matter, the
+    // same reasoning `executor.spawn`'s tokio dependency here already follows.
+    setup(
+        charge_point,
+        client,
+        executor,
+        backoff,
+        crate::clock::SystemMonotonicClock,
+    )
+    .await
+    .map_err(ConnectAndSetupError::Start)
 }

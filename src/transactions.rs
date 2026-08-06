@@ -272,6 +272,10 @@ mod ocpp_2_1 {
     // `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so this impl - unlike
     // the rest of this file - needs both `ocpp_2_1` and `std`.
     #[cfg(feature = "std")]
+    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
+    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
+    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
+    // this timestamp today, so no `is_synchronized` check applies here.
     mod with_system_clock {
         use super::{
             build_meter_values, map_charging_state, map_event_type, map_stop_reason,
@@ -686,6 +690,10 @@ mod ocpp_2_0_1 {
     }
 
     #[cfg(feature = "std")]
+    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
+    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
+    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
+    // this timestamp today, so no `is_synchronized` check applies here.
     mod with_system_clock {
         use super::{
             build_meter_values, map_charging_state, map_event_type, map_stop_reason,
@@ -1036,6 +1044,10 @@ mod ocpp_1_6 {
     // a caller-supplied `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so
     // this impl - unlike the rest of this file - needs both `ocpp_1_6` and `std`.
     #[cfg(feature = "std")]
+    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
+    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
+    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
+    // this timestamp today, so no `is_synchronized` check applies here.
     mod with_system_clock {
         use super::{Ocpp1_6TransactionNotifier, map_stop_reason, sampled_values};
         use crate::clock::{Clock, SystemClock};

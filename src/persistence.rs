@@ -86,7 +86,16 @@ pub struct PersistedTransaction {
     /// The transaction as of the last write that reached storage.
     pub transaction: Transaction,
     /// When the transaction started, per the [`Clock`] supplied to
-    /// [`run_transaction_persistence`]. `None` if the charge point has no usable time source.
+    /// [`run_transaction_persistence`]. `None` if the charge point has no usable time source -
+    /// either because no record reached storage before this one (see [`next_record`]'s docs), or
+    /// because `clock.now()` itself didn't look synchronized (see
+    /// [`crate::clock::is_synchronized`]) at the moment the transaction started - e.g. hardware
+    /// with no RTC that hasn't yet received a CSMS `currentTime` (see `crate::provisioning`'s
+    /// time-sync helpers). This crate never substitutes a fabricated timestamp for either case -
+    /// see `docs/PRODUCTION-ROADMAP.md` §9.3 (G3.1). A transaction recovered with `started_at:
+    /// None` is still fully recoverable and billable on its energy; only its start time is
+    /// unknown until corrected out-of-band (e.g. by an operator reconciling against the CSMS's
+    /// own `TransactionEvent(Started)` receipt time, if that adapter's clock was synchronized).
     pub started_at: Option<DateTime<Utc>>,
     /// The first meter reading seen during this transaction - the baseline the delivered energy
     /// is measured against. `None` until the first reading arrives (a transaction that is cut
@@ -373,13 +382,31 @@ pub async fn run_transaction_persistence<S: Storage, C: Clock>(
 /// Builds the record to write for `occurred`, carrying forward the start time and meter baseline
 /// already established by `previous` (a transaction's start time must not drift with every
 /// subsequent write).
+///
+/// G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): `clock` is exactly the caller-injectable [`Clock`]
+/// that can be backed by hardware with no RTC (see [`run_transaction_persistence`]'s docs and
+/// `crate::clock`'s), so a `Started` event's start time is only recorded when `clock.now()`
+/// actually looks synchronized (see [`crate::clock::is_synchronized`]) - an unset RTC's reading
+/// (conventionally the Unix epoch or similar) becomes `None`, never a fabricated "started at
+/// 1970" record. `started_at` being `None` is the honest, already-`Option` representation this
+/// module chose for "unknown" rather than inventing a plausible-looking timestamp - see
+/// [`PersistedTransaction::started_at`]'s docs. This never blocks recording the transaction
+/// itself (G3.1's explicit requirement): every other field is still written, the transaction is
+/// still recoverable after a power cut, and only the start time is left blank pending a real
+/// sync - the CSMS-facing `TransactionEvent(Started)` timestamp is a separate, `std`-only
+/// concern (see `crate::transactions`'s `with_system_clock` adapters, which are not reachable
+/// from unsynchronized embedded hardware since they're locked to `SystemClock`, always
+/// OS-backed and real).
 fn next_record<C: Clock>(
     previous: Option<&PersistedTransaction>,
     occurred: &TransactionEventOccurred,
     clock: &C,
 ) -> PersistedTransaction {
     let started_at = match (occurred.kind, previous) {
-        (TransactionEventKind::Started, _) => Some(clock.now()),
+        (TransactionEventKind::Started, _) => {
+            let now = clock.now();
+            crate::clock::is_synchronized(&now).then_some(now)
+        }
         (_, Some(previous)) => previous.started_at,
         // Reached only if the record written at start never made it to storage; the transaction
         // is still worth persisting, just without a trustworthy start time.
@@ -981,6 +1008,18 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::hardware::{InMemoryStorage, NoStorage};
     use crate::state::{IdToken, IdTokenKind, StopReason, TransactionChargingState, TransactionId};
+    use chrono::Duration as ChronoDuration;
+
+    /// A [`Clock`] that always reads a fixed, caller-chosen instant - used to simulate both a
+    /// synchronized clock (any plausible date) and an unset, no-RTC clock
+    /// ([`crate::clock::unsynchronized_before`] or earlier).
+    struct FixedClock(DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
 
     fn test_transaction(energy_wh: Option<i64>) -> Transaction {
         Transaction {
@@ -1097,6 +1136,61 @@ mod tests {
             ),
             PersistenceDecision::Write
         );
+    }
+
+    #[test]
+    fn a_started_transaction_records_its_start_time_from_a_synchronized_clock() {
+        let clock = FixedClock(crate::clock::unsynchronized_before() + ChronoDuration::days(1));
+        let record = next_record(None, &occurred(TransactionEventKind::Started, None), &clock);
+
+        assert_eq!(record.started_at, Some(clock.0));
+    }
+
+    /// G3.1: hardware with no RTC (`Clock::now()` reads before
+    /// `crate::clock::unsynchronized_before()`, e.g. an unset RTC's Unix-epoch default - see
+    /// `crate::clock`'s docs) must not have a fabricated, plausible-looking start time invented
+    /// for it. `started_at` stays `None` - honest "unknown" - rather than recording 1970.
+    #[test]
+    fn a_started_transaction_on_an_unsynchronized_clock_records_no_start_time() {
+        let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let record = next_record(
+            None,
+            &occurred(TransactionEventKind::Started, None),
+            &unset_rtc,
+        );
+
+        assert_eq!(record.started_at, None);
+    }
+
+    /// The transaction is still fully recordable with no RTC at all (G3.1's explicit
+    /// requirement) - only `started_at` is left blank; everything else needed to recover and
+    /// bill the transaction is still written.
+    #[test]
+    fn a_transaction_on_an_unsynchronized_clock_is_still_otherwise_recorded() {
+        let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let event = occurred(TransactionEventKind::Started, Some(500));
+        let record = next_record(None, &event, &unset_rtc);
+
+        assert_eq!(record.started_at, None);
+        assert_eq!(record.transaction, event.transaction);
+        assert_eq!(
+            record.meter_start,
+            Some(MeterSample {
+                energy_wh: 500,
+                ..Default::default()
+            })
+        );
+    }
+
+    /// The sentinel value itself counts as synchronized (matching
+    /// [`crate::clock::is_synchronized`]'s own boundary), so a clock that has just barely
+    /// crossed into plausible territory is trusted, not treated as still-unset.
+    #[test]
+    fn a_started_transaction_at_exactly_the_sentinel_records_its_start_time() {
+        let clock = FixedClock(crate::clock::unsynchronized_before());
+        let record = next_record(None, &occurred(TransactionEventKind::Started, None), &clock);
+
+        assert_eq!(record.started_at, Some(clock.0));
     }
 
     #[tokio::test]

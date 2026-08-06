@@ -1,4 +1,5 @@
 use crate::actor::{ActorError, ChargePointActor};
+use crate::clock::MonotonicClock;
 use crate::executor::Executor;
 use crate::hardware::{HardwareCommandReceiver, HardwareEventSender};
 use crate::provisioning::{Backoff, BootNotificationOutcome, BootNotifier};
@@ -39,21 +40,24 @@ impl<T> ChargePointRuntime<T> {
 
     /// Runs the Provisioning functional block's BootNotification exchange. See
     /// [`crate::provisioning::register`].
-    pub async fn register<N: BootNotifier>(
+    pub async fn register<N: BootNotifier, M: MonotonicClock>(
         &self,
         notifier: &N,
+        monotonic: &M,
         vendor_name: &str,
         model_name: &str,
     ) -> Result<RegistrationStatus, N::Error> {
-        crate::provisioning::register(&self.actor, notifier, vendor_name, model_name).await
+        crate::provisioning::register(&self.actor, notifier, monotonic, vendor_name, model_name)
+            .await
     }
 
     /// Runs BootNotification repeatedly until the CSMS accepts registration. See
     /// [`crate::provisioning::register_until_accepted`].
-    pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
+    pub async fn register_until_accepted<N: BootNotifier, B: Backoff, M: MonotonicClock>(
         &self,
         notifier: &N,
         backoff: &B,
+        monotonic: &M,
         vendor_name: &str,
         model_name: &str,
     ) -> BootNotificationOutcome {
@@ -61,6 +65,7 @@ impl<T> ChargePointRuntime<T> {
             &self.actor,
             notifier,
             backoff,
+            monotonic,
             vendor_name,
             model_name,
         )
@@ -165,12 +170,18 @@ mod tests {
             outcome: BootNotificationOutcome {
                 status: RegistrationStatus::Accepted,
                 interval_secs: 60,
+                current_time: None,
             },
         };
         let mut states = runtime.subscribe();
 
         let status = runtime
-            .register(&notifier, "Acme", "Charger 9000")
+            .register(
+                &notifier,
+                &crate::clock::SystemMonotonicClock,
+                "Acme",
+                "Charger 9000",
+            )
             .await
             .unwrap();
         states.changed().await;
@@ -190,12 +201,18 @@ mod tests {
             outcome: BootNotificationOutcome {
                 status: RegistrationStatus::Pending,
                 interval_secs: 10,
+                current_time: None,
             },
         };
         let mut states = runtime.subscribe();
 
         let status = runtime
-            .register(&notifier, "Acme", "Charger 9000")
+            .register(
+                &notifier,
+                &crate::clock::SystemMonotonicClock,
+                "Acme",
+                "Charger 9000",
+            )
             .await
             .unwrap();
         states.changed().await;
@@ -267,6 +284,7 @@ mod tests {
                 Ok(BootNotificationOutcome {
                     status: RegistrationStatus::Accepted,
                     interval_secs: 60,
+                    current_time: None,
                 })
             }
         }
@@ -292,14 +310,17 @@ mod tests {
                 BootNotificationOutcome {
                     status: RegistrationStatus::Pending,
                     interval_secs: 5,
+                    current_time: None,
                 },
                 BootNotificationOutcome {
                     status: RegistrationStatus::Rejected,
                     interval_secs: 5,
+                    current_time: None,
                 },
                 BootNotificationOutcome {
                     status: RegistrationStatus::Accepted,
                     interval_secs: 60,
+                    current_time: None,
                 },
             ],
             calls: core::sync::atomic::AtomicUsize::new(0),
@@ -309,7 +330,13 @@ mod tests {
         };
 
         let outcome = runtime
-            .register_until_accepted(&notifier, &backoff, "Acme", "Charger 9000")
+            .register_until_accepted(
+                &notifier,
+                &backoff,
+                &crate::clock::SystemMonotonicClock,
+                "Acme",
+                "Charger 9000",
+            )
             .await;
 
         assert_eq!(outcome.status, RegistrationStatus::Accepted);
@@ -334,7 +361,13 @@ mod tests {
         };
 
         let outcome = runtime
-            .register_until_accepted(&notifier, &backoff, "Acme", "Charger 9000")
+            .register_until_accepted(
+                &notifier,
+                &backoff,
+                &crate::clock::SystemMonotonicClock,
+                "Acme",
+                "Charger 9000",
+            )
             .await;
 
         assert_eq!(outcome.status, RegistrationStatus::Accepted);

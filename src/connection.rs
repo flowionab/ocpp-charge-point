@@ -16,6 +16,7 @@
 //! delivery once reconnected.
 
 use crate::actor::ChargePointActor;
+use crate::clock::MonotonicClock;
 use crate::provisioning::{Backoff, BootNotifier, register_until_accepted};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -39,15 +40,17 @@ pub trait ReconnectHandler {
 /// dropped. OCPP doesn't mandate this, but it's the conventional way for a charge point to
 /// resynchronize its registration status after a communication interruption, and `ocpp-client`
 /// explicitly leaves it to the caller - see [`ReconnectHandler`]'s docs.
-pub async fn reregister_on_reconnect<N, B>(
+pub async fn reregister_on_reconnect<N, B, M>(
     actor: ChargePointActor,
     notifier: N,
     backoff: B,
+    monotonic: M,
     vendor_name: String,
     model_name: String,
 ) where
     N: ReconnectHandler + BootNotifier + Clone + Send + Sync + 'static,
     B: Backoff + Clone + Send + Sync + 'static,
+    M: MonotonicClock + Clone + Send + Sync + 'static,
 {
     let boot_notifier = notifier.clone();
     notifier
@@ -55,6 +58,7 @@ pub async fn reregister_on_reconnect<N, B>(
             let actor = actor.clone();
             let boot_notifier = boot_notifier.clone();
             let backoff = backoff.clone();
+            let monotonic = monotonic.clone();
             let vendor_name = vendor_name.clone();
             let model_name = model_name.clone();
             async move {
@@ -62,6 +66,7 @@ pub async fn reregister_on_reconnect<N, B>(
                     &actor,
                     &boot_notifier,
                     &backoff,
+                    &monotonic,
                     &vendor_name,
                     &model_name,
                 )
@@ -200,6 +205,7 @@ mod tests {
             Ok(BootNotificationOutcome {
                 status: RegistrationStatus::Accepted,
                 interval_secs: 60,
+                current_time: None,
             })
         }
     }
@@ -228,6 +234,7 @@ mod tests {
             actor.clone(),
             client.clone(),
             NoopBackoff,
+            crate::clock::SystemMonotonicClock,
             String::from("Acme"),
             String::from("Charger 9000"),
         )
@@ -251,6 +258,7 @@ mod tests {
             actor.clone(),
             client.clone(),
             NoopBackoff,
+            crate::clock::SystemMonotonicClock,
             String::from("Acme"),
             String::from("Charger 9000"),
         )
@@ -269,6 +277,7 @@ mod tests {
             actor.clone(),
             client.clone(),
             NoopBackoff,
+            crate::clock::SystemMonotonicClock,
             String::from("Acme"),
             String::from("Charger 9000"),
         )

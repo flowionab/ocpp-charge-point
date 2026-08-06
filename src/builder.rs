@@ -19,6 +19,7 @@
 use crate::ChargePointRuntime;
 use crate::authorization::{Authorizer, run_authorization_requests};
 use crate::availability::{ChangeAvailabilityHandler, DedupedStatusNotifier, StatusNotifier};
+use crate::clock::MonotonicClock;
 use crate::connection::{ReconnectHandler, reregister_on_reconnect};
 #[cfg(feature = "tariff-cost")]
 use crate::cost::CostUpdatedHandler;
@@ -61,8 +62,8 @@ use alloc::vec::Vec;
 /// implements every block at once. See the module docs for why this exists.
 ///
 /// Each registration method (`provisioning`, `status_notifications`, ...) consumes and returns
-/// `Self`, so calls chain: `Builder::start(hw, ex).await?.provisioning(&csms,
-/// backoff).await.status_notifications(&csms).await....build()`. Blocks may be registered in any
+/// `Self`, so calls chain: `Builder::start(hw, ex).await?.provisioning(&csms, backoff,
+/// monotonic).await.status_notifications(&csms).await....build()`. Blocks may be registered in any
 /// combination and any order relative to each other (registering the same block twice, or
 /// skipping it, never panics) with one exception worth calling out: the four event subscriptions
 /// (status/transaction/authorization/security) are taken once, up front, in [`Self::start`] -
@@ -191,17 +192,22 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     ///
     /// `backoff` is caller-supplied (rather than defaulting to tokio) so this doesn't hard-depend
     /// on an async runtime - std/tokio users can pass [`crate::provisioning::TokioBackoff`];
-    /// embedded targets supply their own.
-    pub async fn provisioning<N, B>(self, csms: &N, backoff: B) -> Self
+    /// embedded targets supply their own. `monotonic` is likewise caller-supplied - std/tokio
+    /// users can pass [`crate::clock::SystemMonotonicClock`]; embedded targets supply their own
+    /// free-running timer. It anchors the CSMS's BootNotification/Heartbeat `currentTime`
+    /// against elapsed real time so repeated syncs don't re-report routine drift as a fresh step
+    /// - see `crate::provisioning::register_until_accepted`'s and `run_heartbeat`'s docs.
+    pub async fn provisioning<N, B, M>(self, csms: &N, backoff: B, monotonic: M) -> Self
     where
         N: BootNotifier + HeartbeatSender + ReconnectHandler + Clone + Send + Sync + 'static,
         B: Backoff + Clone + Send + Sync + 'static,
+        M: MonotonicClock + Clone + Send + Sync + 'static,
     {
         let vendor_name = self.vendor_name.as_str();
         let model_name = self.model_name.as_str();
         let outcome = self
             .runtime
-            .register_until_accepted(csms, &backoff, vendor_name, model_name)
+            .register_until_accepted(csms, &backoff, &monotonic, vendor_name, model_name)
             .await;
 
         // The accepted BootNotification interval *is* the `OCPPCommCtrlr`/`HeartbeatInterval`
@@ -233,6 +239,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             self.runtime.actor(),
             csms.clone(),
             backoff.clone(),
+            monotonic.clone(),
             vendor_name.into(),
             model_name.into(),
         )
@@ -240,11 +247,13 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
 
         let heartbeat_sender = csms.clone();
         let heartbeat_backoff = backoff.clone();
+        let heartbeat_monotonic = monotonic.clone();
         let heartbeat_actor = self.runtime.actor();
         self.executor.spawn(Box::pin(async move {
             run_heartbeat(
                 &heartbeat_sender,
                 &heartbeat_backoff,
+                &heartbeat_monotonic,
                 &heartbeat_actor,
                 outcome.interval_secs,
             )
@@ -985,6 +994,7 @@ mod tests {
         FixedBootNotifier(BootNotificationOutcome {
             status: RegistrationStatus::Accepted,
             interval_secs: 60,
+            current_time: None,
         })
     }
 
@@ -1027,8 +1037,10 @@ mod tests {
     impl crate::provisioning::HeartbeatSender for ProvisioningOnlyCsms {
         type Error = core::convert::Infallible;
 
-        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
-            Ok(())
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+            Ok(None)
         }
     }
 
@@ -1051,7 +1063,7 @@ mod tests {
         let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
             .await
             .unwrap()
-            .provisioning(&csms, TokioBackoff)
+            .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
             .await
             .build();
 
@@ -1076,9 +1088,9 @@ mod tests {
         let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
             .await
             .unwrap()
-            .provisioning(&csms, TokioBackoff)
+            .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
             .await
-            .provisioning(&csms, TokioBackoff)
+            .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
             .await
             .build();
 
@@ -1193,7 +1205,7 @@ mod tests {
         let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
             .await
             .unwrap()
-            .provisioning(&csms, TokioBackoff)
+            .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
             .await
             .status_notifications(&csms)
             .await

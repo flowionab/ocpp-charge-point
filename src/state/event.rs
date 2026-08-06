@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
+use chrono::{DateTime, Utc};
 
+use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::{
     ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry, MeterSample,
@@ -84,6 +86,22 @@ pub enum ChargePointEvent {
         next_transaction_id: u64,
         /// The transactions that were in flight when power was lost, in no particular order.
         transactions: Vec<RecoveredTransaction>,
+    },
+    /// A CSMS-supplied `currentTime` (from a BootNotification or Heartbeat response) was accepted
+    /// as this charge point's current best time-sync anchor - see
+    /// [`crate::provisioning::evaluate_time_sync`] and [`crate::state::TimeSyncAnchor`]. Raised on
+    /// every successful BootNotification/Heartbeat exchange that carried a parseable
+    /// `currentTime`, not only when [`crate::provisioning::evaluate_time_sync`] judged the
+    /// difference worth a `SettingSystemTime` security event - so the anchor used for the *next*
+    /// comparison is always the freshest CSMS time seen, keeping routine drift small even when no
+    /// step was reported.
+    TimeSynced {
+        /// The CSMS's `currentTime`.
+        csms_time: DateTime<Utc>,
+        /// A [`MonotonicInstant`] reading taken at the moment `csms_time` was accepted, so a
+        /// later comparison can advance `csms_time` by elapsed monotonic time rather than reusing
+        /// it unmodified - see [`crate::state::TimeSyncAnchor`].
+        recorded_at: MonotonicInstant,
     },
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {

@@ -43,6 +43,7 @@ impl BootNotifier for AlwaysAcceptBootNotifier {
         Ok(BootNotificationOutcome {
             status: RegistrationStatus::Accepted,
             interval_secs: 300,
+            current_time: None,
         })
     }
 }
@@ -51,8 +52,8 @@ impl BootNotifier for AlwaysAcceptBootNotifier {
 impl HeartbeatSender for AlwaysAcceptBootNotifier {
     type Error = core::convert::Infallible;
 
-    async fn send_heartbeat(&self) -> Result<(), Self::Error> {
-        Ok(())
+    async fn send_heartbeat(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+        Ok(None)
     }
 }
 
@@ -361,6 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         AlwaysAcceptBootNotifier,
         TokioExecutor,
         TokioBackoff,
+        ocpp_charge_point::clock::SystemMonotonicClock,
     )
     .await?;
     runtime

@@ -283,6 +283,11 @@ where
 {
     match message {
         TriggerableMessage::Heartbeat => {
+            // The `currentTime` this triggered heartbeat's response carries isn't evaluated for
+            // a time-sync step here - unlike `crate::provisioning::run_heartbeat`'s regular
+            // cadence, a `TriggerMessage`-driven resend has no natural place to keep a
+            // `MonotonicClock` reading anchored, and a CSMS explicitly requesting a resend is not
+            // the routine per-interval case `evaluate_time_sync`'s threshold is tuned for.
             if let Err(err) = notifier.send_heartbeat().await {
                 tracing::warn!(error = %err, "triggered heartbeat failed");
             }
@@ -674,9 +679,11 @@ mod tests {
     impl HeartbeatSender for RecordingNotifier {
         type Error = core::convert::Infallible;
 
-        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
             self.seen.send_modify(|(heartbeats, _)| *heartbeats += 1);
-            Ok(())
+            Ok(None)
         }
     }
 

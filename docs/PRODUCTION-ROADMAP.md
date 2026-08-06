@@ -890,62 +890,122 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
 
 ### 9.3 G3 — Time
 
-- [ ] **G3.1** Behaviour with no RTC and no CSMS time yet — transactions
-      must still be recordable. `crate::clock::is_synchronized` (plus the
-      `unsynchronized_before` sentinel it's built on) now lets a caller tell
-      a plausible wall-clock reading apart from an unset RTC's default one
-      (Unix epoch or similar) without changing `Clock`'s signature — a
-      `Clock` impl on hardware without an RTC is documented to return such a
-      value rather than fabricate a plausible-looking date. What's still
-      missing: nothing in the transaction pipeline (`src/transactions.rs`,
-      `src/persistence.rs`) actually calls it yet, so an unsynchronized
-      clock still produces an honest-looking-but-wrong 1970-ish timestamp on
-      the wire and in persisted records today. `Transaction` itself
-      (`src/state/transaction.rs`) carries no timestamp at all — the state
-      machine stays clock-free as designed — so a transaction *is* already
-      recordable with no RTC/no CSMS time; only the timestamp attached at
-      the reporting/persistence boundary is currently untrustworthy rather
-      than honestly flagged.
-- [ ] **G3.2** Clock sync from `BootNotification`/`Heartbeat` responses,
-      raising `SettingSystemTime`. The decision logic landed and is unit
-      tested: `crate::provisioning::evaluate_time_sync` compares a local
-      time estimate against a CSMS's `currentTime` and returns a
-      `TimeSyncStep` (→ `SecurityEventType::SettingSystemTime` via
-      `TimeSyncStep::to_security_event`) only when there was no prior
-      estimate, the prior estimate was unsynchronized (first real sync), or
-      the two differ by at least `CLOCK_STEP_THRESHOLD_SECS` (10s, chosen to
-      sit above normal WebSocket round-trip latency and RTC drift over one
-      heartbeat interval) — so a CSMS returning `currentTime` on every
-      Heartbeat does not raise the event every cycle. `SettingSystemTime`
-      was already modelled in `SecurityEventType` (not one of F4.1's three
-      missing values), so no new variant was needed. **Not wired into the
-      live path**: `register`/`register_until_accepted`/`run_heartbeat`
-      still don't call this, because doing so needs
-      `BootNotifier::notify_boot`/`HeartbeatSender::send_heartbeat` to
-      surface the wire response's `currentTime`, and both traits plus
-      `BootNotificationOutcome`'s fields are consumed by fixed struct
-      literals and trait impls in `src/builder.rs`/`src/setup.rs` — outside
-      this change's file ownership. Next step for whoever owns those files:
-      add `current_time: Option<DateTime<Utc>>` to `BootNotificationOutcome`
-      / a `HeartbeatOutcome`, update every construction site, then call
-      `evaluate_time_sync` + `report_security_event` from `register`/
-      `run_heartbeat` using a `Clock` reading taken just before the request.
-- [ ] **G3.3** Correct handling of a clock jump mid-transaction (monotonic
+- [x] **G3.1** Behaviour with no RTC and no CSMS time yet — transactions
+      must still be recordable. Wired as far as this crate's *only*
+      caller-injectable, potentially-no-RTC `Clock` in the live path:
+      `crate::persistence::run_transaction_persistence`/`next_record`
+      (`src/persistence.rs`). A `Started` event now checks
+      `crate::clock::is_synchronized` on the `Clock` reading before stamping
+      `PersistedTransaction::started_at` — an unset RTC's implausible
+      reading (Unix epoch or similar, per `Clock`'s own contract) is stored
+      as `None`, never as a fabricated-but-plausible-looking date. The
+      transaction is still fully written and recoverable either way
+      (`transaction`/`meter_start` are unaffected) — only `started_at` is
+      left honestly blank pending a real sync, satisfying G3.1's explicit
+      "must still be recordable" requirement without inventing a garbage
+      timestamp. Once `crate::provisioning`'s time-sync anchor (G3.2, below)
+      corrects the clock, later transactions started on the same boot get a
+      real `started_at`; a transaction already recorded with `None` is not
+      retroactively corrected (`PersistedTransaction::started_at`'s docs
+      spell out the reconciliation options, e.g. against the CSMS's own
+      `TransactionEvent(Started)` receipt time). Deliberately **not** touched:
+      the CSMS-facing `StatusNotification`/`TransactionEvent`/
+      `SecurityEventNotification` `timestamp` adapters
+      (`with_system_clock` modules in `src/transactions.rs`,
+      `src/availability.rs`, `src/security.rs`). Those are hard-locked to
+      `SystemClock` (`std`-only, always OS-backed and real) rather than
+      taking a caller-supplied `Clock` — there is no no-RTC path to reach
+      them today, and OCPP's wire `timestamp` field on those messages is
+      mandatory, so there is no honest "unknown" to fall back to on that
+      boundary even if there were. Each site now carries a one-line comment
+      recording this scope decision explicitly rather than leaving it
+      implicit.
+- [x] **G3.2** Clock sync from `BootNotification`/`Heartbeat` responses,
+      raising `SettingSystemTime`. Fully wired into the live path.
+      `BootNotificationOutcome` grew `current_time: Option<DateTime<Utc>>`,
+      and `HeartbeatSender::send_heartbeat` now returns
+      `Result<Option<DateTime<Utc>>, Self::Error>` instead of
+      `Result<(), Self::Error>`; every `ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1`
+      adapter in `src/provisioning.rs` parses the wire response's
+      `currentTime` via `parse_csms_current_time`, now logging a warning
+      (`parse_csms_current_time_logged`) on a non-empty value that fails to
+      parse rather than silently treating it as "no sync available". Every
+      construction site across `src/builder.rs`, `src/setup.rs`,
+      `src/runtime.rs`, `src/connection.rs`, `src/remote_control.rs`, and
+      `examples/simple.rs` was updated (`current_time: None` for fakes that
+      don't model a CSMS clock).
+
+      `register`/`register_until_accepted`/`run_heartbeat` call
+      `evaluate_time_sync` on every response carrying a parseable
+      `currentTime` and report `SettingSystemTime` via
+      `crate::security::report_security_event` when it returns a step — see
+      those functions' docs for the explicit "this crate detects and
+      reports; setting the actual system/RTC clock is the integrator's job"
+      boundary.
+
+      **Where the sync state lives, and why**: a new
+      `crate::state::TimeSyncAnchor { csms_time, recorded_at }` field
+      (`ChargePointState::time_sync`, mutated only via the new
+      `ChargePointEvent::TimeSynced`, per `CLAUDE.md`'s "state mutations go
+      through events" rule) rather than a local inside the heartbeat loop.
+      Two reasons: (1) `register`/`register_until_accepted` (BootNotification,
+      including a reconnect's fresh one via `reregister_on_reconnect`) and
+      `run_heartbeat` (Heartbeat) are separate call paths that both need to
+      compare against the *same* anchor for drift detection to mean
+      anything — a loop-local would make every reconnect's BootNotification
+      look like a first-ever sync again; (2) the actor is this crate's
+      designated owner of shared, cross-functional-block state per
+      `CLAUDE.md`'s actor-model guidance, and this is exactly that: read by
+      Provisioning, written by Provisioning, but conceptually charge-point
+      state, not heartbeat-loop-private state. The anchor is *not* the raw
+      OCPP-visible `ChargePointState` fields like `registration` — it is
+      still scoped as clearly-internal bookkeeping (no version adapter reads
+      it to build a wire message), but shares the same actor/event
+      infrastructure since that's where cross-call-path shared state
+      already lives in this codebase.
+
+      The anchor's `recorded_at` is a `MonotonicInstant` (G3.3's primitive),
+      not a second wall-clock reading: `local_time_estimate` advances
+      `csms_time` by `MonotonicClock`-measured elapsed time since it was
+      recorded, rather than comparing against a fresh `Clock::now()`. This
+      is deliberate, not incidental — on hardware with no RTC, `Clock::now()`
+      never advances past `clock::unsynchronized_before()` (this crate never
+      sets the RTC itself), so comparing a live reading against the CSMS's
+      `currentTime` on every single Heartbeat would report a "first sync"
+      every cycle, defeating `CLOCK_STEP_THRESHOLD_SECS`'s entire point. The
+      monotonic-anchored estimate tracks real elapsed time regardless of
+      RTC presence, which is also what makes it correct to keep advancing
+      through a `SettingSystemTime` correction mid-session — see G3.3.
+      `register`/`register_until_accepted`/`run_heartbeat`/
+      `reregister_on_reconnect`/`ChargePointBuilder::provisioning`/
+      `crate::setup::setup`/`connect_and_setup` all now take a
+      caller-supplied `M: MonotonicClock` parameter, mirroring the existing
+      `Backoff`/`Executor` pattern — `crate::clock::SystemMonotonicClock` for
+      std/tokio callers, a free-running-timer impl for embedded ones.
+      Covered by five new tests in
+      `provisioning::time_sync_wiring_tests` (first-sync reporting and
+      anchor storage, a consistent second sync staying silent, a genuine
+      step being reported, and a heartbeat response advancing the anchor).
+- [x] **G3.3** Correct handling of a clock jump mid-transaction (monotonic
       durations, not wall-clock subtraction). `crate::clock::MonotonicClock`
-      / `MonotonicInstant` now exist as the primitive: an opaque,
-      saturating-subtraction tick reading (`SystemMonotonicClock` backed by
-      `std::time::Instant` under `std`; embedded targets supply their own
-      free-running-timer impl), kept as a trait distinct from `Clock` so the
-      two can never be accidentally mixed. Nothing in the crate computes a
-      transaction *duration* today (`Transaction` carries no timestamps and
-      every `TransactionEvent`/`StartTransaction`/`StopTransaction` adapter
-      in `src/transactions.rs` independently samples `SystemClock.now()` per
-      message rather than subtracting two stored wall-clock readings), so
-      there is currently no live wall-clock-subtraction bug to fix — this is
-      groundwork for whenever elapsed-duration reporting (e.g. session
-      duration, meter-value sampling intervals under a clock correction) is
-      added, at which point it should use `MonotonicInstant::duration_since`
-      rather than subtracting two `DateTime<Utc>` values.
+      / `MonotonicInstant` (from the prior commit) is now actually consumed,
+      by G3.2's time-sync anchoring above (`local_time_estimate` in
+      `src/provisioning.rs`) — the one piece of duration math this round of
+      work added is exactly the kind G3.3 exists for (elapsed-time-since-
+      last-known-good-sync, immune to a `SettingSystemTime` step happening
+      mid-measurement), and it correctly uses
+      `MonotonicInstant::duration_since` rather than subtracting two
+      `DateTime<Utc>` values. Audited the rest of the tree for other
+      wall-clock duration subtraction while in here: **none exists**.
+      `Transaction` still carries no timestamps, no code subtracts two
+      stored `DateTime<Utc>` readings to compute an elapsed session/interval
+      duration, and `evaluate_time_sync`'s own `csms_time - local` (in
+      `TimeSyncStep`/its tests) is comparing two *point-in-time* estimates
+      to size a clock step, not measuring elapsed real time — a different
+      operation that a `MonotonicClock` cannot substitute for (a "how far
+      apart are these two clocks' opinions" question inherently needs both
+      opinions as wall-clock timestamps). Remains groundwork for whenever
+      session-duration/sampling-interval reporting is added.
 
 ### 9.4 G4 — Failure containment
 

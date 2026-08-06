@@ -2,6 +2,7 @@
 //! CSMS. See `docs/ROADMAP.md` §2.
 
 use crate::actor::ChargePointActor;
+use crate::clock::MonotonicClock;
 use crate::state::{
     ChargePointEvent, Component, RegistrationStatus, Variable, VariableAttributeType,
 };
@@ -22,6 +23,12 @@ pub struct BootNotificationOutcome {
     /// Seconds to wait: the heartbeat interval when `status` is `Accepted`, otherwise the
     /// minimum wait before the charge point may retry BootNotification.
     pub interval_secs: u32,
+    /// The CSMS's `currentTime`, as carried by every version's BootNotification response.
+    /// `None` only if the wire value failed to parse as RFC 3339 (see
+    /// [`parse_csms_current_time`]) - logged by the adapter that produced it, not silently
+    /// dropped. Consumed by [`evaluate_time_sync`] to detect a clock step worth reporting via
+    /// `SettingSystemTime` - see [`register`]/[`register_until_accepted`].
+    pub current_time: Option<DateTime<Utc>>,
 }
 
 /// Sends a BootNotification and reports the CSMS's decision.
@@ -71,20 +78,31 @@ pub trait HeartbeatSender {
     /// The error type returned if the Heartbeat request itself fails.
     type Error: core::error::Error + Send + Sync + 'static;
 
-    /// Sends a Heartbeat to the CSMS.
-    async fn send_heartbeat(&self) -> Result<(), Self::Error>;
+    /// Sends a Heartbeat to the CSMS, returning its `currentTime` (carried by every version's
+    /// Heartbeat response). `Ok(None)` only if the wire value failed to parse as RFC 3339 (see
+    /// [`parse_csms_current_time`]) - logged by the adapter that produced it, not silently
+    /// dropped. Consumed by [`evaluate_time_sync`] via [`run_heartbeat`].
+    async fn send_heartbeat(&self) -> Result<Option<DateTime<Utc>>, Self::Error>;
 }
 
 /// Runs the Provisioning functional block's BootNotification exchange against `actor`: sends a
 /// BootNotification via `notifier` and applies the CSMS's decision to the charge point's state
-/// (see `ChargePointEvent::RegistrationStatusReceived`).
+/// (see `ChargePointEvent::RegistrationStatusReceived`). If the response carried a parseable
+/// `currentTime`, also evaluates it via [`evaluate_time_sync`] against `actor`'s stored
+/// [`crate::state::TimeSyncAnchor`] (advanced by `monotonic` since it was recorded - see
+/// [`local_time_estimate`]), reports a `SettingSystemTime` security event when warranted, and
+/// advances the stored anchor either way. This crate only *detects and reports* a clock step this
+/// way - actually correcting the system/RTC clock is the integrator's job (typically in response
+/// to observing the `SettingSystemTime` `SecurityEventNotification`, or by reading
+/// [`ChargePointActor::state`]`().time_sync` directly), not something this function does.
 ///
 /// This performs a single BootNotification attempt. On `Pending`/`Rejected`, callers are
 /// responsible for retrying after the returned outcome's interval, per the OCPP spec. See
 /// [`register_until_accepted`] for a version that retries automatically.
-pub async fn register<N: BootNotifier>(
+pub async fn register<N: BootNotifier, M: MonotonicClock>(
     actor: &ChargePointActor,
     notifier: &N,
+    monotonic: &M,
     vendor_name: &str,
     model_name: &str,
 ) -> Result<RegistrationStatus, N::Error> {
@@ -92,6 +110,9 @@ pub async fn register<N: BootNotifier>(
     let _ = actor
         .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
         .await;
+    if let Some(csms_time) = outcome.current_time {
+        sync_time(actor, monotonic, csms_time).await;
+    }
     Ok(outcome.status)
 }
 
@@ -99,10 +120,16 @@ pub async fn register<N: BootNotifier>(
 /// applying every intermediate decision to the charge point's state. Per OCPP, a charge point
 /// does not give up: on `Pending`/`Rejected` it waits the response's `interval_secs` before
 /// retrying, and on a transport-level failure it waits [`DEFAULT_RETRY_INTERVAL_SECS`] instead.
-pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
+///
+/// Every response (including intermediate `Pending`/`Rejected` ones) that carries a parseable
+/// `currentTime` is evaluated for a time-sync step, exactly as [`register`] does - see that
+/// function's docs for what "evaluated" means and what this crate does versus what the
+/// integrator's hardware must do.
+pub async fn register_until_accepted<N: BootNotifier, B: Backoff, M: MonotonicClock>(
     actor: &ChargePointActor,
     notifier: &N,
     backoff: &B,
+    monotonic: &M,
     vendor_name: &str,
     model_name: &str,
 ) -> BootNotificationOutcome {
@@ -112,6 +139,9 @@ pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
                 let _ = actor
                     .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
                     .await;
+                if let Some(csms_time) = outcome.current_time {
+                    sync_time(actor, monotonic, csms_time).await;
+                }
                 if outcome.status == RegistrationStatus::Accepted {
                     return outcome;
                 }
@@ -123,6 +153,52 @@ pub async fn register_until_accepted<N: BootNotifier, B: Backoff>(
             }
         }
     }
+}
+
+/// Computes this charge point's current best time estimate from `actor`'s stored
+/// [`crate::state::TimeSyncAnchor`], advanced by elapsed monotonic time since the anchor was
+/// recorded - `None` if no anchor exists yet (this charge point has never received a parseable
+/// `currentTime`). Used as [`evaluate_time_sync`]'s `local_estimate`.
+///
+/// Deliberately *not* a live [`crate::clock::Clock`] reading: on hardware with no RTC,
+/// `Clock::now()` never advances past [`crate::clock::unsynchronized_before`] (this crate never
+/// sets the system/RTC clock itself - see [`register`]'s docs), so comparing a fresh unsynchronized
+/// reading against the CSMS's `currentTime` on every single Heartbeat would report a "first sync"
+/// every cycle, defeating [`CLOCK_STEP_THRESHOLD_SECS`]'s entire point. Anchoring to the last
+/// accepted `currentTime` and advancing it by [`MonotonicClock`] elapsed time instead tracks real
+/// elapsed time even with no RTC and no `std` clock at all.
+fn local_time_estimate<M: MonotonicClock>(
+    actor: &ChargePointActor,
+    monotonic: &M,
+) -> Option<DateTime<Utc>> {
+    let anchor = actor.state().time_sync?;
+    let elapsed = monotonic.now().duration_since(anchor.recorded_at);
+    let elapsed = chrono::Duration::from_std(elapsed).unwrap_or_else(|_| chrono::Duration::zero());
+    Some(anchor.csms_time + elapsed)
+}
+
+/// Evaluates a freshly received `csms_time` against `actor`'s current time-sync anchor (see
+/// [`local_time_estimate`]), reports a `SettingSystemTime` security event via
+/// [`crate::security::report_security_event`] when [`evaluate_time_sync`] judges it a step, and
+/// unconditionally advances the stored anchor to `csms_time` - not only on a reported step, so the
+/// baseline used for the *next* comparison is always the freshest CSMS time seen, keeping routine
+/// per-cycle drift small even between steps (see
+/// [`crate::state::ChargePointEvent::TimeSynced`]'s docs).
+async fn sync_time<M: MonotonicClock>(
+    actor: &ChargePointActor,
+    monotonic: &M,
+    csms_time: DateTime<Utc>,
+) {
+    let local_estimate = local_time_estimate(actor, monotonic);
+    if let Some(step) = evaluate_time_sync(local_estimate, csms_time) {
+        crate::security::report_security_event(actor, step.to_security_event()).await;
+    }
+    let _ = actor
+        .send(ChargePointEvent::TimeSynced {
+            csms_time,
+            recorded_at: monotonic.now(),
+        })
+        .await;
 }
 
 /// Minimum absolute difference, in seconds, between this charge point's own time estimate and a
@@ -167,16 +243,10 @@ pub struct TimeSyncStep {
 /// `currentTime` on every single Heartbeat (as the spec allows) does *not* raise a security event
 /// on every heartbeat, only on a genuine step.
 ///
-/// This is deliberately a pure decision function, not wired into [`register`],
-/// [`register_until_accepted`], or [`run_heartbeat`]: doing so requires threading a
-/// [`crate::clock::Clock`] reading through and reporting via
-/// [`crate::security::report_security_event`] (which needs the same `actor: &ChargePointActor`
-/// these functions already take, so it's a small addition) - but it also requires
-/// [`BootNotifier::notify_boot`]/[`HeartbeatSender::send_heartbeat`] to surface the wire
-/// response's `currentTime` field, which neither trait does today. Both traits' current shape,
-/// and [`BootNotificationOutcome`]'s fields, are consumed by fixed struct literals and trait
-/// impls in `src/builder.rs` and `src/setup.rs`; extending them without touching those two files
-/// isn't possible. See `docs/PRODUCTION-ROADMAP.md` §9.3 (G3.2).
+/// Deliberately a pure decision function (no `actor`, no I/O) so the threshold/first-sync/
+/// recovery logic above is unit-testable without a live `ChargePointActor` - see [`register`],
+/// [`register_until_accepted`], and [`run_heartbeat`] for where it's actually wired in, via
+/// [`local_time_estimate`] and [`sync_time`]. See `docs/PRODUCTION-ROADMAP.md` §9.3 (G3.2).
 pub fn evaluate_time_sync(
     local_estimate: Option<DateTime<Utc>>,
     csms_time: DateTime<Utc>,
@@ -209,6 +279,25 @@ pub fn parse_csms_current_time(raw: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// [`parse_csms_current_time`], but logs a warning on a non-empty value that failed to parse -
+/// see that function's docs. Every version adapter's `currentTime` handling below goes through
+/// this rather than the bare parse, so a malformed wire value is visible in logs instead of
+/// silently becoming "no sync available".
+// Only called from the `ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1` adapter modules below, each gated on
+// its own feature - unused (and so a `dead_code` warning without this) when none of them are
+// compiled in, e.g. `--no-default-features`.
+#[cfg_attr(
+    not(any(feature = "ocpp_1_6", feature = "ocpp_2_0_1", feature = "ocpp_2_1")),
+    allow(dead_code)
+)]
+fn parse_csms_current_time_logged(raw: &str) -> Option<DateTime<Utc>> {
+    let parsed = parse_csms_current_time(raw);
+    if parsed.is_none() && !raw.is_empty() {
+        tracing::warn!(raw, "CSMS currentTime did not parse as RFC 3339");
+    }
+    parsed
 }
 
 impl TimeSyncStep {
@@ -372,18 +461,224 @@ fn heartbeat_interval_secs(actor: &ChargePointActor) -> Option<u32> {
 /// or `0`, so a bad `SetVariables` write can never turn this into a busy-spin. Errors sending the
 /// heartbeat itself are logged and do not stop the loop - the next heartbeat is still due at the
 /// regular interval, per OCPP.
-pub async fn run_heartbeat<H: HeartbeatSender, B: Backoff>(
+///
+/// Every response that carries a parseable `currentTime` is evaluated for a time-sync step
+/// exactly as [`register`] does - see that function's docs for what "evaluated" means and what
+/// this crate does versus what the integrator's hardware must do. `monotonic` should be the same
+/// [`MonotonicClock`] instance used for [`register`]/[`register_until_accepted`] (readings from
+/// different instances are not comparable - see [`crate::clock::MonotonicInstant`]), so a
+/// reconnect's fresh BootNotification and this loop's heartbeats compare against one shared,
+/// ever-freshening anchor rather than each starting from "first sync" independently.
+pub async fn run_heartbeat<H: HeartbeatSender, B: Backoff, M: MonotonicClock>(
     sender: &H,
     backoff: &B,
+    monotonic: &M,
     actor: &ChargePointActor,
     fallback_interval_secs: u32,
 ) {
     loop {
         let interval_secs = heartbeat_interval_secs(actor).unwrap_or(fallback_interval_secs);
         backoff.wait(interval_secs).await;
-        if let Err(err) = sender.send_heartbeat().await {
-            tracing::warn!(error = %err, "heartbeat failed");
+        match sender.send_heartbeat().await {
+            Ok(Some(csms_time)) => sync_time(actor, monotonic, csms_time).await,
+            Ok(None) => {}
+            Err(err) => tracing::warn!(error = %err, "heartbeat failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod time_sync_wiring_tests {
+    use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender, register, run_heartbeat};
+    use crate::actor::ChargePointActor;
+    use crate::clock::{MonotonicClock, MonotonicInstant};
+    use crate::executor::TokioExecutor;
+    use crate::state::{RegistrationStatus, SecurityEventType};
+    use alloc::boxed::Box;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::time::Duration;
+
+    /// A [`MonotonicClock`] whose reading advances only when the test tells it to, so a test can
+    /// assert exactly what `local_time_estimate` computed from a stored anchor plus elapsed time.
+    #[derive(Default)]
+    struct FakeMonotonicClock(AtomicU64);
+
+    impl FakeMonotonicClock {
+        fn advance(&self, duration: Duration) {
+            self.0
+                .fetch_add(duration.as_nanos() as u64, Ordering::SeqCst);
+        }
+    }
+
+    impl MonotonicClock for FakeMonotonicClock {
+        fn now(&self) -> MonotonicInstant {
+            MonotonicInstant::from_ticks(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    struct FixedTimeBootNotifier(DateTime<Utc>);
+
+    #[async_trait::async_trait]
+    impl BootNotifier for FixedTimeBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_boot(
+            &self,
+            _vendor_name: &str,
+            _model_name: &str,
+        ) -> Result<BootNotificationOutcome, Self::Error> {
+            Ok(BootNotificationOutcome {
+                status: RegistrationStatus::Accepted,
+                interval_secs: 60,
+                current_time: Some(self.0),
+            })
+        }
+    }
+
+    struct FixedTimeHeartbeatSender(DateTime<Utc>);
+
+    #[async_trait::async_trait]
+    impl HeartbeatSender for FixedTimeHeartbeatSender {
+        type Error = core::convert::Infallible;
+
+        async fn send_heartbeat(&self) -> Result<Option<DateTime<Utc>>, Self::Error> {
+            Ok(Some(self.0))
+        }
+    }
+
+    fn dt(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn a_first_boot_notification_current_time_is_stored_as_the_sync_anchor() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let notifier = FixedTimeBootNotifier(dt("2026-06-01T12:00:00Z"));
+        let monotonic = FakeMonotonicClock::default();
+
+        register(&actor, &notifier, &monotonic, "Acme", "Charger 9000")
+            .await
+            .unwrap();
+
+        let anchor = actor.state().time_sync.expect("anchor recorded");
+        assert_eq!(anchor.csms_time, dt("2026-06-01T12:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn a_first_boot_notification_reports_setting_system_time() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let notifier = FixedTimeBootNotifier(dt("2026-06-01T12:00:00Z"));
+        let monotonic = FakeMonotonicClock::default();
+        let mut events = actor.subscribe_security_events();
+
+        register(&actor, &notifier, &monotonic, "Acme", "Charger 9000")
+            .await
+            .unwrap();
+
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.event_type, SecurityEventType::SettingSystemTime);
+    }
+
+    #[tokio::test]
+    async fn a_second_sync_consistent_with_elapsed_monotonic_time_does_not_re_report() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let monotonic = FakeMonotonicClock::default();
+
+        register(
+            &actor,
+            &FixedTimeBootNotifier(dt("2026-06-01T12:00:00Z")),
+            &monotonic,
+            "Acme",
+            "Charger 9000",
+        )
+        .await
+        .unwrap();
+
+        // 30 real seconds pass, and the second sync's `currentTime` reflects exactly that -
+        // routine drift within `CLOCK_STEP_THRESHOLD_SECS`, not a step.
+        monotonic.advance(Duration::from_secs(30));
+        let mut events = actor.subscribe_security_events();
+
+        register(
+            &actor,
+            &FixedTimeBootNotifier(dt("2026-06-01T12:00:00Z") + ChronoDuration::seconds(30)),
+            &monotonic,
+            "Acme",
+            "Charger 9000",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err(),
+            "a consistent second sync must not raise SettingSystemTime"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_sync_far_from_the_elapsed_monotonic_estimate_reports_a_step() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let monotonic = FakeMonotonicClock::default();
+
+        register(
+            &actor,
+            &FixedTimeBootNotifier(dt("2026-06-01T12:00:00Z")),
+            &monotonic,
+            "Acme",
+            "Charger 9000",
+        )
+        .await
+        .unwrap();
+
+        // Only 1 real second passes, but the CSMS's next `currentTime` jumped forward an hour -
+        // a genuine step, not routine drift.
+        monotonic.advance(Duration::from_secs(1));
+        let mut events = actor.subscribe_security_events();
+
+        register(
+            &actor,
+            &FixedTimeBootNotifier(dt("2026-06-01T12:00:00Z") + ChronoDuration::hours(1)),
+            &monotonic,
+            "Acme",
+            "Charger 9000",
+        )
+        .await
+        .unwrap();
+
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.event_type, SecurityEventType::SettingSystemTime);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_response_current_time_advances_the_sync_anchor() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let checked_actor = actor.clone();
+
+        struct ImmediateBackoff;
+        #[async_trait::async_trait]
+        impl super::Backoff for ImmediateBackoff {
+            async fn wait(&self, _seconds: u32) {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let handle = tokio::spawn(async move {
+            let monotonic = FakeMonotonicClock::default();
+            let sender = FixedTimeHeartbeatSender(dt("2026-06-01T12:00:00Z"));
+            run_heartbeat(&sender, &ImmediateBackoff, &monotonic, &actor, 60).await;
+        });
+        // Give the loop a moment to run at least one cycle, then stop it - `run_heartbeat` never
+        // returns on its own.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.abort();
+
+        let anchor = checked_actor.state().time_sync.expect("anchor recorded");
+        assert_eq!(anchor.csms_time, dt("2026-06-01T12:00:00Z"));
     }
 }
 
@@ -409,9 +704,11 @@ mod tests {
     impl HeartbeatSender for CountingHeartbeatSender {
         type Error = core::convert::Infallible;
 
-        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(None)
         }
     }
 
@@ -480,7 +777,13 @@ mod tests {
 
         let _ = tokio::time::timeout(
             Duration::from_millis(20),
-            run_heartbeat(&sender, &NoopBackoff, &actor, 5),
+            run_heartbeat(
+                &sender,
+                &NoopBackoff,
+                &crate::clock::SystemMonotonicClock,
+                &actor,
+                5,
+            ),
         )
         .await;
 
@@ -567,7 +870,14 @@ mod tests {
 
         let heartbeat_actor = actor.clone();
         let handle = tokio::spawn(async move {
-            run_heartbeat(&sender, &backoff, &heartbeat_actor, 999).await;
+            run_heartbeat(
+                &sender,
+                &backoff,
+                &crate::clock::SystemMonotonicClock,
+                &heartbeat_actor,
+                999,
+            )
+            .await;
         });
 
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -614,8 +924,10 @@ pub(crate) mod test_support {
     impl HeartbeatSender for FixedBootNotifier {
         type Error = core::convert::Infallible;
 
-        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
-            Ok(())
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+            Ok(self.0.current_time)
         }
     }
 
@@ -837,6 +1149,7 @@ mod ocpp_2_1 {
             Ok(BootNotificationOutcome {
                 status: map_status(response.status),
                 interval_secs: response.interval.max(0) as u32,
+                current_time: super::parse_csms_current_time_logged(&response.current_time),
             })
         }
     }
@@ -845,10 +1158,15 @@ mod ocpp_2_1 {
     impl HeartbeatSender for OCPP2_1Client {
         type Error = ClientError<OCPP2_1Error>;
 
-        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
-            self.send_heartbeat(HeartbeatRequest { custom_data: None })
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+            let response = self
+                .send_heartbeat(HeartbeatRequest { custom_data: None })
                 .await?;
-            Ok(())
+            Ok(super::parse_csms_current_time_logged(
+                &response.current_time,
+            ))
         }
     }
 
@@ -943,6 +1261,7 @@ mod ocpp_2_0_1 {
             Ok(BootNotificationOutcome {
                 status: map_status(response.status),
                 interval_secs: response.interval.max(0) as u32,
+                current_time: super::parse_csms_current_time_logged(&response.current_time),
             })
         }
     }
@@ -951,10 +1270,15 @@ mod ocpp_2_0_1 {
     impl HeartbeatSender for OCPP2_0_1Client {
         type Error = ClientError<OCPP2_0_1Error>;
 
-        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
-            self.send_heartbeat(HeartbeatRequest { custom_data: None })
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+            let response = self
+                .send_heartbeat(HeartbeatRequest { custom_data: None })
                 .await?;
-            Ok(())
+            Ok(super::parse_csms_current_time_logged(
+                &response.current_time,
+            ))
         }
     }
 
@@ -1049,6 +1373,7 @@ mod ocpp_1_6 {
             Ok(BootNotificationOutcome {
                 status: map_status(response.status),
                 interval_secs: response.interval.max(0) as u32,
+                current_time: super::parse_csms_current_time_logged(&response.current_time),
             })
         }
     }
@@ -1057,9 +1382,13 @@ mod ocpp_1_6 {
     impl HeartbeatSender for OCPP1_6Client {
         type Error = ClientError<OCPP1_6Error>;
 
-        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
-            self.send_heartbeat(HeartbeatRequest {}).await?;
-            Ok(())
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+            let response = self.send_heartbeat(HeartbeatRequest {}).await?;
+            Ok(super::parse_csms_current_time_logged(
+                &response.current_time,
+            ))
         }
     }
 

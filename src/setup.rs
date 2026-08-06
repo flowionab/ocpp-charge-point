@@ -1,6 +1,7 @@
 use crate::ChargePointRuntime;
 use crate::availability::{ChangeAvailabilityHandler, StatusNotifier};
 use crate::builder::ChargePointBuilder;
+use crate::clock::MonotonicClock;
 use crate::connection::ReconnectHandler;
 use crate::cost::CostUpdatedHandler;
 use crate::device_model::{GetVariablesHandler, SetVariablesHandler};
@@ -28,21 +29,24 @@ use crate::transactions::TransactionNotifier;
 /// request via Authorize, and forward every reported security event via
 /// SecurityEventNotification, for as long as the process runs.
 ///
-/// `executor`/`backoff` are caller-supplied (rather than defaulting to tokio) so this function
-/// doesn't hard-depend on an async runtime - std/tokio users can pass
-/// [`crate::executor::TokioExecutor`]/[`crate::provisioning::TokioBackoff`]; embedded targets
-/// supply their own.
+/// `executor`/`backoff`/`monotonic` are caller-supplied (rather than defaulting to tokio) so this
+/// function doesn't hard-depend on an async runtime - std/tokio users can pass
+/// [`crate::executor::TokioExecutor`]/[`crate::provisioning::TokioBackoff`]/
+/// [`crate::clock::SystemMonotonicClock`]; embedded targets supply their own. `monotonic` anchors
+/// BootNotification/Heartbeat `currentTime` sync - see
+/// [`crate::builder::ChargePointBuilder::provisioning`]'s docs.
 ///
 /// This is a thin "everything on" wrapper around [`ChargePointBuilder`], registering every
 /// functional block it exposes in the same order this function has always used. Callers whose
 /// CSMS client only implements a subset of blocks - or who want to skip a block outright - should
 /// use [`ChargePointBuilder`] directly instead; `N`'s single 21-trait bound below is exactly the
 /// limitation the builder exists to remove.
-pub async fn setup<T, E, C, N, X, B>(
+pub async fn setup<T, E, C, N, X, B, M>(
     charge_point: T,
     csms: N,
     executor: X,
     backoff: B,
+    monotonic: M,
 ) -> Result<ChargePointRuntime<T>, T::StartError>
 where
     T: ChargePoint<E, C>,
@@ -75,10 +79,11 @@ where
         + 'static,
     X: Executor,
     B: Backoff + Clone + Send + Sync + 'static,
+    M: MonotonicClock + Clone + Send + Sync + 'static,
 {
     let mut builder = ChargePointBuilder::start(charge_point, executor)
         .await?
-        .provisioning(&csms, backoff)
+        .provisioning(&csms, backoff, monotonic)
         .await
         .status_notifications(&csms)
         .await
@@ -134,6 +139,7 @@ mod tests {
         FixedBootNotifier(BootNotificationOutcome {
             status: RegistrationStatus::Accepted,
             interval_secs: 60,
+            current_time: None,
         })
     }
 
@@ -152,6 +158,7 @@ mod tests {
             accepted_boot_notifier(),
             TokioExecutor,
             TokioBackoff,
+            crate::clock::SystemMonotonicClock,
         )
         .await
         .unwrap();
@@ -178,6 +185,7 @@ mod tests {
             accepted_boot_notifier(),
             TokioExecutor,
             TokioBackoff,
+            crate::clock::SystemMonotonicClock,
         )
         .await
         .unwrap();
@@ -230,8 +238,10 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::provisioning::HeartbeatSender for RecordingCsms {
         type Error = core::convert::Infallible;
-        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
-            Ok(())
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+            Ok(None)
         }
     }
 
@@ -454,6 +464,7 @@ mod tests {
                     csms.clone(),
                     TokioExecutor,
                     TokioBackoff,
+                    crate::clock::SystemMonotonicClock,
                 )
                 .await
                 .unwrap();

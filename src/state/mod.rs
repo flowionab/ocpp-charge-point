@@ -15,7 +15,7 @@ mod security_event;
 mod transaction;
 
 pub use self::authorization_status::AuthorizationStatus;
-pub use self::charge_point_state::{ChargePointState, LifecycleState};
+pub use self::charge_point_state::{ChargePointState, LifecycleState, TimeSyncAnchor};
 pub use self::connector_state::ConnectorState;
 pub use self::connector_status::ConnectorStatus;
 pub use self::device_model::{
