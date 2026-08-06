@@ -6,16 +6,25 @@
 //! protocol handling, state machines, transaction lifecycle, and networking are this crate's own
 //! responsibility, not something an integrator needs to touch.
 
+mod capabilities;
 mod charge_point;
 mod command_executor;
 mod command_receiver;
 mod connector;
 mod event_sender;
 mod evse;
+mod storage;
 
+pub use self::capabilities::{
+    CAPABILITY_GATES, Capabilities, CapabilityGate, Iso15118SupportLevel,
+    supported_feature_profiles_1_6, warn_on_feature_mismatches,
+};
 pub use self::charge_point::ChargePoint;
 pub use self::command_executor::execute_hardware_command;
 pub use self::command_receiver::HardwareCommandReceiver;
 pub use self::connector::Connector;
 pub use self::event_sender::HardwareEventSender;
 pub use self::evse::Evse;
+#[cfg(feature = "std")]
+pub use self::storage::{InMemoryStorage, InMemoryStorageError};
+pub use self::storage::{NoStorage, NoStorageError, Storage};

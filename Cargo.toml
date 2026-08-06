@@ -28,7 +28,27 @@ tokio-runtime = ["std", "dep:tokio"]
 # `ocpp-client`'s own convention; embedded targets build with `--no-default-features` and
 # register their own critical-section backend via `critical_section::set_impl!`, plus supply
 # their own `Executor`/`Backoff`/`Clock` (see `docs/ROADMAP.md` §0).
-default = ["tokio-runtime", "websocket", "ocpp_1_6", "ocpp_2_0_1", "ocpp_2_1"]
+default = [
+    "tokio-runtime",
+    "websocket",
+    "ocpp_1_6",
+    "ocpp_2_0_1",
+    "ocpp_2_1",
+    "smart-charging",
+    "firmware-management",
+    "diagnostics",
+    "variable-monitoring",
+    "display-message",
+    "reservation",
+    "local-auth-list",
+    "tariff-cost",
+    "payment",
+    "iso15118",
+    "der-control",
+    "battery-swap",
+    "periodic-event-stream",
+    "certificates",
+]
 ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
 ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
 ocpp_2_1 = ["ocpp-client/ocpp_2_1"]
@@ -38,6 +58,66 @@ ocpp_2_1 = ["ocpp-client/ocpp_2_1"]
 # needs a tokio runtime. In `default` for zero-config ergonomics; embedded/no_std targets that
 # supply their own transport build with `--no-default-features`.
 websocket = ["tokio-runtime", "ocpp-client/websocket"]
+
+# --- Functional-block capability features (docs/PRODUCTION-ROADMAP.md §5.1, C1) ---
+#
+# One feature per optional OCPP functional block, orthogonal to the `ocpp_1_6`/`ocpp_2_0_1`/
+# `ocpp_2_1` version features above - any combination of the two groups must compile (verified in
+# CI's feature-matrix job). All of them start in `default` so existing users see no behavioural
+# change from this crate gaining the ability to turn a block off. Turning one off saves flash on
+# an image that will never exercise that block (e.g. an MCU build with no reservation hardware
+# story) rather than changing what's negotiated at runtime - see
+# `docs/PRODUCTION-ROADMAP.md` §5 for why this is a compile-time, not runtime, decision. See
+# README.md for the certification-profile mapping (C1.2) and the recommended set per hardware
+# class (C1.4).
+#
+# Blocks that already have code gate that code out entirely when disabled (module declarations,
+# re-exports, and `ChargePointBuilder` registration methods - see `src/lib.rs`/`src/builder.rs`).
+# Blocks with no code yet are declared now, ready for their implementation to land behind the
+# flag, and gate nothing today - each says so below.
+
+# Gates nothing yet: OCPP 2.0.1/2.1 Smart Charging (SetChargingProfile, GetCompositeSchedule, and
+# related messages, roadmap workstream B2/B8.2) has no implementation in this crate yet.
+smart-charging = []
+# Gates nothing yet: firmware update/download/install (roadmap B3) has no implementation in this
+# crate yet.
+firmware-management = []
+# Gates nothing yet: GetLog/diagnostics upload, GetTransactionStatus, and CustomerInformation
+# (roadmap B5) have no implementation in this crate yet.
+diagnostics = []
+# Gates nothing yet: SetVariableMonitoring/NotifyEvent and the rest of the 2.x monitoring engine
+# (roadmap B5.2/B5.3) have no implementation in this crate yet.
+variable-monitoring = []
+# Gates nothing yet: SetDisplayMessage/GetDisplayMessages/ClearDisplayMessage (roadmap B6) have no
+# implementation in this crate yet.
+display-message = []
+# Gates `crate::reservation` (the `ReserveNowHandler`/`CancelReservationHandler` traits) and
+# `ChargePointBuilder::reservation`, which register them. Off by default in a build that has no
+# reservation UX/hardware story.
+reservation = []
+# Gates `crate::local_authorization_list` (the `SendLocalListHandler`/`GetLocalListVersionHandler`
+# traits) and `ChargePointBuilder::local_authorization_list`, which register them.
+local-auth-list = []
+# Gates `crate::cost` (the `CostUpdatedHandler` trait, OCPP `CostUpdated`) and
+# `ChargePointBuilder::cost`, which registers it. 2.1's richer tariff/`SetDefaultTariff` surface
+# (roadmap B7.1) isn't implemented yet and gates nothing additional today.
+tariff-cost = []
+# Gates nothing yet: the 2.1 Payment functional block (SetDefaultTariff, payment-terminal
+# integration, roadmap B7.2) has no implementation in this crate yet.
+payment = []
+# Gates nothing yet: ISO 15118 Plug & Charge (roadmap B4.5) has no implementation in this crate
+# yet.
+iso15118 = []
+# Gates nothing yet: 2.1 DER control (roadmap B8.2) has no implementation in this crate yet.
+der-control = []
+# Gates nothing yet: 2.1 battery swap (roadmap B8.3) has no implementation in this crate yet.
+battery-swap = []
+# Gates nothing yet: 2.1 periodic event streams (roadmap B5.6) have no implementation in this
+# crate yet.
+periodic-event-stream = []
+# Gates nothing yet: certificate store/install/CSR (roadmap B4.1-B4.4) has no implementation in
+# this crate yet.
+certificates = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }

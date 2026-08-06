@@ -6,13 +6,67 @@
 //! flat-key naming convention; see that submodule's docs for the convention and its limits.
 
 use crate::actor::ChargePointActor;
+use crate::hardware::{CAPABILITY_GATES, Capabilities};
 use crate::state::{
-    ChargePointEvent, Component, DeviceModel, DeviceModelEvent, Variable, VariableAttributeType,
-    VariableMutability,
+    ChargePointEvent, Component, DeviceModel, DeviceModelEvent, Variable, VariableAttribute,
+    VariableAttributeType, VariableCharacteristics, VariableDataType, VariableMutability,
 };
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
+
+/// Builds the `DeviceModelEvent::VariableRegistered` events that advertise every
+/// [`CAPABILITY_GATES`] entry's `*Ctrlr.Available` variable, reflecting `capabilities` (C3.2/C3.4,
+/// `docs/PRODUCTION-ROADMAP.md` §5.3) - registered for every gate regardless of whether the
+/// capability is present, so `GetBaseReport`/`GetVariables` can truthfully report `Available:
+/// false` rather than the component not existing at all (both 2.1 Part 2 and the 1.6J projection
+/// distinguish "not supported" from "unknown component"). Entries with no `ctrlr_component` (see
+/// that field's docs) contribute nothing - there's no standardized component to register.
+///
+/// This is the single place all four C3 propagation surfaces ultimately agree through: the
+/// handler-registration skip in [`crate::setup::setup`], the `SupportedFeatureProfiles` value from
+/// [`crate::hardware::supported_feature_profiles_1_6`], and this device model both read
+/// [`CAPABILITY_GATES`] and `capabilities` directly, so a gate added to the table is picked up by
+/// all of them at once.
+pub fn capability_gate_events(capabilities: &Capabilities) -> Vec<ChargePointEvent> {
+    CAPABILITY_GATES
+        .iter()
+        .filter_map(|gate| {
+            let ctrlr_component = gate.ctrlr_component?;
+            let available = (gate.enabled)(capabilities);
+            Some(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::VariableRegistered {
+                    component: Component {
+                        name: ctrlr_component.to_string(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: Variable {
+                        name: "Available".to_string(),
+                        instance: None,
+                    },
+                    characteristics: VariableCharacteristics {
+                        data_type: VariableDataType::Boolean,
+                        unit: None,
+                        min_limit: None,
+                        max_limit: None,
+                        values_list: None,
+                        supports_monitoring: false,
+                    },
+                    attributes: vec![VariableAttribute {
+                        attribute_type: VariableAttributeType::Actual,
+                        value: available.to_string(),
+                        mutability: VariableMutability::ReadOnly,
+                        persistent: false,
+                        constant: true,
+                        requires_reboot: false,
+                    }],
+                },
+            ))
+        })
+        .collect()
+}
 
 /// One requested attribute in a `GetVariables` request: which component/variable/attribute-type
 /// to read (OCPP `GetVariableData`, minus wire-only bookkeeping fields).
@@ -1160,6 +1214,7 @@ mod ocpp_1_6 {
         handle_set_variables,
     };
     use crate::actor::ChargePointActor;
+    use crate::hardware::Capabilities;
     use crate::state::{
         Component, DeviceModel, Variable, VariableAttributeType, VariableDefinition,
         VariableMutability,
@@ -1411,29 +1466,59 @@ mod ocpp_1_6 {
         })
     }
 
-    /// Resolves a `GetConfiguration` request against `device_model`: every registered
-    /// charge-point-wide variable if `keys` is `None`, or just the requested ones (with
-    /// unresolved keys collected separately into the second element) otherwise. See the module
-    /// docs for why this reads the device model directly rather than through
-    /// [`crate::device_model::handle_get_variables`].
+    /// The 1.6J standard `GetConfiguration` key name for `SupportedFeatureProfiles` - a
+    /// comma-separated list of every functional-block profile this charge point genuinely
+    /// supports (Core, FirmwareManagement, LocalAuthListManagement, Reservation, SmartCharging,
+    /// RemoteTrigger - OCPP 1.6J Appendix 1). Synthetic: unlike every other key this module
+    /// answers, it has no device model backing at all (1.6J has no Component/Variable model to
+    /// register it against) - it's computed fresh from [`crate::hardware::Capabilities`] on every
+    /// request via [`crate::hardware::supported_feature_profiles_1_6`] (C3.3,
+    /// `docs/PRODUCTION-ROADMAP.md` §5.3), so it can never drift from what
+    /// [`super::capability_gate_events`] advertised in the 2.x device model or what
+    /// [`crate::setup::setup`] actually registered handlers for - all three read
+    /// [`crate::hardware::CAPABILITY_GATES`]/`Capabilities` directly.
+    const SUPPORTED_FEATURE_PROFILES_KEY: &str = "SupportedFeatureProfiles";
+
+    /// Builds the synthetic `SupportedFeatureProfiles` [`ConfigurationKeyItem`] - see
+    /// [`SUPPORTED_FEATURE_PROFILES_KEY`]'s docs.
+    fn supported_feature_profiles_item(capabilities: &Capabilities) -> ConfigurationKeyItem {
+        let value = crate::hardware::supported_feature_profiles_1_6(capabilities);
+        ConfigurationKeyItem {
+            key: heapless::String::try_from(SUPPORTED_FEATURE_PROFILES_KEY).unwrap(),
+            readonly: true,
+            value: heapless::String::try_from(truncate_to_byte_boundary(&value, 500)).ok(),
+        }
+    }
+
+    /// Resolves a `GetConfiguration` request against `device_model`/`capabilities`: every
+    /// registered charge-point-wide variable plus the synthetic `SupportedFeatureProfiles` key if
+    /// `keys` is `None`, or just the requested ones (with unresolved keys collected separately
+    /// into the second element) otherwise. See the module docs for why this reads the device
+    /// model directly rather than through [`crate::device_model::handle_get_variables`].
     fn resolve_get_configuration(
         device_model: &DeviceModel,
+        capabilities: &Capabilities,
         keys: Option<&[heapless::String<50>]>,
     ) -> (Vec<ConfigurationKeyItem>, Vec<heapless::String<50>>) {
         match keys {
             None => {
-                let configuration_key = device_model
+                let mut configuration_key: Vec<ConfigurationKeyItem> = device_model
                     .iter()
                     .filter_map(|(component, variable, definition)| {
                         build_configuration_key_item(component, variable, definition)
                     })
                     .collect();
+                configuration_key.push(supported_feature_profiles_item(capabilities));
                 (configuration_key, Vec::new())
             }
             Some(keys) => {
                 let mut configuration_key = Vec::new();
                 let mut unknown_key = Vec::new();
                 for key in keys {
+                    if key.as_str() == SUPPORTED_FEATURE_PROFILES_KEY {
+                        configuration_key.push(supported_feature_profiles_item(capabilities));
+                        continue;
+                    }
                     let resolved = decode_key(key.as_str()).and_then(|(component, variable)| {
                         let definition = device_model.get(&component, &variable)?;
                         build_configuration_key_item(&component, &variable, definition)
@@ -1473,8 +1558,11 @@ mod ocpp_1_6 {
                 let actor = actor.clone();
                 async move {
                     let state = actor.state();
-                    let (configuration_key, unknown_key) =
-                        resolve_get_configuration(&state.device_model, request.key.as_deref());
+                    let (configuration_key, unknown_key) = resolve_get_configuration(
+                        &state.device_model,
+                        &state.capabilities,
+                        request.key.as_deref(),
+                    );
                     Ok(GetConfigurationResponse {
                         configuration_key: (!configuration_key.is_empty())
                             .then_some(configuration_key),
@@ -1657,7 +1745,8 @@ mod ocpp_1_6 {
         fn getting_every_key_lists_the_built_in_defaults_under_their_standard_names() {
             let model = DeviceModel::new();
 
-            let (configuration_key, unknown_key) = resolve_get_configuration(&model, None);
+            let (configuration_key, unknown_key) =
+                resolve_get_configuration(&model, &Capabilities::default(), None);
 
             assert!(unknown_key.is_empty());
             assert!(
@@ -1685,6 +1774,7 @@ mod ocpp_1_6 {
 
             let (configuration_key, unknown_key) = resolve_get_configuration(
                 &model,
+                &Capabilities::default(),
                 Some(&[heapless::String::try_from("OCPPCommCtrlr.HeartbeatInterval").unwrap()]),
             );
 
@@ -1700,6 +1790,7 @@ mod ocpp_1_6 {
 
             let (configuration_key, unknown_key) = resolve_get_configuration(
                 &model,
+                &Capabilities::default(),
                 Some(&[heapless::String::try_from("HeartbeatInterval").unwrap()]),
             );
 
@@ -1715,6 +1806,7 @@ mod ocpp_1_6 {
 
             let (configuration_key, unknown_key) = resolve_get_configuration(
                 &model,
+                &Capabilities::default(),
                 Some(&[heapless::String::try_from("TotallyUnknownVendorKey").unwrap()]),
             );
 
@@ -1748,6 +1840,7 @@ mod ocpp_1_6 {
 
             let (configuration_key, _) = resolve_get_configuration(
                 &actor.state().device_model,
+                &Capabilities::default(),
                 Some(&[heapless::String::try_from("HeartbeatInterval").unwrap()]),
             );
             assert_eq!(configuration_key[0].value.as_deref(), Some("120"));

@@ -65,6 +65,10 @@ pub async fn execute_hardware_command<E: Evse<C>, C: Connector>(
                     .open_contactor()
                     .await
                     .map(|()| ConnectorEvent::ContactorOpened),
+                HardwareCommand::SetCurrentLimit { limit_ma, .. } => connector
+                    .set_current_limit(limit_ma)
+                    .await
+                    .map(|()| ConnectorEvent::CurrentLimitConfirmed(limit_ma)),
                 HardwareCommand::Reboot { .. } => {
                     unreachable!("Reboot is handled and returned above")
                 }
@@ -107,6 +111,11 @@ fn command_address(command: HardwareCommand) -> (usize, usize) {
         | HardwareCommand::OpenContactor {
             evse_id,
             connector_id,
+        }
+        | HardwareCommand::SetCurrentLimit {
+            evse_id,
+            connector_id,
+            ..
         } => (evse_id, connector_id),
         HardwareCommand::Reboot { .. } => {
             unreachable!("Reboot is handled by execute_hardware_command before this is called")

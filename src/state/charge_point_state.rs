@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+use crate::hardware::Capabilities;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
@@ -32,6 +33,10 @@ pub struct ChargePointState {
     /// The Component/Variable device model (OCPP `GetVariables`/`SetVariables`). See
     /// `docs/ROADMAP.md` §2 and `crate::device_model`.
     pub device_model: DeviceModel,
+    /// The hardware binding's declared capabilities (see [`ChargePointEvent::CapabilitiesDeclared`]).
+    /// Conservatively empty ([`Capabilities::default`]) until `ChargePointBuilder::start` captures
+    /// the real value - see `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
+    pub capabilities: Capabilities,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -62,6 +67,7 @@ impl ChargePointState {
             local_authorization_list: LocalAuthorizationList::new(),
             pending_reset: None,
             device_model: DeviceModel::new(),
+            capabilities: Capabilities::default(),
         }
     }
 
@@ -148,6 +154,9 @@ impl ChargePointState {
                     value,
                 ),
             },
+            ChargePointEvent::CapabilitiesDeclared(capabilities) => {
+                set_if_changed(&mut self.capabilities, capabilities)
+            }
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
                     connector_id,

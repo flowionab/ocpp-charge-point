@@ -220,6 +220,60 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) §0 for the detailed history of what's 
 
 ---
 
+## 🧱 Capability Cargo Features
+
+On top of the protocol-version features above (`ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1`), the crate has one Cargo feature per optional OCPP *functional block*. Both groups are orthogonal - any combination compiles (verified in CI's feature matrix, and via `cargo check --no-default-features --features ...` for representative combinations). All capability features are in `default`, so a plain `ocpp-charge-point = "0.x"` dependency behaves exactly as before this section existed; turning one off is an opt-in decision to shrink a firmware image that will never exercise that block, not a runtime behaviour change - see [`docs/PRODUCTION-ROADMAP.md`](docs/PRODUCTION-ROADMAP.md) §5 for the compile-time-vs-runtime split this is one half of.
+
+Two blocks that already have code today gate that code out entirely when their feature is disabled - the module, its re-exports, and the corresponding `ChargePointBuilder` registration method are all `#[cfg]`'d away, so the linked binary genuinely doesn't contain them:
+
+| Feature      | Gates (today)                                                          |
+| ------------ | ----------------------------------------------------------------------- |
+| `reservation` | `ocpp_charge_point::reservation` (`ReserveNowHandler`/`CancelReservationHandler`), `ChargePointBuilder::reservation` |
+| `local-auth-list` | `ocpp_charge_point::local_authorization_list` (`SendLocalListHandler`/`GetLocalListVersionHandler`), `ChargePointBuilder::local_authorization_list` |
+| `tariff-cost` | `ocpp_charge_point::cost` (`CostUpdatedHandler`, OCPP `CostUpdated`), `ChargePointBuilder::cost` |
+
+The remaining features are declared now, ready for their implementation to land behind them, and gate nothing yet: `smart-charging`, `firmware-management`, `diagnostics`, `variable-monitoring`, `display-message`, `payment`, `iso15118`, `der-control`, `battery-swap`, `periodic-event-stream`, `certificates`.
+
+`setup()` and `connect_and_setup()` are this crate's "everything on" convenience wrappers - they bound their CSMS client type by every functional block's trait at once, so they only exist when `reservation`, `local-auth-list`, and `tariff-cost` are all enabled. Disabling any of those three (or wanting to skip a block outright, regardless of feature flags) means driving [`ChargePointBuilder`](src/builder.rs) directly instead, registering only the blocks you need.
+
+### OCPP certification profile mapping
+
+The OCPP 2.1 and 2.0.1 "Part 5 - Certification Profiles" specifications (vendored under [`docs/OCPP-2.1/`](docs/OCPP-2.1/) and [`docs/OCPP-2.0.1/`](docs/OCPP-2.0.1/)) define independently-certifiable certification profiles on top of the mandatory "Core" profile. The table below maps each capability feature to the profile(s) it participates in, so a build can be described (and certified) as, for example, "Core + Reservation + Smart Charging":
+
+| Feature | OCPP 2.1 profile(s) | OCPP 2.0.1 profile(s) | Notes |
+| --- | --- | --- | --- |
+| `smart-charging` | Smart Charging (2.0.1 / 2.1) | Smart Charging | `SetChargingProfile`, `GetCompositeSchedule`, `GetChargingProfile`, `ClearChargingProfile`; 2.1 adds priority/dynamic profiles and EMS Control. |
+| `firmware-management` | Core | Core | Secure Firmware Update is a Core-profile capability, not its own certification profile. |
+| `diagnostics` | Core | Core | `GetLog`/log retrieval, `GetTransactionStatus`, and `CustomerInformation` are all listed as Core-profile capabilities. |
+| `variable-monitoring` | Advanced Device Management | Advanced Device Management | `SetVariableMonitoring`, `SetMonitoringBase`/`Level`, `GetMonitoringReport`, `NotifyEvent` (feature id `DM-0`). |
+| `display-message` | Advanced User Interface | Advanced User Interface | `SetDisplayMessage`/`GetDisplayMessages`/`ClearDisplayMessage`/`NotifyDisplayMessages` (feature id `UI-0`). |
+| `reservation` | Reservation | Reservation | `ReserveNow`/`CancelReservation`/`ReservationStatusUpdate` (feature id `R-0`). |
+| `local-auth-list` | Local Authorization List Management | Local Authorization List Management | `SendLocalList`/`GetLocalListVersion` (feature id `LA-0`). |
+| `tariff-cost` | Advanced User Interface (display/tariff bullets) + Payment (2.1, tariff management messages) | Advanced User Interface | `CostUpdated` and driver-facing tariff/cost display are Advanced User Interface; 2.1's `SetDefaultTariff`/`ChangeTransactionTariff`/`GetTariffs` are listed under Payment (2.1). |
+| `payment` | Payment (2.1) | *(not part of 2.0.1)* | Integrated/standalone payment terminal, prepaid card, QR code, settlement (feature id `P-0`). 2.1-only. |
+| `iso15118` | ISO 15118 support (2.0.1 / 2.1) | ISO 15118 support | Requires a number of Advanced Security and Smart Charging test cases per the spec's own note; covers both ISO 15118-2 (2.0.1/2.1) and ISO 15118-20 (2.1). |
+| `der-control` | DER control (2.1) | *(not part of 2.0.1)* | `SetDERControl`/`GetDERControl`/`ClearDERControl`/`ReportDERControl`, `NotifyDERAlarm`/`NotifyDERStartStop`. 2.1-only. |
+| `battery-swap` | Core (feature id `C-76`) | *(not part of 2.0.1)* | `BatterySwap`/`RequestBatterySwap`; a Core-profile optional feature (`BatterySwapCtrlr`), not its own certification profile. 2.1-only. |
+| `periodic-event-stream` | Advanced Device Management | *(not modeled as PeriodicEventStream messages in 2.0.1)* | `Open`/`Close`/`Adjust`/`GetPeriodicEventStream`, `NotifyPeriodicEventStream` (feature id `DM-0`, test cases `TC_N_107`-`TC_N_109`). 2.1-only messages. |
+| `certificates` | Core (install/retrieve/delete certificates) + ISO 15118 support (EV-side contract/MO/V2G certificates) | Core + ISO 15118 support | `InstallCertificate`/`DeleteCertificate`/`GetInstalledCertificateIds`/`CertificateSigned`/`SignCertificate`/`GetCertificateStatus` are Core; `Get15118EVCertificate` and related ISO 15118 certificate management are under ISO 15118 support. |
+
+Derived from `docs/OCPP-2.1/OCPP-2.1_edition2_part5_certification_profiles.pdf` (Table 1 "Certification profiles", p.4-7, and §3.1 "Optional feature list for charging station", p.8-13) and `docs/OCPP-2.0.1/OCPP-2.0.1_edition4_part5_certification_profiles.pdf` (the equivalent Table 1 and §3.1), read via `pdftotext -layout`.
+
+### Recommended feature set per hardware class
+
+A concrete image never needs every block. Some starting points (start from `default-features = false` and add the version feature(s) your CSMS speaks, plus the capabilities below):
+
+| Hardware class | Suggested capability features | Rationale |
+| --- | --- | --- |
+| Simple AC wallbox (home/residential, single connector, no display) | *(none - Core only)* | No reservation UX, no display, no payment hardware, no bidirectional power. Core alone (BootNotification, Authorize, StatusNotification, TransactionEvent, Reset) covers it. |
+| Public AC charge point (RFID/app auth, optionally a display, pay-by-app) | `reservation`, `local-auth-list`, `variable-monitoring`, `display-message`, `diagnostics` | Public sites typically want reservation and offline authorization (local list) support, plus fleet diagnostics; a display, if fitted, needs `display-message`. |
+| DC fast charger (unattended, high utilization, remote diagnostics, firmware fleet management) | `reservation`, `local-auth-list`, `diagnostics`, `firmware-management`, `variable-monitoring`, `tariff-cost`, `certificates`, `smart-charging` | Unattended DC sites lean on remote diagnostics/firmware and smart charging (load management across a site); `certificates` matters once TLS client-cert rotation is in play. |
+| V2X-capable / bidirectional (vehicle-to-grid, DER-aware, payment terminal) | All of the above, plus `payment`, `iso15118`, `der-control`, `periodic-event-stream` | V2X needs ISO 15118-20 (`iso15118`) for the EV negotiation, `der-control` for grid-services participation, and `periodic-event-stream` for the higher-rate telemetry DER/V2X operation expects; `payment` if the unit has an integrated terminal. |
+
+`battery-swap` is niche enough (battery-swap stations specifically) that it's not part of any of the four classes above - enable it only for that product line.
+
+---
+
 ## 🎯 Use Cases
 
 OCPP Charge Point is designed for:

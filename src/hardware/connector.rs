@@ -33,4 +33,29 @@ pub trait Connector {
     /// Opens the contactor, stopping energy flow. Requested when a transaction stops (normally
     /// or due to a fault) and whenever a fault is detected, regardless of transaction state.
     async fn open_contactor(&self) -> Result<(), Self::Error>;
+
+    /// Limits the current this connector may draw to at most `limit_ma` milliamps (matching
+    /// [`MeterSample::current_ma`](crate::state::MeterSample::current_ma)'s unit, for enough
+    /// resolution to be useful at typical EV charging currents). Requested via
+    /// [`HardwareCommand::SetCurrentLimit`](crate::state::HardwareCommand::SetCurrentLimit).
+    ///
+    /// This is a hardware hook only (`docs/PRODUCTION-ROADMAP.md` §"B2 — Smart charging",
+    /// B2.3): nothing in this crate today decides *what* limit to request - there is no
+    /// charging-profile store or composite-schedule evaluation yet (B2.1/B2.2/B2.4), and no
+    /// OCPP `SetChargingProfile` handling wired up to call this. Implementors should simply
+    /// clamp the connector's contactor to the requested limit (or the nearest limit the
+    /// hardware can actually enforce, if it can't hit `limit_ma` exactly) and return `Err` -
+    /// never panic or retry internally - if the limit can't be honoured at all, which drives the
+    /// connector into [`ConnectorState::Faulted`](crate::state::ConnectorState::Faulted) the
+    /// same as any other hardware failure (see `CLAUDE.md`'s error-handling guidance).
+    ///
+    /// **Breaking change:** this is a new required method on an existing trait, batched with
+    /// [`ChargePoint::capabilities`](crate::hardware::ChargePoint::capabilities) and
+    /// [`Storage`](crate::hardware::Storage) so integrators absorb one break instead of three
+    /// (`docs/PRODUCTION-ROADMAP.md` §5.2 C2.2). A connector with no way to limit current at all
+    /// should simply return `Err` for every call - the crate never calls this unless
+    /// [`Capabilities::smart_charging`](crate::hardware::Capabilities::smart_charging) was
+    /// declared `true`, once the profile/schedule machinery (B2.1/B2.2/B2.4) that would trigger
+    /// it exists.
+    async fn set_current_limit(&self, limit_ma: u32) -> Result<(), Self::Error>;
 }

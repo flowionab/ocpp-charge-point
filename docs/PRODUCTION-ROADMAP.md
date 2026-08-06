@@ -218,7 +218,7 @@ first: without it there is no load management.
       purposes, validity windows, recurrency).
 - [ ] **B2.2** Schedule composition: profile stack → composite schedule at
       time `t`, with the 1.6J/2.x precedence rules.
-- [ ] **B2.3** **New hardware hook** — `Connector::set_current_limit` (or an
+- [x] **B2.3** **New hardware hook** — `Connector::set_current_limit` (or an
       `Evse`-level power limit). Nothing in `crate::hardware` can express
       "limit to N amps" today. Breaking change to the integrator surface;
       batch it with [C2](#52-c2--runtime-capability-declaration)'s
@@ -344,36 +344,36 @@ MCU build carries DER-control code it will never execute.
 
 ### 5.1 C1 — Cargo feature per functional block
 
-- [ ] **C1.1** Add one feature per optional block, all in `default` so
+- [x] **C1.1** Add one feature per optional block, all in `default` so
       today's users see no change:
       `smart-charging`, `firmware-management`, `diagnostics`,
       `variable-monitoring`, `display-message`, `reservation`,
       `local-auth-list`, `tariff-cost`, `payment`, `iso15118`,
       `der-control`, `battery-swap`, `periodic-event-stream`,
       `certificates`.
-- [ ] **C1.2** Map each to the OCPP certification profiles it participates
+- [x] **C1.2** Map each to the OCPP certification profiles it participates
       in, so a build can be described as "Core + Smart Charging" and
       certified as such. `docs/OCPP-2.1/…part5_certification_profiles.pdf`
       and the 2.0.1 equivalent are vendored — derive the mapping from them
       rather than from memory.
-- [ ] **C1.3** Keep the existing `ocpp_1_6` / `ocpp_2_0_1` / `ocpp_2_1`
+- [x] **C1.3** Keep the existing `ocpp_1_6` / `ocpp_2_0_1` / `ocpp_2_1`
       version features orthogonal to the capability features: any
       combination must compile.
-- [ ] **C1.4** Document the flag matrix in `README.md` with a
+- [x] **C1.4** Document the flag matrix in `README.md` with a
       recommended-set-per-hardware-class table.
 
 ### 5.2 C2 — Runtime capability declaration
 
-- [ ] **C2.1** `hardware::Capabilities` — a plain struct of `bool`s and
+- [x] **C2.1** `hardware::Capabilities` — a plain struct of `bool`s and
       small values (has display, supports bidirectional power, can unlock
       under load, has an RTC, has persistent storage, ISO 15118 support
       level, max current per connector, …).
-- [ ] **C2.2** `ChargePoint::capabilities()` returning it. Breaking change
+- [x] **C2.2** `ChargePoint::capabilities()` returning it. Breaking change
       — **batch with [B2.3](#b2--smart-charging-r11) and [E1](#71-e1--storage-trait)**.
-- [ ] **C2.3** Sensible `Default` so an integrator adding one capability
+- [x] **C2.3** Sensible `Default` so an integrator adding one capability
       doesn't have to enumerate all of them, and so the trait can grow
       without breaking again.
-- [ ] **C2.4** Validate capabilities against enabled Cargo features at
+- [x] **C2.4** Validate capabilities against enabled Cargo features at
       startup, and log loudly on contradiction (hardware claims a display,
       `display-message` is off).
 
@@ -383,16 +383,16 @@ A capability that isn't advertised consistently is worse than one that's
 absent — the CSMS will send messages the charger then fails. Every
 advertisement surface must be derived from **one** source of truth:
 
-- [ ] **C3.1** Handler registration — an absent capability means the
+- [x] **C3.1** Handler registration — an absent capability means the
       handler is never registered, so `ocpp-client` answers
       `NotImplemented` (already correct, see [2.1](#21-message-coverage-verified)).
-- [ ] **C3.2** 2.x device model — only register components/variables for
+- [x] **C3.2** 2.x device model — only register components/variables for
       present capabilities, so `GetBaseReport` describes the real machine.
-- [ ] **C3.3** 1.6J `SupportedFeatureProfiles` — compute from enabled
+- [x] **C3.3** 1.6J `SupportedFeatureProfiles` — compute from enabled
       features rather than hardcoding.
-- [ ] **C3.4** 2.x `*Ctrlr.Available` / `.Enabled` variables reflect the
+- [x] **C3.4** 2.x `*Ctrlr.Available` / `.Enabled` variables reflect the
       capability set.
-- [ ] **C3.5** A single test that asserts all four surfaces agree, run
+- [x] **C3.5** A single test that asserts all four surfaces agree, run
       across the feature matrix from [H1](#101-h1--ci-hardening).
 
 ### 5.4 C4 — Builder refactor
@@ -447,12 +447,69 @@ Compile-time exclusion is handled. Runtime refusal is not, and the spec is
 specific about it — a `NotImplemented` CALLERROR where a `Rejected` status
 was required is a certification failure.
 
-- [ ] **C5.1** Decide and document, per message, whether a runtime-absent
+- [x] **C5.1** Decide and document, per message, whether a runtime-absent
       capability yields a rejection *status* in a normal response or a
       CALLERROR. (Rule of thumb: if the response schema has a status field
-      that can say no, use it.)
-- [ ] **C5.2** A shared helper so every handler refuses the same way.
-- [ ] **C5.3** Tests per message asserting the exact refusal shape.
+      that can say no, use it.) Done: full decision table below, also
+      recorded as a doc comment on `src/refusal.rs`.
+- [x] **C5.2** A shared helper so every handler refuses the same way. Done:
+      `src/refusal.rs` — `REFUSAL_GATES`/`capability_present` (data-driven:
+      one table row per capability-gated message) plus
+      `ocpp_2_1_not_supported`/`ocpp_2_0_1_not_supported`/
+      `ocpp_1_6_not_supported` for the CALLERROR cases. Wired into
+      `ReserveNow`/`CancelReservation` (`src/reservation.rs`), `SendLocalList`
+      (`src/local_authorization_list.rs`, new
+      `SendLocalListOutcome::NotSupported`), `GetLocalListVersion`
+      (`src/local_authorization_list.rs`, all three protocol modules), and
+      `CostUpdated` (`src/cost.rs`, both 2.x modules) — the only messages
+      whose registered handler can be runtime-absent today (the other
+      capability rows in
+      [`CAPABILITY_GATES`](#52-c2--runtime-capability-declaration) have
+      `has_handler: false`).
+- [x] **C5.3** Tests per message asserting the exact refusal shape. Done —
+      see `src/refusal.rs`, `src/reservation.rs`, `src/local_authorization_list.rs`,
+      `src/cost.rs` test modules; each CALLRESULT-status case asserts the
+      specific outcome/status enum variant, each CALLERROR case asserts
+      `RpcErrorCode::NotSupported` on the concrete per-version error type.
+
+#### Decision table
+
+Verified against the generated Rust response types in `ocpp-types` 0.1.3
+(`~/.cargo/registry/.../ocpp-types-0.1.3/src/{v16,v201,v21}/*_response.rs`
+and each version's `common.rs` status enums, since that's what actually
+ships on the wire) and cross-checked against the vendored `docs/OCPP-2.1`/
+`docs/OCPP-2.0.1` spec sets for the corresponding message definitions. Rule
+of thumb: if the response schema has a status field that can say no, refuse
+through it (`RefusalShape::CallResultStatus`); if the response schema has no
+status field at all, no CALLRESULT can say no, so refusal must be a
+CALLERROR (`RpcErrorCode::NotSupported`) instead
+(`RefusalShape::CallError`). Rows marked "N/A today" are messages this
+crate's `Capabilities` model doesn't gate at runtime yet (no
+`CAPABILITY_GATES` row with `has_handler: true`) — the shape shown is what a
+future capability addition should target, not something wired up now (see
+C5.2's "not yet gated" list above and `CLAUDE.md`'s OUT-OF-SCOPE guidance
+against implementing new functional blocks in this step).
+
+| Message | 1.6J | 2.0.1 | 2.1 |
+|---|---|---|---|
+| `UnlockConnector` | CALLRESULT `UnlockConnectorResponseStatus::NotSupported` — N/A today | CALLRESULT `UnlockStatusEnum::UnlockFailed` (no `NotSupported` variant) — N/A today | CALLRESULT `UnlockStatusEnum::UnlockFailed` — N/A today |
+| `RequestStartTransaction` | n/a (1.6J's `RemoteStartTransaction`/`RemoteStartTransactionResponseStatus` is `Accepted`/`Rejected` only) — CALLRESULT `Rejected`, N/A today | CALLRESULT `RequestStartStopStatusEnum::Rejected` — N/A today | CALLRESULT `RequestStartStopStatusEnum::Rejected` — N/A today |
+| `RequestStopTransaction` | n/a (`RemoteStopTransaction`, same 2-value enum) — CALLRESULT `Rejected`, N/A today | CALLRESULT `RequestStartStopStatusEnum::Rejected` — N/A today | CALLRESULT `RequestStartStopStatusEnum::Rejected` — N/A today |
+| `ChangeAvailability` | CALLRESULT `ChangeAvailabilityResponseStatus::Rejected` — N/A today | CALLRESULT `ChangeAvailabilityStatusEnum::Rejected` — N/A today | CALLRESULT `ChangeAvailabilityStatusEnum::Rejected` — N/A today |
+| `ReserveNow` | CALLRESULT `ReserveNowResponseStatus::Rejected` | CALLRESULT `ReserveNowStatusEnum::Rejected` | CALLRESULT `ReserveNowStatusEnum::Rejected` — **wired** (`src/reservation.rs`) |
+| `CancelReservation` | CALLRESULT `CancelReservationResponseStatus::Rejected` | CALLRESULT `CancelReservationStatusEnum::Rejected` | CALLRESULT `CancelReservationStatusEnum::Rejected` — **wired** |
+| `SendLocalList` | CALLRESULT `SendLocalListResponseStatus::NotSupported` — **wired** | CALLRESULT `SendLocalListStatusEnum::Failed` (no `NotSupported` in 2.x) — **wired** | CALLRESULT `SendLocalListStatusEnum::Failed` — **wired** |
+| `GetLocalListVersion` | CALLERROR `NotSupported` (`GetLocalListVersionResponse` is `{ listVersion }` — no status field in any version) — **wired** | CALLERROR `NotSupported` — **wired** | CALLERROR `NotSupported` — **wired** |
+| `CostUpdated` | n/a (no `CostUpdated` message in 1.6J — `tariff_and_cost` has no 1.6 feature profile) | CALLERROR `NotSupported` (`CostUpdatedResponse` is `{}` — no status field) — **wired** | CALLERROR `NotSupported` — **wired** |
+| `GetVariables`/`SetVariables` | n/a (device model is 2.x-only) | CALLRESULT `GetVariableStatusEnum::Rejected`/`SetVariableStatusEnum::Rejected` — N/A today | same as 2.0.1 |
+| `GetBaseReport`/`GetReport` | n/a (2.x-only) | CALLRESULT `GenericDeviceModelStatusEnum::NotSupported` — N/A today | CALLRESULT `GenericDeviceModelStatusEnum::NotSupported` — N/A today |
+| `Reset` | CALLRESULT `ResetResponseStatus::Rejected` — N/A today (`Reset` is core, always registered) | CALLRESULT `ResetStatusEnum::Rejected` — N/A today | CALLRESULT `ResetStatusEnum::Rejected` — N/A today |
+| `DataTransfer` | CALLRESULT `DataTransferResponseStatus::UnknownVendorId`/`Rejected` — N/A today (vendor-id routing, not a `Capabilities` field) | CALLRESULT `DataTransferStatusEnum::UnknownVendorId`/`Rejected` — N/A today | same as 2.0.1 |
+| `Authorize` | CALLRESULT (`AuthorizeResponse.idTagInfo.status`) — not capability-gated, always answers | CALLRESULT `AuthorizationStatusEnum` — not capability-gated | same as 2.0.1 |
+
+Nothing here fell back on assumption where the vendored spec/generated types
+didn't settle it — every response type above either has a documented status
+enum or a documented-empty body in the generated `ocpp-types` source.
 
 ---
 
@@ -555,13 +612,13 @@ mid-transaction currently loses the transaction.
 
 ### 7.1 E1 — Storage trait
 
-- [ ] **E1.1** `hardware::Storage`: `no_std`-friendly, async, key-value,
+- [x] **E1.1** `hardware::Storage`: `no_std`-friendly, async, key-value,
       explicitly allowed to fail. Failure must degrade (run without
       persistence, raise a security/diagnostic event) rather than panic —
       per `CLAUDE.md`'s error-handling stance.
-- [ ] **E1.2** Optional: a charge point without storage must still run, with
+- [x] **E1.2** Optional: a charge point without storage must still run, with
       the durability guarantees clearly documented as absent.
-- [ ] **E1.3** `std` reference implementation for tests and desktop
+- [x] **E1.3** `std` reference implementation for tests and desktop
       integrators.
 
 ### 7.2 E2 — What must survive
@@ -837,7 +894,7 @@ Everything else is cheaper after this. [C4](#54-c4--builder-refactor) in particu
 message" from "add a bound to a 20-bound signature that every caller must
 satisfy" into a local change.
 
-### M1 — Capability model
+### M1 — Capability model — ✅ complete (2026-08-06)
 
 [C1](#51-c1--cargo-feature-per-functional-block) Cargo features · [C2](#52-c2--runtime-capability-declaration) runtime capabilities · [C3](#53-c3--capability-propagation) propagation ·
 [C5](#55-c5--unsupported-response-discipline) refusal discipline
@@ -849,6 +906,41 @@ satisfy" into a local change.
 Do the breaking hardware-trait changes here, together, in one release:
 `capabilities()`, `set_current_limit`, `Storage`. Integrators absorb one
 break rather than three.
+
+All three breaks were taken together as planned: `ChargePoint::capabilities()`
+([C2.2](#52-c2--runtime-capability-declaration)), `Connector::set_current_limit`
+([B2.3](#b2--smart-charging-r11)) and `hardware::Storage` ([E1.1](#71-e1--storage-trait)) landed in one
+change. Only the *hardware surface* of the latter two is done — B2.1/B2.2/B2.4
+(profile store, schedule composition, limit projection) and E2–E4 (wiring
+persistence into `ChargePointState`/the offline queue) remain untouched in M3
+and M2 respectively. `set_current_limit` therefore has a dispatch path and a
+fail-safe error path, but nothing yet *calls* it.
+
+The single source of truth is `CAPABILITY_GATES` in
+`src/hardware/capabilities.rs`: capability field ↔ Cargo feature ↔ 2.1
+`*Ctrlr` component ↔ 1.6J feature-profile name ↔ `has_handler`. All four
+advertisement surfaces derive from it, and
+`setup.rs::tests::all_four_capability_propagation_surfaces_agree_with_the_capability_set`
+([C3.5](#53-c3--capability-propagation)) is data-driven over the table, so a new capability cannot be
+added to one surface and forgotten in the others.
+
+Four honest caveats on the exit criteria, none blocking M2:
+
+- **11 of the 14 capability features gate nothing yet.** Only `reservation`,
+  `local-auth-list` and `tariff-cost` have code to compile out; the rest are
+  declared against blocks that do not exist. "A build can exclude any optional
+  block" is true only of blocks that exist.
+- **[C3.3](#53-c3--capability-propagation)'s 1.6J `SupportedFeatureProfiles` is unverified against a
+  vendored spec** — only the 2.0.1 and 2.1 specs are under `docs/`, so the
+  profile-name list comes from general OCPP 1.6J knowledge. Verify it before
+  claiming 1.6J certification.
+- **Most of [C5](#55-c5--unsupported-response-discipline)'s decision table is documentation, not live code.** Only the
+  three capabilities with real handlers can be registered-but-runtime-absent
+  today; the other rows record the shape a future capability must refuse in.
+  They are marked N/A in the table rather than implied to be wired.
+- **`examples/` and `tests/` assume default features** and do not compile under
+  a capability subset. The capability contract is `--lib`-only, and CI checks
+  it that way.
 
 ### M2 — Durability
 

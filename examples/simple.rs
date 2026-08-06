@@ -284,6 +284,10 @@ impl ChargePoint<SampleEvse, SampleConnector> for SampleChargePoint {
         &self.evses[..]
     }
 
+    async fn capabilities(&self) -> ocpp_charge_point::hardware::Capabilities {
+        ocpp_charge_point::hardware::Capabilities::default()
+    }
+
     async fn start(
         &self,
         events: ocpp_charge_point::hardware::HardwareEventSender,
@@ -335,6 +339,10 @@ impl Connector for SampleConnector {
     }
 
     async fn open_contactor(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn set_current_limit(&self, _limit_ma: u32) -> Result<(), Self::Error> {
         Ok(())
     }
 }

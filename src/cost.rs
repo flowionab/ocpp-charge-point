@@ -129,7 +129,7 @@ mod ocpp_2_1 {
     use crate::actor::ChargePointActor;
     use crate::state::TransactionId;
     use alloc::boxed::Box;
-    use ocpp_client::ocpp_2_1::OCPP2_1Client;
+    use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
     use ocpp_client::ocpp_types::v21::{CostUpdatedRequest, CostUpdatedResponse};
 
     /// A `transactionId` that doesn't parse as a `u64` can't address a transaction - treated the
@@ -143,18 +143,29 @@ mod ocpp_2_1 {
             .map(TransactionId)
     }
 
+    /// The logic behind [`OCPP2_1Client`]'s registered `CostUpdated` handler, factored out so
+    /// C5's capability-off CALLERROR can be asserted directly in a unit test rather than only
+    /// through a full client/transport round trip. See this module's top-level docs and
+    /// `crate::refusal`.
+    async fn handle(
+        actor: &ChargePointActor,
+        request: &CostUpdatedRequest,
+    ) -> Result<CostUpdatedResponse, OCPP2_1Error> {
+        if !crate::refusal::capability_present(&actor.state().capabilities, "CostUpdated") {
+            return Err(crate::refusal::ocpp_2_1_not_supported("CostUpdated"));
+        }
+        if let Some(transaction_id) = parse_transaction_id(request) {
+            handle_cost_updated(actor, transaction_id, request.total_cost).await;
+        }
+        Ok(CostUpdatedResponse { custom_data: None })
+    }
+
     #[async_trait::async_trait]
     impl CostUpdatedHandler for OCPP2_1Client {
         async fn register_cost_updated_handler(&self, actor: ChargePointActor) {
             self.on_cost_updated(move |request, _client| {
                 let actor = actor.clone();
-                async move {
-                    // No status to report either way - see this module's top-level docs.
-                    if let Some(transaction_id) = parse_transaction_id(&request) {
-                        handle_cost_updated(&actor, transaction_id, request.total_cost).await;
-                    }
-                    Ok(CostUpdatedResponse { custom_data: None })
-                }
+                async move { handle(&actor, &request).await }
             })
             .await;
         }
@@ -163,6 +174,10 @@ mod ocpp_2_1 {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::executor::TokioExecutor;
+        use crate::hardware::Capabilities;
+        use crate::state::ChargePointEvent;
+        use ocpp_client::ocpp_types::v21::RpcErrorCode;
 
         fn request(transaction_id: &str) -> CostUpdatedRequest {
             CostUpdatedRequest {
@@ -180,6 +195,34 @@ mod ocpp_2_1 {
         #[test]
         fn a_non_numeric_transaction_id_fails_to_parse() {
             assert_eq!(parse_transaction_id(&request("not-a-number")), None);
+        }
+
+        // C5 (docs/PRODUCTION-ROADMAP.md §5.5): `CostUpdatedResponse` has no status field, so a
+        // runtime-absent `tariff_and_cost` capability must refuse with a `NotSupported`
+        // CALLERROR, never a bare `Ok` and never a generic error.
+        #[tokio::test]
+        async fn cost_updated_is_a_not_supported_call_error_when_the_capability_is_absent() {
+            let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+            let result = handle(&actor, &request("7")).await;
+
+            assert_eq!(result.unwrap_err().code, RpcErrorCode::NotSupported);
+        }
+
+        #[tokio::test]
+        async fn cost_updated_succeeds_when_the_capability_is_present() {
+            let actor = ChargePointActor::spawn([1], &TokioExecutor);
+            actor
+                .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
+                    tariff_and_cost: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+
+            let result = handle(&actor, &request("not-a-number")).await;
+
+            assert!(result.is_ok());
         }
     }
 }
@@ -192,7 +235,7 @@ mod ocpp_2_0_1 {
     use crate::actor::ChargePointActor;
     use crate::state::TransactionId;
     use alloc::boxed::Box;
-    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
+    use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
     use ocpp_client::ocpp_types::v201::{CostUpdatedRequest, CostUpdatedResponse};
 
     fn parse_transaction_id(request: &CostUpdatedRequest) -> Option<TransactionId> {
@@ -203,17 +246,26 @@ mod ocpp_2_0_1 {
             .map(TransactionId)
     }
 
+    /// Mirrors [`super::ocpp_2_1::handle`].
+    async fn handle(
+        actor: &ChargePointActor,
+        request: &CostUpdatedRequest,
+    ) -> Result<CostUpdatedResponse, OCPP2_0_1Error> {
+        if !crate::refusal::capability_present(&actor.state().capabilities, "CostUpdated") {
+            return Err(crate::refusal::ocpp_2_0_1_not_supported("CostUpdated"));
+        }
+        if let Some(transaction_id) = parse_transaction_id(request) {
+            handle_cost_updated(actor, transaction_id, request.total_cost).await;
+        }
+        Ok(CostUpdatedResponse { custom_data: None })
+    }
+
     #[async_trait::async_trait]
     impl CostUpdatedHandler for OCPP2_0_1Client {
         async fn register_cost_updated_handler(&self, actor: ChargePointActor) {
             self.on_cost_updated(move |request, _client| {
                 let actor = actor.clone();
-                async move {
-                    if let Some(transaction_id) = parse_transaction_id(&request) {
-                        handle_cost_updated(&actor, transaction_id, request.total_cost).await;
-                    }
-                    Ok(CostUpdatedResponse { custom_data: None })
-                }
+                async move { handle(&actor, &request).await }
             })
             .await;
         }
@@ -222,6 +274,10 @@ mod ocpp_2_0_1 {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::executor::TokioExecutor;
+        use crate::hardware::Capabilities;
+        use crate::state::ChargePointEvent;
+        use ocpp_client::ocpp_types::v201::RpcErrorCode;
 
         fn request(transaction_id: &str) -> CostUpdatedRequest {
             CostUpdatedRequest {
@@ -239,6 +295,31 @@ mod ocpp_2_0_1 {
         #[test]
         fn a_non_numeric_transaction_id_fails_to_parse() {
             assert_eq!(parse_transaction_id(&request("not-a-number")), None);
+        }
+
+        #[tokio::test]
+        async fn cost_updated_is_a_not_supported_call_error_when_the_capability_is_absent() {
+            let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+            let result = handle(&actor, &request("7")).await;
+
+            assert_eq!(result.unwrap_err().code, RpcErrorCode::NotSupported);
+        }
+
+        #[tokio::test]
+        async fn cost_updated_succeeds_when_the_capability_is_present() {
+            let actor = ChargePointActor::spawn([1], &TokioExecutor);
+            actor
+                .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
+                    tariff_and_cost: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+
+            let result = handle(&actor, &request("not-a-number")).await;
+
+            assert!(result.is_ok());
         }
     }
 }

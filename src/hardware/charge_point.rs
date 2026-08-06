@@ -1,3 +1,4 @@
+use crate::hardware::Capabilities;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
 use crate::hardware::HardwareCommandReceiver;
@@ -23,6 +24,20 @@ pub trait ChargePoint<E: Evse<C>, C: Connector> {
     /// crate (index 0 is `evse_id` 0, and so on). The set of EVSEs is assumed fixed for the
     /// lifetime of the charge point.
     async fn evses(&self) -> &[E];
+
+    /// The fixed, static capabilities of this hardware (see [`Capabilities`]) - what optional
+    /// functional blocks and physical/electrical abilities are actually present, so the crate
+    /// (and, eventually, its OCPP advertisements - `docs/PRODUCTION-ROADMAP.md` §5.3) can adapt
+    /// rather than assuming everything is available. Values are expected to be static for the
+    /// lifetime of the charge point; this is called at most once during setup, not polled.
+    ///
+    /// **Breaking change:** this is a new *required* method on an existing trait
+    /// (`docs/PRODUCTION-ROADMAP.md` §5.2 C2.2, batched with the smart-charging current-limit
+    /// hook and the storage trait per §"B2 — Smart charging" B2.3 so integrators absorb one
+    /// break instead of three). Every existing [`ChargePoint`] implementation must add this
+    /// method; `Capabilities::default()` (see its docs) is the conservative starting point for
+    /// an integrator that hasn't yet audited which capabilities their hardware actually has.
+    async fn capabilities(&self) -> Capabilities;
 
     /// Brings the hardware up and hands over the two channels that connect it to this crate's
     /// state machine, for as long as the process runs:

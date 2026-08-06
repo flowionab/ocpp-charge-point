@@ -76,7 +76,7 @@ where
     X: Executor,
     B: Backoff + Clone + Send + Sync + 'static,
 {
-    let runtime = ChargePointBuilder::start(charge_point, executor)
+    let mut builder = ChargePointBuilder::start(charge_point, executor)
         .await?
         .provisioning(&csms, backoff)
         .await
@@ -92,25 +92,36 @@ where
         .await
         .availability_control(&csms)
         .await
-        .reservation(&csms)
-        .await
         .reset(&csms)
         .await
-        .local_authorization_list(&csms)
-        .await
         .device_model(&csms)
-        .await
-        .cost(&csms)
-        .await
-        .build();
+        .await;
 
-    Ok(runtime)
+    // C3.1 (docs/PRODUCTION-ROADMAP.md §5.3): each of these blocks is only registered when the
+    // hardware actually declares the matching capability - an absent capability means the CSMS
+    // gets `NotImplemented` from `ocpp-client` rather than a handler that was wired up but backed
+    // by hardware that can't do the thing. `capabilities()` is the single source of truth every
+    // other C3 surface (device model, `SupportedFeatureProfiles`, `*Ctrlr.Available`) also reads.
+    let capabilities = builder.capabilities();
+    if capabilities.reservation {
+        builder = builder.reservation(&csms).await;
+    }
+    if capabilities.local_auth_list {
+        builder = builder.local_authorization_list(&csms).await;
+    }
+    if capabilities.tariff_and_cost {
+        builder = builder.cost(&csms).await;
+    }
+
+    Ok(builder.build())
 }
 
 #[cfg(test)]
 mod tests {
     use super::setup;
-    use crate::builder::test_support::{TestChargePoint, TestConnector, TestEvse};
+    use crate::builder::test_support::{
+        TestChargePoint, TestConnector, TestEvse, WithCapabilities,
+    };
     use crate::executor::TokioExecutor;
     use crate::provisioning::BootNotificationOutcome;
     use crate::provisioning::TokioBackoff;
@@ -176,5 +187,338 @@ mod tests {
             ConnectorState::Faulted
         );
         assert!(!locked.load(Ordering::SeqCst));
+    }
+
+    /// A CSMS fake that behaves exactly like [`FixedBootNotifier`] (accepts every registration
+    /// silently) but also records whether the Reservation/Local-Auth-List/Tariff-and-Cost
+    /// registration methods were actually called, the only three
+    /// [`crate::hardware::CAPABILITY_GATES`] entries that gate a real handler today (see
+    /// `has_handler`'s docs). Used by the keystone C3.5 test below to observe C3.1 (handler
+    /// registration) the same way the other three surfaces are observed: through the real
+    /// production code path, not a re-implementation of it.
+    #[derive(Clone)]
+    struct RecordingCsms {
+        boot: FixedBootNotifier,
+        reservation_registered: Arc<AtomicBool>,
+        local_auth_list_registered: Arc<AtomicBool>,
+        cost_registered: Arc<AtomicBool>,
+    }
+
+    impl RecordingCsms {
+        fn new() -> Self {
+            Self {
+                boot: accepted_boot_notifier(),
+                reservation_registered: Arc::new(AtomicBool::new(false)),
+                local_auth_list_registered: Arc::new(AtomicBool::new(false)),
+                cost_registered: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::BootNotifier for RecordingCsms {
+        type Error = core::convert::Infallible;
+        async fn notify_boot(
+            &self,
+            vendor_name: &str,
+            model_name: &str,
+        ) -> Result<BootNotificationOutcome, Self::Error> {
+            self.boot.notify_boot(vendor_name, model_name).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::HeartbeatSender for RecordingCsms {
+        type Error = core::convert::Infallible;
+        async fn send_heartbeat(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::availability::StatusNotifier for RecordingCsms {
+        type Error = core::convert::Infallible;
+        async fn notify_status(
+            &self,
+            _evse_id: usize,
+            _connector_id: usize,
+            _status: crate::state::ConnectorStatus,
+            _connector_state: ConnectorState,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transactions::TransactionNotifier for RecordingCsms {
+        type Error = core::convert::Infallible;
+        async fn notify_transaction_event(
+            &self,
+            _evse_id: usize,
+            _connector_id: usize,
+            _kind: crate::state::TransactionEventKind,
+            _transaction: crate::state::Transaction,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::authorization::Authorizer for RecordingCsms {
+        type Error = core::convert::Infallible;
+        async fn authorize(
+            &self,
+            _id_token: &crate::state::IdToken,
+        ) -> Result<crate::state::AuthorizationStatus, Self::Error> {
+            Ok(crate::state::AuthorizationStatus::Accepted)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_control::UnlockConnectorHandler for RecordingCsms {
+        async fn register_unlock_connector_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::availability::ChangeAvailabilityHandler for RecordingCsms {
+        async fn register_change_availability_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_control::RequestStartTransactionHandler for RecordingCsms {
+        async fn register_request_start_transaction_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_control::RequestStopTransactionHandler for RecordingCsms {
+        async fn register_request_stop_transaction_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reservation::ReserveNowHandler for RecordingCsms {
+        async fn register_reserve_now_handler(&self, _actor: crate::actor::ChargePointActor) {
+            self.reservation_registered.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reservation::CancelReservationHandler for RecordingCsms {
+        async fn register_cancel_reservation_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reset::ResetHandler for RecordingCsms {
+        async fn register_reset_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::local_authorization_list::SendLocalListHandler for RecordingCsms {
+        async fn register_send_local_list_handler(&self, _actor: crate::actor::ChargePointActor) {
+            self.local_auth_list_registered
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::local_authorization_list::GetLocalListVersionHandler for RecordingCsms {
+        async fn register_get_local_list_version_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::device_model::GetVariablesHandler for RecordingCsms {
+        async fn register_get_variables_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::device_model::SetVariablesHandler for RecordingCsms {
+        async fn register_set_variables_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reporting::GetBaseReportHandler for RecordingCsms {
+        async fn register_get_base_report_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reporting::GetReportHandler for RecordingCsms {
+        async fn register_get_report_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::security::SecurityEventNotifier for RecordingCsms {
+        type Error = core::convert::Infallible;
+        async fn notify_security_event(
+            &self,
+            _event_type: &crate::state::SecurityEventType,
+            _tech_info: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cost::CostUpdatedHandler for RecordingCsms {
+        async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {
+            self.cost_registered.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connection::ReconnectHandler for RecordingCsms {
+        async fn register_reconnect_handler<F, FF>(&self, _callback: F)
+        where
+            F: FnMut() -> FF + Send + Sync + 'static,
+            FF: core::future::Future<Output = ()> + Send + 'static,
+        {
+        }
+    }
+
+    /// The keystone test (C3.5, `docs/PRODUCTION-ROADMAP.md` §5.3): for every entry in
+    /// [`crate::hardware::CAPABILITY_GATES`], with the capability both present and absent, checks
+    /// that every advertisement surface that entry names agrees with the capability set - all
+    /// through the real production code paths (`setup()` for handler registration, the actual
+    /// `ChargePointState::device_model` `setup()` populated for the device model, and the same
+    /// [`crate::hardware::supported_feature_profiles_1_6`] function the 1.6J `GetConfiguration`
+    /// handler calls). Data-driven over the table itself, not a hardcoded list of capabilities, so
+    /// a capability added to [`crate::hardware::CAPABILITY_GATES`] without being reflected
+    /// everywhere fails this test rather than silently drifting.
+    #[tokio::test]
+    async fn all_four_capability_propagation_surfaces_agree_with_the_capability_set() {
+        for gate in crate::hardware::CAPABILITY_GATES {
+            for enabled in [true, false] {
+                let capabilities = match gate.name {
+                    "reservation" => crate::hardware::Capabilities {
+                        reservation: enabled,
+                        ..Default::default()
+                    },
+                    "local_auth_list" => crate::hardware::Capabilities {
+                        local_auth_list: enabled,
+                        ..Default::default()
+                    },
+                    "tariff_and_cost" => crate::hardware::Capabilities {
+                        tariff_and_cost: enabled,
+                        ..Default::default()
+                    },
+                    "smart_charging" => crate::hardware::Capabilities {
+                        smart_charging: enabled,
+                        ..Default::default()
+                    },
+                    "has_display" => crate::hardware::Capabilities {
+                        has_display: enabled,
+                        ..Default::default()
+                    },
+                    "firmware_management" => crate::hardware::Capabilities {
+                        firmware_management: enabled,
+                        ..Default::default()
+                    },
+                    other => panic!(
+                        "CAPABILITY_GATES grew a new entry (`{other}`) this test doesn't know \
+                         how to set yet - extend the match above so it stays data-driven"
+                    ),
+                };
+                assert_eq!((gate.enabled)(&capabilities), enabled);
+
+                let csms = RecordingCsms::new();
+                let runtime = setup(
+                    WithCapabilities {
+                        inner: TestChargePoint {
+                            evses: [TestEvse {
+                                connectors: [TestConnector {
+                                    locked: Arc::new(AtomicBool::new(false)),
+                                    lock_succeeds: true,
+                                }],
+                            }],
+                        },
+                        capabilities,
+                    },
+                    csms.clone(),
+                    TokioExecutor,
+                    TokioBackoff,
+                )
+                .await
+                .unwrap();
+
+                // Surface 1: handler registration (C3.1) - only meaningful for gates that
+                // actually gate a handler today.
+                if gate.has_handler {
+                    let registered = match gate.name {
+                        "reservation" => csms.reservation_registered.load(Ordering::SeqCst),
+                        "local_auth_list" => csms.local_auth_list_registered.load(Ordering::SeqCst),
+                        "tariff_and_cost" => csms.cost_registered.load(Ordering::SeqCst),
+                        other => panic!("gate `{other}` claims has_handler but isn't wired here"),
+                    };
+                    assert_eq!(
+                        registered, enabled,
+                        "gate `{}`: handler registration ({registered}) disagreed with the \
+                         capability set ({enabled})",
+                        gate.name
+                    );
+                }
+
+                // Surface 2: the 2.x device model's `*Ctrlr.Available` variable (C3.2/C3.4).
+                if let Some(ctrlr_component) = gate.ctrlr_component {
+                    let component = crate::state::Component {
+                        name: ctrlr_component.into(),
+                        instance: None,
+                        evse: None,
+                    };
+                    let variable = crate::state::Variable {
+                        name: "Available".into(),
+                        instance: None,
+                    };
+                    let state = runtime.state();
+                    let definition = state
+                        .device_model
+                        .get(&component, &variable)
+                        .unwrap_or_else(|| {
+                            panic!("gate `{}`: {ctrlr_component}.Available was never registered in the device model", gate.name)
+                        });
+                    let actual = &definition
+                        .attribute(crate::state::VariableAttributeType::Actual)
+                        .unwrap()
+                        .value;
+                    assert_eq!(
+                        actual,
+                        &enabled.to_string(),
+                        "gate `{}`: {ctrlr_component}.Available ({actual}) disagreed with the \
+                         capability set ({enabled})",
+                        gate.name
+                    );
+                }
+
+                // Surface 3: 1.6J `SupportedFeatureProfiles` (C3.3) - the exact function the 1.6J
+                // `GetConfiguration` handler calls.
+                if let Some(profile) = gate.feature_profile_1_6 {
+                    let profiles = crate::hardware::supported_feature_profiles_1_6(&capabilities);
+                    let listed = profiles.split(',').any(|name| name == profile);
+                    assert_eq!(
+                        listed, enabled,
+                        "gate `{}`: SupportedFeatureProfiles ({profiles:?}) disagreed with the \
+                         capability set ({enabled}) for profile `{profile}`",
+                        gate.name
+                    );
+                }
+            }
+        }
     }
 }

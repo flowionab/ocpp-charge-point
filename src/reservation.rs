@@ -44,6 +44,13 @@ pub async fn handle_reserve_now(
     id_token: IdToken,
 ) -> ReserveNowOutcome {
     let state = actor.state();
+    // C5 (docs/PRODUCTION-ROADMAP.md §5.5): the handler is registered whenever the
+    // `reservation` Cargo feature is on, but the hardware may still declare the capability
+    // runtime-absent - refuse via the same `Rejected` status a wire-level rejection already
+    // uses, per `crate::refusal`'s decision table.
+    if !crate::refusal::capability_present(&state.capabilities, "ReserveNow") {
+        return ReserveNowOutcome::Rejected;
+    }
     let Some(considered) = considered_connectors(&state, evse_id) else {
         return ReserveNowOutcome::Rejected;
     };
@@ -154,7 +161,13 @@ pub async fn handle_cancel_reservation(
     actor: &ChargePointActor,
     reservation_id: ReservationId,
 ) -> CancelReservationOutcome {
-    let Some((evse_id, connector_id)) = find_reservation(&actor.state(), reservation_id) else {
+    let state = actor.state();
+    // C5 (docs/PRODUCTION-ROADMAP.md §5.5): mirrors the capability check in
+    // `handle_reserve_now`.
+    if !crate::refusal::capability_present(&state.capabilities, "CancelReservation") {
+        return CancelReservationOutcome::Rejected;
+    }
+    let Some((evse_id, connector_id)) = find_reservation(&state, reservation_id) else {
         return CancelReservationOutcome::Rejected;
     };
 
@@ -201,6 +214,7 @@ mod tests {
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
+    use crate::hardware::Capabilities;
     use crate::state::{
         ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, IdToken, IdTokenKind,
         ReservationId,
@@ -213,9 +227,26 @@ mod tests {
         }
     }
 
+    /// Spawns an actor with the `reservation` capability declared present - every test in this
+    /// module except the C5 capability-off ones below wants a charge point that actually
+    /// supports reservations, mirroring what `ChargePointBuilder`/`setup()` would have declared
+    /// from the hardware binding's [`crate::hardware::ChargePoint::capabilities`] in a real
+    /// deployment.
+    async fn spawn_with_reservation<const N: usize>(evses: [usize; N]) -> ChargePointActor {
+        let actor = ChargePointActor::spawn(evses, &TokioExecutor);
+        actor
+            .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
+                reservation: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        actor
+    }
+
     #[tokio::test]
     async fn reserving_an_available_connector_on_a_given_evse_succeeds() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_reservation([1]).await;
 
         let outcome = handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
 
@@ -228,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_evse_id_reserves_the_first_available_connector_on_any_evse() {
-        let actor = ChargePointActor::spawn([1, 1], &TokioExecutor);
+        let actor = spawn_with_reservation([1, 1]).await;
         actor
             .send(ChargePointEvent::Evse {
                 evse_id: 0,
@@ -251,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_evse_is_rejected() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_reservation([1]).await;
 
         let outcome = handle_reserve_now(&actor, Some(5), ReservationId(1), test_id_token()).await;
 
@@ -260,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_occupied_connector_reports_occupied() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_reservation([1]).await;
         actor
             .send(ChargePointEvent::Evse {
                 evse_id: 0,
@@ -279,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unavailable_connector_reports_unavailable() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_reservation([1]).await;
         actor
             .send(ChargePointEvent::Evse {
                 evse_id: 0,
@@ -298,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_known_reservation_frees_the_connector() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_reservation([1]).await;
         handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
 
         let outcome = handle_cancel_reservation(&actor, ReservationId(1)).await;
@@ -312,11 +343,53 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_an_unknown_reservation_is_rejected() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_reservation([1]).await;
 
         let outcome = handle_cancel_reservation(&actor, ReservationId(1)).await;
 
         assert_eq!(outcome, CancelReservationOutcome::Rejected);
+    }
+
+    // C5 (docs/PRODUCTION-ROADMAP.md §5.5): with the `reservation` capability runtime-absent
+    // (the default - see `Capabilities::default`), both handlers must refuse via the same
+    // `Rejected` status a normal CALLRESULT already uses, per `crate::refusal`'s decision table -
+    // never let a `NotImplemented`/generic error leak out of a handler that's actually registered.
+
+    #[tokio::test]
+    async fn reserve_now_is_rejected_when_the_reservation_capability_is_absent() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
+
+        assert_eq!(outcome, ReserveNowOutcome::Rejected);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Available,
+            "a refused reservation must not mutate connector state"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_reservation_is_rejected_when_the_reservation_capability_is_absent() {
+        let actor = spawn_with_reservation([1]).await;
+        handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
+        // Turn the capability back off - the reservation already made must not become
+        // cancellable just because it exists.
+        actor
+            .send(ChargePointEvent::CapabilitiesDeclared(
+                Capabilities::default(),
+            ))
+            .await
+            .unwrap();
+
+        let outcome = handle_cancel_reservation(&actor, ReservationId(1)).await;
+
+        assert_eq!(outcome, CancelReservationOutcome::Rejected);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Reserved,
+            "a refused cancellation must not mutate connector state"
+        );
     }
 }
 

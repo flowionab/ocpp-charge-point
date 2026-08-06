@@ -20,12 +20,15 @@ use crate::ChargePointRuntime;
 use crate::authorization::{Authorizer, run_authorization_requests};
 use crate::availability::{ChangeAvailabilityHandler, DedupedStatusNotifier, StatusNotifier};
 use crate::connection::{ReconnectHandler, reregister_on_reconnect};
+#[cfg(feature = "tariff-cost")]
 use crate::cost::CostUpdatedHandler;
 use crate::device_model::{GetVariablesHandler, SetVariablesHandler};
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
+use crate::hardware::{Capabilities, warn_on_feature_mismatches};
+#[cfg(feature = "local-auth-list")]
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
 use crate::offline_queue::{OfflineQueue, run_with_offline_queue};
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
@@ -33,6 +36,7 @@ use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
 };
 use crate::reporting::{GetBaseReportHandler, GetReportHandler};
+#[cfg(feature = "reservation")]
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::reset::ResetHandler;
 use crate::security::SecurityEventNotifier;
@@ -73,6 +77,11 @@ pub struct ChargePointBuilder<T, X> {
     // generic over `E`/`C`, so they can't call those hardware methods themselves.
     vendor_name: String,
     model_name: String,
+    // Captured in `start()`, same reasoning as `vendor_name`/`model_name` above - later
+    // registration methods aren't generic over `E`/`C` and can't call `charge_point.capabilities()`
+    // themselves. See `Self::capabilities` and `docs/PRODUCTION-ROADMAP.md` §5.3 (C3) for how this
+    // is consulted to keep every advertisement surface in sync with what the hardware declares.
+    capabilities: Capabilities,
     status_changes: Option<BroadcastReceiver<ConnectorStatusChanged>>,
     transaction_events: Option<BroadcastReceiver<TransactionEventOccurred>>,
     authorization_requests: Option<BroadcastReceiver<AuthorizationRequested>>,
@@ -92,6 +101,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     {
         let vendor_name = charge_point.vendor_name().await.to_string();
         let model_name = charge_point.model_name().await.to_string();
+        let capabilities = charge_point.capabilities().await;
+        // C2.4 (docs/PRODUCTION-ROADMAP.md §5.2): catch a hardware binding that claims a
+        // capability whose Cargo feature is compiled out, or that leaves a compiled-in feature's
+        // capability unclaimed, as early as possible - logged, never fatal (see
+        // `warn_on_feature_mismatches`'s docs for why this doesn't panic/fail startup).
+        warn_on_feature_mismatches(&capabilities);
         tracing::info!(
             vendor = vendor_name.as_str(),
             model = model_name.as_str(),
@@ -111,6 +126,22 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let transaction_events = runtime.subscribe_transaction_events();
         let authorization_requests = runtime.subscribe_authorization_requests();
         let security_events = runtime.subscribe_security_events();
+
+        // C3 (docs/PRODUCTION-ROADMAP.md §5.3): land the hardware-declared capabilities into state
+        // itself first - the single source of truth `crate::hardware::supported_feature_profiles_1_6`
+        // and every other capability-propagation surface ultimately reads - then register every
+        // `*Ctrlr.Available` device model variable [`CAPABILITY_GATES`] knows about, all before the
+        // hardware binding gets a chance to register its own components.
+        let _ = runtime
+            .hardware_events()
+            .send(crate::state::ChargePointEvent::CapabilitiesDeclared(
+                capabilities,
+            ))
+            .await;
+        for event in crate::device_model::capability_gate_events(&capabilities) {
+            let _ = runtime.hardware_events().send(event).await;
+        }
+
         runtime
             .hardware()
             .start(runtime.hardware_events(), runtime.hardware_commands())
@@ -121,11 +152,21 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             executor,
             vendor_name,
             model_name,
+            capabilities,
             status_changes: Some(status_changes),
             transaction_events: Some(transaction_events),
             authorization_requests: Some(authorization_requests),
             security_events: Some(security_events),
         })
+    }
+
+    /// The capabilities the hardware declared via
+    /// [`ChargePoint::capabilities`](crate::hardware::ChargePoint::capabilities), captured once in
+    /// [`Self::start`]. The single source of truth callers (e.g. [`crate::setup::setup`]) consult
+    /// to decide which registration methods below to actually call - see
+    /// `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
     }
 
     /// Registers the Provisioning functional block: retries BootNotification (via
@@ -427,6 +468,11 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
 
     /// Registers the Reservation functional block: ReserveNow and CancelReservation handlers
     /// both feed into the runtime's actor.
+    ///
+    /// Only present when the `reservation` Cargo feature is enabled - with it off,
+    /// `crate::reservation` (and therefore this method) doesn't exist, so a build that omits the
+    /// feature never links the reservation handling code at all.
+    #[cfg(feature = "reservation")]
     pub async fn reservation<N>(self, csms: &N) -> Self
     where
         N: ReserveNowHandler + CancelReservationHandler + Send + Sync + 'static,
@@ -451,6 +497,11 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
 
     /// Registers the Local Authorization List functional block: SendLocalList and
     /// GetLocalListVersion handlers both feed into the runtime's actor.
+    ///
+    /// Only present when the `local-auth-list` Cargo feature is enabled - see
+    /// [`Self::reservation`]'s doc comment for why the method itself disappears rather than
+    /// becoming a no-op.
+    #[cfg(feature = "local-auth-list")]
     pub async fn local_authorization_list<N>(self, csms: &N) -> Self
     where
         N: SendLocalListHandler + GetLocalListVersionHandler + Send + Sync + 'static,
@@ -489,6 +540,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
 
     /// Registers the Tariff and Cost functional block: the CostUpdated handler feeds into the
     /// runtime's actor.
+    ///
+    /// Only present when the `tariff-cost` Cargo feature is enabled - see [`Self::reservation`]'s
+    /// doc comment for why the method itself disappears rather than becoming a no-op.
+    #[cfg(feature = "tariff-cost")]
     pub async fn cost<N>(self, csms: &N) -> Self
     where
         N: CostUpdatedHandler + Send + Sync + 'static,
@@ -550,13 +605,55 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::hardware::{
-        ChargePoint, Connector, Evse, HardwareCommandReceiver, HardwareEventSender,
+        Capabilities, ChargePoint, Connector, Evse, HardwareCommandReceiver, HardwareEventSender,
         execute_hardware_command,
     };
     use crate::state::{ChargePointEvent, ConnectorEvent, EvseEvent};
     use alloc::sync::Arc;
     use core::convert::Infallible;
     use core::sync::atomic::AtomicBool;
+
+    /// Wraps any [`ChargePoint`] fixture to override just [`ChargePoint::capabilities`], so tests
+    /// can exercise capability-driven behaviour (`docs/PRODUCTION-ROADMAP.md` §5.3, C3) without a
+    /// dedicated fixture per capability combination.
+    pub(crate) struct WithCapabilities<T> {
+        pub(crate) inner: T,
+        pub(crate) capabilities: Capabilities,
+    }
+
+    #[async_trait::async_trait]
+    impl<T, E, C> ChargePoint<E, C> for WithCapabilities<T>
+    where
+        T: ChargePoint<E, C> + Sync,
+        E: Evse<C>,
+        C: Connector,
+    {
+        type StartError = T::StartError;
+
+        async fn vendor_name(&self) -> &str {
+            self.inner.vendor_name().await
+        }
+
+        async fn model_name(&self) -> &str {
+            self.inner.model_name().await
+        }
+
+        async fn evses(&self) -> &[E] {
+            self.inner.evses().await
+        }
+
+        async fn capabilities(&self) -> Capabilities {
+            self.capabilities
+        }
+
+        async fn start(
+            &self,
+            events: HardwareEventSender,
+            commands: HardwareCommandReceiver,
+        ) -> Result<(), Self::StartError> {
+            self.inner.start(events, commands).await
+        }
+    }
 
     /// A minimal [`ChargePoint`] fixture: one EVSE, one connector, that reports a cable-connect
     /// event on start and then drives whichever single hardware command the runtime issues.
@@ -600,6 +697,10 @@ pub(crate) mod test_support {
 
         async fn evses(&self) -> &[TestEvse] {
             &self.evses
+        }
+
+        async fn capabilities(&self) -> crate::hardware::Capabilities {
+            crate::hardware::Capabilities::default()
         }
 
         async fn start(
@@ -658,6 +759,10 @@ pub(crate) mod test_support {
         }
 
         async fn open_contactor(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn set_current_limit(&self, _limit_ma: u32) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -871,6 +976,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst) - before, 1);
     }
 
+    #[cfg(all(
+        feature = "reservation",
+        feature = "local-auth-list",
+        feature = "tariff-cost"
+    ))]
     #[tokio::test]
     async fn a_fully_configured_builder_behaves_like_setup() {
         let (charge_point, locked) = test_charge_point(false);

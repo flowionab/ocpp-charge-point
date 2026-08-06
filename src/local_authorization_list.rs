@@ -27,8 +27,11 @@ pub enum LocalListUpdate {
 }
 
 /// The outcome of a CSMS-initiated `SendLocalList` request, matching (a subset of) OCPP's
-/// `SendLocalListStatusEnum`. `Failed` isn't reachable - the list is a plain in-memory `Vec`, so
-/// nothing about applying an update (once the version check passes) can fail.
+/// `SendLocalListStatusEnum`. The wire `Failed` value isn't reachable directly - the list is a
+/// plain in-memory `Vec`, so nothing about applying an update (once the version check passes)
+/// can fail - but 2.x's `SendLocalListStatusEnum` has no `NotSupported` variant, so
+/// [`NotSupported`](Self::NotSupported) maps to wire `Failed` there anyway (1.6J has a real
+/// `NotSupported` wire value and uses it). See `crate::refusal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendLocalListOutcome {
     /// The update was applied.
@@ -36,6 +39,10 @@ pub enum SendLocalListOutcome {
     /// A differential update whose `version` doesn't immediately follow the charge point's
     /// current version - only a full update may (re)set an arbitrary version.
     VersionMismatch,
+    /// The local authorization list capability is registered (the `local-auth-list` Cargo
+    /// feature is on) but runtime-absent (`Capabilities::local_auth_list` is `false`) - see
+    /// `crate::refusal` (docs/PRODUCTION-ROADMAP.md §5.5, C5).
+    NotSupported,
 }
 
 /// Handles a CSMS-initiated `SendLocalList` request against `actor`. A `Full` update always
@@ -49,7 +56,14 @@ pub async fn handle_send_local_list(
     version: i64,
     update: LocalListUpdate,
 ) -> SendLocalListOutcome {
-    let current = actor.state().local_authorization_list;
+    let state = actor.state();
+    // C5 (docs/PRODUCTION-ROADMAP.md §5.5): the handler is registered whenever the
+    // `local-auth-list` Cargo feature is on, but the hardware may still declare the capability
+    // runtime-absent.
+    if !crate::refusal::capability_present(&state.capabilities, "SendLocalList") {
+        return SendLocalListOutcome::NotSupported;
+    }
+    let current = state.local_authorization_list;
 
     let entries = match update {
         LocalListUpdate::Full(entries) => entries,
@@ -128,7 +142,10 @@ mod tests {
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
-    use crate::state::{AuthorizationStatus, IdToken, IdTokenKind, LocalListEntry};
+    use crate::hardware::Capabilities;
+    use crate::state::{
+        AuthorizationStatus, ChargePointEvent, IdToken, IdTokenKind, LocalListEntry,
+    };
     use alloc::vec;
 
     fn id_token(value: &str) -> IdToken {
@@ -145,9 +162,23 @@ mod tests {
         }
     }
 
+    /// Spawns an actor with the `local_auth_list` capability declared present - mirrors
+    /// `crate::reservation::tests::spawn_with_reservation`.
+    async fn spawn_with_local_auth_list<const N: usize>(evses: [usize; N]) -> ChargePointActor {
+        let actor = ChargePointActor::spawn(evses, &TokioExecutor);
+        actor
+            .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
+                local_auth_list: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        actor
+    }
+
     #[tokio::test]
     async fn a_full_update_replaces_the_list_and_reports_the_new_version() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_local_auth_list([1]).await;
 
         let outcome = handle_send_local_list(
             &actor,
@@ -166,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_full_update_may_jump_to_any_version() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_local_auth_list([1]).await;
 
         let outcome = handle_send_local_list(&actor, 42, LocalListUpdate::Full(vec![])).await;
 
@@ -176,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sequential_differential_update_upserts_and_removes_entries() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_local_auth_list([1]).await;
         handle_send_local_list(
             &actor,
             1,
@@ -211,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_sequential_differential_update_is_a_version_mismatch() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = spawn_with_local_auth_list([1]).await;
         handle_send_local_list(&actor, 1, LocalListUpdate::Full(vec![])).await;
 
         let outcome = handle_send_local_list(
@@ -234,6 +265,27 @@ mod tests {
         let actor = ChargePointActor::spawn([1], &TokioExecutor);
 
         assert_eq!(handle_get_local_list_version(&actor), 0);
+    }
+
+    // C5 (docs/PRODUCTION-ROADMAP.md §5.5): with `local_auth_list` runtime-absent (the default),
+    // `SendLocalList` must refuse via `NotSupported` rather than silently applying the update.
+    #[tokio::test]
+    async fn send_local_list_is_not_supported_when_the_capability_is_absent() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_send_local_list(
+            &actor,
+            5,
+            LocalListUpdate::Full(vec![entry("A", AuthorizationStatus::Accepted)]),
+        )
+        .await;
+
+        assert_eq!(outcome, SendLocalListOutcome::NotSupported);
+        assert_eq!(
+            actor.state().local_authorization_list.entries,
+            vec![],
+            "a refused update must not mutate the list"
+        );
     }
 }
 
@@ -316,6 +368,10 @@ mod ocpp_2_1 {
         match outcome {
             SendLocalListOutcome::Accepted => SendLocalListStatusEnum::Accepted,
             SendLocalListOutcome::VersionMismatch => SendLocalListStatusEnum::VersionMismatch,
+            // 2.x's `SendLocalListStatusEnum` has no `NotSupported` variant - `Failed` is the
+            // closest available "no", per crate::refusal's decision table (docs/PRODUCTION-ROADMAP.md
+            // §5.5).
+            SendLocalListOutcome::NotSupported => SendLocalListStatusEnum::Failed,
         }
     }
 
@@ -339,17 +395,32 @@ mod ocpp_2_1 {
         }
     }
 
+    /// The logic behind [`OCPP2_1Client`]'s registered `GetLocalListVersion` handler, factored
+    /// out so C5's capability-off CALLERROR can be asserted directly. See
+    /// [`super::CostUpdatedHandler`]... - mirrors `crate::cost::ocpp_2_1::handle`.
+    fn handle_get_local_list_version_request(
+        actor: &ChargePointActor,
+    ) -> Result<GetLocalListVersionResponse, ocpp_client::ocpp_2_1::OCPP2_1Error> {
+        // C5 (docs/PRODUCTION-ROADMAP.md §5.5): `GetLocalListVersionResponse` has no status
+        // field in any protocol version, so a runtime-absent capability can only be refused as
+        // a CALLERROR - see `crate::refusal`'s decision table.
+        if !crate::refusal::capability_present(&actor.state().capabilities, "GetLocalListVersion") {
+            return Err(crate::refusal::ocpp_2_1_not_supported(
+                "GetLocalListVersion",
+            ));
+        }
+        Ok(GetLocalListVersionResponse {
+            custom_data: None,
+            version_number: handle_get_local_list_version(actor),
+        })
+    }
+
     #[async_trait::async_trait]
     impl GetLocalListVersionHandler for OCPP2_1Client {
         async fn register_get_local_list_version_handler(&self, actor: ChargePointActor) {
             self.on_get_local_list_version(move |_request, _client| {
                 let actor = actor.clone();
-                async move {
-                    Ok(GetLocalListVersionResponse {
-                        custom_data: None,
-                        version_number: handle_get_local_list_version(&actor),
-                    })
-                }
+                async move { handle_get_local_list_version_request(&actor) }
             })
             .await;
         }
@@ -369,6 +440,47 @@ mod ocpp_2_1 {
                 map_outcome(SendLocalListOutcome::VersionMismatch),
                 SendLocalListStatusEnum::VersionMismatch
             );
+            assert_eq!(
+                map_outcome(SendLocalListOutcome::NotSupported),
+                SendLocalListStatusEnum::Failed
+            );
+        }
+
+        // C5 (docs/PRODUCTION-ROADMAP.md §5.5): `GetLocalListVersionResponse` has no status
+        // field, so a runtime-absent `local_auth_list` capability must refuse with a
+        // `NotSupported` CALLERROR.
+        #[tokio::test]
+        async fn get_local_list_version_is_a_not_supported_call_error_when_the_capability_is_absent()
+         {
+            use crate::executor::TokioExecutor;
+            use ocpp_client::ocpp_types::v21::RpcErrorCode;
+
+            let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
+
+            let result = handle_get_local_list_version_request(&actor);
+
+            assert_eq!(result.unwrap_err().code, RpcErrorCode::NotSupported);
+        }
+
+        #[tokio::test]
+        async fn get_local_list_version_succeeds_when_the_capability_is_present() {
+            use crate::executor::TokioExecutor;
+            use crate::hardware::Capabilities;
+
+            let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
+            actor
+                .send(crate::state::ChargePointEvent::CapabilitiesDeclared(
+                    Capabilities {
+                        local_auth_list: true,
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap();
+
+            let result = handle_get_local_list_version_request(&actor);
+
+            assert_eq!(result.unwrap().version_number, 0);
         }
 
         fn wire_id_token() -> ocpp_client::ocpp_types::v21::common::IdToken {
@@ -536,6 +648,10 @@ mod ocpp_2_0_1 {
         match outcome {
             SendLocalListOutcome::Accepted => SendLocalListStatusEnum::Accepted,
             SendLocalListOutcome::VersionMismatch => SendLocalListStatusEnum::VersionMismatch,
+            // 2.x's `SendLocalListStatusEnum` has no `NotSupported` variant - `Failed` is the
+            // closest available "no", per crate::refusal's decision table (docs/PRODUCTION-ROADMAP.md
+            // §5.5).
+            SendLocalListOutcome::NotSupported => SendLocalListStatusEnum::Failed,
         }
     }
 
@@ -559,17 +675,27 @@ mod ocpp_2_0_1 {
         }
     }
 
+    /// Mirrors `super::ocpp_2_1::handle_get_local_list_version_request`.
+    fn handle_get_local_list_version_request(
+        actor: &ChargePointActor,
+    ) -> Result<GetLocalListVersionResponse, ocpp_client::ocpp_2_0_1::OCPP2_0_1Error> {
+        if !crate::refusal::capability_present(&actor.state().capabilities, "GetLocalListVersion") {
+            return Err(crate::refusal::ocpp_2_0_1_not_supported(
+                "GetLocalListVersion",
+            ));
+        }
+        Ok(GetLocalListVersionResponse {
+            custom_data: None,
+            version_number: handle_get_local_list_version(actor),
+        })
+    }
+
     #[async_trait::async_trait]
     impl GetLocalListVersionHandler for OCPP2_0_1Client {
         async fn register_get_local_list_version_handler(&self, actor: ChargePointActor) {
             self.on_get_local_list_version(move |_request, _client| {
                 let actor = actor.clone();
-                async move {
-                    Ok(GetLocalListVersionResponse {
-                        custom_data: None,
-                        version_number: handle_get_local_list_version(&actor),
-                    })
-                }
+                async move { handle_get_local_list_version_request(&actor) }
             })
             .await;
         }
@@ -589,6 +715,44 @@ mod ocpp_2_0_1 {
                 map_outcome(SendLocalListOutcome::VersionMismatch),
                 SendLocalListStatusEnum::VersionMismatch
             );
+            assert_eq!(
+                map_outcome(SendLocalListOutcome::NotSupported),
+                SendLocalListStatusEnum::Failed
+            );
+        }
+
+        #[tokio::test]
+        async fn get_local_list_version_is_a_not_supported_call_error_when_the_capability_is_absent()
+         {
+            use crate::executor::TokioExecutor;
+            use ocpp_client::ocpp_types::v201::RpcErrorCode;
+
+            let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
+
+            let result = handle_get_local_list_version_request(&actor);
+
+            assert_eq!(result.unwrap_err().code, RpcErrorCode::NotSupported);
+        }
+
+        #[tokio::test]
+        async fn get_local_list_version_succeeds_when_the_capability_is_present() {
+            use crate::executor::TokioExecutor;
+            use crate::hardware::Capabilities;
+
+            let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
+            actor
+                .send(crate::state::ChargePointEvent::CapabilitiesDeclared(
+                    Capabilities {
+                        local_auth_list: true,
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap();
+
+            let result = handle_get_local_list_version_request(&actor);
+
+            assert_eq!(result.unwrap().version_number, 0);
         }
 
         fn wire_id_token() -> ocpp_client::ocpp_types::v201::common::IdToken {
@@ -699,10 +863,10 @@ mod ocpp_2_0_1 {
 /// `idTagInfo`, the same "present means Upsert, absent means Remove" shape 2.x's `AuthorizationData`
 /// has - just with `idTagInfo.status: IdTagInfoStatus` (5 values) instead of `AuthorizationStatusEnum`
 /// (10 values), so [`map_status`] narrows the same way [`crate::authorization::ocpp_1_6::map_status`]
-/// does (only `Accepted` maps to `Accepted`). `SendLocalListResponseStatus` has two values this
-/// crate's `SendLocalListOutcome` doesn't produce - `Failed` (unreachable, per this module's
-/// `SendLocalListOutcome` docs) and `NotSupported` (this crate always supports the local
-/// authorization list, so never returns it) - both simply go unused rather than mapped to.
+/// does (only `Accepted` maps to `Accepted`). `SendLocalListResponseStatus`'s `Failed` value stays
+/// unreachable (unlike 2.x, 1.6J's wire enum has a real `NotSupported` value, so
+/// [`SendLocalListOutcome::NotSupported`] maps to it directly - see [`map_outcome`] and
+/// `crate::refusal`).
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
     use super::{
@@ -758,6 +922,7 @@ mod ocpp_1_6 {
         match outcome {
             SendLocalListOutcome::Accepted => SendLocalListResponseStatus::Accepted,
             SendLocalListOutcome::VersionMismatch => SendLocalListResponseStatus::VersionMismatch,
+            SendLocalListOutcome::NotSupported => SendLocalListResponseStatus::NotSupported,
         }
     }
 
@@ -779,16 +944,28 @@ mod ocpp_1_6 {
         }
     }
 
+    /// Mirrors `super::ocpp_2_1::handle_get_local_list_version_request` - 1.6J's
+    /// `GetLocalListVersionResponse` (`{ listVersion }`) has no status field either, so this too
+    /// can only refuse via a CALLERROR.
+    fn handle_get_local_list_version_request(
+        actor: &ChargePointActor,
+    ) -> Result<GetLocalListVersionResponse, ocpp_client::ocpp_1_6::OCPP1_6Error> {
+        if !crate::refusal::capability_present(&actor.state().capabilities, "GetLocalListVersion") {
+            return Err(crate::refusal::ocpp_1_6_not_supported(
+                "GetLocalListVersion",
+            ));
+        }
+        Ok(GetLocalListVersionResponse {
+            list_version: handle_get_local_list_version(actor),
+        })
+    }
+
     #[async_trait::async_trait]
     impl GetLocalListVersionHandler for OCPP1_6Client {
         async fn register_get_local_list_version_handler(&self, actor: ChargePointActor) {
             self.on_get_local_list_version(move |_request, _client| {
                 let actor = actor.clone();
-                async move {
-                    Ok(GetLocalListVersionResponse {
-                        list_version: handle_get_local_list_version(&actor),
-                    })
-                }
+                async move { handle_get_local_list_version_request(&actor) }
             })
             .await;
         }
@@ -808,6 +985,44 @@ mod ocpp_1_6 {
                 map_outcome(SendLocalListOutcome::VersionMismatch),
                 SendLocalListResponseStatus::VersionMismatch
             );
+            assert_eq!(
+                map_outcome(SendLocalListOutcome::NotSupported),
+                SendLocalListResponseStatus::NotSupported
+            );
+        }
+
+        #[tokio::test]
+        async fn get_local_list_version_is_a_not_supported_call_error_when_the_capability_is_absent()
+         {
+            use crate::executor::TokioExecutor;
+            use ocpp_client::ocpp_types::v16::RpcErrorCode;
+
+            let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
+
+            let result = handle_get_local_list_version_request(&actor);
+
+            assert_eq!(result.unwrap_err().code, RpcErrorCode::NotSupported);
+        }
+
+        #[tokio::test]
+        async fn get_local_list_version_succeeds_when_the_capability_is_present() {
+            use crate::executor::TokioExecutor;
+            use crate::hardware::Capabilities;
+
+            let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
+            actor
+                .send(crate::state::ChargePointEvent::CapabilitiesDeclared(
+                    Capabilities {
+                        local_auth_list: true,
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap();
+
+            let result = handle_get_local_list_version_request(&actor);
+
+            assert_eq!(result.unwrap().list_version, 0);
         }
 
         fn id_tag_info(status: IdTagInfoStatus) -> ocpp_client::ocpp_types::v16::common::IdTagInfo {

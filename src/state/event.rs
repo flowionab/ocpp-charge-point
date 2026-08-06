@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+use crate::hardware::Capabilities;
 use crate::state::{
     ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry, MeterSample,
     RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent, StopReason,
@@ -59,6 +60,12 @@ pub enum ChargePointEvent {
     /// `SetVariables`, or 1.6J's `GetConfiguration`/`ChangeConfiguration` projection onto it) -
     /// see `crate::state::device_model` and `crate::device_model`. See `docs/ROADMAP.md` §2.
     DeviceModel(DeviceModelEvent),
+    /// The hardware binding's declared [`Capabilities`], captured once during
+    /// [`crate::builder::ChargePointBuilder::start`]. The single source of truth every
+    /// capability-propagation surface (handler registration, the device model's `*Ctrlr.Available`
+    /// variables, 1.6J `SupportedFeatureProfiles`) ultimately derives from - see
+    /// `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
+    CapabilitiesDeclared(Capabilities),
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {
         /// The addressed EVSE's index.
@@ -168,6 +175,12 @@ pub enum ConnectorEvent {
     /// A previously reported fault on this connector has cleared. Only takes effect once the
     /// connector has confirmed its contactor is open (`FaultedSafe`); otherwise a no-op.
     FaultCleared,
+    /// Hardware confirmed the current limit was applied, in response to a
+    /// [`HardwareCommand::SetCurrentLimit`]. Carries the limit that was applied, in milliamps.
+    /// This is a hardware hook only - nothing in this crate emits `SetCurrentLimit` yet (see
+    /// that variant's docs); reserved for the charging-profile machinery
+    /// (`docs/PRODUCTION-ROADMAP.md` §"B2 — Smart charging" B2.1/B2.2/B2.4) to drive later.
+    CurrentLimitConfirmed(u32),
 }
 
 /// A side effect of applying a [`ChargePointEvent`], to be carried out by the actor's caller
@@ -298,5 +311,18 @@ pub enum HardwareCommand {
     Reboot {
         /// The targeted EVSE's index.
         evse_id: usize,
+    },
+    /// Limit the connector's current draw to `limit_ma` milliamps. Dispatched via
+    /// [`crate::hardware::Connector::set_current_limit`]. This is a hardware hook only
+    /// (`docs/PRODUCTION-ROADMAP.md` §"B2 — Smart charging" B2.3) - nothing in this crate's
+    /// state machine emits this yet; that's the charging-profile store and composite-schedule
+    /// evaluation (B2.1/B2.2/B2.4), still to come.
+    SetCurrentLimit {
+        /// The targeted connector's EVSE index.
+        evse_id: usize,
+        /// The targeted connector's index within its EVSE.
+        connector_id: usize,
+        /// The current limit to apply, in milliamps.
+        limit_ma: u32,
     },
 }

@@ -489,11 +489,13 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(feature = "reservation")]
     #[async_trait::async_trait]
     impl crate::reservation::ReserveNowHandler for FixedBootNotifier {
         async fn register_reserve_now_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
 
+    #[cfg(feature = "reservation")]
     #[async_trait::async_trait]
     impl crate::reservation::CancelReservationHandler for FixedBootNotifier {
         async fn register_cancel_reservation_handler(
@@ -508,11 +510,13 @@ pub(crate) mod test_support {
         async fn register_reset_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
 
+    #[cfg(feature = "local-auth-list")]
     #[async_trait::async_trait]
     impl crate::local_authorization_list::SendLocalListHandler for FixedBootNotifier {
         async fn register_send_local_list_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
 
+    #[cfg(feature = "local-auth-list")]
     #[async_trait::async_trait]
     impl crate::local_authorization_list::GetLocalListVersionHandler for FixedBootNotifier {
         async fn register_get_local_list_version_handler(
@@ -555,6 +559,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(feature = "tariff-cost")]
     #[async_trait::async_trait]
     impl crate::cost::CostUpdatedHandler for FixedBootNotifier {
         async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {}

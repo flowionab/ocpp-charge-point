@@ -48,6 +48,16 @@ jobs:
   # version's module. `cargo hack --each-feature` covers that axis directly,
   # and the named configurations below cover the runtime axis (no_std / std
   # without tokio / everything).
+  #
+  # C1.3: the 14 capability features (`reservation`, `smart-charging`, ...) are
+  # a third axis, and it must be orthogonal to the version axis - any
+  # combination has to compile. `--each-feature` already builds each capability
+  # feature *alone*; the `Capability set:` steps below cover the combinations
+  # that axis actually ships in, rather than its 2^14 powerset: everything off
+  # (the smallest real build), a Core-only charger, and Core + Smart Charging
+  # (the first profile a real deployment adds). `--all-features` above is the
+  # everything-on end. `--lib` because `examples/` and `tests/` assume default
+  # features and are not part of the capability contract.
   feature-matrix:
     runs-on: ubuntu-latest
     steps:
@@ -63,6 +73,12 @@ jobs:
         run: cargo check --no-default-features --features std,ocpp_1_6,ocpp_2_0_1,ocpp_2_1 --lib
       - name: All features
         run: cargo check --all-features --all-targets
+      - name: 'Capability set: all off, every version'
+        run: cargo check --no-default-features --features tokio-runtime,ocpp_1_6,ocpp_2_0_1,ocpp_2_1 --lib
+      - name: 'Capability set: Core only'
+        run: cargo check --no-default-features --features tokio-runtime,ocpp_2_1,local-auth-list,reservation --lib
+      - name: 'Capability set: Core + Smart Charging'
+        run: cargo check --no-default-features --features tokio-runtime,ocpp_2_1,local-auth-list,reservation,smart-charging --lib
 
   # H1.3: the target this crate exists for. `cargo check` (not build) because
   # linking a bare-metal binary additionally needs a `critical-section` backend
