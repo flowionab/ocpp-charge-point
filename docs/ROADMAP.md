@@ -7,10 +7,13 @@ internal state/model it needs, the key OCPP messages it drives, current
 status in this repo, and notes on projecting it down to OCPP 2.0.1 and
 1.6J.
 
-Only the OCPP 2.0.1 spec PDFs are currently vendored under `docs/`. The 2.1
-delta is drawn from public knowledge of the 2.1 release and should be
-re-verified against the official 2.1 spec text once it's available locally
-— items below marked **(verify vs 2.1 spec)** need that check.
+~~Only the OCPP 2.0.1 spec PDFs are currently vendored under `docs/`.~~
+**Stale as of 2026-08-06:** `docs/OCPP-2.1/` now holds the full 2.1
+edition-2 spec set (parts 0–6, plus the CSV appendices), and
+`docs/UPSTREAM-GAPS.md` audits against it directly. Items below still
+marked **(verify vs 2.1 spec)** were written before that and have not yet
+been re-checked against the real text — the material to do so is now
+present, so those markers are a to-do, not a blocker.
 
 Status legend: ✅ done · 🚧 partial · ⬜ not started
 
@@ -911,29 +914,36 @@ CSMS-initiated control of the charge point.
   parses the wire `transactionId` string as a `u64`, treating anything
   that doesn't parse as an unknown transaction. `TriggerMessage` has a
   protocol-agnostic internal handler
-  (`remote_control::{TriggerableMessage, handle_trigger_message}`) but
-  **no CSMS-facing entry point at all** - blocked upstream, not something
-  fixable from this side. `rust-ocpp`'s `v2_1` module (gated behind its
-  own `wip_v2_1` feature) never declares a `trigger_message` message
-  module in the first place - `v2_1/messages/mod.rs` has no
-  `pub mod trigger_message;` line, so there's no
-  `TriggerMessageRequest`/`TriggerMessageResponse` to receive at all. This
-  is a step behind `NotifyReport`, which at least has an (empty) stub file
-  upstream - see `ocpp-client`'s own `CLAUDE.md`, which documents that gap
-  the same way. Consequently `ocpp-client`'s OCPP 2.1 actions module has
-  no `on_trigger_message`/`send_trigger_message` at all, and no
-  `TriggerMessageHandler` trait or `setup()` wiring exists here either -
-  **but note the block is 2.1-only, narrower than the paragraph above
-  originally implied** (re-verified directly against `ocpp-client` 0.2.0's
-  vendored source, not assumed): `OCPP2_0_1Client` and `OCPP1_6Client` both
-  *do* have real `on_trigger_message`/`send_trigger_message` methods with
-  `TriggerMessageRequest`/`TriggerMessageResponse` types. So a 2.0.1 and a
-  1.6J adapter for the existing `handle_trigger_message` are buildable
-  today; only the 2.1 one has to wait for upstream. The reason nothing is
-  wired yet is the `setup()` bound problem described above, not a total
-  absence of upstream types -
-  adding either now, ahead of something that could implement it, would
-  just break every real caller of `setup()` (their `N` could never
+  (`remote_control::{TriggerableMessage, handle_trigger_message}`) but no
+  CSMS-facing entry point wired on any version yet.
+
+  **This paragraph's long-standing "blocked upstream on 2.1" claim was
+  wrong, and is corrected here (D1.3).** It used to say `rust-ocpp`'s
+  `v2_1` module never declares a `trigger_message` message module, so
+  there were no `TriggerMessageRequest`/`TriggerMessageResponse` types to
+  receive at all. Two things are wrong with that. First, `rust-ocpp` is
+  not in this crate's dependency graph — the types come from
+  `ocpp-types`, an independently generated crate, and
+  `ocpp-types-0.1.2/src/v21/trigger_message_request.rs` **exists**
+  (verified against the copy `Cargo.lock` actually pins; see
+  `docs/UPSTREAM-GAPS.md`). Second, what was genuinely missing was only
+  `ocpp-client`'s *action wrapper* — one macro line, not a type gap. That
+  wrapper now exists (see `PRODUCTION-ROADMAP.md` D1), so 2.1 is no longer
+  blocked either, pending a released `ocpp-client` this crate can depend
+  on. 2.0.1 and 1.6J were never blocked: `OCPP2_0_1Client` and
+  `OCPP1_6Client` have had real `on_trigger_message`/`send_trigger_message`
+  methods all along.
+
+  So all three versions are now buildable, and what's left is ordinary
+  work in this crate, not an upstream wall. The `setup()` bound problem
+  that also held this up — adding a `TriggerMessageHandler` bound ahead of
+  a type that could satisfy it would break every caller of `setup()` — is
+  itself resolved: `ChargePointBuilder` (`PRODUCTION-ROADMAP.md` C4) lets
+  a block be registered with only its own bounds, so a `trigger_message`
+  registration method can land without touching anyone else's `N`. The
+  old reasoning for waiting, kept for the record: adding either now, ahead
+  of something that could implement it, would just break every real caller
+  of `setup()` (their `N` could never
   satisfy the bound). What does exist: `TriggerableMessage` covers the
   subset of OCPP's 13-value `MessageTriggerEnumType` this crate can
   actually fulfil today, each backed by an outbound trait it already has

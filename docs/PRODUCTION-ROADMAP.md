@@ -98,28 +98,29 @@ close — mostly missing one version each.
 |------|--------|------|
 | Actor model, version-independent state | ✅ | `ChargePointState` owns transactions, reservations, local auth list, cost, reset, device model — all mutated only via `ChargePointEvent`. |
 | Hardware abstraction | 🚧 | `ChargePoint` / `Evse` / `Connector`: lock, unlock, contactor, reboot. **No capability model, no current-limit hook, no file transfer, no display, no RTC.** |
-| `no_std` | ✅ | `cargo check --no-default-features --lib` compiles. `embassy-sync` channels, `tokio` fully optional. |
+| `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. |
 | Offline queueing | 🚧 | `OfflineQueue` exists and is used by Availability / Transactions / Security. Unbounded and in-RAM — see [G2](#92-g2--bounded-memory). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | ⬜ | **Nothing survives a restart.** `VariableAttribute::persistent` is recorded and ignored. |
 | Test suite | 🚧 | 668 test functions in `src/`, one integration test (`tests/connect_2_1_websocket.rs`). Strong unit coverage, near-zero end-to-end. |
-| CI | 🚧 | `cargo build` + `cargo test` on stable/ubuntu only. No clippy, no fmt, no `no_std` target, no feature matrix. |
+| CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
-### 2.4 The structural blocker
+### 2.4 The structural blocker — resolved
 
-`setup()`'s CSMS type parameter carries **21 protocol trait bounds** today
-(`src/setup.rs:51`), one per handled message family, and grows by one for
-every message added. Two consequences:
+*Was:* `setup()`'s CSMS type parameter carried **21 protocol trait bounds**
+(`src/setup.rs:51`), one per handled message family, growing by one per
+message added — so a build excluding Smart Charging still had to satisfy a
+`SetChargingProfileHandler` bound, and reaching ~86 actions meant ~80 bounds
+on one function.
 
-1. A build that excludes Smart Charging still has to satisfy a
-   `SetChargingProfileHandler` bound, so compile-time capability exclusion
-   is impossible without changing this signature.
-2. Completing message coverage to ~86 actions means ~80 bounds on a single
-   function — unworkable.
-
-**[C4](#54-c4--builder-refactor) has to land before Workstream B gets much
-past its current size.** This is the single highest-leverage item in the
-document, and it's cheap relative to what it unblocks.
+*Now:* [C4](#54-c4--builder-refactor) landed. `ChargePointBuilder`
+(`src/builder.rs`) registers one functional block per call, each carrying
+only its own bounds; `setup()` survives unchanged as the "everything on"
+wrapper. A CSMS client implementing a single block now compiles, which is
+what [A2](#3-workstream-a--transport-negotiation-connection-lifecycle) (runtime
+adapter-set selection), [C1](#51-c1--cargo-feature-per-functional-block)/[C2](#52-c2--runtime-capability-declaration)
+(capability gating) and most of [Workstream B](#4-workstream-b--message-coverage)
+were waiting on.
 
 ---
 
@@ -475,16 +476,41 @@ exists).
 | 2.1 | `SetDERControl` | yes |
 | 2.1 | `UpdateDynamicSchedule` | yes |
 
-- [ ] **D1.1** Upstream PR to `ocpp-client` adding the six macro entries.
+- [x] **D1.1** Upstream PR to `ocpp-client` adding the six macro entries.
+      **All six claims above verified true** before implementing (types
+      present in `ocpp-types` 0.1.2, wrapper absent in `ocpp-client` 0.2.0),
+      and all six were genuinely one macro line. Implemented on branch
+      `add-missing-action-wrappers` in `/Users/joatin/git/ocpp-client`
+      (commit `2c93e83`), each with a `send_*`/`on_*`/`wait_for_*` trio and a
+      fake-transport test mirroring that crate's existing pattern; its full
+      suite, fmt, clippy and per-version no_std builds are green. **Not
+      pushed and no PR opened** — awaiting the go-ahead.
 - [ ] **D1.2** Bump the dependency and unblock [B1.4](#b1--core-spine-must-be-complete-for-any-production-deployment), [B6](#b6--display-message-r15), [B8.2](#b8--reservation-derv2x-battery-swap), [B2](#b2--smart-charging-r11), and 2.0.1 security events.
-- [ ] **D1.3** Correct `ROADMAP.md` §0's `TriggerMessage` claim.
+      Blocked on D1.1 being released: this crate depends on `ocpp-client`
+      `"0.2"` from the registry, so the branch above does nothing here until
+      it ships. Worth bundling with an `ocpp-types` bump — 0.1.3 is already
+      out and fixes `DataTransfer.data` being generated as `Option<()>`,
+      which `ROADMAP.md` §16 still records as an open upstream limitation.
+- [x] **D1.3** Correct `ROADMAP.md` §0's `TriggerMessage` claim. Done — and
+      the claim was wronger than this line implies: it blamed `rust-ocpp`,
+      which isn't in this crate's dependency graph at all. Corrected in
+      `ROADMAP.md` §6, along with §0's stale "only 2.0.1 spec PDFs are
+      vendored" note.
 
 ### 6.2 D2 — Type completeness audit
 
-- [ ] **D2.1** Diff `ocpp-types` v21's 90 request types against the 2.1
+- [x] **D2.1** Diff `ocpp-types` v21's 90 request types against the 2.1
       specification's message list; same for v201's 64 and v16's 28.
       Anything genuinely absent upstream is a real blocker and needs to be
-      known *now*, not when a certification run hits it.
+      known *now*, not when a certification run hits it. **Done — see
+      [`UPSTREAM-GAPS.md`](./UPSTREAM-GAPS.md).** The 90/64/28 counts and
+      Appendix A's 19/28, 21/63, 22/86 wired counts all re-derived and
+      confirmed. For 2.1 and 2.0.1 the `ocpp-types` message list matches the
+      vendored spec text 1:1 — **no genuinely-absent types**, so every 2.x
+      gap is a wiring gap, not a blocker. 1.6J has one real blocker: see
+      D2.2. (1.6J's spec is not vendored under `docs/`, so its 28 was
+      cross-checked against `rust-ocpp` instead — a weaker source, flagged as
+      such in the audit.)
 - [ ] **D2.2** 1.6J security whitepaper extensions (`SecurityEventNotification`,
       `SignedUpdateFirmware`, `SignedFirmwareStatusNotification`,
       `LogStatusNotification`, `GetLog`, `InstallCertificate`,
@@ -492,13 +518,22 @@ exists).
       `SignCertificate`) are absent from `ocpp-client`'s 1.6 action list
       entirely. Decide: contribute them upstream, or declare 1.6J security
       profiles out of scope — and say so in the README either way.
+      **Audited, decision still open** — and the gap is bigger than this
+      line assumed: all 10 are missing from `ocpp-types`' v16 module
+      *entirely*, not merely unwrapped in `ocpp-client`, so this is type
+      work upstream, not another round of D1's macro lines. Absent from
+      `rust-ocpp` too, so switching type crates wouldn't help.
+      [`UPSTREAM-GAPS.md`](./UPSTREAM-GAPS.md) lays out the cost either way;
+      **the user decides.**
 
 ### 6.3 D3 — Dependency policy
 
 - [ ] **D3.1** Pin `ocpp-client` to a version range this crate has actually
       tested against; today `"0.2"` accepts any 0.2.x.
 - [ ] **D3.2** Vendor-or-fork contingency if upstream PRs stall.
-- [ ] **D3.3** `cargo-deny` for licences and advisories, in CI.
+- [x] **D3.3** `cargo-deny` for licences and advisories, in CI. Done
+      alongside [H1.5](#101-h1--ci-hardening) — `deny.toml` plus a `deny` job,
+      verified locally (`advisories ok, bans ok, licenses ok, sources ok`).
 
 ---
 
@@ -673,17 +708,49 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
 
 ### 10.1 H1 — CI hardening
 
-Current CI is `cargo build` + `cargo test` on one target.
+~~Current CI is `cargo build` + `cargo test` on one target.~~ Rewritten —
+`.github/workflows/ci.yaml` now runs six gating jobs plus coverage.
 
-- [ ] **H1.1** `cargo clippy -- -D warnings`, `cargo fmt --check`.
-- [ ] **H1.2** Feature matrix — each version feature alone, each capability
+- [x] **H1.1** `cargo clippy -- -D warnings`, `cargo fmt --check`. Both gating,
+      for `--all-features --all-targets` *and* `--no-default-features --lib`
+      (the no_std paths `--all-features` never compiles). `cargo doc` too,
+      so `lib.rs`'s `missing_docs` warning becomes a CI error without
+      failing local builds. Getting there needed a real cleanup: 13 clippy
+      warnings fixed properly (5 `while let` loops, 4 collapsed `if`s, 2
+      extracted type aliases, an `EffectSenders` struct for the actor's
+      `run`), with exactly one documented `#[allow]` — on a `Result` shape
+      `tungstenite`'s `Callback` trait dictates — plus a whole-repo `cargo
+      fmt` pass, kept in its own commit so the churn hides nothing.
+- [x] **H1.2** Feature matrix — each version feature alone, each capability
       feature off, `--no-default-features`, and `--all-features`.
-      `cargo-hack --feature-powerset` with a depth limit.
-- [ ] **H1.3** Embedded target build ([G1.1](#91-g1--no_std-across-the-matrix)).
-- [ ] **H1.4** MSRV declared and enforced.
-- [ ] **H1.5** `cargo-deny` ([D3.3](#63-d3--dependency-policy)).
+      `cargo hack check --each-feature` (not a full powerset: the version
+      features are the only genuinely independent axis, and each must compile
+      *alone* without secretly depending on another version's module), plus
+      the three named runtime configurations — true no_std, std-without-tokio,
+      and everything.
+- [x] **H1.3** Embedded target build ([G1.1](#91-g1--no_std-across-the-matrix)).
+      `thumbv7em-none-eabihf`, and **this had never actually compiled** —
+      the no_std claim had only ever been checked on a host target. Two real
+      fixes were needed: `tracing` now builds with `default-features = false`
+      (its `std` feature pulls `once_cell`, which doesn't compile bare-metal
+      at all), and `getrandom` — reached via `ocpp-client` → `uuid`'s `v4` —
+      needs `--cfg getrandom_backend="custom"`, the same "the final binary
+      supplies this" contract `critical-section` already has. Set in the job,
+      not papered over.
+- [x] **H1.4** MSRV declared and enforced. `rust-version = "1.88"`, verified
+      rather than guessed: 1.87 fails on this crate's own let-chains, and
+      dependencies independently require up to 1.87.
+- [x] **H1.5** `cargo-deny` ([D3.3](#63-d3--dependency-policy)). `deny.toml`
+      added and run locally before committing — `advisories ok, bans ok,
+      licenses ok, sources ok`. Permissive-only allow-list, every entry taken
+      from a licence actually in the tree; `ignore = []` with a note that
+      exceptions get a reason, never silence. This closes D3.3 as well.
 - [ ] **H1.6** Coverage reporting, with a floor on the protocol adapters.
-- [ ] **H1.7** Run on PRs, not just `push`.
+      *Partial* — `cargo llvm-cov` runs and reports, but nothing is gated. A
+      floor set before a baseline exists is either trivially passable or
+      arbitrary; the first green `main` run supplies the number, and this
+      stays open until `--fail-under-lines` is in.
+- [x] **H1.7** Run on PRs, not just `push`.
 
 ### 10.2 H2 — Integration testing
 
@@ -741,13 +808,21 @@ missing is proof that the pieces work *together* over a real socket.
 Ordered by dependency, not by size. Each milestone's exit criterion is
 testable.
 
-### M0 — Unblock (small, do first)
+### M0 — Unblock (small, do first) — ✅ complete (2026-08-06)
 
 [C4](#54-c4--builder-refactor) builder refactor · [D1](#61-d1--missing-action-wrappers) upstream wrappers · [H1](#101-h1--ci-hardening) CI hardening ·
 [D2.1](#62-d2--type-completeness-audit) type audit
 
 > **Exit:** handlers register independently with per-block bounds; CI runs
 > clippy, fmt and a feature matrix; the full upstream gap list is known.
+
+All three exit conditions met. Two carry-overs, neither blocking M1:
+[D1.2](#61-d1--missing-action-wrappers) (bump the dependency) waits on the
+`ocpp-client` branch being released, and [H1.6](#101-h1--ci-hardening)'s
+coverage floor waits on a baseline. One decision is now the user's:
+[D2.2](#62-d2--type-completeness-audit) — 1.6J security whitepaper extensions
+are missing upstream as *types*, so contributing them is real work, not a
+macro line.
 
 Everything else is cheaper after this. [C4](#54-c4--builder-refactor) in particular converts "add a
 message" from "add a bound to a 20-bound signature that every caller must
