@@ -11,16 +11,23 @@ pub struct ReservationId(pub i64);
 /// same way [`crate::state::Transaction`] is distinct from `ConnectorState::Charging` - tracked
 /// per connector on `EvseState`.
 ///
-/// `expires_at` carries OCPP `ReserveNowRequest.expiryDateTime`, but this crate doesn't yet
-/// *act* on it live (see `docs/ROADMAP.md` §8): a reservation still only ends via an explicit
-/// `CancelReservation` or being superseded by a cable connection while the process keeps
-/// running, since there is no background timer that expires one on the clock. The field exists
-/// today specifically so `persistence::restore_reservations` can refuse to resurrect a
-/// reservation whose window has already closed while the charge point was powered off - see that
-/// function's docs. `None` for a reservation created without ever supplying an expiry (e.g. every
-/// existing test/call site that constructs one directly rather than through the OCPP wire
-/// handler) is treated as "never expires" throughout, matching the pre-existing behaviour before
-/// this field was added.
+/// `expires_at` carries OCPP `ReserveNowRequest.expiryDateTime` (2.x)/`expiryDate` (1.6J), parsed
+/// from the wire request by `crate::reservation::handle_reserve_now`'s callers - `None` if the
+/// CSMS's value didn't parse as RFC 3339, or if the `Reservation` was constructed directly (e.g.
+/// most existing tests) rather than through the OCPP wire handler; either way it is treated as
+/// "never expires" throughout.
+///
+/// This crate doesn't yet *act* on `expires_at` live (see `docs/ROADMAP.md` §8): a reservation
+/// still only ends via an explicit `CancelReservation` or being superseded by a cable connection
+/// while the process keeps running, since the state machine is deliberately clock-free and there
+/// is no background timer that expires one on the clock. The field is consulted today
+/// specifically so `persistence::restore_reservations` can refuse to resurrect a reservation
+/// whose window has already closed while the charge point was powered off - see that function's
+/// docs. A reservation created and expiring within a single boot therefore does not expire on its
+/// own yet; a periodic sweep task (in the shape of `crate::provisioning::run_heartbeat`, driving
+/// a new `ChargePointEvent` through the actor on an `Executor`/`Backoff`-driven interval) is the
+/// natural next step, but needs a new event variant on `ChargePointEvent`/`ChargePointState` to
+/// land first.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reservation {
     /// This reservation's identifier, assigned by the CSMS.

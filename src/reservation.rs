@@ -7,9 +7,30 @@ use crate::state::{
     Reservation, ReservationId,
 };
 use alloc::boxed::Box;
+use chrono::{DateTime, Utc};
 
 #[cfg(feature = "ocpp_1_6")]
 pub use self::ocpp_1_6::Ocpp1_6ReserveNowHandler;
+
+/// Parses a wire `expiryDateTime` (OCPP 2.x)/`expiryDate` (1.6J) string, as carried by
+/// `ReserveNowRequest`, into a [`DateTime<Utc>`] for [`crate::state::Reservation::expires_at`].
+/// `None` if the CSMS sent something that doesn't parse as RFC 3339 - mirrors
+/// [`crate::provisioning::parse_csms_current_time`]'s "don't treat a malformed value as fatal"
+/// stance: a reservation is still made, just with `expires_at: None` (i.e. it is treated as never
+/// expiring, per [`Reservation`]'s docs), rather than the whole `ReserveNow` being rejected over
+/// an unparseable but otherwise-honorable request.
+// Only called from the `ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1` adapter modules below, each gated on
+// its own feature - unused (and so a `dead_code` warning without this) when none of them are
+// compiled in, e.g. `--no-default-features`.
+#[cfg_attr(
+    not(any(feature = "ocpp_1_6", feature = "ocpp_2_0_1", feature = "ocpp_2_1")),
+    allow(dead_code)
+)]
+fn parse_expiry_date_time(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
 
 /// The outcome of a CSMS-initiated `ReserveNow` request, matching OCPP's
 /// `ReserveNowStatusEnum`.
@@ -37,11 +58,17 @@ pub enum ReserveNowOutcome {
 /// OCPP's `ReserveNow` addresses at most an EVSE (`evseId` is optional and has no `connectorId`
 /// counterpart) - unlike `RequestStartTransaction`/`ChangeAvailability`, there is no way for the
 /// CSMS to target one specific connector directly.
+///
+/// `expires_at` becomes [`Reservation::expires_at`] directly - callers (the `ocpp_1_6`/
+/// `ocpp_2_0_1`/`ocpp_2_1` adapters below) are expected to have already parsed it from the wire
+/// request via [`parse_expiry_date_time`], so a malformed wire value has already become `None`
+/// (never-expires) before it gets here.
 pub async fn handle_reserve_now(
     actor: &ChargePointActor,
     evse_id: Option<usize>,
     reservation_id: ReservationId,
     id_token: IdToken,
+    expires_at: Option<DateTime<Utc>>,
 ) -> ReserveNowOutcome {
     let state = actor.state();
     // C5 (docs/PRODUCTION-ROADMAP.md §5.5): the handler is registered whenever the
@@ -74,12 +101,7 @@ pub async fn handle_reserve_now(
                 event: ConnectorEvent::Reserved(Reservation {
                     id: reservation_id,
                     id_token,
-                    // Wiring the wire `expiryDateTime`/`expiry_date` through to here is future
-                    // work (see `crate::state::Reservation`'s docs) - `expires_at` today is only
-                    // consulted by `persistence::restore_reservations`, so a reservation created
-                    // through this handler never expires on its own within a single boot, exactly
-                    // as before this field existed.
-                    expires_at: None,
+                    expires_at,
                 }),
             },
         })
@@ -217,6 +239,7 @@ pub trait CancelReservationHandler {
 mod tests {
     use super::{
         CancelReservationOutcome, ReserveNowOutcome, handle_cancel_reservation, handle_reserve_now,
+        parse_expiry_date_time,
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
@@ -231,6 +254,18 @@ mod tests {
             value: "04A224B2".into(),
             kind: IdTokenKind::ISO14443,
         }
+    }
+
+    #[test]
+    fn a_valid_rfc3339_expiry_parses() {
+        let parsed = parse_expiry_date_time("2030-01-01T00:00:00Z");
+
+        assert_eq!(parsed, Some("2030-01-01T00:00:00Z".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_malformed_expiry_parses_to_none() {
+        assert_eq!(parse_expiry_date_time("not a date"), None);
     }
 
     /// Spawns an actor with the `reservation` capability declared present - every test in this
@@ -254,12 +289,45 @@ mod tests {
     async fn reserving_an_available_connector_on_a_given_evse_succeeds() {
         let actor = spawn_with_reservation([1]).await;
 
-        let outcome = handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
+        let outcome =
+            handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
 
         assert_eq!(outcome, ReserveNowOutcome::Accepted);
         assert_eq!(
             actor.state().evses[0].connectors[0],
             ConnectorState::Reserved
+        );
+        assert_eq!(
+            actor.state().evses[0].reservations[0]
+                .as_ref()
+                .and_then(|r| r.expires_at),
+            None,
+            "no expiry was supplied to the handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserving_with_an_expiry_records_it_on_the_reservation() {
+        use chrono::{DateTime, Utc};
+
+        let actor = spawn_with_reservation([1]).await;
+        let expires_at: DateTime<Utc> = "2030-01-01T00:00:00Z".parse().unwrap();
+
+        let outcome = handle_reserve_now(
+            &actor,
+            Some(0),
+            ReservationId(1),
+            test_id_token(),
+            Some(expires_at),
+        )
+        .await;
+
+        assert_eq!(outcome, ReserveNowOutcome::Accepted);
+        assert_eq!(
+            actor.state().evses[0].reservations[0]
+                .as_ref()
+                .and_then(|r| r.expires_at),
+            Some(expires_at)
         );
     }
 
@@ -277,7 +345,8 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = handle_reserve_now(&actor, None, ReservationId(1), test_id_token()).await;
+        let outcome =
+            handle_reserve_now(&actor, None, ReservationId(1), test_id_token(), None).await;
 
         assert_eq!(outcome, ReserveNowOutcome::Accepted);
         assert_eq!(
@@ -290,7 +359,8 @@ mod tests {
     async fn an_unknown_evse_is_rejected() {
         let actor = spawn_with_reservation([1]).await;
 
-        let outcome = handle_reserve_now(&actor, Some(5), ReservationId(1), test_id_token()).await;
+        let outcome =
+            handle_reserve_now(&actor, Some(5), ReservationId(1), test_id_token(), None).await;
 
         assert_eq!(outcome, ReserveNowOutcome::Rejected);
     }
@@ -309,7 +379,8 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
+        let outcome =
+            handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
 
         assert_eq!(outcome, ReserveNowOutcome::Occupied);
     }
@@ -328,7 +399,8 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
+        let outcome =
+            handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
 
         assert_eq!(outcome, ReserveNowOutcome::Unavailable);
     }
@@ -336,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_known_reservation_frees_the_connector() {
         let actor = spawn_with_reservation([1]).await;
-        handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
+        handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
 
         let outcome = handle_cancel_reservation(&actor, ReservationId(1)).await;
 
@@ -365,7 +437,8 @@ mod tests {
     async fn reserve_now_is_rejected_when_the_reservation_capability_is_absent() {
         let actor = ChargePointActor::spawn([1], &TokioExecutor);
 
-        let outcome = handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
+        let outcome =
+            handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
 
         assert_eq!(outcome, ReserveNowOutcome::Rejected);
         assert_eq!(
@@ -378,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_reservation_is_rejected_when_the_reservation_capability_is_absent() {
         let actor = spawn_with_reservation([1]).await;
-        handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token()).await;
+        handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
         // Turn the capability back off - the reservation already made must not become
         // cancellable just because it exists.
         actor
@@ -479,6 +552,7 @@ mod ocpp_2_1 {
                                 evse_id,
                                 ReservationId(request.id),
                                 map_id_token(&request.id_token),
+                                super::parse_expiry_date_time(&request.expiry_date_time),
                             )
                             .await
                         }
@@ -672,6 +746,7 @@ mod ocpp_2_0_1 {
                                 evse_id,
                                 ReservationId(request.id),
                                 map_id_token(&request.id_token),
+                                super::parse_expiry_date_time(&request.expiry_date_time),
                             )
                             .await
                         }
@@ -906,6 +981,7 @@ mod ocpp_1_6 {
                                     evse_id,
                                     ReservationId(request.reservation_id),
                                     map_id_token(&request.id_tag),
+                                    super::parse_expiry_date_time(&request.expiry_date),
                                 )
                                 .await
                             }
