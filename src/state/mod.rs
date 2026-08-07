@@ -1,3 +1,4 @@
+mod authorization_cache;
 mod authorization_status;
 mod boot_reason;
 mod charge_point_state;
@@ -17,6 +18,9 @@ mod reset;
 mod security_event;
 mod transaction;
 
+pub use self::authorization_cache::{
+    AuthorizationCache, AuthorizationCacheEntry, DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
+};
 pub use self::authorization_status::AuthorizationStatus;
 pub use self::boot_reason::BootReasonCause;
 pub use self::charge_point_state::{ChargePointState, LifecycleState, TimeSyncAnchor};

@@ -60,6 +60,7 @@ where
     E: Evse<C>,
     C: Connector,
     N: BootNotifier
+        + crate::authorization::ClearCacheHandler
         + HeartbeatSender
         + StatusNotifier
         + TransactionNotifier
@@ -102,7 +103,9 @@ where
         .await
         .transaction_events(&csms)
         .await
-        .authorization(&csms)
+        .authorization(&csms, clock.clone())
+        .await
+        .clear_cache(&csms)
         .await
         .security_events(&csms)
         .await
@@ -423,6 +426,11 @@ mod tests {
         async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {
             self.cost_registered.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::authorization::ClearCacheHandler for RecordingCsms {
+        async fn register_clear_cache_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
 
     #[async_trait::async_trait]

@@ -872,10 +872,18 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     }
 
     /// Registers the Authorization functional block: every presented-id-token authorization
-    /// request is answered via Authorize.
-    pub async fn authorization<N>(mut self, csms: &N) -> Self
+    /// request is answered via Authorize, every answer the CSMS gives is remembered in the
+    /// authorization cache, and a request that can't reach the CSMS falls back to the local
+    /// authorization list and then that cache - see [`crate::authorization`] for the order and
+    /// the device-model switches that gate it.
+    ///
+    /// `clock` stamps cache entries so `AuthCacheCtrlr`/`LifeTime` can expire them; an
+    /// unsynchronized clock records no timestamp and the entry then never expires on age, rather
+    /// than this crate inventing one.
+    pub async fn authorization<N, K>(mut self, csms: &N, clock: K) -> Self
     where
         N: Authorizer + Clone + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
     {
         let Some(authorization_requests) = self.take_authorization_requests() else {
             return self;
@@ -884,9 +892,23 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let authorizer = csms.clone();
         let actor = self.runtime.actor();
         self.executor.spawn(Box::pin(async move {
-            run_authorization_requests(authorization_requests, &authorizer, actor).await;
+            run_authorization_requests(authorization_requests, &authorizer, actor, &clock).await;
         }));
 
+        self
+    }
+
+    /// Registers inbound `ClearCache` handling (`docs/ROADMAP.md` §3,
+    /// `docs/PRODUCTION-ROADMAP.md` B1.2): a CSMS emptying the authorization cache.
+    ///
+    /// Separate from [`Self::authorization`] because it is an inbound handler rather than an
+    /// outbound loop, and a CSMS client may implement one without the other.
+    pub async fn clear_cache<N>(self, csms: &N) -> Self
+    where
+        N: crate::authorization::ClearCacheHandler + Send + Sync + 'static,
+    {
+        csms.register_clear_cache_handler(self.runtime.actor())
+            .await;
         self
     }
 
@@ -2783,7 +2805,7 @@ mod tests {
             .await
             .transaction_events(&csms)
             .await
-            .authorization(&csms)
+            .authorization(&csms, crate::clock::SystemClock)
             .await
             .security_events(&csms)
             .await

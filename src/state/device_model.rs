@@ -326,6 +326,93 @@ impl DeviceModel {
     ///   `RequestStartTransaction` still needs an `Authorize` round trip. Not yet consulted by
     ///   `crate::remote_control` either, for the same reason.
     fn register_defaults(&mut self) {
+        // Authorization caching (docs/PRODUCTION-ROADMAP.md B1.2). All three are registered
+        // explicitly rather than left absent with a guessed fallback: a charge point's answer to
+        // "may this card charge while you're offline?" should be readable by the CSMS, not
+        // inferred from what this crate assumes when a variable is missing.
+        self.register(
+            Component {
+                name: "AuthCacheCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            Variable {
+                name: "Enabled".into(),
+                instance: None,
+            },
+            VariableCharacteristics {
+                data_type: VariableDataType::Boolean,
+                unit: None,
+                min_limit: None,
+                max_limit: None,
+                values_list: None,
+                supports_monitoring: false,
+            },
+            alloc::vec![VariableAttribute {
+                attribute_type: VariableAttributeType::Actual,
+                value: "true".into(),
+                mutability: VariableMutability::ReadWrite,
+                persistent: false,
+                constant: false,
+                requires_reboot: false,
+            }],
+        );
+        self.register(
+            Component {
+                name: "AuthCacheCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            Variable {
+                name: "LifeTime".into(),
+                instance: None,
+            },
+            VariableCharacteristics {
+                data_type: VariableDataType::Integer,
+                unit: Some("s".into()),
+                min_limit: None,
+                max_limit: None,
+                values_list: None,
+                supports_monitoring: false,
+            },
+            // `0` is OCPP's "no lifetime configured", which this crate reads as "entries don't
+            // expire on age". They are still bounded in number and still clearable.
+            alloc::vec![VariableAttribute {
+                attribute_type: VariableAttributeType::Actual,
+                value: "0".into(),
+                mutability: VariableMutability::ReadWrite,
+                persistent: false,
+                constant: false,
+                requires_reboot: false,
+            }],
+        );
+        self.register(
+            Component {
+                name: "AuthCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            Variable {
+                name: "LocalAuthorizeOffline".into(),
+                instance: None,
+            },
+            VariableCharacteristics {
+                data_type: VariableDataType::Boolean,
+                unit: None,
+                min_limit: None,
+                max_limit: None,
+                values_list: None,
+                supports_monitoring: false,
+            },
+            alloc::vec![VariableAttribute {
+                attribute_type: VariableAttributeType::Actual,
+                value: "true".into(),
+                mutability: VariableMutability::ReadWrite,
+                persistent: false,
+                constant: false,
+                requires_reboot: false,
+            }],
+        );
         // Clock-aligned data (docs/PRODUCTION-ROADMAP.md B1.1). `0` is OCPP's own "disabled",
         // which is the right default for a charge point nobody has configured yet: a charge point
         // that started reporting on a 15-minute drumbeat because this crate picked a number would
@@ -608,15 +695,17 @@ mod tests {
         );
         assert_eq!(
             model.len(),
-            3,
-            "the built-in defaults: HeartbeatInterval, AuthorizeRemoteStart, AlignedDataCtrlr.Interval"
+            6,
+            "the built-in defaults: HeartbeatInterval, AuthorizeRemoteStart, \
+             AlignedDataCtrlr.Interval, AuthCacheCtrlr.Enabled, AuthCacheCtrlr.LifeTime, \
+             AuthCtrlr.LocalAuthorizeOffline"
         );
     }
 
     #[test]
     fn registering_past_the_maximum_is_refused_and_leaves_the_model_alone() {
         // One slot above the built-in defaults, so exactly one custom registration fits.
-        let mut model = DeviceModel::with_max_variables(4);
+        let mut model = DeviceModel::with_max_variables(7);
         assert!(model.register(
             component("Custom"),
             variable("First"),
@@ -632,7 +721,7 @@ mod tests {
         );
 
         assert!(!registered);
-        assert_eq!(model.len(), 4);
+        assert_eq!(model.len(), 7);
         assert_eq!(model.get(&component("Custom"), &variable("Second")), None);
     }
 
@@ -640,7 +729,7 @@ mod tests {
     /// block it - otherwise a full model could never have a value's characteristics corrected.
     #[test]
     fn redefining_an_existing_variable_is_allowed_at_the_maximum() {
-        let mut model = DeviceModel::with_max_variables(3);
+        let mut model = DeviceModel::with_max_variables(6);
 
         let registered = model.register(
             component("OCPPCommCtrlr"),
@@ -650,7 +739,7 @@ mod tests {
         );
 
         assert!(registered);
-        assert_eq!(model.len(), 3);
+        assert_eq!(model.len(), 6);
         assert_eq!(
             model
                 .get(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval"))
@@ -668,8 +757,8 @@ mod tests {
     fn a_maximum_below_the_built_in_defaults_is_raised_to_fit_them() {
         let model = DeviceModel::with_max_variables(0);
 
-        assert_eq!(model.max_variables(), 3);
-        assert_eq!(model.len(), 3);
+        assert_eq!(model.max_variables(), 6);
+        assert_eq!(model.len(), 6);
     }
 
     #[test]
@@ -699,6 +788,9 @@ mod tests {
             vec![
                 "AlignedDataCtrlr",
                 "Alpha",
+                "AuthCacheCtrlr",
+                "AuthCacheCtrlr",
+                "AuthCtrlr",
                 "AuthCtrlr",
                 "OCPPCommCtrlr",
                 "Zeta"

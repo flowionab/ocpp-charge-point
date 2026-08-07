@@ -102,7 +102,7 @@ close — mostly missing one version each.
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: authorization cache, certificates, network profiles. |
-| Test suite | 🚧 | 694 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Test suite | 🚧 | 717 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -168,7 +168,7 @@ version.
 | Reset | ✅ | ✅ | ✅ | |
 | UnlockConnector | ✅ | ✅ | ✅ | |
 | RemoteStart/Stop · RequestStart/StopTransaction | ✅ | ✅ | ✅ | |
-| **ClearCache** | ⬜ | ⬜ | ⬜ | Needs an authorization cache to clear — the cache itself doesn't exist yet. |
+| **ClearCache** | ✅ | ✅ | ✅ | |
 | **TriggerMessage** | ✅ | ✅ | ✅ | Heartbeat and StatusNotification are fulfilled; every other `requestedMessage` is refused with `NotImplemented`. |
 | GetConfiguration / ChangeConfiguration | ✅ | — | — | 12 of ~46 standard keys aliased. |
 | GetVariables / SetVariables | — | ✅ | ✅ | |
@@ -226,8 +226,49 @@ version.
       pushes readings in — so the sampling rate is the binding's choice today. Throttling what
       reaches the CSMS to that interval is real, contained work in the outbound path (where a clock
       exists), and it is left outstanding rather than half-done.
-- [ ] **B1.2** Authorization cache (2.x `AuthCacheCtrlr`, 1.6J
-      `AuthorizationCacheEnabled`) + `ClearCache` on all three versions.
+- [x] **B1.2** Authorization cache + `ClearCache` on all three versions —
+      `src/state/authorization_cache.rs` and `src/authorization.rs`.
+
+      **The cache is learned; the local authorization list is pushed.** That distinction decides
+      the precedence: `SendLocalList` is an operator's advance decision and outranks anything the
+      charge point merely observed, so an offline lookup consults the list first and the cache
+      second. Only the cache expires.
+
+      **It is consulted, not just filled.** A cache nothing reads would be exactly the
+      inert-feature trap §2's variables kept falling into, so this slice also gave
+      `run_authorization_requests` an offline path: an `Authorize` that fails at the transport now
+      falls back to the list, then the cache, instead of denying outright. Nothing offline having
+      an opinion is still a denial - erratic connectivity must not leave a connector waiting, and
+      "we don't know" is not "yes". This is also the first time the local authorization list is
+      consulted anywhere (R§4 had flagged that it wasn't).
+
+      **Rejections are cached too.** A cache that only remembered acceptances would let a revoked
+      card in every time the link drops - the opposite of what caching is for.
+
+      Three device-model variables gate it, all registered as built-in defaults rather than left
+      absent with a guessed fallback, so "what will you do offline?" is a question the CSMS can
+      actually ask: `AuthCacheCtrlr`/`Enabled` (1.6J's `AuthorizationCacheEnabled` aliases onto
+      it), `AuthCacheCtrlr`/`LifeTime` (0 = entries don't age out), and
+      `AuthCtrlr`/`LocalAuthorizeOffline` (false disables *both* offline sources).
+
+      Bounded by `StateLimits::max_authorization_cache_entries` (default 50), evicting the least
+      recently *authorized* entry - and that wording is exact: `lookup` takes `&self` so it can
+      read from a state snapshot, so eviction order tracks CSMS decisions rather than cache hits.
+      Documented on the method rather than left to be discovered.
+
+      Expiry follows the same clock-honesty rule as everything else here: `cached_at` comes from
+      the caller's `Clock` and is `None` when that clock isn't synchronized, which makes the entry
+      non-expiring. On hardware with no RTC the alternatives are a cache that caches nothing or an
+      invented age; keeping the entry is also the recoverable error, since `ClearCache` exists.
+
+      `ClearCache` is `Accepted` even when the cache was already empty - the CSMS asked for "no
+      cached decisions", and that is the resulting state either way - and `Rejected` only when
+      caching is switched off entirely, where accepting would imply a cache this charge point is
+      keeping clear.
+
+      **E2.5 (persisting the cache) is now unblocked** and is the natural follow-up: today the
+      cache is RAM-only, so a reboot loses exactly the decisions an offline charge point would
+      have needed.
 - [x] **B1.3 / B1.4** `TriggerMessage` wire adapters for all three versions, in
       `src/remote_control.rs` beside the protocol-agnostic `handle_trigger_message` that has been
       waiting for them. **B1.4's upstream dependency was already satisfied**: 2.1's
@@ -832,7 +873,7 @@ mid-transaction currently loses the transaction.
 | Transaction sequence numbers / `seqNo` | 2.x `TransactionEvent` ordering | R§5 |
 | Device model attributes marked `persistent` | Already flagged in the model, now acted on | R§2 |
 | Local authorization list + version number | Re-download after every boot is unacceptable offline | R§4 |
-| Authorization cache | Offline authorization | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
+| Authorization cache | Offline authorization — **now unblocked**: [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)'s cache exists, so E2.5 is ordinary work | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
 | Reservations | Survive a reboot inside the reservation window | R§8 |
 | Charging profiles | Load limits survive a reboot (`persistence::ChargingProfileSnapshotStore`; `ChargePointBuilder::charging_profile_persistence`) | [B2.1](#b2--smart-charging-r11) |
 | Offline message queue | All three queues now durable (`src/persistence.rs`; `ChargePointBuilder::transaction_events_persisted` / `status_notifications_persisted` / `security_events_persisted`) | [G2](#92-g2--bounded-memory) |
@@ -1089,11 +1130,14 @@ mid-transaction currently loses the transaction.
       the blocks that would (`GetLog`, customer-information erasure) are [B5.1](#b5--diagnostics-and-monitoring-r14)/[B5.5](#b5--diagnostics-and-monitoring-r14) - which is
       the honest remaining half of [F4.3](#84-f4--security-events): the durable log exists, the `GetLog` reader
       does not.
-- [ ] **E2.5, E2.9, E2.11** One task per remaining row above. All three remain blocked on
-      functional blocks that don't exist yet: authorization cache on
-      [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment), certificates on
-      [B4.1](#b4--certificates-and-iso-15118-r1-r13), network profiles on
-      [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle).
+- [ ] **E2.9, E2.11** Certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)) and network
+      profiles ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle))
+      remain blocked on functional blocks that don't exist yet.
+- [ ] **E2.5** Authorization cache. **No longer blocked** —
+      [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)'s cache landed, and
+      `ChargePointEvent::PersistedAuthorizationCacheRestored` is already in place for a restore to
+      use. Until it does, a reboot loses exactly the decisions an offline charge point would have
+      needed, which is the case the cache exists for.
 - [x] **E2.7** Charging profiles — `persistence::ChargingProfileSnapshotStore`/
       `restore_charging_profiles`/`run_charging_profile_persistence`, wired via
       `ChargePointBuilder::charging_profile_persistence`. Unblocked by
@@ -1928,13 +1972,13 @@ mid-transaction clock jumps.
 
 Three honest caveats, none of them a hole in the exit criteria:
 
-- **Three E2 rows remain RAM-only**, every one blocked on a functional block that does not exist
-  yet: authorization cache ([B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)),
-  certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)), network profiles
+- **Three E2 rows remain RAM-only.** Two are still blocked on functional blocks that do not exist
+  yet: certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)) and network profiles
   ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle)).
-  Charging profiles ([E2.7](#72-e2--what-must-survive)) was the fourth until
-  [B2.1](#b2--smart-charging-r11) unblocked it; it landed with B2 rather than being left as a
-  durability gap behind a shipped block.
+  The third, the authorization cache ([E2.5](#72-e2--what-must-survive)), stopped being blocked
+  when [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) landed and is now
+  simply outstanding - the same shape charging profiles ([E2.7](#72-e2--what-must-survive)) was in
+  after B2, which was closed immediately rather than left behind a shipped block.
 - **Durability is opt-in per concern.** Every `*_persistence` / `*_persisted` registration on
   `ChargePointBuilder` is a separate call an integrator has to make; `setup()`'s
   "everything on" wrapper does not wire any of them, because it has no `Storage` to wire them
@@ -1984,29 +2028,29 @@ Method: every `.on_*(` / `.send_*(` call inside a `mod ocpp_1_6` /
 `ocpp-client` 0.2.0 generates per version. Re-run it after any coverage
 work; it's the honest number.
 
-### A.1 OCPP 1.6J — 24 of 28 wired
+### A.1 OCPP 1.6J — 25 of 28 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
-ChangeAvailability, ChangeConfiguration, DataTransfer, GetConfiguration,
+ChangeAvailability, ChangeConfiguration, ClearCache, DataTransfer, GetConfiguration,
 ClearChargingProfile, GetCompositeSchedule, GetLocalListVersion, Heartbeat,
 MeterValues, RemoteStartTransaction, RemoteStopTransaction, ReserveNow, Reset,
 SendLocalList, SetChargingProfile, StartTransaction, StatusNotification,
 StopTransaction, TriggerMessage, UnlockConnector
 
-**Missing:** ClearCache, DiagnosticsStatusNotification,
+**Missing:** DiagnosticsStatusNotification,
 FirmwareStatusNotification, GetDiagnostics, UpdateFirmware
 
-### A.2 OCPP 2.0.1 — 27 of 63 wired
+### A.2 OCPP 2.0.1 — 28 of 63 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
-ChangeAvailability, ClearChargingProfile, CostUpdated, DataTransfer,
+ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
 GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
 MeterValues, RequestStopTransaction, ReserveNow, Reset, SendLocalList,
 SetChargingProfile, SetVariables, StatusNotification, TransactionEvent,
 TriggerMessage, UnlockConnector
 
-**Missing:** CertificateSigned, ClearCache,
+**Missing:** CertificateSigned,
 ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
 CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
 Get15118EVCertificate, GetCertificateStatus, GetChargingProfiles,
@@ -2024,10 +2068,10 @@ SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 `ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
 [D1](#61-d1--missing-action-wrappers).
 
-### A.3 OCPP 2.1 — 28 of 86 wired
+### A.3 OCPP 2.1 — 29 of 86 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
-ChangeAvailability, ClearChargingProfile, CostUpdated, DataTransfer,
+ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
 GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
@@ -2035,7 +2079,7 @@ MeterValues, SendLocalList, SetChargingProfile, SetVariables,
 StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
 
 **Missing:** AFRRSignal, AdjustPeriodicEventStream, BatterySwap,
-CertificateSigned, ChangeTransactionTariff, ClearCache, ClearDERControl, ClearDisplayMessage, ClearTariffs,
+CertificateSigned, ChangeTransactionTariff, ClearDERControl, ClearDisplayMessage, ClearTariffs,
 ClearVariableMonitoring, ClearedChargingLimit, ClosePeriodicEventStream,
 CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
 Get15118EVCertificate, GetCertificateChainStatus, GetCertificateStatus,
@@ -2067,10 +2111,10 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 |--------|-------|--------|
 | Device-model rows in the 2.1 appendix | 438 | `docs/OCPP-2.1/Appendices_CSV_v2.1/dm_components_vars.csv` |
 | …marked Required | 122, across 23 components | same |
-| …registered by this crate | 3 (`AlignedDataCtrlr.Interval`, `AuthCtrlr.AuthorizeRemoteStart`, `OCPPCommCtrlr.HeartbeatInterval`) | `src/state/device_model.rs` |
-| 1.6J standard config keys aliased | 13 | `src/device_model.rs` |
+| …registered by this crate | 6 (`AlignedDataCtrlr.Interval`, `AuthCacheCtrlr.Enabled`, `AuthCacheCtrlr.LifeTime`, `AuthCtrlr.AuthorizeRemoteStart`, `AuthCtrlr.LocalAuthorizeOffline`, `OCPPCommCtrlr.HeartbeatInterval`) | `src/state/device_model.rs` |
+| 1.6J standard config keys aliased | 14 | `src/device_model.rs` |
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
-| Protocol trait bounds on `setup()`'s CSMS parameter | 26 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 694 | `#[test]` + `#[tokio::test]`, re-counted at the B1.5 commit (684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Protocol trait bounds on `setup()`'s CSMS parameter | 27 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
+| Test functions in `src/` | 717 | `#[test]` + `#[tokio::test]`, re-counted at the B1.2 commit (694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

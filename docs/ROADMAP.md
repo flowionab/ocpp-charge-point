@@ -753,9 +753,18 @@ Deciding whether an identifier is allowed to start/continue charging.
   particular is folded into `Rejected` even though the spec's own guidance
   ("advised to not stop charging if status is Accepted or ConcurrentTx")
   suggests it may deserve different treatment once transactions can run
-  concurrently per token. Still missing: group id tokens, cache TTL/offline
-  authorization policy, and `idTokenInfo`'s richer fields (e.g.
-  `evseId`-scoped validity).
+  concurrently per token. An **authorization cache** now backs offline
+  operation (`state::AuthorizationCache`, B1.2): every CSMS decision is
+  remembered - rejections included, or a revoked card would get in every time
+  the link drops - and an `Authorize` that fails at the transport falls back to
+  the local authorization list first (pushed by the operator, so authoritative)
+  and the cache second, with `AuthCtrlr`/`LocalAuthorizeOffline`,
+  `AuthCacheCtrlr`/`Enabled` and `AuthCacheCtrlr`/`LifeTime` gating both. That
+  is also the first thing that consults the local list at all (see §4).
+  `ClearCache` is wired on all three versions. Still missing: group id tokens,
+  `idTokenInfo`'s richer fields (e.g. `evseId`-scoped validity), and persisting
+  the cache across a reboot (E2.5 - RAM-only today, so a restart loses exactly
+  the decisions an offline charge point would need).
 - Version notes: 1.6J's `Authorize.req`/`.conf` maps closely; 2.1 adds
   richer `IdTokenInfo` (groups, restrictions) that must downgrade to
   1.6J's flatter `idTagInfo`.
@@ -790,11 +799,14 @@ Offline authorization without a CSMS round-trip.
   the CSMS is out of sync) and reports `VersionMismatch` rather than risking
   applying changes on top of an unknown base; `SendLocalListStatusEnum`'s
   third value, `Failed`, isn't reachable, since the list is a plain in-memory
-  `Vec` with nothing else that can fail. Still missing: the list isn't
-  consulted anywhere yet - every presented id token still round-trips
-  through Authorize regardless of what's cached, online or not, since there
-  is no notion of "the CSMS is unreachable" anywhere in this crate today
-  (needs the connection-state tracking noted as unstarted in §0).
+  `Vec` with nothing else that can fail. The list is now consulted: an `Authorize`
+  that fails at the transport falls back to it before the authorization cache
+  (§3, B1.2), gated on `AuthCtrlr`/`LocalAuthorizeOffline`. "The CSMS is
+  unreachable" is still not tracked as *state* - the fallback triggers per
+  failed request rather than from a connection-state machine - which is enough
+  for offline authorization but not for anything that needs to know the link is
+  down before it tries. Still missing: persisting the list is done (E2.4), but
+  nothing pre-authorizes from it while online (`LocalPreAuthorize`).
 - Version notes: present in both 1.6J and 2.0.1/2.1 with compatible
   semantics — low downgrade risk.
 

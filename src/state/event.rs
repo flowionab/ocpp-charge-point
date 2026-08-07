@@ -5,10 +5,11 @@ use chrono::{DateTime, Utc};
 use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::{
-    ChargingProfile, ChargingProfileCriteria, ChargingProfileScope, Component, ConnectorState,
-    ConnectorStatus, DeviceModelEvent, IdToken, InstalledChargingProfile, LocalListEntry,
-    MeterSample, RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent,
-    StopReason, Transaction, Variable, VariableAttributeType,
+    AuthorizationCacheEntry, AuthorizationStatus, ChargingProfile, ChargingProfileCriteria,
+    ChargingProfileScope, Component, ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken,
+    InstalledChargingProfile, LocalListEntry, MeterSample, RegistrationStatus, Reservation,
+    ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, Variable,
+    VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -59,6 +60,29 @@ pub enum ChargePointEvent {
         /// Whether to interrupt anything in progress right away, or wait for `target` to go
         /// idle first.
         kind: ResetKind,
+    },
+    /// The CSMS answered an `Authorize` request, and the decision is worth remembering - see
+    /// [`crate::state::AuthorizationCache`]. Raised by
+    /// [`crate::authorization::run_authorization_requests`] for every decision it receives,
+    /// acceptance or rejection alike.
+    AuthorizationCached {
+        /// The identifier the decision was about.
+        id_token: IdToken,
+        /// What the CSMS decided.
+        status: AuthorizationStatus,
+        /// When, per the caller's [`Clock`](crate::clock::Clock) - `None` when that clock wasn't
+        /// synchronized, which makes the entry non-expiring (see
+        /// [`crate::state::AuthorizationCacheEntry::cached_at`]).
+        cached_at: Option<DateTime<Utc>>,
+    },
+    /// The CSMS asked for the authorization cache to be emptied (OCPP `ClearCache`), or an
+    /// operator did.
+    AuthorizationCacheCleared,
+    /// The authorization cache as recovered from durable storage at boot.
+    PersistedAuthorizationCacheRestored {
+        /// The recovered entries, least recently authorized first. Entries beyond the configured
+        /// bound are dropped from the *oldest* end, keeping the half a cache exists to serve.
+        entries: Vec<AuthorizationCacheEntry>,
     },
     /// The CSMS installed a charging profile (OCPP `SetChargingProfile`). Applied through
     /// [`crate::state::ChargingProfileStore::install`], so the replacement rules and the

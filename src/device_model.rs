@@ -1288,6 +1288,15 @@ mod ocpp_1_6 {
             variable: "AuthorizeRemoteStart",
             instance: None,
         },
+        // dm_components_vars.csv:93 - 1.6's "AuthorizationCacheEnabled" became
+        // "AuthCacheCtrlr.Enabled". Live rather than decorative: it is what
+        // `crate::authorization` consults before answering from the cache while offline.
+        StandardKeyAlias {
+            key: "AuthorizationCacheEnabled",
+            component: "AuthCacheCtrlr",
+            variable: "Enabled",
+            instance: None,
+        },
         // dm_components_vars.csv:60 - 1.6's "ClockAlignedDataInterval" became
         // "AlignedDataCtrlr.Interval". This one is live rather than decorative: it is what
         // `crate::meter_values::run_aligned_meter_values` reads on every cycle, so a 1.6J CSMS

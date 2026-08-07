@@ -38,6 +38,11 @@ pub const DEFAULT_MAX_DEVICE_MODEL_VARIABLES: usize = 256;
 /// exists at all.
 pub const DEFAULT_MAX_CHARGING_PROFILES: usize = 16;
 
+/// Default maximum number of cached authorization decisions - see
+/// [`crate::state::DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES`], which documents the reasoning; this
+/// re-export exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
+pub use crate::state::authorization_cache::DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES;
+
 /// The configured maxima for every growable collection in [`crate::state::ChargePointState`], so a
 /// charge point's peak memory is a function of its configuration rather than of how much a CSMS or
 /// a hardware binding decides to push at it - see `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2). Passed
@@ -82,6 +87,12 @@ pub struct StateLimits {
     /// let the charge point draw more current than the CSMS last told it to. Replacing an
     /// already-installed profile is always allowed, even at the bound. Clamped to at least 1.
     pub max_charging_profiles: usize,
+    /// The most authorization decisions the cache may remember. Reaching it evicts the least
+    /// recently authorized entry rather than refusing the new one - unlike
+    /// [`Self::max_charging_profiles`], where forgetting is a safety problem: a forgotten *cache*
+    /// entry just means the next `Authorize` for that token goes to the CSMS, which is the normal
+    /// path anyway. Clamped to at least 1.
+    pub max_authorization_cache_entries: usize,
 }
 
 impl StateLimits {
@@ -92,7 +103,14 @@ impl StateLimits {
             max_local_authorization_list_entries: DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES,
             max_device_model_variables: DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
             max_charging_profiles: DEFAULT_MAX_CHARGING_PROFILES,
+            max_authorization_cache_entries: DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
         }
+    }
+
+    /// Overrides [`Self::max_authorization_cache_entries`].
+    pub const fn with_max_authorization_cache_entries(mut self, max: usize) -> Self {
+        self.max_authorization_cache_entries = max;
+        self
     }
 
     /// Overrides [`Self::max_charging_profiles`].

@@ -413,7 +413,7 @@ mod tests {
 
         let entries = report_base_entries(&model, ReportBase::FullInventory);
 
-        assert_eq!(entries.len(), 3); // the three built-in defaults
+        assert_eq!(entries.len(), 6); // the six built-in defaults
     }
 
     #[test]
@@ -434,7 +434,7 @@ mod tests {
 
         // Every built-in default is ReadWrite, so they're all included; the freshly registered
         // ReadOnly-only variable is not.
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 6);
         assert!(
             entries
                 .iter()
@@ -458,17 +458,31 @@ mod tests {
 
         let entries = report_base_entries(&model, ReportBase::SummaryInventory);
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].variable.name, "Problem");
+        // The freshly registered `Problem`, plus the one well-known control variable the built-in
+        // defaults contribute (`AuthCacheCtrlr.Enabled`) - and nothing else, which is the point:
+        // `HeartbeatInterval` and friends are configuration, not status.
+        let names: alloc::vec::Vec<_> = entries
+            .iter()
+            .map(|entry| entry.variable.name.as_str())
+            .collect();
+        assert_eq!(names, alloc::vec!["Enabled", "Problem"]);
     }
 
+    /// A fresh model now has exactly one well-known status/control variable among its built-in
+    /// defaults - `AuthCacheCtrlr.Enabled`, registered by B1.2 - so the summary report is no
+    /// longer empty out of the box. That is the summary working, not leaking: whether the
+    /// authorization cache is enabled is precisely the kind of control state this report is for.
     #[test]
-    fn a_fresh_device_model_reports_no_summary_variables_at_all() {
+    fn a_fresh_device_model_summarises_the_control_variables_it_has() {
         let model = DeviceModel::new();
 
         let entries = report_base_entries(&model, ReportBase::SummaryInventory);
 
-        assert!(entries.is_empty());
+        let names: alloc::vec::Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.component.name.as_str(), entry.variable.name.as_str()))
+            .collect();
+        assert_eq!(names, alloc::vec![("AuthCacheCtrlr", "Enabled")]);
     }
 
     #[test]
@@ -655,13 +669,25 @@ mod tests {
         );
     }
 
+    /// `GetBaseReport` is `Accepted` whatever it finds - including nothing. A summary report on a
+    /// charge point whose hardware registers no status variables at all is empty but still
+    /// accepted, which is the case this pins (the built-in `AuthCacheCtrlr.Enabled` is filtered
+    /// out here so the assertion is about emptiness, not about which defaults exist).
     #[tokio::test]
-    async fn get_base_report_is_always_accepted_even_when_empty() {
+    async fn get_base_report_is_always_accepted_even_when_it_finds_almost_nothing() {
         let actor = ChargePointActor::spawn([1], &TokioExecutor);
 
         let outcome = handle_get_base_report(&actor, ReportBase::SummaryInventory);
 
-        assert_eq!(outcome, ReportOutcome::Accepted(alloc::vec::Vec::new()));
+        let ReportOutcome::Accepted(entries) = outcome else {
+            panic!("a base report is always accepted");
+        };
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.component.name == "AuthCacheCtrlr"),
+            "nothing but the built-in control variable should be summarised on a fresh model"
+        );
     }
 
     #[tokio::test]

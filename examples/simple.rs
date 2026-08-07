@@ -1,4 +1,4 @@
-use ocpp_charge_point::authorization::Authorizer;
+use ocpp_charge_point::authorization::{Authorizer, ClearCacheHandler};
 use ocpp_charge_point::availability::{ChangeAvailabilityHandler, StatusNotifier};
 use ocpp_charge_point::connection::ReconnectHandler;
 use ocpp_charge_point::cost::CostUpdatedHandler;
@@ -232,6 +232,16 @@ impl SecurityEventNotifier for AlwaysAcceptBootNotifier {
 #[async_trait::async_trait]
 impl CostUpdatedHandler for AlwaysAcceptBootNotifier {
     async fn register_cost_updated_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+// ClearCache (docs/ROADMAP.md §3): emptying the authorization cache.
+#[async_trait::async_trait]
+impl ClearCacheHandler for AlwaysAcceptBootNotifier {
+    async fn register_clear_cache_handler(
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {

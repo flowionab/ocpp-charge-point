@@ -5,11 +5,11 @@ use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
-    AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargingProfileScope,
-    ChargingProfileStore, ConnectorEvent, ConnectorState, ConnectorStatusChanged, DeviceModel,
-    DeviceModelEvent, EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList,
-    LocalListEntry, MeterSample, PendingReset, RegistrationStatus, ResetKind, ResetTarget,
-    SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
+    AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
+    ChargingProfileScope, ChargingProfileStore, ConnectorEvent, ConnectorState,
+    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
+    IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, PendingReset, RegistrationStatus,
+    ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
     TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
     TransactionUpdateReason,
 };
@@ -62,6 +62,9 @@ pub struct ChargePointState {
     /// Conservatively empty ([`Capabilities::default`]) until `ChargePointBuilder::start` captures
     /// the real value - see `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
     pub capabilities: Capabilities,
+    /// Authorization decisions the CSMS has already made, kept so a charge point that can't
+    /// reach it can still answer - see [`AuthorizationCache`] and `docs/ROADMAP.md` §3.
+    pub authorization_cache: AuthorizationCache,
     /// Every charging profile the CSMS has installed, across every scope - the Smart Charging
     /// functional block's state. See [`ChargingProfileStore`] and `docs/ROADMAP.md` §11.
     pub charging_profiles: ChargingProfileStore,
@@ -116,6 +119,9 @@ impl ChargePointState {
             pending_reset: None,
             device_model: DeviceModel::with_max_variables(limits.max_device_model_variables),
             capabilities: Capabilities::default(),
+            authorization_cache: AuthorizationCache::with_max_entries(
+                limits.max_authorization_cache_entries,
+            ),
             charging_profiles: ChargingProfileStore::with_limit(limits.max_charging_profiles),
             time_sync: None,
         }
@@ -180,6 +186,25 @@ impl ChargePointState {
                     }
                 }
                 true
+            }
+            ChargePointEvent::AuthorizationCached {
+                id_token,
+                status,
+                cached_at,
+            } => self
+                .authorization_cache
+                .remember(id_token, status, cached_at),
+            ChargePointEvent::AuthorizationCacheCleared => self.authorization_cache.clear() > 0,
+            ChargePointEvent::PersistedAuthorizationCacheRestored { entries } => {
+                let dropped = self.authorization_cache.replace(entries);
+                if dropped > 0 {
+                    tracing::warn!(
+                        dropped,
+                        max_entries = self.authorization_cache.max_entries(),
+                        "truncated the recovered authorization cache to its configured maximum"
+                    );
+                }
+                !self.authorization_cache.is_empty()
             }
             ChargePointEvent::ChargingProfileSet { scope, profile } => {
                 let id = profile.id;

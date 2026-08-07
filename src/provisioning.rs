@@ -1110,6 +1110,11 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::authorization::ClearCacheHandler for FixedBootNotifier {
+        async fn register_clear_cache_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
     impl crate::remote_control::TriggerMessageHandler for FixedBootNotifier {
         async fn register_trigger_message_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
