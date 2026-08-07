@@ -12,7 +12,8 @@ use crate::hardware::Evse;
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender};
 use crate::remote_control::{
-    RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
+    RequestStartTransactionHandler, RequestStopTransactionHandler, TriggerMessageHandler,
+    UnlockConnectorHandler,
 };
 use crate::reporting::{GetBaseReportHandler, GetReportHandler};
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
@@ -67,6 +68,7 @@ where
         + ChangeAvailabilityHandler
         + RequestStartTransactionHandler
         + RequestStopTransactionHandler
+        + TriggerMessageHandler
         + ReserveNowHandler
         + CancelReservationHandler
         + ResetHandler
@@ -105,6 +107,8 @@ where
         .security_events(&csms)
         .await
         .remote_control(&csms)
+        .await
+        .trigger_message(&csms)
         .await
         .availability_control(&csms)
         .await
@@ -419,6 +423,11 @@ mod tests {
         async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {
             self.cost_registered.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_control::TriggerMessageHandler for RecordingCsms {
+        async fn register_trigger_message_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
 
     #[async_trait::async_trait]

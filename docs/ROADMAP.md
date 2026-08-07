@@ -920,10 +920,13 @@ CSMS-initiated control of the charge point.
   `RequestStopTransactionHandler` trait, implemented for `ocpp-client`'s
   OCPP 2.1 client (registering via `Client::on_request_stop_transaction`),
   parses the wire `transactionId` string as a `u64`, treating anything
-  that doesn't parse as an unknown transaction. `TriggerMessage` has a
-  protocol-agnostic internal handler
-  (`remote_control::{TriggerableMessage, handle_trigger_message}`) but no
-  CSMS-facing entry point wired on any version yet.
+  that doesn't parse as an unknown transaction. `TriggerMessage` is wired on
+  all three versions (`remote_control::{TriggerableMessage,
+  handle_trigger_message}` plus per-version adapters and
+  `ChargePointBuilder::trigger_message`): `Heartbeat` and `StatusNotification`
+  are fulfilled, every other `requestedMessage` is refused with
+  `NotImplemented` rather than `Rejected`, and an address that cannot exist is
+  rejected rather than widened to the whole charge point.
 
   **This paragraph's long-standing "blocked upstream on 2.1" claim was
   wrong, and is corrected here (D1.3).** It used to say `rust-ocpp`'s

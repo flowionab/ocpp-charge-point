@@ -13,7 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(feature = "ocpp_1_6")]
-pub use self::ocpp_1_6::Ocpp1_6RemoteControlHandler;
+pub use self::ocpp_1_6::{Ocpp1_6RemoteControlHandler, Ocpp1_6TriggerMessageHandler};
 
 /// The outcome of a CSMS-initiated `UnlockConnector` request, matching OCPP's
 /// `UnlockStatusEnum`.
@@ -90,6 +90,18 @@ pub trait UnlockConnectorHandler {
     /// Registers an `UnlockConnector` handler with the CSMS connection that dispatches incoming
     /// requests to [`handle_unlock_request`] against `actor`.
     async fn register_unlock_connector_handler(&self, actor: ChargePointActor);
+}
+
+/// Registers this charge point's inbound `TriggerMessage` handling with the CSMS connection.
+/// Implemented per protocol version, mirroring [`UnlockConnectorHandler`].
+///
+/// The implementing type is also the notifier the re-send goes out through - a `TriggerMessage`
+/// asking for a Heartbeat is answered by *sending a Heartbeat*, so the handler needs the same
+/// connection it was asked on, not a second one.
+#[async_trait::async_trait]
+pub trait TriggerMessageHandler {
+    /// Registers a `TriggerMessage` handler dispatching against `actor`.
+    async fn register_trigger_message_handler(&self, actor: ChargePointActor);
 }
 
 /// The outcome of a CSMS-initiated `RequestStartTransaction` request, matching (a subset of)
@@ -243,10 +255,11 @@ pub trait RequestStopTransactionHandler {
 /// `MeterValues`/`TransactionEvent` - needs a "resend current snapshot" capability neither
 /// functional block has yet; firmware/log/certificate triggers, `CustomTrigger` - no supporting
 /// functional block exists at all, §1/§12) has no internal representation to construct here.
-/// There is currently no way to reach this from the network: the OCPP 2.1 wire types for
-/// `TriggerMessage` don't exist yet in the `rust-ocpp`/`ocpp-client` dependencies (see
-/// `docs/ROADMAP.md` §6) - this only exists as a protocol-agnostic building block for once that
-/// lands.
+/// All three versions can now reach this from the network - see
+/// [`TriggerMessageHandler`] and the `ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1` adapters below. (An
+/// earlier revision of these docs said the 2.1 wire types did not exist; they do, in the
+/// `ocpp-types`/`ocpp-client` versions this crate pins - see `docs/PRODUCTION-ROADMAP.md` D1.3
+/// for that correction.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerableMessage {
     /// Re-sends `Heartbeat`.
@@ -804,22 +817,189 @@ mod tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
+
+    // --- TriggerMessage (B1.4) ---
+
+    /// Maps a wire `evse` field onto this crate's [`AvailabilityTarget`]. Absent means the whole
+    /// charge point; `id`/`connectorId` are 1-based on the wire and 0-based here.
+    ///
+    /// `Err(())` is an address that cannot exist - a non-positive id - which the caller answers
+    /// with `Rejected` rather than silently widening it to "the whole charge point".
+    fn trigger_target(evse: Option<&EVSE>) -> Result<AvailabilityTarget, ()> {
+        let Some(evse) = evse else {
+            return Ok(AvailabilityTarget::ChargePoint);
+        };
+        let evse_id = usize::try_from(evse.id)
+            .map_err(|_| ())?
+            .checked_sub(1)
+            .ok_or(())?;
+        match evse.connector_id {
+            None => Ok(AvailabilityTarget::Evse { evse_id }),
+            Some(connector_id) => {
+                let connector_id = usize::try_from(connector_id)
+                    .map_err(|_| ())?
+                    .checked_sub(1)
+                    .ok_or(())?;
+                Ok(AvailabilityTarget::Connector {
+                    evse_id,
+                    connector_id,
+                })
+            }
+        }
+    }
+
+    /// Maps a wire `requestedMessage` onto this crate's [`TriggerableMessage`], or `None` for a
+    /// value no functional block here can fulfil - which is exactly OCPP's `NotImplemented`, and
+    /// why [`TriggerMessageOutcome`] has no variant for it (see that type's docs): the
+    /// distinction only exists at the wire, where the unsupported values live.
+    fn triggerable_message(
+        requested: &MessageTriggerEnum,
+        target: AvailabilityTarget,
+    ) -> Option<TriggerableMessage> {
+        match requested {
+            MessageTriggerEnum::Heartbeat => Some(TriggerableMessage::Heartbeat),
+            MessageTriggerEnum::StatusNotification => {
+                Some(TriggerableMessage::StatusNotification(target))
+            }
+            _ => None,
+        }
+    }
+
+    fn trigger_response(status: TriggerMessageStatusEnum) -> TriggerMessageResponse {
+        TriggerMessageResponse {
+            custom_data: None,
+            status,
+            status_info: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TriggerMessageHandler for OCPP2_1Client {
+        async fn register_trigger_message_handler(&self, actor: ChargePointActor) {
+            // The client is both the handler and the notifier the re-send goes out through: a
+            // `TriggerMessage` asking for a Heartbeat is answered by sending one, on this same
+            // connection.
+            let notifier = self.clone();
+            self.on_trigger_message(move |request: TriggerMessageRequest, _client| {
+                let actor = actor.clone();
+                let notifier = notifier.clone();
+                async move {
+                    let Ok(target) = trigger_target(request.evse.as_ref()) else {
+                        return Ok(trigger_response(TriggerMessageStatusEnum::Rejected));
+                    };
+                    let Some(message) = triggerable_message(&request.requested_message, target)
+                    else {
+                        return Ok(trigger_response(TriggerMessageStatusEnum::NotImplemented));
+                    };
+                    let outcome = handle_trigger_message(&actor, &notifier, message).await;
+                    Ok(trigger_response(match outcome {
+                        TriggerMessageOutcome::Accepted => TriggerMessageStatusEnum::Accepted,
+                        TriggerMessageOutcome::Rejected => TriggerMessageStatusEnum::Rejected,
+                    }))
+                }
+            })
+            .await;
+        }
+    }
+
+    #[cfg(test)]
+    mod trigger_message_tests {
+        use super::*;
+
+        fn evse(id: i64, connector_id: Option<i64>) -> EVSE {
+            EVSE {
+                connector_id,
+                custom_data: None,
+                id,
+            }
+        }
+
+        #[test]
+        fn an_absent_evse_addresses_the_whole_charge_point() {
+            assert_eq!(trigger_target(None), Ok(AvailabilityTarget::ChargePoint));
+        }
+
+        #[test]
+        fn wire_ids_are_one_based_and_this_crates_are_zero_based() {
+            assert_eq!(
+                trigger_target(Some(&evse(1, None))),
+                Ok(AvailabilityTarget::Evse { evse_id: 0 })
+            );
+            assert_eq!(
+                trigger_target(Some(&evse(2, Some(1)))),
+                Ok(AvailabilityTarget::Connector {
+                    evse_id: 1,
+                    connector_id: 0
+                })
+            );
+        }
+
+        #[test]
+        fn an_address_that_cannot_exist_is_rejected_rather_than_widened() {
+            // `0` and negatives are not valid wire ids; treating either as "the whole charge
+            // point" would answer a request the CSMS did not make.
+            assert_eq!(trigger_target(Some(&evse(0, None))), Err(()));
+            assert_eq!(trigger_target(Some(&evse(-1, None))), Err(()));
+            assert_eq!(trigger_target(Some(&evse(1, Some(0)))), Err(()));
+        }
+
+        #[test]
+        fn the_two_messages_this_crate_can_resend_map_and_the_rest_are_not_implemented() {
+            assert_eq!(
+                triggerable_message(
+                    &MessageTriggerEnum::Heartbeat,
+                    AvailabilityTarget::ChargePoint
+                ),
+                Some(TriggerableMessage::Heartbeat)
+            );
+            assert_eq!(
+                triggerable_message(
+                    &MessageTriggerEnum::StatusNotification,
+                    AvailabilityTarget::Evse { evse_id: 0 }
+                ),
+                Some(TriggerableMessage::StatusNotification(
+                    AvailabilityTarget::Evse { evse_id: 0 }
+                ))
+            );
+            // Everything else needs a functional block this crate doesn't have. Reported as
+            // NotImplemented rather than Rejected, which would claim the request was understood
+            // and refused.
+            for requested in [
+                MessageTriggerEnum::BootNotification,
+                MessageTriggerEnum::MeterValues,
+                MessageTriggerEnum::TransactionEvent,
+                MessageTriggerEnum::FirmwareStatusNotification,
+                MessageTriggerEnum::LogStatusNotification,
+            ] {
+                assert_eq!(
+                    triggerable_message(&requested, AvailabilityTarget::ChargePoint),
+                    None
+                );
+            }
+        }
+    }
+
     use super::{
         RequestStartTransactionHandler, RequestStartTransactionOutcome,
-        RequestStopTransactionHandler, RequestStopTransactionOutcome, UnlockConnectorHandler,
-        UnlockOutcome, handle_request_start_transaction, handle_request_stop_transaction,
+        RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
+        TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
+        handle_request_start_transaction, handle_request_stop_transaction, handle_trigger_message,
         handle_unlock_request,
     };
     use crate::actor::ChargePointActor;
+    use crate::availability::AvailabilityTarget;
     use crate::state::{IdToken, IdTokenKind, TransactionId};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{RequestStartStopStatusEnum, UnlockStatusEnum};
+    use ocpp_client::ocpp_types::v21::common::{
+        EVSE, MessageTriggerEnum, RequestStartStopStatusEnum, TriggerMessageStatusEnum,
+        UnlockStatusEnum,
+    };
     use ocpp_client::ocpp_types::v21::{
         RequestStartTransactionRequest, RequestStartTransactionResponse,
-        RequestStopTransactionRequest, RequestStopTransactionResponse, UnlockConnectorRequest,
-        UnlockConnectorResponse,
+        RequestStopTransactionRequest, RequestStopTransactionResponse, TriggerMessageRequest,
+        TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
     };
 
     /// Mirrors [`crate::local_authorization_list::ocpp_2_1::map_id_token_kind`] - each `ocpp_2_1`
@@ -1130,24 +1310,189 @@ mod ocpp_2_1 {
 /// since it's a different direction, but the same closed-enum shape to work around.
 #[cfg(feature = "ocpp_2_0_1")]
 pub(crate) mod ocpp_2_0_1 {
+
+    // --- TriggerMessage (B1.3) ---
+
+    /// Maps a wire `evse` field onto this crate's [`AvailabilityTarget`]. Absent means the whole
+    /// charge point; `id`/`connectorId` are 1-based on the wire and 0-based here.
+    ///
+    /// `Err(())` is an address that cannot exist - a non-positive id - which the caller answers
+    /// with `Rejected` rather than silently widening it to "the whole charge point".
+    fn trigger_target(evse: Option<&EVSE>) -> Result<AvailabilityTarget, ()> {
+        let Some(evse) = evse else {
+            return Ok(AvailabilityTarget::ChargePoint);
+        };
+        let evse_id = usize::try_from(evse.id)
+            .map_err(|_| ())?
+            .checked_sub(1)
+            .ok_or(())?;
+        match evse.connector_id {
+            None => Ok(AvailabilityTarget::Evse { evse_id }),
+            Some(connector_id) => {
+                let connector_id = usize::try_from(connector_id)
+                    .map_err(|_| ())?
+                    .checked_sub(1)
+                    .ok_or(())?;
+                Ok(AvailabilityTarget::Connector {
+                    evse_id,
+                    connector_id,
+                })
+            }
+        }
+    }
+
+    /// Maps a wire `requestedMessage` onto this crate's [`TriggerableMessage`], or `None` for a
+    /// value no functional block here can fulfil - which is exactly OCPP's `NotImplemented`, and
+    /// why [`TriggerMessageOutcome`] has no variant for it (see that type's docs): the
+    /// distinction only exists at the wire, where the unsupported values live.
+    fn triggerable_message(
+        requested: &MessageTriggerEnum,
+        target: AvailabilityTarget,
+    ) -> Option<TriggerableMessage> {
+        match requested {
+            MessageTriggerEnum::Heartbeat => Some(TriggerableMessage::Heartbeat),
+            MessageTriggerEnum::StatusNotification => {
+                Some(TriggerableMessage::StatusNotification(target))
+            }
+            _ => None,
+        }
+    }
+
+    fn trigger_response(status: TriggerMessageStatusEnum) -> TriggerMessageResponse {
+        TriggerMessageResponse {
+            custom_data: None,
+            status,
+            status_info: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TriggerMessageHandler for OCPP2_0_1Client {
+        async fn register_trigger_message_handler(&self, actor: ChargePointActor) {
+            // The client is both the handler and the notifier the re-send goes out through: a
+            // `TriggerMessage` asking for a Heartbeat is answered by sending one, on this same
+            // connection.
+            let notifier = self.clone();
+            self.on_trigger_message(move |request: TriggerMessageRequest, _client| {
+                let actor = actor.clone();
+                let notifier = notifier.clone();
+                async move {
+                    let Ok(target) = trigger_target(request.evse.as_ref()) else {
+                        return Ok(trigger_response(TriggerMessageStatusEnum::Rejected));
+                    };
+                    let Some(message) = triggerable_message(&request.requested_message, target)
+                    else {
+                        return Ok(trigger_response(TriggerMessageStatusEnum::NotImplemented));
+                    };
+                    let outcome = handle_trigger_message(&actor, &notifier, message).await;
+                    Ok(trigger_response(match outcome {
+                        TriggerMessageOutcome::Accepted => TriggerMessageStatusEnum::Accepted,
+                        TriggerMessageOutcome::Rejected => TriggerMessageStatusEnum::Rejected,
+                    }))
+                }
+            })
+            .await;
+        }
+    }
+
+    #[cfg(test)]
+    mod trigger_message_tests {
+        use super::*;
+
+        fn evse(id: i64, connector_id: Option<i64>) -> EVSE {
+            EVSE {
+                connector_id,
+                custom_data: None,
+                id,
+            }
+        }
+
+        #[test]
+        fn an_absent_evse_addresses_the_whole_charge_point() {
+            assert_eq!(trigger_target(None), Ok(AvailabilityTarget::ChargePoint));
+        }
+
+        #[test]
+        fn wire_ids_are_one_based_and_this_crates_are_zero_based() {
+            assert_eq!(
+                trigger_target(Some(&evse(1, None))),
+                Ok(AvailabilityTarget::Evse { evse_id: 0 })
+            );
+            assert_eq!(
+                trigger_target(Some(&evse(2, Some(1)))),
+                Ok(AvailabilityTarget::Connector {
+                    evse_id: 1,
+                    connector_id: 0
+                })
+            );
+        }
+
+        #[test]
+        fn an_address_that_cannot_exist_is_rejected_rather_than_widened() {
+            // `0` and negatives are not valid wire ids; treating either as "the whole charge
+            // point" would answer a request the CSMS did not make.
+            assert_eq!(trigger_target(Some(&evse(0, None))), Err(()));
+            assert_eq!(trigger_target(Some(&evse(-1, None))), Err(()));
+            assert_eq!(trigger_target(Some(&evse(1, Some(0)))), Err(()));
+        }
+
+        #[test]
+        fn the_two_messages_this_crate_can_resend_map_and_the_rest_are_not_implemented() {
+            assert_eq!(
+                triggerable_message(
+                    &MessageTriggerEnum::Heartbeat,
+                    AvailabilityTarget::ChargePoint
+                ),
+                Some(TriggerableMessage::Heartbeat)
+            );
+            assert_eq!(
+                triggerable_message(
+                    &MessageTriggerEnum::StatusNotification,
+                    AvailabilityTarget::Evse { evse_id: 0 }
+                ),
+                Some(TriggerableMessage::StatusNotification(
+                    AvailabilityTarget::Evse { evse_id: 0 }
+                ))
+            );
+            // Everything else needs a functional block this crate doesn't have. Reported as
+            // NotImplemented rather than Rejected, which would claim the request was understood
+            // and refused.
+            for requested in [
+                MessageTriggerEnum::BootNotification,
+                MessageTriggerEnum::MeterValues,
+                MessageTriggerEnum::TransactionEvent,
+                MessageTriggerEnum::FirmwareStatusNotification,
+                MessageTriggerEnum::LogStatusNotification,
+            ] {
+                assert_eq!(
+                    triggerable_message(&requested, AvailabilityTarget::ChargePoint),
+                    None
+                );
+            }
+        }
+    }
+
     use super::{
         RequestStartTransactionHandler, RequestStartTransactionOutcome,
-        RequestStopTransactionHandler, RequestStopTransactionOutcome, UnlockConnectorHandler,
-        UnlockOutcome, handle_request_start_transaction, handle_request_stop_transaction,
+        RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
+        TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
+        handle_request_start_transaction, handle_request_stop_transaction, handle_trigger_message,
         handle_unlock_request,
     };
     use crate::actor::ChargePointActor;
+    use crate::availability::AvailabilityTarget;
     use crate::state::{IdToken, IdTokenKind, TransactionId};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
     use ocpp_client::ocpp_types::v201::common::{
-        IdTokenEnum, RequestStartStopStatusEnum, UnlockStatusEnum,
+        EVSE, IdTokenEnum, MessageTriggerEnum, RequestStartStopStatusEnum,
+        TriggerMessageStatusEnum, UnlockStatusEnum,
     };
     use ocpp_client::ocpp_types::v201::{
         RequestStartTransactionRequest, RequestStartTransactionResponse,
-        RequestStopTransactionRequest, RequestStopTransactionResponse, UnlockConnectorRequest,
-        UnlockConnectorResponse,
+        RequestStopTransactionRequest, RequestStopTransactionResponse, TriggerMessageRequest,
+        TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
     };
 
     /// The reverse of [`crate::authorization::ocpp_2_0_1::map_id_token_kind`] - 2.0.1's
@@ -1476,25 +1821,254 @@ pub(crate) mod ocpp_2_0_1 {
 mod ocpp_1_6 {
     use super::{
         RequestStartTransactionHandler, RequestStartTransactionOutcome,
-        RequestStopTransactionHandler, RequestStopTransactionOutcome, UnlockConnectorHandler,
-        UnlockOutcome, handle_request_start_transaction, handle_request_stop_transaction,
+        RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
+        TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
+        handle_request_start_transaction, handle_request_stop_transaction, handle_trigger_message,
         handle_unlock_request,
     };
     use crate::actor::ChargePointActor;
+    use crate::availability::{AvailabilityTarget, Ocpp1_6StatusNotifier};
     use crate::id_tag::map_id_token;
     use crate::state::TransactionId;
     use crate::topology::unflatten_ocpp_1_6_connector_id;
     use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
     use ocpp_client::ocpp_1_6::OCPP1_6Client;
     use ocpp_client::ocpp_types::v16::common::{
         RemoteStartTransactionResponseStatus, RemoteStopTransactionResponseStatus,
-        UnlockConnectorResponseStatus,
+        RequestedMessage, TriggerMessageResponseStatus, UnlockConnectorResponseStatus,
     };
     use ocpp_client::ocpp_types::v16::{
         RemoteStartTransactionRequest, RemoteStartTransactionResponse,
-        RemoteStopTransactionResponse, UnlockConnectorResponse,
+        RemoteStopTransactionResponse, TriggerMessageRequest, TriggerMessageResponse,
+        UnlockConnectorResponse,
     };
+
+    // --- TriggerMessage (B1.3) ---
+
+    /// 1.6J's flat `connectorId` onto this crate's [`AvailabilityTarget`]: absent or `0` is the
+    /// whole charge point, anything else resolves through [`unflatten_ocpp_1_6_connector_id`] to
+    /// one connector. Unlike the 2.x adapters, this keeps the connector half of the address -
+    /// 1.6J has no EVSE to lose it to.
+    ///
+    /// `Err(())` is an address this topology has no connector for, answered with `Rejected`.
+    fn trigger_target(
+        connector_counts: &[usize],
+        connector_id: Option<i64>,
+    ) -> Result<AvailabilityTarget, ()> {
+        match connector_id {
+            None | Some(0) => Ok(AvailabilityTarget::ChargePoint),
+            Some(connector_id) => {
+                let (evse_id, connector_id) =
+                    unflatten_ocpp_1_6_connector_id(connector_counts, connector_id).ok_or(())?;
+                Ok(AvailabilityTarget::Connector {
+                    evse_id,
+                    connector_id,
+                })
+            }
+        }
+    }
+
+    /// 1.6J's `requestedMessage` onto this crate's [`TriggerableMessage`], or `None` for one no
+    /// functional block here can fulfil - reported as `NotImplemented`, exactly as the 2.x
+    /// adapters do. 1.6J's enum is smaller (six values, with `DiagnosticsStatusNotification` where
+    /// 2.x has the log/certificate triggers), but the two this crate can answer are the same two.
+    fn triggerable_message(
+        requested: &RequestedMessage,
+        target: AvailabilityTarget,
+    ) -> Option<TriggerableMessage> {
+        match requested {
+            RequestedMessage::Heartbeat => Some(TriggerableMessage::Heartbeat),
+            RequestedMessage::StatusNotification => {
+                Some(TriggerableMessage::StatusNotification(target))
+            }
+            _ => None,
+        }
+    }
+
+    /// Wraps an [`OCPP1_6Client`] with the connector topology 1.6J's flat addressing needs.
+    ///
+    /// This wrapper exists for a reason the 2.x adapters don't have: `handle_trigger_message`
+    /// needs *one* notifier that is both a [`crate::provisioning::HeartbeatSender`] and a
+    /// [`crate::availability::StatusNotifier`], and under 1.6J those live on two different types -
+    /// the bare client sends heartbeats, while status notifications need
+    /// [`Ocpp1_6StatusNotifier`]'s topology to flatten the connector address. This type implements
+    /// both by delegating to each, so the shared protocol-agnostic handler works unchanged.
+    pub struct Ocpp1_6TriggerMessageHandler {
+        client: OCPP1_6Client,
+        connector_counts: Vec<usize>,
+        status: Arc<Ocpp1_6StatusNotifier>,
+    }
+
+    impl Ocpp1_6TriggerMessageHandler {
+        /// Wraps `client`, resolving connector addresses against `connector_counts` (each EVSE's
+        /// connector count, in `evse_id` order).
+        pub fn new(
+            client: OCPP1_6Client,
+            connector_counts: impl IntoIterator<Item = usize>,
+        ) -> Self {
+            let connector_counts: Vec<usize> = connector_counts.into_iter().collect();
+            Self {
+                status: Arc::new(Ocpp1_6StatusNotifier::new(
+                    client.clone(),
+                    connector_counts.clone(),
+                )),
+                client,
+                connector_counts,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::HeartbeatSender for Ocpp1_6TriggerMessageHandler {
+        type Error = <OCPP1_6Client as crate::provisioning::HeartbeatSender>::Error;
+
+        async fn send_heartbeat(
+            &self,
+        ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
+            // Delegates to the trait impl on the bare client (which builds the request and parses
+            // the response's `currentTime`), not to the client's inherent `send_heartbeat`.
+            crate::provisioning::HeartbeatSender::send_heartbeat(&self.client).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::availability::StatusNotifier for Ocpp1_6TriggerMessageHandler {
+        type Error = <Ocpp1_6StatusNotifier as crate::availability::StatusNotifier>::Error;
+
+        async fn notify_status(
+            &self,
+            evse_id: usize,
+            connector_id: usize,
+            status: crate::state::ConnectorStatus,
+            connector_state: crate::state::ConnectorState,
+        ) -> Result<(), Self::Error> {
+            self.status
+                .notify_status(evse_id, connector_id, status, connector_state)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TriggerMessageHandler for Ocpp1_6TriggerMessageHandler {
+        async fn register_trigger_message_handler(&self, actor: ChargePointActor) {
+            let client = self.client.clone();
+            let connector_counts = self.connector_counts.clone();
+            let notifier = Arc::new(Ocpp1_6TriggerMessageHandler::new(
+                self.client.clone(),
+                self.connector_counts.clone(),
+            ));
+            client
+                .on_trigger_message(move |request: TriggerMessageRequest, _client| {
+                    let actor = actor.clone();
+                    let notifier = notifier.clone();
+                    let connector_counts = connector_counts.clone();
+                    async move {
+                        let Ok(target) = trigger_target(&connector_counts, request.connector_id)
+                        else {
+                            return Ok(TriggerMessageResponse {
+                                status: TriggerMessageResponseStatus::Rejected,
+                            });
+                        };
+                        let Some(message) = triggerable_message(&request.requested_message, target)
+                        else {
+                            return Ok(TriggerMessageResponse {
+                                status: TriggerMessageResponseStatus::NotImplemented,
+                            });
+                        };
+                        let outcome =
+                            handle_trigger_message(&actor, notifier.as_ref(), message).await;
+                        Ok(TriggerMessageResponse {
+                            status: match outcome {
+                                TriggerMessageOutcome::Accepted => {
+                                    TriggerMessageResponseStatus::Accepted
+                                }
+                                TriggerMessageOutcome::Rejected => {
+                                    TriggerMessageResponseStatus::Rejected
+                                }
+                            },
+                        })
+                    }
+                })
+                .await;
+        }
+    }
+
+    #[cfg(test)]
+    mod trigger_message_tests {
+        use super::*;
+
+        #[test]
+        fn connector_zero_or_absent_addresses_the_whole_charge_point() {
+            let counts = [2, 2];
+            assert_eq!(
+                trigger_target(&counts, None),
+                Ok(AvailabilityTarget::ChargePoint)
+            );
+            assert_eq!(
+                trigger_target(&counts, Some(0)),
+                Ok(AvailabilityTarget::ChargePoint)
+            );
+        }
+
+        #[test]
+        fn a_flat_connector_id_resolves_to_its_evse_and_connector() {
+            // Two EVSEs, two connectors each: 1.6J connector 3 is EVSE 1's connector 0.
+            let counts = [2, 2];
+            assert_eq!(
+                trigger_target(&counts, Some(1)),
+                Ok(AvailabilityTarget::Connector {
+                    evse_id: 0,
+                    connector_id: 0
+                })
+            );
+            assert_eq!(
+                trigger_target(&counts, Some(3)),
+                Ok(AvailabilityTarget::Connector {
+                    evse_id: 1,
+                    connector_id: 0
+                })
+            );
+        }
+
+        #[test]
+        fn an_address_this_topology_does_not_have_is_rejected() {
+            assert_eq!(trigger_target(&[2], Some(5)), Err(()));
+            assert_eq!(trigger_target(&[2], Some(-1)), Err(()));
+        }
+
+        #[test]
+        fn the_two_messages_this_crate_can_resend_map_and_the_rest_are_not_implemented() {
+            assert_eq!(
+                triggerable_message(
+                    &RequestedMessage::Heartbeat,
+                    AvailabilityTarget::ChargePoint
+                ),
+                Some(TriggerableMessage::Heartbeat)
+            );
+            assert_eq!(
+                triggerable_message(
+                    &RequestedMessage::StatusNotification,
+                    AvailabilityTarget::ChargePoint
+                ),
+                Some(TriggerableMessage::StatusNotification(
+                    AvailabilityTarget::ChargePoint
+                ))
+            );
+            for requested in [
+                RequestedMessage::BootNotification,
+                RequestedMessage::DiagnosticsStatusNotification,
+                RequestedMessage::FirmwareStatusNotification,
+                RequestedMessage::MeterValues,
+            ] {
+                assert_eq!(
+                    triggerable_message(&requested, AvailabilityTarget::ChargePoint),
+                    None
+                );
+            }
+        }
+    }
 
     pub(super) fn map_outcome(outcome: UnlockOutcome) -> UnlockConnectorResponseStatus {
         match outcome {

@@ -13,7 +13,8 @@ use ocpp_charge_point::provisioning::{
     BootNotificationOutcome, BootNotifier, HeartbeatSender, TokioBackoff,
 };
 use ocpp_charge_point::remote_control::{
-    RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
+    RequestStartTransactionHandler, RequestStopTransactionHandler, TriggerMessageHandler,
+    UnlockConnectorHandler,
 };
 use ocpp_charge_point::reporting::{GetBaseReportHandler, GetReportHandler};
 use ocpp_charge_point::reservation::{CancelReservationHandler, ReserveNowHandler};
@@ -231,6 +232,17 @@ impl SecurityEventNotifier for AlwaysAcceptBootNotifier {
 #[async_trait::async_trait]
 impl CostUpdatedHandler for AlwaysAcceptBootNotifier {
     async fn register_cost_updated_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+// TriggerMessage (docs/ROADMAP.md §6): a CSMS asking for a Heartbeat or StatusNotification
+// re-send. This fake registers nothing, so nothing is ever triggered.
+#[async_trait::async_trait]
+impl TriggerMessageHandler for AlwaysAcceptBootNotifier {
+    async fn register_trigger_message_handler(
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {

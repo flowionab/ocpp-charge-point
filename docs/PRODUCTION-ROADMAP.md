@@ -102,7 +102,7 @@ close — mostly missing one version each.
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: authorization cache, certificates, network profiles. |
-| Test suite | 🚧 | 672 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Test suite | 🚧 | 684 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -169,7 +169,7 @@ version.
 | UnlockConnector | ✅ | ✅ | ✅ | |
 | RemoteStart/Stop · RequestStart/StopTransaction | ✅ | ✅ | ✅ | |
 | **ClearCache** | ⬜ | ⬜ | ⬜ | Needs an authorization cache to clear — the cache itself doesn't exist yet. |
-| **TriggerMessage** | ⬜ | ⬜ | 🔒 | Protocol-agnostic handler exists (R§6). 1.6J and 2.0.1 are buildable **today**; 2.1 needs [D1](#61-d1--missing-action-wrappers). |
+| **TriggerMessage** | ✅ | ✅ | ✅ | Heartbeat and StatusNotification are fulfilled; every other `requestedMessage` is refused with `NotImplemented`. |
 | GetConfiguration / ChangeConfiguration | ✅ | — | — | 12 of ~46 standard keys aliased. |
 | GetVariables / SetVariables | — | ✅ | ✅ | |
 | GetBaseReport / GetReport / NotifyReport | — | ✅ | ✅ | |
@@ -228,8 +228,42 @@ version.
       exists), and it is left outstanding rather than half-done.
 - [ ] **B1.2** Authorization cache (2.x `AuthCacheCtrlr`, 1.6J
       `AuthorizationCacheEnabled`) + `ClearCache` on all three versions.
-- [ ] **B1.3** `TriggerMessage` wire adapters for 1.6J and 2.0.1.
-- [ ] **B1.4** `TriggerMessage` for 2.1, after [D1](#61-d1--missing-action-wrappers).
+- [x] **B1.3 / B1.4** `TriggerMessage` wire adapters for all three versions, in
+      `src/remote_control.rs` beside the protocol-agnostic `handle_trigger_message` that has been
+      waiting for them. **B1.4's upstream dependency was already satisfied**: 2.1's
+      `on_trigger_message` was genuinely absent in `ocpp-client` 0.2.0, [D1.1](#61-d1--missing-action-wrappers)
+      added it upstream and [D1.2](#61-d1--missing-action-wrappers) bumped this crate to 0.2.1 -
+      re-verified against the pinned source here rather than assumed either way - so B1.4 needed
+      no further upstream work and landed alongside B1.3 instead of after it.
+
+      Two `requestedMessage` values are fulfilled, `Heartbeat` and `StatusNotification`, because
+      those are the two this crate has an outbound path for. Everything else is answered
+      `NotImplemented` rather than `Rejected` - the distinction matters, since `Rejected` claims
+      the request was understood and refused, while these simply have no functional block behind
+      them yet (`BootNotification` needs vendor/model strings this module can't see;
+      `MeterValues`/`TransactionEvent` need a resend-current-snapshot capability neither block
+      has; the log/firmware/certificate triggers need §1/§12). That is also why
+      `TriggerMessageOutcome` still has no `NotImplemented` variant: the decision belongs to the
+      wire layer, which is the only place the unsupported values exist.
+
+      Addressing is the usual three-way split. 2.x's optional `evse` maps onto
+      `AvailabilityTarget` with the wire's 1-based ids converted to this crate's 0-based ones, and
+      an id that cannot exist (`0` or negative) is *rejected* rather than silently widened to "the
+      whole charge point" - answering a broader request than the CSMS made would be worse than
+      refusing. 1.6J's flat `connectorId` resolves through `crate::topology` and keeps the
+      connector half, since 1.6J has no EVSE to lose it to; absent or `0` means the whole charge
+      point, per that version's own convention.
+
+      One structural wrinkle 1.6J alone has: `handle_trigger_message` needs a single notifier that
+      is both a `HeartbeatSender` and a `StatusNotifier`, and under 1.6J those live on different
+      types (the bare client sends heartbeats; status notifications need `Ocpp1_6StatusNotifier`'s
+      topology to flatten the address). `Ocpp1_6TriggerMessageHandler` implements both by
+      delegating to each, so the shared handler works unchanged rather than growing a
+      version-shaped bound.
+
+      Registration is `ChargePointBuilder::trigger_message`, separate from `remote_control`:
+      `TriggerMessage` needs a CSMS type that can *send* the triggered messages, and folding that
+      bound into `remote_control` would force it on callers who only wanted `UnlockConnector`.
 - [ ] **B1.5** Distinguish `SuspendedEV` / `SuspendedEVSE` in
       `ConnectorState`, and map them on all three versions.
 - [ ] **B1.6** Complete the 1.6J standard configuration key table —
@@ -1923,26 +1957,27 @@ Method: every `.on_*(` / `.send_*(` call inside a `mod ocpp_1_6` /
 `ocpp-client` 0.2.0 generates per version. Re-run it after any coverage
 work; it's the honest number.
 
-### A.1 OCPP 1.6J — 22 of 28 wired
+### A.1 OCPP 1.6J — 24 of 28 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ChangeConfiguration, DataTransfer, GetConfiguration,
 ClearChargingProfile, GetCompositeSchedule, GetLocalListVersion, Heartbeat,
 MeterValues, RemoteStartTransaction, RemoteStopTransaction, ReserveNow, Reset,
 SendLocalList, SetChargingProfile, StartTransaction, StatusNotification,
-StopTransaction, UnlockConnector
+StopTransaction, TriggerMessage, UnlockConnector
 
 **Missing:** ClearCache, DiagnosticsStatusNotification,
-FirmwareStatusNotification, GetDiagnostics, TriggerMessage, UpdateFirmware
+FirmwareStatusNotification, GetDiagnostics, UpdateFirmware
 
-### A.2 OCPP 2.0.1 — 24 of 63 wired
+### A.2 OCPP 2.0.1 — 27 of 63 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
 GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
-RequestStopTransaction, ReserveNow, Reset, SendLocalList, SetChargingProfile,
-SetVariables, StatusNotification, TransactionEvent, UnlockConnector
+MeterValues, RequestStopTransaction, ReserveNow, Reset, SendLocalList,
+SetChargingProfile, SetVariables, StatusNotification, TransactionEvent,
+TriggerMessage, UnlockConnector
 
 **Missing:** CertificateSigned, ClearCache,
 ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
@@ -1950,28 +1985,27 @@ CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
 Get15118EVCertificate, GetCertificateStatus, GetChargingProfiles,
 GetDisplayMessages, GetInstalledCertificateIds,
 GetLog, GetMonitoringReport, GetTransactionStatus, InstallCertificate,
-LogStatusNotification, MeterValues, NotifyChargingLimit,
+LogStatusNotification, NotifyChargingLimit,
 NotifyCustomerInformation, NotifyDisplayMessages, NotifyEVChargingNeeds,
 NotifyEVChargingSchedule, NotifyEvent, NotifyMonitoringReport,
 PublishFirmware, PublishFirmwareStatusNotification, ReportChargingProfiles,
 ReservationStatusUpdate, SetDisplayMessage,
 SetMonitoringBase, SetMonitoringLevel, SetNetworkProfile,
-SetVariableMonitoring, SignCertificate, TriggerMessage, UnpublishFirmware,
-UpdateFirmware
+SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 
 **Also:** `SecurityEventNotification` is in the 2.0.1 spec and in
 `ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
 [D1](#61-d1--missing-action-wrappers).
 
-### A.3 OCPP 2.1 — 25 of 86 wired
+### A.3 OCPP 2.1 — 28 of 86 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
 GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
-SendLocalList, SetChargingProfile, SetVariables, StatusNotification,
-TransactionEvent, UnlockConnector
+MeterValues, SendLocalList, SetChargingProfile, SetVariables,
+StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
 
 **Missing:** AFRRSignal, AdjustPeriodicEventStream, BatterySwap,
 CertificateSigned, ChangeTransactionTariff, ClearCache, ClearDERControl, ClearDisplayMessage, ClearTariffs,
@@ -1981,7 +2015,7 @@ Get15118EVCertificate, GetCertificateChainStatus, GetCertificateStatus,
 GetChargingProfiles, GetDisplayMessages,
 GetInstalledCertificateIds, GetLog, GetMonitoringReport,
 GetPeriodicEventStream, GetTariffs, GetTransactionStatus,
-InstallCertificate, LogStatusNotification, MeterValues,
+InstallCertificate, LogStatusNotification,
 NotifyAllowedEnergyTransfer, NotifyChargingLimit, NotifyCustomerInformation,
 NotifyDERAlarm, NotifyDERStartStop, NotifyDisplayMessages,
 NotifyEVChargingNeeds, NotifyEVChargingSchedule, NotifyEvent,
@@ -1994,9 +2028,11 @@ SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel, SetNetworkProfile,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware,
 UsePriorityCharging, VatNumberValidation
 
-**Plus** five messages `ocpp-types` defines but `ocpp-client` generates no
-action for: TriggerMessage, SetDisplayMessage, GetDERControl, SetDERControl,
+**Plus** four messages `ocpp-types` defines but `ocpp-client` generates no
+action for: SetDisplayMessage, GetDERControl, SetDERControl,
 UpdateDynamicSchedule — see [D1](#61-d1--missing-action-wrappers).
+(TriggerMessage was on this list; the pinned `ocpp-client` 0.2.1 does generate
+it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 
 ### A.4 Other verified figures
 
@@ -2008,6 +2044,6 @@ UpdateDynamicSchedule — see [D1](#61-d1--missing-action-wrappers).
 | 1.6J standard config keys aliased | 13 | `src/device_model.rs` |
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
-| Protocol trait bounds on `setup()`'s CSMS parameter | 25 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 672 | `#[test]` + `#[tokio::test]`, re-counted at the B1.1 commit (658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Protocol trait bounds on `setup()`'s CSMS parameter | 26 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
+| Test functions in `src/` | 684 | `#[test]` + `#[tokio::test]`, re-counted at the B1.3/B1.4 commit (672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

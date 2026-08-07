@@ -254,6 +254,27 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self.capabilities
     }
 
+    /// Registers inbound `TriggerMessage` handling (`docs/ROADMAP.md` §6,
+    /// `docs/PRODUCTION-ROADMAP.md` B1.3/B1.4): a CSMS asking the charge point to re-send a
+    /// message it can produce - a `Heartbeat`, or a `StatusNotification` for the whole charge
+    /// point, one EVSE or one connector - gets it, and anything else gets OCPP's
+    /// `NotImplemented`.
+    ///
+    /// Registered separately from [`Self::remote_control`] rather than inside it: `TriggerMessage`
+    /// needs a CSMS type that can *send* the triggered messages too (a `HeartbeatSender` and a
+    /// `StatusNotifier`, not just a handler registration), and folding that bound into
+    /// `remote_control` would force it on callers who only wanted `UnlockConnector`. Under 1.6J
+    /// those two senders live on different types, so pass
+    /// [`crate::remote_control::Ocpp1_6TriggerMessageHandler`], which is both.
+    pub async fn trigger_message<N>(self, csms: &N) -> Self
+    where
+        N: crate::remote_control::TriggerMessageHandler + Send + Sync + 'static,
+    {
+        csms.register_trigger_message_handler(self.runtime.actor())
+            .await;
+        self
+    }
+
     /// Registers standalone `MeterValues` (`docs/ROADMAP.md` §10,
     /// `docs/PRODUCTION-ROADMAP.md` B1.1): a background loop that reports every connector's latest
     /// meter reading on the wall-clock schedule the CSMS configures through
