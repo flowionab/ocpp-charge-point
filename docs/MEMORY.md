@@ -50,7 +50,7 @@ Measured on a 64-bit host. See [32-bit targets](#32-bit-targets) below — a
 Each row is filled to its configured worst case: the local authorization list
 full of 36-character id tokens (OCPP 2.x's maximum), the device model full at its
 configured maximum, every connector holding both an active transaction and a
-reservation, and all three offline queues full.
+reservation, all three offline queues full, and the durable security log full.
 
 | | Tight AC wallbox | Crate defaults | DC site |
 | --- | --- | --- | --- |
@@ -58,6 +58,7 @@ reservation, and all three offline queues full.
 | `max_local_authorization_list_entries` | 25 | 100 | 500 |
 | `max_device_model_variables` | 64 | 256 | 512 |
 | Offline queue capacity (each of 3) | 25 | 100 | 200 |
+| Security log capacity | 25 | 50 | 200 |
 | Empty state (incl. built-in device model) | 5.0 KB | 5.2 KB | 6.6 KB |
 | Local authorization list, full | 3.1 KB | 10.9 KB | 52.5 KB |
 | Device model, full | 22.4 KB | 95.8 KB | 190.7 KB |
@@ -65,11 +66,19 @@ reservation, and all three offline queues full.
 | Status queue, full | 0.8 KB | 3.1 KB | 6.1 KB |
 | Transaction queue, full | 6.0 KB | 23.8 KB | 47.6 KB |
 | Security queue, full | 5.1 KB | 20.5 KB | 41.1 KB |
-| **Total retained** | **42.6 KB** | **159.7 KB** | **345.8 KB** |
+| Security log, full | 5.6 KB | 11.3 KB | 45.2 KB |
+| **Total retained** | **48.3 KB** | **171.0 KB** | **391.0 KB** |
 
-Read that as: the crate's own defaults need roughly **160 KB of heap** in the
+Read that as: the crate's own defaults need roughly **171 KB of heap** in the
 worst case, and a deliberately tightened single-connector wallbox fits in
-roughly **43 KB**. Neither figure includes the exclusions above.
+roughly **48 KB**. Neither figure includes the exclusions above.
+
+The security log is the one row an integrator sizes on a different axis from the
+rest: it retains history whether or not those events ever reached the CSMS, so
+its bound answers "how much history is worth keeping" rather than "how long an
+outage must be absorbed" — see
+[`SecurityEventLog`](../src/security.rs). A charge point with no compliance
+reason to keep a long trail can cut it well below the default 50.
 
 #### Per-unit costs, for sizing your own configuration
 
@@ -84,10 +93,12 @@ Derived from the same measurements, so you can price a bound before setting it:
 | Queued status notification | ~31 B | no owned strings — just the deque slot |
 | Queued transaction event | ~240 B | id token plus the deque slot |
 | Queued security event | ~205 B | with `techInfo` text; less without |
+| Security log entry | ~226 B | queued security event plus a recorded-at timestamp |
 
 An offline queue's `VecDeque` grows by doubling, so a queue configured with
 capacity 100 ends up with 128 slots allocated. Round a configured capacity up to
-the next power of two when budgeting.
+the next power of two when budgeting. The security log is a `VecDeque` too and
+behaves the same way.
 
 ### The device model dominates — and its shape matters
 

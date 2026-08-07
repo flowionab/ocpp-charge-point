@@ -46,6 +46,7 @@ use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::hardware::{AtomicStorage, Storage};
 use crate::offline_queue::{OfflineQueue, flush_offline_queue};
+use crate::security::{SecurityEventLog, SecurityLogEntry};
 use crate::state::{
     BootReasonCause, ChargePointEvent, ChargePointState, Component, ConnectorState,
     ConnectorStatus, ConnectorStatusChanged, LocalListEntry, MeterSample,
@@ -1375,6 +1376,289 @@ pub async fn flush_and_persist_security_event_queue<S, F, Fut, E>(
         queue, store, send,
     )
     .await
+}
+
+// --- security log persistence (E2.10, docs/PRODUCTION-ROADMAP.md §7.2) ---
+
+/// The version stamped into every [`PersistedSecurityLog`] record. Independent of the other schema
+/// constants in this module - see [`SCHEMA_VERSION`]'s docs for why each concern versions on its
+/// own schedule.
+pub const SECURITY_LOG_SCHEMA_VERSION: u32 = 1;
+
+/// The key the whole security log is written under. A single whole-log snapshot, not one record
+/// per entry: the log is a bounded ring with exactly one owner (see
+/// [`crate::security::SecurityEventLog`]), so there is no per-entry addressing to gain the way
+/// [`TransactionStore`] needs per-connector keys, and a snapshot is what lets
+/// [`restore_security_log`] replay the whole history **in order** with a single read.
+const SECURITY_LOG_KEY: &str = "ocpp-cp/security-log";
+
+/// The on-disk representation of one [`SecurityLogEntry`]. `event_type` goes through
+/// `PersistedSecurityEventType` (shared with the offline security-event queue, rather than a
+/// second mirror of the same enum) for the reason documented there.
+///
+/// Its fields are private - unlike [`PersistedTransaction`]'s - precisely because that shared
+/// mirror enum is itself private to this module: the way to read a persisted entry is to convert
+/// it into a [`SecurityLogEntry`], which is the type the rest of the crate speaks.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedSecurityLogEntry {
+    /// The kind of security event that occurred.
+    event_type: PersistedSecurityEventType,
+    /// OCPP's `techInfo` free-text detail, if the raiser supplied any.
+    tech_info: Option<String>,
+    /// When the event was recorded, or `None` if the clock wasn't synchronized then - see
+    /// [`SecurityLogEntry::recorded_at`].
+    recorded_at: Option<DateTime<Utc>>,
+}
+
+impl From<SecurityLogEntry> for PersistedSecurityLogEntry {
+    fn from(entry: SecurityLogEntry) -> Self {
+        Self {
+            event_type: entry.event.event_type.into(),
+            tech_info: entry.event.tech_info,
+            recorded_at: entry.recorded_at,
+        }
+    }
+}
+
+impl From<PersistedSecurityLogEntry> for SecurityLogEntry {
+    fn from(persisted: PersistedSecurityLogEntry) -> Self {
+        Self {
+            event: SecurityEvent {
+                event_type: persisted.event_type.into(),
+                tech_info: persisted.tech_info,
+            },
+            recorded_at: persisted.recorded_at,
+        }
+    }
+}
+
+/// The whole security log as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedSecurityLog {
+    /// The [`SECURITY_LOG_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// Every retained entry, oldest first.
+    pub entries: Vec<PersistedSecurityLogEntry>,
+}
+
+/// A borrowing twin of [`PersistedSecurityLog`], so [`SecurityLogStore::save`] can encode the
+/// live log's entries without taking ownership of them - mirrors
+/// [`SerializablePersistedQueue`]'s role for queue snapshots.
+#[derive(serde::Serialize)]
+struct SerializablePersistedSecurityLog<'a> {
+    schema_version: u32,
+    entries: &'a [PersistedSecurityLogEntry],
+}
+
+/// Reads and writes the [`crate::security::SecurityEventLog`], as a whole-log snapshot, through a
+/// [`Storage`].
+///
+/// Every method degrades rather than failing, exactly like [`TransactionStore`] and
+/// [`QueueStore`] - see the module docs and `CLAUDE.md`'s error-handling stance. A store built
+/// over [`crate::hardware::NoStorage`] persists nothing and recovers nothing, leaving the live log
+/// a purely in-RAM one.
+///
+/// # Write policy
+///
+/// Unlike [`TransactionStore`] (debounced by energy moved) and [`QueueStore`] (debounced by
+/// mutation count), every recorded event is written immediately, undebounced. Security events are
+/// rare and individually meaningful - a tamper detection, a failed CSMS authentication, a firmware
+/// signature rejection - and the event most worth having durably is precisely the one that
+/// immediately precedes whatever took the charge point down. There is no high-rate equivalent of
+/// periodic meter samples here for a threshold to protect flash against, so a threshold would buy
+/// wear savings that don't matter at the cost of losing the entries that matter most.
+#[derive(Debug, Clone)]
+pub struct SecurityLogStore<S> {
+    storage: S,
+}
+
+impl<S: Storage> SecurityLogStore<S> {
+    /// Creates a store over `storage`.
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Writes `entries` as the whole log, replacing whatever snapshot was there before. Returns
+    /// whether the write actually reached storage - `false` means the log is now running without
+    /// durability, already logged.
+    pub async fn save(&self, entries: &[SecurityLogEntry]) -> bool {
+        let entries: Vec<PersistedSecurityLogEntry> = entries
+            .iter()
+            .cloned()
+            .map(PersistedSecurityLogEntry::from)
+            .collect();
+        let Ok(encoded) = serde_json::to_vec(&SerializablePersistedSecurityLog {
+            schema_version: SECURITY_LOG_SCHEMA_VERSION,
+            entries: &entries,
+        }) else {
+            tracing::error!("failed to encode the security log for storage");
+            return false;
+        };
+        match self.storage.set(SECURITY_LOG_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist the security log; continuing without durability for it"
+                );
+                false
+            }
+        }
+    }
+
+    /// Removes the stored log, if any. A missing log is not an error.
+    pub async fn clear(&self) {
+        if let Err(err) = self.storage.remove(SECURITY_LOG_KEY).await {
+            tracing::warn!(error = %err, "failed to clear the persisted security log");
+        }
+    }
+
+    /// Reads back the persisted log, oldest entry first, or an empty `Vec` if there isn't one, it
+    /// can't be read, or it was written by an incompatible [`SECURITY_LOG_SCHEMA_VERSION`] -
+    /// discarded rather than guessed at, exactly like [`TransactionStore::load`].
+    pub async fn load(&self) -> Vec<SecurityLogEntry> {
+        let encoded = match self.storage.get(SECURITY_LOG_KEY).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read the persisted security log; treating it as absent"
+                );
+                return Vec::new();
+            }
+        };
+        let record: PersistedSecurityLog = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "the persisted security log could not be decoded; discarding it"
+                );
+                return Vec::new();
+            }
+        };
+        if record.schema_version != SECURITY_LOG_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = SECURITY_LOG_SCHEMA_VERSION,
+                "discarding a persisted security log written by an incompatible schema version"
+            );
+            return Vec::new();
+        }
+        record
+            .entries
+            .into_iter()
+            .map(SecurityLogEntry::from)
+            .collect()
+    }
+}
+
+impl<S: Storage + Send + Sync> SecurityLogStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does - see that method's docs. A torn security-log write
+    /// would otherwise cost the *whole* log rather than one entry, since the log is written as a
+    /// single snapshot.
+    pub fn new_atomic(storage: S) -> Self {
+        SecurityLogStore::new(AtomicStorage::new(storage))
+    }
+}
+
+/// Restores the persisted security log into `log` at boot, oldest entry first, **before** any live
+/// events start flowing into it - call this before spawning [`run_security_log_persistence`] for
+/// the same log, or an event recorded during start-up would end up ordered before the history it
+/// follows.
+///
+/// The restored entries go through [`crate::security::SecurityEventLog::restore`], so a persisted
+/// log larger than the live log's capacity (e.g. the capacity was lowered since) is trimmed by the
+/// same bound live recording would apply - logged, not silently swallowed.
+///
+/// Returns the number of entries read back from storage (not the number actually kept, if the
+/// capacity bound dropped any).
+pub async fn restore_security_log<S: Storage>(
+    log: &SecurityEventLog,
+    store: &SecurityLogStore<S>,
+) -> usize {
+    let entries = store.load().await;
+    let recovered = entries.len();
+    if recovered > 0 {
+        tracing::info!(count = recovered, "restoring the persisted security log");
+    }
+    let dropped = log.restore(entries);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "the persisted security log exceeded the live log's capacity; the oldest entries were \
+             dropped exactly as they would have been while running"
+        );
+    }
+    recovered
+}
+
+/// Records every security event received on `events` into `log`, timestamped from `clock`, and
+/// writes the whole log through to `store` after each one, forever. Storage failures are logged
+/// and never stop the loop - losing durability must not also lose the log.
+///
+/// This is a *separate* consumer of the security-event broadcast from the one that reports events
+/// to the CSMS (see [`crate::security::run_security_events`] /
+/// [`run_persisted_security_event_queue`]): an event must be logged whether or not it is ever
+/// delivered, and delivery must not wait on the log - see
+/// [`crate::security::SecurityEventLog`]'s docs for how the two differ.
+///
+/// `clock` stamps [`SecurityLogEntry::recorded_at`], and only when the reading actually looks
+/// synchronized (see [`crate::clock::is_synchronized`]): hardware with no RTC records the event
+/// with no time rather than a fabricated one, exactly as `next_record` does for a transaction's
+/// start time (`docs/PRODUCTION-ROADMAP.md` §9.3, G3.1).
+pub async fn run_security_log_persistence<S: Storage, C: Clock>(
+    mut events: BroadcastReceiver<SecurityEvent>,
+    log: &SecurityEventLog,
+    store: &SecurityLogStore<S>,
+    clock: &C,
+) {
+    while let Ok(event) = events.recv().await {
+        let now = clock.now();
+        let evicted = log.record(SecurityLogEntry {
+            event,
+            recorded_at: crate::clock::is_synchronized(&now).then_some(now),
+        });
+        if let Some(evicted) = evicted {
+            tracing::warn!(
+                event_type = ?evicted.event.event_type,
+                "the security log is full; dropping its oldest entry to make room for a new one"
+            );
+        }
+        store.save(&log.entries()).await;
+    }
+}
+
+/// Clears the security log - in memory and in durable storage - and reports the OCPP
+/// `SecurityLogWasCleared` event for it, returning how many entries were discarded.
+///
+/// The report is what makes clearing auditable, and is raised through
+/// [`crate::security::report_security_event`] like any other event, so it flows to the CSMS *and*
+/// straight back into the freshly-cleared log (via [`run_security_log_persistence`], if it's
+/// running) as its first new entry. That ordering is deliberate: the new log's first line then
+/// says how the previous history ended.
+///
+/// Nothing in this crate calls this yet - clearing is a CSMS-initiated or maintenance action, and
+/// the blocks that would trigger it (`GetLog`, customer-information erasure) don't exist yet; see
+/// `docs/PRODUCTION-ROADMAP.md` §8.4 (F4.3) and B5.1/B5.5.
+pub async fn clear_security_log<S: Storage>(
+    actor: &ChargePointActor,
+    log: &SecurityEventLog,
+    store: &SecurityLogStore<S>,
+) -> usize {
+    let discarded = log.clear();
+    store.clear().await;
+    crate::security::report_security_event(
+        actor,
+        SecurityEvent {
+            event_type: SecurityEventType::SecurityLogWasCleared,
+            tech_info: None,
+        },
+    )
+    .await;
+    discarded
 }
 
 // --- local authorization list persistence (E2.4, docs/PRODUCTION-ROADMAP.md §7.2) ---
@@ -3018,6 +3302,269 @@ mod tests {
         .await;
 
         assert_eq!(*delivered.lock().unwrap(), alloc::vec![first, second]);
+    }
+
+    // --- security log persistence (E2.10) ---
+
+    fn log_entry(recorded_at: Option<DateTime<Utc>>) -> SecurityLogEntry {
+        SecurityLogEntry {
+            event: SecurityEvent {
+                event_type: SecurityEventType::TamperDetectionActivated,
+                tech_info: Some("door switch tripped".into()),
+            },
+            recorded_at,
+        }
+    }
+
+    #[test]
+    fn a_security_log_entry_round_trips_through_its_persisted_mirror() {
+        let stamped = log_entry(DateTime::<Utc>::from_timestamp(1_800_000_000, 0));
+        let persisted: PersistedSecurityLogEntry = stamped.clone().into();
+        assert_eq!(SecurityLogEntry::from(persisted), stamped);
+
+        // An entry recorded with no usable time source keeps its `None` rather than acquiring a
+        // fabricated one on the way through storage (G3.1).
+        let untimed = SecurityLogEntry {
+            event: SecurityEvent {
+                event_type: SecurityEventType::Other("VendorThing".into()),
+                tech_info: None,
+            },
+            recorded_at: None,
+        };
+        let persisted: PersistedSecurityLogEntry = untimed.clone().into();
+        assert_eq!(SecurityLogEntry::from(persisted), untimed);
+    }
+
+    #[tokio::test]
+    async fn a_security_log_snapshot_round_trips_through_storage() {
+        let store = SecurityLogStore::new(InMemoryStorage::new());
+        let entries = alloc::vec![
+            log_entry(DateTime::<Utc>::from_timestamp(1_800_000_000, 0)),
+            log_entry(None),
+        ];
+        assert!(store.save(&entries).await);
+        assert_eq!(store.load().await, entries);
+    }
+
+    #[tokio::test]
+    async fn a_security_log_snapshot_from_an_incompatible_schema_version_is_discarded() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = SecurityLogStore::new(storage.clone());
+        let encoded = serde_json::to_vec(&PersistedSecurityLog {
+            schema_version: SECURITY_LOG_SCHEMA_VERSION + 1,
+            entries: alloc::vec![PersistedSecurityLogEntry::from(log_entry(None))],
+        })
+        .unwrap();
+        storage.set(SECURITY_LOG_KEY, &encoded).await.unwrap();
+
+        assert_eq!(store.load().await, alloc::vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_security_log_snapshot_is_discarded_rather_than_panicking() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = SecurityLogStore::new(storage.clone());
+        storage.set(SECURITY_LOG_KEY, b"not json").await.unwrap();
+
+        assert_eq!(store.load().await, alloc::vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_event_is_stamped_from_the_clock_and_written_through() {
+        use crate::sync::broadcast_channel;
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = SecurityLogStore::new(storage.clone());
+        let log = alloc::sync::Arc::new(SecurityEventLog::new());
+        let now = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        let task_log = log.clone();
+        let task = tokio::spawn(async move {
+            run_security_log_persistence(receiver, &task_log, &store, &FixedClock(now)).await;
+        });
+
+        sender.send(SecurityEvent {
+            event_type: SecurityEventType::TamperDetectionActivated,
+            tech_info: Some("door switch tripped".into()),
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        task.await.unwrap();
+
+        assert_eq!(log.entries(), alloc::vec![log_entry(Some(now))]);
+        assert_eq!(
+            SecurityLogStore::new(storage).load().await,
+            alloc::vec![log_entry(Some(now))]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_recorded_with_an_unsynchronized_clock_is_still_logged_without_a_timestamp() {
+        use crate::sync::broadcast_channel;
+
+        let store = SecurityLogStore::new(InMemoryStorage::new());
+        let log = alloc::sync::Arc::new(SecurityEventLog::new());
+        let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        assert!(!crate::clock::is_synchronized(&unset_rtc.now()));
+
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        let task_log = log.clone();
+        let task = tokio::spawn(async move {
+            run_security_log_persistence(receiver, &task_log, &store, &unset_rtc).await;
+        });
+
+        sender.send(SecurityEvent {
+            event_type: SecurityEventType::TamperDetectionActivated,
+            tech_info: Some("door switch tripped".into()),
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        task.await.unwrap();
+
+        // The event itself is recorded in full - only its time is honestly blank.
+        assert_eq!(log.entries(), alloc::vec![log_entry(None)]);
+    }
+
+    /// The end-to-end guarantee E2.10 exists for: the security log outlives both delivery to the
+    /// CSMS and a power cut, so a later `SecurityLogWasCleared` has something real to be about.
+    #[tokio::test]
+    async fn a_security_log_interrupted_by_a_power_cut_is_recovered_in_order_after_reboot() {
+        use crate::sync::broadcast_channel;
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let now = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // --- before the cut: two events recorded.
+        let store = SecurityLogStore::new(storage.clone());
+        let log = alloc::sync::Arc::new(SecurityEventLog::new());
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        let task_log = log.clone();
+        let task = tokio::spawn(async move {
+            run_security_log_persistence(receiver, &task_log, &store, &FixedClock(now)).await;
+        });
+        sender.send(SecurityEvent {
+            event_type: SecurityEventType::StartupOfTheDevice,
+            tech_info: None,
+        });
+        sender.send(SecurityEvent {
+            event_type: SecurityEventType::TamperDetectionActivated,
+            tech_info: Some("door switch tripped".into()),
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        task.await.unwrap();
+
+        // --- the cut: nothing but `storage` survives.
+        let restored_log = SecurityEventLog::new();
+        let restored_store = SecurityLogStore::new(storage.clone());
+        assert_eq!(
+            restore_security_log(&restored_log, &restored_store).await,
+            2
+        );
+
+        let recovered: Vec<SecurityEventType> = restored_log
+            .entries()
+            .into_iter()
+            .map(|entry| entry.event.event_type)
+            .collect();
+        assert_eq!(
+            recovered,
+            alloc::vec![
+                SecurityEventType::StartupOfTheDevice,
+                SecurityEventType::TamperDetectionActivated
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evicted_entry_is_gone_from_storage_too_rather_than_resurfacing_after_a_reboot() {
+        use crate::sync::broadcast_channel;
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = SecurityLogStore::new(storage.clone());
+        // Capacity 1: the second event evicts the first, and the snapshot written must reflect
+        // that - a stale snapshot would "recover" an entry the live log had already dropped.
+        let log = alloc::sync::Arc::new(SecurityEventLog::with_capacity(1));
+        let now = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        let task_log = log.clone();
+        let task = tokio::spawn(async move {
+            run_security_log_persistence(receiver, &task_log, &store, &FixedClock(now)).await;
+        });
+        sender.send(SecurityEvent {
+            event_type: SecurityEventType::StartupOfTheDevice,
+            tech_info: None,
+        });
+        sender.send(SecurityEvent {
+            event_type: SecurityEventType::TamperDetectionActivated,
+            tech_info: Some("door switch tripped".into()),
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        task.await.unwrap();
+
+        assert_eq!(
+            SecurityLogStore::new(storage).load().await,
+            alloc::vec![log_entry(Some(now))]
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_log_empties_storage_and_reports_that_it_was_cleared() {
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let mut reported = actor.subscribe_security_events();
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = SecurityLogStore::new(storage.clone());
+        let log = SecurityEventLog::new();
+        log.record(log_entry(None));
+        store.save(&log.entries()).await;
+
+        assert_eq!(clear_security_log(&actor, &log, &store).await, 1);
+
+        assert!(log.is_empty());
+        assert_eq!(store.load().await, alloc::vec![]);
+        // Clearing a security log is itself a security event - that is the whole reason the log
+        // has to be durable (E2.10).
+        let event = reported.recv().await.unwrap();
+        assert_eq!(event.event_type, SecurityEventType::SecurityLogWasCleared);
+    }
+
+    #[tokio::test]
+    async fn a_charge_point_without_storage_still_keeps_an_in_memory_security_log() {
+        let store = SecurityLogStore::new(NoStorage);
+        let log = SecurityEventLog::new();
+        log.record(log_entry(None));
+        store.save(&log.entries()).await;
+
+        // Nothing was persisted (`NoStorage` keeps nothing), but the live log is unaffected.
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            restore_security_log(&SecurityEventLog::new(), &store).await,
+            0
+        );
     }
 
     // --- local authorization list persistence (E2.4) ---

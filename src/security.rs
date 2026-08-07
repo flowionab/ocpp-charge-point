@@ -10,6 +10,10 @@ use crate::actor::ChargePointActor;
 use crate::state::{ChargePointEvent, SecurityEvent, SecurityEventType};
 use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use core::cell::RefCell;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 #[cfg(feature = "ocpp_2_1")]
 pub use self::ocpp_2_1::Ocpp2_1SecurityEventNotifier;
@@ -122,6 +126,161 @@ mod wire_type_tests {
     }
 }
 
+/// Default [`SecurityEventLog`] capacity used by [`SecurityEventLog::new`].
+///
+/// 50 entries keeps the log's worst-case retained memory in the low tens of KB (an entry is a
+/// [`SecurityEventType`] plus an optional free-text `techInfo`, bounded by OCPP's own 255-byte
+/// wire bound on that field) while still covering the recent history an operator or a CSMS
+/// `GetLog` upload actually looks at after an incident. Integrators with more flash and a
+/// compliance reason to keep a longer trail should pick their own via
+/// [`SecurityEventLog::with_capacity`] - see `docs/PRODUCTION-ROADMAP.md` §7.2 (E2.10) and §9.2
+/// (G2.2/G2.3) for the bounded-memory stance this follows.
+pub const DEFAULT_SECURITY_LOG_CAPACITY: usize = 50;
+
+/// One recorded security event, with the time it was recorded at.
+///
+/// `recorded_at` is stamped by the [`Clock`](crate::clock::Clock) supplied to
+/// [`crate::persistence::run_security_log_persistence`] rather than carried on
+/// [`SecurityEvent`] itself: the events flow through the actor, whose state machine is
+/// deliberately clock-free (see [`crate::clock`]), so the timestamp is added at the log's edge -
+/// the same split [`crate::persistence::PersistedTransaction::started_at`] makes.
+///
+/// It is `None` when the charge point had no usable time source at the moment the event was
+/// recorded (see [`crate::clock::is_synchronized`]) - hardware with no RTC that hasn't yet
+/// received a CSMS `currentTime`. The event is still recorded in full; only its time is honestly
+/// left blank rather than fabricated as a plausible-looking 1970 stamp
+/// (`docs/PRODUCTION-ROADMAP.md` §9.3, G3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityLogEntry {
+    /// The security event that occurred.
+    pub event: SecurityEvent,
+    /// When it was recorded, or `None` if the clock wasn't synchronized at the time - see the
+    /// type's docs.
+    pub recorded_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The charge point's security log: a bounded, oldest-first record of the security events raised
+/// on this charge point, independent of whether each one reached the CSMS.
+///
+/// # Why this exists alongside the offline security-event queue
+///
+/// [`crate::offline_queue::OfflineQueue`] holds security events *pending delivery* and drops each
+/// one the moment the CSMS accepts it - it is a delivery buffer, not a history. OCPP's
+/// `SecurityLogWasCleared` event, and `GetLog`'s `SecurityLog` upload, both presuppose a log that
+/// outlives delivery and outlives a reboot: clearing something that was never kept is not a
+/// meaningful event to report. This is that log (`docs/PRODUCTION-ROADMAP.md` §7.2, E2.10 - the
+/// durability half of §8.4's F4.3; the `GetLog` reader itself is still to come, see B5.1).
+///
+/// # Bounds and overflow
+///
+/// Bounded at construction (see [`DEFAULT_SECURITY_LOG_CAPACITY`] / [`Self::with_capacity`]), so
+/// an event storm - a stuck tamper switch, a CSMS that keeps failing authentication - grows the
+/// log only up to that bound rather than until allocation fails (G2.2). Overflow always evicts the
+/// **oldest** entry; unlike [`crate::offline_queue::OfflineQueue`] there is no policy choice here,
+/// because a log's newest entries are the ones an incident investigation starts from, and the
+/// alternative (refusing new entries once full) would freeze the log at the first storm and record
+/// nothing about whatever came after it. The evicted entry is handed back from [`Self::record`] so
+/// the caller can log that an audit-trail entry was lost.
+///
+/// Durability is a separate concern layered on top - see
+/// [`crate::persistence::SecurityLogStore`]. This type is pure in-memory state and has no
+/// [`crate::hardware::Storage`] dependency of its own, so a charge point without durable storage
+/// still gets an in-RAM log for the life of the process.
+///
+/// Cheap to share: put it behind an [`alloc::sync::Arc`] and hand clones to the persistence task
+/// and to whatever reads the log; it is internally synchronized by the same
+/// `embassy-sync`-backed blocking mutex the rest of this crate's no_std-safe shared state uses.
+pub struct SecurityEventLog {
+    entries: BlockingMutex<CriticalSectionRawMutex, RefCell<VecDeque<SecurityLogEntry>>>,
+    capacity: usize,
+}
+
+impl SecurityEventLog {
+    /// An empty log holding at most [`DEFAULT_SECURITY_LOG_CAPACITY`] entries.
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_SECURITY_LOG_CAPACITY)
+    }
+
+    /// An empty log holding at most `capacity` entries (clamped to at least 1 - a log that can
+    /// hold nothing would discard every event immediately, which is indistinguishable from having
+    /// no log at all while still costing every write).
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: BlockingMutex::new(RefCell::new(VecDeque::new())),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// The maximum number of entries this log retains - see [`Self::with_capacity`].
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Appends `entry`, evicting and returning the oldest entry if the log is already at capacity
+    /// (see the type's docs for why eviction is unconditional). Returns `None` when nothing was
+    /// evicted.
+    pub fn record(&self, entry: SecurityLogEntry) -> Option<SecurityLogEntry> {
+        self.entries.lock(|entries| {
+            let mut entries = entries.borrow_mut();
+            let evicted = if entries.len() >= self.capacity {
+                entries.pop_front()
+            } else {
+                None
+            };
+            entries.push_back(entry);
+            evicted
+        })
+    }
+
+    /// Every retained entry, oldest first - the order an operator reads a log in, and the order
+    /// [`crate::persistence::SecurityLogStore`] snapshots and restores it in.
+    pub fn entries(&self) -> alloc::vec::Vec<SecurityLogEntry> {
+        self.entries
+            .lock(|entries| entries.borrow().iter().cloned().collect())
+    }
+
+    /// How many entries are currently retained.
+    pub fn len(&self) -> usize {
+        self.entries.lock(|entries| entries.borrow().len())
+    }
+
+    /// Whether the log currently holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Discards every entry, returning how many were discarded.
+    ///
+    /// This is the in-memory half only: clearing the log durably - and reporting the OCPP
+    /// `SecurityLogWasCleared` event that makes the clearing itself auditable - is
+    /// [`crate::persistence::clear_security_log`], which is what callers should use.
+    pub fn clear(&self) -> usize {
+        self.entries.lock(|entries| {
+            let mut entries = entries.borrow_mut();
+            let discarded = entries.len();
+            entries.clear();
+            discarded
+        })
+    }
+
+    /// Appends every entry from `entries`, oldest first, through [`Self::record`] - so a log
+    /// restored from durable storage after a reboot respects this log's capacity exactly as if the
+    /// entries had been recorded one at a time while running. Returns how many entries the
+    /// capacity bound dropped (non-zero only if the persisted log is larger than this log's
+    /// capacity, e.g. because the capacity was lowered since the snapshot was written).
+    pub fn restore(&self, entries: alloc::vec::Vec<SecurityLogEntry>) -> usize {
+        entries.into_iter().fold(0, |dropped, entry| {
+            dropped + usize::from(self.record(entry).is_some())
+        })
+    }
+}
+
+impl Default for SecurityEventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Reports a security event to the CSMS via SecurityEventNotification. Implemented per protocol
 /// version (see the `ocpp_2_1` module), mirroring [`crate::availability::StatusNotifier`].
 #[async_trait::async_trait]
@@ -228,6 +387,87 @@ mod tests {
                 Some(String::from("case opened"))
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::{DEFAULT_SECURITY_LOG_CAPACITY, SecurityEventLog, SecurityLogEntry};
+    use crate::state::{SecurityEvent, SecurityEventType};
+    use chrono::{DateTime, Utc};
+
+    fn entry(tech_info: &str) -> SecurityLogEntry {
+        SecurityLogEntry {
+            event: SecurityEvent {
+                event_type: SecurityEventType::TamperDetectionActivated,
+                tech_info: Some(tech_info.into()),
+            },
+            recorded_at: DateTime::<Utc>::from_timestamp(1_800_000_000, 0),
+        }
+    }
+
+    fn tech_infos(log: &SecurityEventLog) -> alloc::vec::Vec<alloc::string::String> {
+        log.entries()
+            .into_iter()
+            .filter_map(|entry| entry.event.tech_info)
+            .collect()
+    }
+
+    #[test]
+    fn a_new_log_is_empty_and_uses_the_default_capacity() {
+        let log = SecurityEventLog::new();
+        assert!(log.is_empty());
+        assert_eq!(log.len(), 0);
+        assert_eq!(log.capacity(), DEFAULT_SECURITY_LOG_CAPACITY);
+        assert_eq!(log.entries(), alloc::vec![]);
+    }
+
+    #[test]
+    fn entries_are_returned_oldest_first() {
+        let log = SecurityEventLog::new();
+        assert_eq!(log.record(entry("first")), None);
+        assert_eq!(log.record(entry("second")), None);
+        assert_eq!(tech_infos(&log), alloc::vec!["first", "second"]);
+    }
+
+    #[test]
+    fn recording_past_capacity_evicts_the_oldest_entry() {
+        let log = SecurityEventLog::with_capacity(2);
+        log.record(entry("first"));
+        log.record(entry("second"));
+        // Full at [first, second]: the third entry evicts the first, which is handed back so the
+        // caller can log that an audit-trail entry was lost.
+        assert_eq!(log.record(entry("third")), Some(entry("first")));
+        assert_eq!(tech_infos(&log), alloc::vec!["second", "third"]);
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn capacity_is_clamped_to_at_least_one() {
+        let log = SecurityEventLog::with_capacity(0);
+        assert_eq!(log.capacity(), 1);
+        log.record(entry("first"));
+        assert_eq!(log.record(entry("second")), Some(entry("first")));
+        assert_eq!(tech_infos(&log), alloc::vec!["second"]);
+    }
+
+    #[test]
+    fn clearing_empties_the_log_and_reports_how_many_entries_were_discarded() {
+        let log = SecurityEventLog::new();
+        log.record(entry("first"));
+        log.record(entry("second"));
+        assert_eq!(log.clear(), 2);
+        assert!(log.is_empty());
+        // Clearing an already-empty log is not an error and discards nothing.
+        assert_eq!(log.clear(), 0);
+    }
+
+    #[test]
+    fn restoring_respects_capacity_exactly_as_live_recording_would() {
+        let log = SecurityEventLog::with_capacity(2);
+        let dropped = log.restore(alloc::vec![entry("first"), entry("second"), entry("third")]);
+        assert_eq!(dropped, 1);
+        assert_eq!(tech_infos(&log), alloc::vec!["second", "third"]);
     }
 }
 

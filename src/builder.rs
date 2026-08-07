@@ -37,11 +37,11 @@ use crate::persistence::{
     TransactionStore, flush_and_persist_security_event_queue,
     flush_and_persist_status_notification_queue, flush_and_persist_transaction_event_queue,
     restore_device_model, restore_local_authorization_list, restore_reservations,
-    restore_security_event_queue, restore_status_notification_queue,
+    restore_security_event_queue, restore_security_log, restore_status_notification_queue,
     restore_transaction_event_queue, restore_transactions, run_device_model_persistence,
     run_local_authorization_list_persistence, run_persisted_security_event_queue,
     run_persisted_status_notification_queue, run_persisted_transaction_event_queue,
-    run_reservation_persistence, run_transaction_persistence,
+    run_reservation_persistence, run_security_log_persistence, run_transaction_persistence,
 };
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
 use crate::remote_control::{
@@ -105,6 +105,12 @@ pub struct ChargePointBuilder<T, X> {
     // for the same reason as the other four - so a transaction the hardware reports during
     // start-up is persisted rather than missed.
     transaction_persistence_events: Option<BroadcastReceiver<TransactionEventOccurred>>,
+    // A second security-event subscription, independent of the one the Security block consumes,
+    // for the same reason `transaction_persistence_events` is independent of `transaction_events`:
+    // the security *log* (E2.10) must record every event whether or not it ever reaches the CSMS,
+    // and must not starve - or be starved by - the CSMS forwarder. Taken in `start()` so an event
+    // raised during hardware start-up is logged rather than missed.
+    security_log_events: Option<BroadcastReceiver<SecurityEvent>>,
     // Set by `boot_reason_persistence`, read by `provisioning`: the cause loaded from durable
     // storage at build time (`None` - no `boot_reason_persistence` call, or nothing was
     // persisted - reports an uncommanded restart, same as before this feature existed). Fixed for
@@ -199,6 +205,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let authorization_requests = runtime.subscribe_authorization_requests();
         let security_events = runtime.subscribe_security_events();
         let transaction_persistence_events = runtime.subscribe_transaction_events();
+        let security_log_events = runtime.subscribe_security_events();
 
         // C3 (docs/PRODUCTION-ROADMAP.md §5.3): land the hardware-declared capabilities into state
         // itself first - the single source of truth `crate::hardware::supported_feature_profiles_1_6`
@@ -231,6 +238,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             authorization_requests: Some(authorization_requests),
             security_events: Some(security_events),
             transaction_persistence_events: Some(transaction_persistence_events),
+            security_log_events: Some(security_log_events),
             boot_reason: None,
             boot_reason_clearer: None,
         })
@@ -1117,6 +1125,55 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let state_changes = self.runtime.actor().subscribe();
         self.executor.spawn(Box::pin(async move {
             run_device_model_persistence(state_changes, &store).await;
+        }));
+
+        self
+    }
+
+    /// Registers the durable security log (`docs/PRODUCTION-ROADMAP.md` §7.2, E2.10): recovers
+    /// whatever security events were logged before the charge point last lost power, then records
+    /// and persists every subsequent one through `store` for the life of the process.
+    ///
+    /// `log` is the caller's handle onto the live log - hold on to it (it is cheap to clone behind
+    /// the [`Arc`] this takes) to read the history back, and to clear it via
+    /// [`crate::persistence::clear_security_log`]. It also fixes the bound on how much the log
+    /// retains; see [`crate::security::SecurityEventLog::with_capacity`].
+    ///
+    /// Independent of [`Self::security_events`]/[`Self::security_events_persisted`] and of every
+    /// other `*_persistence` method: the log records every event whether or not it is ever
+    /// delivered to a CSMS, so a charge point may register this alone, with either security-event
+    /// forwarder, or with none. `store` may be built over [`crate::hardware::NoStorage`], leaving
+    /// an in-RAM-only log that starts empty each boot.
+    ///
+    /// `clock` stamps each entry - [`crate::clock::SystemClock`] on std, an RTC-backed
+    /// [`crate::clock::Clock`] on embedded; hardware with no usable time source records the events
+    /// with no timestamp rather than a fabricated one (see
+    /// [`crate::security::SecurityLogEntry::recorded_at`]).
+    ///
+    /// Registering this a second time is a no-op (logged), like the other subscription-consuming
+    /// blocks - see the type's docs.
+    pub async fn security_log_persisted<S, K>(
+        mut self,
+        log: Arc<crate::security::SecurityEventLog>,
+        store: crate::persistence::SecurityLogStore<S>,
+        clock: K,
+    ) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+    {
+        let Some(events) =
+            Self::warn_if_taken(self.security_log_events.take(), "security_log_persisted")
+        else {
+            return self;
+        };
+
+        // Before spawning the writer: a live event must not be recorded ahead of the history it
+        // follows, nor race a write against the same key.
+        restore_security_log(&log, &store).await;
+
+        self.executor.spawn(Box::pin(async move {
+            run_security_log_persistence(events, &log, &store, &clock).await;
         }));
 
         self
@@ -2174,6 +2231,101 @@ mod tests {
         assert_eq!(
             csms2.delivered.lock().unwrap().clone(),
             alloc::vec![first, second]
+        );
+    }
+
+    /// E2.10's end-to-end guarantee at the builder level: the security log is recorded
+    /// independently of whether the CSMS ever accepted the events, and survives a power cut.
+    #[tokio::test]
+    async fn security_log_persisted_survives_a_reboot_and_is_restored_in_order() {
+        use crate::persistence::{SecurityLogStore, restore_security_log};
+        use crate::security::SecurityEventLog;
+
+        let storage = Arc::new(InMemoryStorage::new());
+
+        // --- before the cut: two security events raised. No CSMS is registered at all here, which
+        // is the point: the log is not a delivery buffer.
+        let charge_point1 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let log1 = Arc::new(SecurityEventLog::new());
+        let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
+            .await
+            .unwrap()
+            .security_log_persisted(
+                log1.clone(),
+                SecurityLogStore::new(storage.clone()),
+                crate::clock::SystemClock,
+            )
+            .await;
+        report_security_event(
+            &builder1.runtime.actor(),
+            SecurityEvent {
+                event_type: crate::state::SecurityEventType::StartupOfTheDevice,
+                tech_info: None,
+            },
+        )
+        .await;
+        report_security_event(
+            &builder1.runtime.actor(),
+            SecurityEvent {
+                event_type: crate::state::SecurityEventType::TamperDetectionActivated,
+                tech_info: Some("door switch tripped".into()),
+            },
+        )
+        .await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(log1.len(), 2);
+        drop(builder1);
+
+        // --- the cut: nothing but `storage` survives. A fresh charge point restores the history.
+        let charge_point2 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let log2 = Arc::new(SecurityEventLog::new());
+        let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
+            .await
+            .unwrap()
+            .security_log_persisted(
+                log2.clone(),
+                SecurityLogStore::new(storage.clone()),
+                crate::clock::SystemClock,
+            )
+            .await
+            .build();
+        let _ = &runtime2;
+
+        let recovered: alloc::vec::Vec<crate::state::SecurityEventType> = log2
+            .entries()
+            .into_iter()
+            .map(|entry| entry.event.event_type)
+            .collect();
+        assert_eq!(
+            recovered,
+            alloc::vec![
+                crate::state::SecurityEventType::StartupOfTheDevice,
+                crate::state::SecurityEventType::TamperDetectionActivated
+            ]
+        );
+
+        // Registering the block restored the log into the caller's handle, not just into some
+        // task-private copy - a later `GetLog`/clear reads this same handle.
+        let restored_again = SecurityEventLog::new();
+        assert_eq!(
+            restore_security_log(&restored_again, &SecurityLogStore::new(storage)).await,
+            2
         );
     }
 

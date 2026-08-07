@@ -35,6 +35,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ocpp_charge_point::offline_queue::OfflineQueue;
+use ocpp_charge_point::security::{SecurityEventLog, SecurityLogEntry};
 use ocpp_charge_point::state::{
     AuthorizationStatus, ChargePointEvent, Component, ConnectorState, ConnectorStatus,
     ConnectorStatusChanged, DeviceModelEvent, IdToken, IdTokenKind, LocalListEntry, MeterSample,
@@ -96,6 +97,12 @@ struct Configuration {
     /// The capacity each of the three offline queues (status, transaction, security) is configured
     /// with - `crate::offline_queue::DEFAULT_CAPACITY` (100) unless the integrator picks otherwise.
     queue_capacity: usize,
+    /// The capacity the durable security log (E2.10) is configured with -
+    /// `crate::security::DEFAULT_SECURITY_LOG_CAPACITY` (50) unless the integrator picks
+    /// otherwise. Sized independently of `queue_capacity`: the log retains history whether or not
+    /// it was ever delivered, so its bound answers "how much history do we keep", not "how long an
+    /// outage do we absorb".
+    security_log_capacity: usize,
 }
 
 /// The id token length this test fills with: OCPP 2.x's `IdTokenType.idToken` is a 36-character
@@ -280,6 +287,25 @@ fn full_security_queue(capacity: usize) -> OfflineQueue<SecurityEvent> {
     queue
 }
 
+/// A worst-case security log: `capacity` recorded entries, each carrying `techInfo` text and a
+/// timestamp - the same filling as [`full_security_queue`], since the log records exactly the
+/// events that queue forwards.
+fn full_security_log(capacity: usize) -> SecurityEventLog {
+    let log = SecurityEventLog::with_capacity(capacity);
+    log.restore(
+        (0..capacity)
+            .map(|index| SecurityLogEntry {
+                event: SecurityEvent {
+                    event_type: SecurityEventType::MemoryExhaustion,
+                    tech_info: Some(filler("an offline-report queue overflowed: ", index, 80)),
+                },
+                recorded_at: chrono::DateTime::from_timestamp(1_800_000_000 + index as i64, 0),
+            })
+            .collect(),
+    );
+    log
+}
+
 /// One configuration's measured retained heap, in bytes, broken down by what holds it.
 struct Measurement {
     empty_state: usize,
@@ -290,6 +316,7 @@ struct Measurement {
     status_queue: usize,
     transaction_queue: usize,
     security_queue: usize,
+    security_log: usize,
 }
 
 impl Measurement {
@@ -302,7 +329,7 @@ impl Measurement {
     }
 
     fn total(&self) -> usize {
-        self.state_total() + self.queue_total()
+        self.state_total() + self.queue_total() + self.security_log
     }
 }
 
@@ -336,9 +363,10 @@ fn measure(configuration: &Configuration) -> Measurement {
     let (transaction_queue, transactions) =
         retained(|| full_transaction_queue(configuration.queue_capacity));
     let (security_queue, security) = retained(|| full_security_queue(configuration.queue_capacity));
+    let (security_log, log) = retained(|| full_security_log(configuration.security_log_capacity));
 
     // Nothing measured may be dropped before the last reading is taken.
-    drop((state, status, transactions, security));
+    drop((state, status, transactions, security, log));
 
     Measurement {
         empty_state,
@@ -349,6 +377,7 @@ fn measure(configuration: &Configuration) -> Measurement {
         status_queue,
         transaction_queue,
         security_queue,
+        security_log,
     }
 }
 
@@ -364,6 +393,7 @@ fn configurations() -> Vec<Configuration> {
                 .with_max_local_authorization_list_entries(25)
                 .with_max_device_model_variables(64),
             queue_capacity: 25,
+            security_log_capacity: 25,
         },
         Configuration {
             name: "Crate defaults (1 EVSE x 2 connectors)",
@@ -371,6 +401,7 @@ fn configurations() -> Vec<Configuration> {
             connector_counts: &[2],
             limits: StateLimits::default(),
             queue_capacity: 100,
+            security_log_capacity: ocpp_charge_point::security::DEFAULT_SECURITY_LOG_CAPACITY,
         },
         Configuration {
             name: "DC site (4 EVSEs x 2 connectors)",
@@ -380,6 +411,7 @@ fn configurations() -> Vec<Configuration> {
                 .with_max_local_authorization_list_entries(500)
                 .with_max_device_model_variables(512),
             queue_capacity: 200,
+            security_log_capacity: 200,
         },
     ]
 }
@@ -476,6 +508,10 @@ fn retained_heap_per_configuration_stays_within_its_documented_budget() {
         println!(
             "  security queue             {:>7} B",
             measured.security_queue
+        );
+        println!(
+            "  security log ({:>3})         {:>7} B",
+            configuration.security_log_capacity, measured.security_log
         );
         println!(
             "  state subtotal             {:>7} B",

@@ -634,7 +634,7 @@ mid-transaction currently loses the transaction.
 | Charging profiles | Load limits must not vanish on reboot | [B2.1](#b2--smart-charging-r11) |
 | Offline message queue | All three queues now durable (`src/persistence.rs`; `ChargePointBuilder::transaction_events_persisted` / `status_notifications_persisted` / `security_events_persisted`) | [G2](#92-g2--bounded-memory) |
 | Certificates and keys | Security profile 2/3 | [B4.1](#b4--certificates-and-iso-15118-r1-r13) |
-| Security event log | `SecurityLogWasCleared` is only meaningful against a durable log | [F4](#84-f4--security-events) |
+| Security event log | Durable and size-bounded (`src/security.rs`, `src/persistence.rs`; `ChargePointBuilder::security_log_persisted`) | [F4](#84-f4--security-events) |
 | Network profiles | Recover connectivity after a bad profile switch | [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) |
 | Boot reason | `BootNotification.reason` must distinguish power-up from a commanded reset | R§2 |
 
@@ -840,7 +840,56 @@ mid-transaction currently loses the transaction.
       `boot_reason_persistence` call, or `hardware::NoStorage`) now always reports the honest
       uncommanded-restart variant (`Unknown`) instead of the previously-hardcoded `PowerUp` —
       itself a small behavior change, but a strictly more honest one.
-- [ ] **E2.5, E2.7, E2.9–E2.11** One task per remaining row above.
+- [x] **E2.10** Security event log - `crate::security::SecurityEventLog` (the bounded in-RAM
+      ring) plus `persistence::SecurityLogStore`/`restore_security_log`/
+      `run_security_log_persistence`, wired via `ChargePointBuilder::security_log_persisted`.
+
+      **Why this is a second consumer of the security-event broadcast, not a reuse of the
+      existing one.** E2.8 already persists the offline *security-event queue*, and at a glance
+      that looks like the same data. It isn't: the queue holds events **pending delivery** and
+      drops each one the moment the CSMS accepts it, so on a healthy connection it is empty
+      almost always - exactly when an operator most wants the history. `SecurityLogWasCleared`
+      and `GetLog`'s `SecurityLog` upload both presuppose a record that outlives delivery, so
+      the log takes its own `subscribe_security_events()` subscription (taken up front in
+      `ChargePointBuilder::start`, like the four block subscriptions and the transaction
+      persistence one, so an event raised during hardware start-up is logged rather than
+      missed). Logging and delivery therefore cannot starve each other, and a charge point may
+      register either, both, or neither.
+
+      **Bounded, per G2.2**: a ring of `DEFAULT_SECURITY_LOG_CAPACITY` (50) entries by default,
+      overflowing by evicting the **oldest**. Unlike `OfflineQueue` there is no
+      `OverflowPolicy` choice here - a log's newest entries are where an incident investigation
+      starts, and the alternative (refuse new entries when full) would freeze the log at the
+      first event storm and record nothing about what followed. The eviction is logged and the
+      trimmed log is what reaches storage, so a stale snapshot can't resurrect an entry the
+      live log already dropped (a regression test covers exactly that). `tests/memory_budget.rs`
+      now measures the log alongside everything else - see G2.3's updated figures.
+
+      **Write policy: undebounced, deliberately.** `TransactionStore` debounces by energy moved
+      and `QueueStore` by mutation count; this one writes the whole log on every recorded event.
+      Security events are rare and individually meaningful, there is no high-rate equivalent of
+      periodic meter samples for a threshold to protect flash against, and the entry most worth
+      having durably is precisely the one immediately preceding whatever took the charge point
+      down - so a threshold would buy wear savings that don't matter at the cost of the entries
+      that do. `SecurityLogStore::new_atomic` matters more here than elsewhere, too: the log is
+      one whole-snapshot record, so a torn write costs the entire history rather than one entry.
+
+      **Timestamps follow G3.1's honesty rule**: `SecurityLogEntry::recorded_at` is stamped from
+      the caller-supplied `Clock` only when `crate::clock::is_synchronized` accepts the reading;
+      hardware with no RTC records the event in full with no time rather than a fabricated 1970
+      one. That is the `PersistedTransaction::started_at` split again - the state machine stays
+      clock-free and the timestamp is added at the log's edge.
+
+      `persistence::clear_security_log` clears memory and storage and raises
+      `SecurityEventType::SecurityLogWasCleared` through the normal reporting path, so the
+      cleared log's first new entry says how the previous history ended. Nothing calls it yet -
+      the blocks that would (`GetLog`, customer-information erasure) are [B5.1](#b5--diagnostics-and-monitoring-r14)/[B5.5](#b5--diagnostics-and-monitoring-r14) - which is
+      the honest remaining half of [F4.3](#84-f4--security-events): the durable log exists, the `GetLog` reader
+      does not.
+- [ ] **E2.5, E2.7, E2.9, E2.11** One task per remaining row above. All four are blocked on
+      functional blocks that don't exist yet (authorization cache on [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment), charging profiles
+      on [B2.1](#b2--smart-charging-r11), certificates on [B4.1](#b4--certificates-and-iso-15118-r1-r13), network profiles on [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle)), so E2's table is
+      now complete as far as this milestone can take it.
 
 ### 7.3 E3 — Crash consistency
 
@@ -986,7 +1035,10 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
 - [ ] **F4.2** Actually *raise* each event from the code path that detects
       it — most are declared but never emitted.
 - [ ] **F4.3** Durable, size-bounded security log ([E2](#72-e2--what-must-survive)), readable via
-      `GetLog`.
+      `GetLog`. *Partial* - the log itself is done ([E2.10](#72-e2--what-must-survive)): bounded,
+      durable, restored at boot, and clearable with a `SecurityLogWasCleared` report. What's left
+      is the `GetLog` reader that uploads it, which needs [B5.1](#b5--diagnostics-and-monitoring-r14)'s
+      file-transfer abstraction.
 - [ ] **F4.4** `SecurityEventNotification` for 2.0.1 (after [D1](#61-d1--missing-action-wrappers)) and a
       decision on 1.6J.
 
@@ -1125,11 +1177,12 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
       `GlobalAlloc` and reads live requested bytes around each structure, filled
       to its configured bounds (local list full of 36-character id tokens,
       device model full, every connector holding a transaction *and* a
-      reservation, all three offline queues full). It runs as part of
+      reservation, all three offline queues full, and - since E2.10 - the
+      durable security log full). It runs as part of
       `cargo test`, and asserts a ceiling per configuration - so a change that
       meaningfully grows retained state fails the build instead of being found
-      on a device. Headline figures: ~43 KB for a tightened single-connector
-      wallbox, ~160 KB at this crate's defaults, ~346 KB for a 4-EVSE DC site
+      on a device. Headline figures: ~48 KB for a tightened single-connector
+      wallbox, ~171 KB at this crate's defaults, ~391 KB for a 4-EVSE DC site
       (64-bit host; a 32-bit MCU holds 0.5-0.85x of each type, so those are
       conservative upper bounds - `size_of` for both targets is tabulated,
       the 32-bit column measured via `cargo check --target
@@ -1531,8 +1584,8 @@ fail-safe error path, but nothing yet *calls* it. (Since updated by M2's first
 slice: E2.1/E2.2, E3.2, E3.3 and E4.1 are now done — the in-flight transaction
 is persisted and recovered. Later slices closed E2.3, E2.4, E2.6, E2.12 and
 E4.2, then E2.8/E4.3 for all three offline queues — transaction-event, status
-and security. The rest of E2's table is still RAM-only, and four of its five
-remaining rows are blocked on blocks that don't exist yet: authorization cache
+and security — then E2.10's durable security log. Every remaining E2 row is
+blocked on a block that doesn't exist yet: authorization cache
 on B1.2, charging profiles on B2.1, certificates on B4.1, network profiles on
 B1.8/A9.)
 

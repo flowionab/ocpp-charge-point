@@ -558,7 +558,15 @@ Secures the OCPP connection and reports security-relevant events.
   Critically, **nothing in this crate raises one of these on its own yet**:
   there's no certificate handling (the rest of this block), no firmware
   update flow (§12), and no TLS-layer visibility (that lives in
-  `ocpp-client`, not here). `security::report_security_event(actor, event)`
+  `ocpp-client`, not here). A durable, size-bounded **security log** now sits alongside
+  the reporting pipeline (`security::SecurityEventLog` plus
+  `persistence::SecurityLogStore`, wired via
+  `ChargePointBuilder::security_log_persisted`): every raised event is recorded
+  and written through to storage whether or not the CSMS ever accepts it, and
+  restored at the next boot, which is what makes `SecurityLogWasCleared`
+  (raised by `persistence::clear_security_log`) mean anything. The `GetLog`
+  upload that would read it is still missing (§14).
+  `security::report_security_event(actor, event)`
   is the one public entry point - callable by hardware (e.g. a tamper
   switch, the same way `MeterValueSampled` is pushed in) or by future
   functional blocks once they exist, but nothing calls it today. Version
