@@ -1,0 +1,12 @@
+# Measurement-only settings, mirroring `.github/workflows/ci.yaml`'s `embedded` job plus what a
+# linked (rather than merely checked) bare-metal binary additionally needs.
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    # `getrandom` (reached via `ocpp-client` -> `uuid`'s `v4` feature) has no entropy source on a
+    # bare-metal target; the real firmware registers one. `src/main.rs`'s `getrandom_backend`
+    # implementation is a stub, exactly as CI's `embedded` job does for `cargo check`.
+    '--cfg', 'getrandom_backend="custom"',
+    # This crate ships no memory layout of its own, so the probe supplies a plausible
+    # 1 MB flash / 128 KB RAM one - see `link.x`.
+    '-C', 'link-arg=-Tlink.x',
+]

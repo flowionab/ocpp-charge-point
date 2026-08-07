@@ -99,6 +99,13 @@ jobs:
       - run: cargo check --no-default-features --lib --target thumbv7em-none-eabihf
         env:
           RUSTFLAGS: -D warnings --cfg getrandom_backend="custom"
+      # G2.4: `tools/flash-probe` is the only thing in the repository that *links* a bare-metal
+      # image rather than just checking one, so it catches breakage `cargo check` cannot (a missing
+      # symbol, a `critical-section` backend gone stale). `--quick` builds only the core and
+      # all-features rows - enough to keep the probe honest without paying for the whole table on
+      # every push. Re-run `scripts/flash-cost.sh` (no flag) by hand when docs/MEMORY.md's flash
+      # figures need refreshing.
+      - run: scripts/flash-cost.sh --quick
 
   # H1.4: enforces the `rust-version` declared in Cargo.toml, so bumping the
   # MSRV becomes a deliberate edit rather than an accident that silently drops

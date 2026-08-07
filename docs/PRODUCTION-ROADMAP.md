@@ -1154,8 +1154,65 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
       `GetBaseReport`'s need to iterate per component, and deliberately *not*
       done here: G2.3 was to measure and document, not to redesign the model
       on the strength of a first measurement.
-- [ ] **G2.4** Measure flash cost per Cargo feature — that's the whole
-      point of [C1](#51-c1--cargo-feature-per-functional-block), and it should be a number in the README.
+- [x] **G2.4** Measured, and the numbers are in the README (plus the full table
+      in [`docs/MEMORY.md`](MEMORY.md#flash)).
+      [`scripts/flash-cost.sh`](../scripts/flash-cost.sh) builds
+      [`tools/flash-probe`](../tools/flash-probe) - a real bare-metal firmware
+      image that *exercises* the enabled features - for
+      `thumbv7em-none-eabihf` with `opt-level="z"`, fat LTO and
+      `--gc-sections`, then reports the flashable image size
+      (`objcopy -O binary`, i.e. the bytes you program onto the part), once per
+      feature set. The `--quick` form (core + everything) runs in CI's
+      `embedded` job: the probe is the only thing in the repository that
+      *links* a bare-metal image rather than checking one, so it catches what
+      `cargo check` cannot - a missing symbol, a stale `critical-section`
+      backend - and it can't silently rot.
+
+      | Feature set | Flash | vs core |
+      | --- | --- | --- |
+      | Core, no protocol version | 32 KB | - |
+      | Core + 1.6J | 174 KB | +141 KB |
+      | Core + 2.0.1 | 224 KB | +191 KB |
+      | Core + 2.1 | 310 KB | +277 KB |
+      | Core + all three versions | 474 KB | +441 KB |
+      | Core + 2.1 + `reservation` | 320 KB | +10 KB over 2.1 |
+      | Core + 2.1 + `local-auth-list` | 322 KB | +12 KB over 2.1 |
+      | Core + 2.1 + `tariff-cost` | 315 KB | +5 KB over 2.1 |
+      | Core + 2.1 + the 11 declared-capability features | 311 KB | +1 KB over 2.1 |
+      | Everything | 523 KB | +490 KB |
+
+      **What it says about [C1](#51-c1--cargo-feature-per-functional-block).**
+      The version-independent core is small (32 KB); the negotiated protocol
+      version dominates everything else, and the second and third version cost
+      +164 KB on top of 2.1 alone - so on a 512 KB part, "which versions do we
+      speak" is the flash decision, and a single-version build is the first
+      lever. The three functional blocks that are *genuinely* feature-gated
+      today are cheap and behave exactly as C1 intends: 5-12 KB each, absent if
+      unused. The other eleven capability features cost ~1 KB **in total**, and
+      the honest reading is not "they're free" but "there is nothing behind them
+      yet" - they are capability declarations whose functional blocks (workstream
+      B) aren't implemented. Each should grow a real number as its block lands,
+      which is what this table now exists to catch.
+
+      Deliberately not attempted: splitting a per-version figure into "this
+      crate" versus "`ocpp-client`/`ocpp-types`/`serde`". The codecs are only
+      reachable *because* the adapters name those message types, so the split
+      isn't defensible from a linked-image measurement; `cargo bloat` on the
+      probe is the tool for looking inside a number. The figures also exclude
+      what the integrator brings (transport, TLS, executor, allocator, reset
+      vector/startup, a real panic handler) and assume the probe's release
+      profile - both stated in the doc rather than left implied.
+
+      Two measurement traps worth recording, since both silently produce
+      *plausible* numbers rather than errors: escaping a spawned future's
+      address through a thin pointer discards its vtable, after which LTO proves
+      every future body unreachable (the whole image measured 60 bytes), so the
+      probe polls each future once instead; and a `GlobalAlloc` that always
+      returns null lets LLVM fold every allocation into an abort and every
+      caller into dead code, so the probe uses a real bump allocator over a
+      static arena. `scripts/flash-cost.sh` also deletes the previous image
+      before each build and fails loudly, rather than measuring a stale binary
+      when a feature set doesn't compile.
 
 ### 9.3 G3 — Time
 

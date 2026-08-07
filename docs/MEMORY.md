@@ -1,10 +1,16 @@
 # Memory budget
 
-How much RAM a charge point built on this crate holds, per configuration, so an
-integrator can size the part before committing to hardware. This closes **G2.3**
-in [`PRODUCTION-ROADMAP.md`](PRODUCTION-ROADMAP.md) §9.2.
+How much RAM and flash a charge point built on this crate needs, so an integrator
+can size the part before committing to hardware. RAM is **G2.3** and flash is
+**G2.4** in [`PRODUCTION-ROADMAP.md`](PRODUCTION-ROADMAP.md) §9.2; both are
+measured, neither is estimated.
 
-Every number here is **measured, not estimated**: they come from
+- [RAM](#ram) — worst-case retained heap per configuration
+- [Flash](#flash) — image size per Cargo feature set
+
+## RAM
+
+Every RAM number here comes from
 [`tests/memory_budget.rs`](../tests/memory_budget.rs), which installs a counting
 `GlobalAlloc` and reads live requested bytes around each structure it builds.
 Regenerate them with
@@ -17,7 +23,7 @@ The test also asserts a ceiling per configuration, so a change that meaningfully
 grows retained state fails `cargo test` rather than being discovered on a device.
 Raise a ceiling only together with the table below.
 
-## What is counted
+### What is counted
 
 Counted: bytes this crate requests from the allocator and has not freed while the
 state is alive — the `Vec`/`VecDeque`/`BTreeMap`/`String` backing storage that
@@ -36,7 +42,7 @@ scales with the configured bounds.
 The figures are therefore a **floor for the application layer**, and the right
 input to a RAM budget rather than the whole budget.
 
-## Per configuration
+### Per configuration
 
 Measured on a 64-bit host. See [32-bit targets](#32-bit-targets) below — a
 32-bit MCU holds *less*, so these numbers are a safe upper bound.
@@ -65,7 +71,7 @@ Read that as: the crate's own defaults need roughly **160 KB of heap** in the
 worst case, and a deliberately tightened single-connector wallbox fits in
 roughly **43 KB**. Neither figure includes the exclusions above.
 
-### Per-unit costs, for sizing your own configuration
+#### Per-unit costs, for sizing your own configuration
 
 Derived from the same measurements, so you can price a bound before setting it:
 
@@ -83,7 +89,7 @@ An offline queue's `VecDeque` grows by doubling, so a queue configured with
 capacity 100 ends up with 128 slots allocated. Round a configured capacity up to
 the next power of two when budgeting.
 
-## The device model dominates — and its shape matters
+### The device model dominates — and its shape matters
 
 The device model is the largest single consumer in every configuration, and its
 cost per variable depends heavily on how variables are distributed across
@@ -118,7 +124,7 @@ Two consequences worth stating plainly:
   charge point's topology — note how little the floor moves between a
   1-connector and an 8-connector configuration.
 
-## 32-bit targets
+### 32-bit targets
 
 `size_of` for the types that dominate, measured on the host and on
 `thumbv7em-none-eabihf`:
@@ -150,12 +156,94 @@ replace with its own.
 The string payloads (id tokens, component/variable names, `techInfo`) are
 target-independent — a 36-byte token is 36 bytes everywhere.
 
-## What is not bounded yet
+---
+
+## Flash
+
+Measured by [`scripts/flash-cost.sh`](../scripts/flash-cost.sh), which builds
+[`tools/flash-probe`](../tools/flash-probe) — a real bare-metal firmware image
+that exercises the enabled features — for `thumbv7em-none-eabihf` with
+`opt-level="z"`, fat LTO and `--gc-sections`, then reports the size of the
+flashable image (`objcopy -O binary`, i.e. the bytes you program onto the part):
+
+```sh
+scripts/flash-cost.sh          # the whole table
+scripts/flash-cost.sh --quick  # core + everything, what CI runs
+```
+
+| Feature set | Flash | vs core |
+| --- | --- | --- |
+| Core, no protocol version | 32 KB | — |
+| Core + OCPP 1.6J | 174 KB | +141 KB |
+| Core + OCPP 2.0.1 | 224 KB | +191 KB |
+| Core + OCPP 2.1 | 310 KB | +277 KB |
+| Core + all three versions | 474 KB | +441 KB |
+| Core + 2.1 + `reservation` | 320 KB | +10 KB over 2.1 |
+| Core + 2.1 + `local-auth-list` | 322 KB | +12 KB over 2.1 |
+| Core + 2.1 + `tariff-cost` | 315 KB | +5 KB over 2.1 |
+| Core + 2.1 + the 11 declared-capability features | 311 KB | +1 KB over 2.1 |
+| Everything | 523 KB | +490 KB |
+
+"Core" is the version-independent charge point: the state machine, the actor, the
+hardware binding and dispatch, and every functional block that isn't
+feature-gated. **32 KB** — that part is small.
+
+### What this tells you
+
+**The protocol version is the decision that matters.** A 2.1-only charge point is
+310 KB; supporting all three versions is 474 KB, so the second and third version
+cost **+164 KB** on top of 2.1 alone (less than the 609 KB the three would sum to,
+because they share this crate's internal model and much of `ocpp-types`). On a
+512 KB part, all-three-versions plus TLS plus your own application is a tight fit;
+a single negotiated version is the lever to pull first, and it's a one-line
+feature change.
+
+The per-version figure is the *whole* wire stack — this crate's adapters plus the
+`ocpp-client` code and `ocpp-types`/`serde` monomorphizations they pull in —
+because that is what a charge point must flash to speak the version at all. Don't
+read it as "this crate's adapter code is 277 KB"; the split isn't cleanly
+attributable, since the codecs are only reachable *because* the adapters name
+those message types. `cargo bloat` on the probe is the tool if you want to see
+inside the number.
+
+**The functional-block features are cheap: 5–12 KB each.** Reservation, local
+authorization list and tariff/cost are genuinely feature-gated, so a charge point
+that doesn't need one doesn't flash it.
+
+**The other 11 capability features currently cost ~1 KB in total, because they
+gate almost no code yet.** `smart-charging`, `firmware-management`, `diagnostics`,
+`variable-monitoring`, `display-message`, `payment`, `iso15118`, `der-control`,
+`battery-swap`, `periodic-event-stream` and `certificates` exist today as
+capability *declarations* — they appear in the capability table and gate nothing
+else, because the functional blocks behind them aren't implemented (roadmap
+workstream B). The honest reading of that row is not "these features are free" but
+"there is nothing behind them yet"; expect each to grow a real number as its block
+lands, which is exactly what this table is for.
+
+### What the flash figures exclude
+
+Everything an integrator brings: a real transport (the probe's never sends) and
+its TLS stack, a real async executor (embassy or otherwise), a real heap
+allocator, the reset vector and startup code (`cortex-m-rt`), and a panic handler
+that does something. Add those to the numbers above, don't read them as a whole
+firmware.
+
+They also assume the release profile the probe uses — `opt-level = "z"`, `lto =
+true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`. A debug build, thin
+LTO, or `panic = "unwind"` is a different and much larger number.
+
+---
+
+## What is not measured or bounded yet
 
 - **Transient allocation during deserialization.** An over-long CSMS payload or
   persisted record is fully deserialized before this crate's bounds truncate or
-  refuse it, so peak transient use is not yet bounded — roadmap **F5.2**.
-- **Flash, as opposed to RAM.** Per-Cargo-feature flash cost is roadmap **G2.4**.
-- **Long-run growth.** These are worst-case snapshots, not a soak test; the
-  assertion that memory doesn't creep across thousands of transactions is roadmap
-  **H4.2**.
+  refuse it, so peak transient RAM use is not yet bounded — roadmap **F5.2**.
+- **Long-run growth.** The RAM figures are worst-case snapshots, not a soak test;
+  the assertion that memory doesn't creep across thousands of transactions is
+  roadmap **H4.2**.
+- **Where the per-version flash goes.** The table attributes flash per feature
+  set, not per crate within a feature set — see the note under
+  [What this tells you](#what-this-tells-you).
+- **The 11 declared-capability features' real cost**, which only exists once the
+  functional blocks behind them do (roadmap workstream B).

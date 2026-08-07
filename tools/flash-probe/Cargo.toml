@@ -1,0 +1,64 @@
+# A standalone workspace on purpose: this crate is a measurement fixture, not part of the library's
+# build. Keeping it out of the main workspace means `cargo test`/`cargo hack`/`cargo clippy` at the
+# repository root never build it, and it can pin a `no_std`-only profile without affecting anything
+# else.
+[workspace]
+
+[package]
+name = "flash-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "flash-probe"
+path = "src/main.rs"
+
+[dependencies]
+# Always `default-features = false`: the point of the probe is to measure a bare-metal build, and
+# `scripts/flash-cost.sh` turns individual features on from the outside, one feature set per
+# measurement.
+ocpp-charge-point = { path = "../..", default-features = false }
+ocpp-client = { version = "0.2.1", default-features = false }
+chrono = { version = "0.4", default-features = false }
+critical-section = { version = "1", features = ["restore-state-bool"] }
+async-trait = "0.1"
+# Only to name `getrandom::Error` in the custom backend below; `getrandom` itself arrives
+# transitively via `ocpp-client` -> `uuid`.
+getrandom = "0.4"
+
+[features]
+# Each of these forwards to the library feature of the same name and switches on the probe code that
+# exercises it - a feature whose code the probe never reaches would be dead-stripped by the linker
+# and would measure as free.
+ocpp_1_6 = ["ocpp-charge-point/ocpp_1_6", "ocpp-client/ocpp_1_6"]
+ocpp_2_0_1 = ["ocpp-charge-point/ocpp_2_0_1", "ocpp-client/ocpp_2_0_1"]
+ocpp_2_1 = ["ocpp-charge-point/ocpp_2_1", "ocpp-client/ocpp_2_1"]
+reservation = ["ocpp-charge-point/reservation"]
+local-auth-list = ["ocpp-charge-point/local-auth-list"]
+tariff-cost = ["ocpp-charge-point/tariff-cost"]
+# The capability features that gate no code of their own today - see `scripts/flash-cost.sh` and
+# docs/MEMORY.md's flash section for what that means for the table.
+declared-capabilities = [
+    "ocpp-charge-point/smart-charging",
+    "ocpp-charge-point/firmware-management",
+    "ocpp-charge-point/diagnostics",
+    "ocpp-charge-point/variable-monitoring",
+    "ocpp-charge-point/display-message",
+    "ocpp-charge-point/payment",
+    "ocpp-charge-point/iso15118",
+    "ocpp-charge-point/der-control",
+    "ocpp-charge-point/battery-swap",
+    "ocpp-charge-point/periodic-event-stream",
+    "ocpp-charge-point/certificates",
+]
+
+# Sized for flash, the way firmware ships: size-optimized, LTO'd, one codegen unit, no unwinding
+# tables, no debug info. Measuring anything else would flatter or slander the library for reasons
+# that have nothing to do with it.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

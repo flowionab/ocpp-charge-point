@@ -208,7 +208,7 @@ std/tokio users get all four for free (`TokioExecutor`, `TokioBackoff`, `SystemC
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) §0 for the detailed history of what's been abstracted and what's still tracked.
 
-### 📏 Memory footprint
+### 📏 Memory and flash footprint
 
 Every collection that can grow is bounded by a configured maximum (`state::StateLimits` for the local authorization list and device model, `offline_queue::OfflineQueue`'s capacity for the offline report queues), so peak memory is a property of your configuration rather than of how much a CSMS sends you.
 
@@ -222,7 +222,20 @@ Measured worst-case retained heap, filled to those bounds:
 
 These are 64-bit host figures and a conservative upper bound for a 32-bit MCU, which holds less. They exclude task stacks, transport/TLS buffers, and allocator overhead.
 
-[`docs/MEMORY.md`](docs/MEMORY.md) has the full breakdown, the per-unit costs for sizing your own configuration, and one finding worth reading before writing a hardware binding: **how you group device model variables across components changes their cost by up to 5.6×**. The numbers come from `cargo test --test memory_budget -- --nocapture`, which also gates against regressions.
+Measured flash, as a linked `thumbv7em-none-eabihf` image (`opt-level="z"`, fat LTO, `--gc-sections`):
+
+| Feature set | Flash |
+| --- | --- |
+| Core, no protocol version (state machine, actor, hardware dispatch) | **32 KB** |
+| Core + OCPP 1.6J | **174 KB** |
+| Core + OCPP 2.0.1 | **224 KB** |
+| Core + OCPP 2.1 | **310 KB** |
+| Core + all three versions | **474 KB** |
+| Everything (all versions + every capability feature) | **523 KB** |
+
+The negotiated protocol version is the decision that dominates: the second and third version cost +164 KB on top of 2.1 alone, so a single-version build is the first lever to pull on a 512 KB part. The individually gated functional blocks are cheap by comparison — `reservation` +10 KB, `local-auth-list` +12 KB, `tariff-cost` +5 KB. These exclude your transport, TLS, executor, allocator and startup code.
+
+[`docs/MEMORY.md`](docs/MEMORY.md) has the full breakdown for both RAM and flash, the per-unit costs for sizing your own configuration, and one finding worth reading before writing a hardware binding: **how you group device model variables across components changes their RAM cost by up to 5.6×**. Regenerate the numbers with `cargo test --test memory_budget -- --nocapture` (RAM, also gates against regressions) and `scripts/flash-cost.sh` (flash).
 
 ---
 
