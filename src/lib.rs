@@ -42,6 +42,7 @@ pub mod hardware;
 mod id_tag;
 #[cfg(feature = "local-auth-list")]
 pub mod local_authorization_list;
+pub mod meter_values;
 pub mod offline_queue;
 pub mod persistence;
 pub mod provisioning;

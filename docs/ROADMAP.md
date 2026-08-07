@@ -1136,24 +1136,30 @@ Energy/power measurement reporting.
   `TransactionEvent.meterValue` the same way energy-only sampling was
   wired. `current_ma` (milliamps) is the one field with a non-obvious unit -
   chosen over whole amps for enough resolution at typical EV charging
-  currents; the wire adapter divides by 1000 before reporting. Not yet done:
-  standalone `MeterValues` for 1.6J - note the parenthetical that used to sit
-  here ("no 1.6J wire adapter of any kind exists yet in this crate ... every
-  adapter implemented so far targets `OCPP2_1Client` only") is long stale and
-  has been removed; 1.6J and 2.0.1 adapters exist throughout, including a
-  1.6J `MeterValues` embedded in `Ocpp1_6TransactionNotifier`. What's
-  genuinely missing is the *standalone* 1.6J sender. Also missing: per-phase
-  measurements (`SampledValue.phase` is always `None`), sampled-data
-  configuration - no longer blocked, since the §2 device model it needed now
-  exists (`SampledDataCtrlr`/`TxUpdatedInterval` is already in the 1.6J
-  configuration-key alias table; nothing reads it yet, which makes it exactly
-  the inert-variable trap `HeartbeatInterval` was fixed out of) - and
-  clock-aligned periodic scheduling (still requires an integrator-owned
-  timer today; the crate has no scheduling hook for it - same gap noted
-  against §8's reservation expiry).
+  currents; the wire adapter divides by 1000 before reporting. Standalone `MeterValues` now exists for all three versions
+  (`crate::meter_values`), driven by the `AlignedDataCtrlr`/`Interval` device
+  model variable (1.6J's `ClockAlignedDataInterval` aliases onto it) and
+  aligned to the wall clock rather than to boot time, so readings taken between
+  sessions - and by a charge point with nothing plugged in at all - reach the
+  CSMS. `EvseState::latest_meter_samples` keeps the reading that makes that
+  possible, recorded on every sample regardless of connector state. Sampled-data
+  configuration (`SampledDataCtrlr`/`TxUpdatedInterval`) is still inert: this
+  crate never polls hardware, so how often a reading arrives remains the
+  binding's choice - throttling what reaches the CSMS to that interval is the
+  outstanding half.
+
+  Clock-aligned scheduling no longer needs an integrator-owned timer: the loop
+  sleeps on the same caller-supplied `Backoff` the heartbeat uses, computing
+  each wait from the next wall-clock boundary. (§8's reservation expiry still
+  has no such driver.) Still missing: per-phase measurements
+  (`SampledValue.phase` is always `None`), and the sampled-data throttling
+  noted above.
 - Version notes: measurand/unit enums are close to compatible across
-  versions; sampling-context differs slightly. 1.6J needs a standalone
-  `MeterValues` sender, not yet built.
+  versions; sampling-context differs slightly. 2.x's `MeterValuesRequest`
+  addresses an EVSE with no connector field at all, so a multi-connector EVSE's
+  readings are indistinguishable on that wire - the spec's shape, not a
+  simplification this crate made; 1.6J addresses a flat `connectorId` and so
+  keeps the finer address.
 
 ## 11. Smart charging
 

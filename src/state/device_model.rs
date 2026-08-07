@@ -326,6 +326,37 @@ impl DeviceModel {
     ///   `RequestStartTransaction` still needs an `Authorize` round trip. Not yet consulted by
     ///   `crate::remote_control` either, for the same reason.
     fn register_defaults(&mut self) {
+        // Clock-aligned data (docs/PRODUCTION-ROADMAP.md B1.1). `0` is OCPP's own "disabled",
+        // which is the right default for a charge point nobody has configured yet: a charge point
+        // that started reporting on a 15-minute drumbeat because this crate picked a number would
+        // be spending a CSMS's bandwidth on a decision it never made.
+        self.register(
+            Component {
+                name: "AlignedDataCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            Variable {
+                name: "Interval".into(),
+                instance: None,
+            },
+            VariableCharacteristics {
+                data_type: VariableDataType::Integer,
+                unit: Some("s".into()),
+                min_limit: None,
+                max_limit: None,
+                values_list: None,
+                supports_monitoring: false,
+            },
+            alloc::vec![VariableAttribute {
+                attribute_type: VariableAttributeType::Actual,
+                value: "0".into(),
+                mutability: VariableMutability::ReadWrite,
+                persistent: false,
+                constant: false,
+                requires_reboot: false,
+            }],
+        );
         self.register(
             Component {
                 name: "OCPPCommCtrlr".into(),
@@ -575,12 +606,17 @@ mod tests {
             model.max_variables(),
             crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES
         );
-        assert_eq!(model.len(), 2, "the two built-in defaults");
+        assert_eq!(
+            model.len(),
+            3,
+            "the built-in defaults: HeartbeatInterval, AuthorizeRemoteStart, AlignedDataCtrlr.Interval"
+        );
     }
 
     #[test]
     fn registering_past_the_maximum_is_refused_and_leaves_the_model_alone() {
-        let mut model = DeviceModel::with_max_variables(3);
+        // One slot above the built-in defaults, so exactly one custom registration fits.
+        let mut model = DeviceModel::with_max_variables(4);
         assert!(model.register(
             component("Custom"),
             variable("First"),
@@ -596,7 +632,7 @@ mod tests {
         );
 
         assert!(!registered);
-        assert_eq!(model.len(), 3);
+        assert_eq!(model.len(), 4);
         assert_eq!(model.get(&component("Custom"), &variable("Second")), None);
     }
 
@@ -604,7 +640,7 @@ mod tests {
     /// block it - otherwise a full model could never have a value's characteristics corrected.
     #[test]
     fn redefining_an_existing_variable_is_allowed_at_the_maximum() {
-        let mut model = DeviceModel::with_max_variables(2);
+        let mut model = DeviceModel::with_max_variables(3);
 
         let registered = model.register(
             component("OCPPCommCtrlr"),
@@ -614,7 +650,7 @@ mod tests {
         );
 
         assert!(registered);
-        assert_eq!(model.len(), 2);
+        assert_eq!(model.len(), 3);
         assert_eq!(
             model
                 .get(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval"))
@@ -632,8 +668,8 @@ mod tests {
     fn a_maximum_below_the_built_in_defaults_is_raised_to_fit_them() {
         let model = DeviceModel::with_max_variables(0);
 
-        assert_eq!(model.max_variables(), 2);
-        assert_eq!(model.len(), 2);
+        assert_eq!(model.max_variables(), 3);
+        assert_eq!(model.len(), 3);
     }
 
     #[test]
@@ -657,7 +693,16 @@ mod tests {
             .map(|(component, _, _)| component.name.as_str())
             .collect();
 
-        // `Alpha`, `AuthCtrlr`, `OCPPCommCtrlr`, `Zeta` - alphabetical, defaults included.
-        assert_eq!(names, vec!["Alpha", "AuthCtrlr", "OCPPCommCtrlr", "Zeta"]);
+        // Alphabetical, with all three built-in defaults' components included.
+        assert_eq!(
+            names,
+            vec![
+                "AlignedDataCtrlr",
+                "Alpha",
+                "AuthCtrlr",
+                "OCPPCommCtrlr",
+                "Zeta"
+            ]
+        );
     }
 }

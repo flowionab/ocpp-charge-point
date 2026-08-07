@@ -254,6 +254,34 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self.capabilities
     }
 
+    /// Registers standalone `MeterValues` (`docs/ROADMAP.md` §10,
+    /// `docs/PRODUCTION-ROADMAP.md` B1.1): a background loop that reports every connector's latest
+    /// meter reading on the wall-clock schedule the CSMS configures through
+    /// `AlignedDataCtrlr`/`Interval`.
+    ///
+    /// Sends nothing until that variable is non-zero - OCPP's own "disabled" default - and picks
+    /// the change up on the next cycle, so a CSMS can turn clock-aligned data on and off at
+    /// runtime without a reboot. Unlike [`Self::transaction_events`], this reports readings taken
+    /// with no transaction running at all, which is the whole point of the message.
+    ///
+    /// `backoff`/`clock` are caller-supplied for the same no_std reason [`Self::provisioning`]'s
+    /// are.
+    pub async fn meter_values<N, B, K>(self, csms: &N, backoff: B, clock: K) -> Self
+    where
+        N: crate::meter_values::MeterValuesNotifier + Clone + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+    {
+        let actor = self.runtime.actor();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::meter_values::run_aligned_meter_values(&notifier, &backoff, &clock, &actor)
+                .await;
+        }));
+
+        self
+    }
+
     /// Registers durable charging-profile state (`docs/PRODUCTION-ROADMAP.md` §7.2, E2.7):
     /// recovers whatever load limits the CSMS had installed before the charge point last lost
     /// power, then persists every subsequent change through `storage` for the life of the process.

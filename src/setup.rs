@@ -78,6 +78,7 @@ where
         + GetReportHandler
         + SecurityEventNotifier
         + CostUpdatedHandler
+        + crate::meter_values::MeterValuesNotifier
         + SetChargingProfileHandler
         + ClearChargingProfileHandler
         + GetCompositeScheduleHandler
@@ -110,6 +111,8 @@ where
         .reset(&csms)
         .await
         .device_model(&csms)
+        .await
+        .meter_values(&csms, backoff.clone(), clock.clone())
         .await;
 
     // C3.1 (docs/PRODUCTION-ROADMAP.md §5.3): each of these blocks is only registered when the
@@ -415,6 +418,20 @@ mod tests {
     impl crate::cost::CostUpdatedHandler for RecordingCsms {
         async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {
             self.cost_registered.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::meter_values::MeterValuesNotifier for RecordingCsms {
+        type Error = core::convert::Infallible;
+
+        async fn send_meter_values(
+            &self,
+            _evse_id: usize,
+            _connector_id: usize,
+            _sample: crate::state::MeterSample,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 

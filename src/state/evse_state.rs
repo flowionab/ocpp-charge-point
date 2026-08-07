@@ -1,7 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::state::{ConnectorState, EvseEvent, Reservation, Transaction};
+use crate::state::{ConnectorState, EvseEvent, MeterSample, Reservation, Transaction};
 
 /// The internal state of one EVSE (Electric Vehicle Supply Equipment): its own availability/
 /// fault status, plus one entry per connector it owns in each of the parallel `Vec`s below.
@@ -23,6 +23,18 @@ pub struct EvseState {
     /// with no carried-over cost from a previous one on the same connector. See
     /// `docs/ROADMAP.md` §9.
     pub running_costs: Vec<Option<f64>>,
+    /// The most recent meter reading each connector's hardware pushed in, indexed the same as
+    /// `connectors` - recorded whether or not a transaction is running on it, unlike
+    /// [`Transaction::last_meter_sample`](crate::state::Transaction::last_meter_sample), which is
+    /// only updated while one is actively charging.
+    ///
+    /// This is what standalone `MeterValues` reports (`docs/ROADMAP.md` §10,
+    /// `docs/PRODUCTION-ROADMAP.md` B1.1): OCPP's clock-aligned data is due on the wall clock
+    /// whether or not anything is charging, so it needs a reading that outlives the transaction
+    /// that happened to produce it. `None` until the hardware has pushed its first
+    /// [`ConnectorEvent::MeterValueSampled`](crate::state::ConnectorEvent::MeterValueSampled) for
+    /// that connector.
+    pub latest_meter_samples: Vec<Option<MeterSample>>,
     /// The current limit most recently *requested* of each connector's hardware, in milliamps,
     /// indexed the same as `connectors`. `None` means no installed charging profile imposes a
     /// limit on that connector - see [`ConnectorEvent::CurrentLimitComputed`](crate::state::ConnectorEvent::CurrentLimitComputed)
@@ -64,6 +76,7 @@ impl EvseState {
             transactions: vec![None; connector_count],
             reservations: vec![None; connector_count],
             running_costs: vec![None; connector_count],
+            latest_meter_samples: vec![None; connector_count],
             charging_limits: vec![None; connector_count],
             applied_charging_limits: vec![None; connector_count],
         }

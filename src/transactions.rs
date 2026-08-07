@@ -132,7 +132,7 @@ mod tests {
 }
 
 #[cfg(feature = "ocpp_2_1")]
-mod ocpp_2_1 {
+pub(crate) mod ocpp_2_1 {
     pub use with_clock::Ocpp2_1TransactionNotifier;
 
     use crate::state::{
@@ -208,6 +208,10 @@ mod ocpp_2_1 {
 
     /// Builds one `sampledValue` per measurand present in `sample` - always the energy register,
     /// plus power/current/voltage/SoC when the hardware reported them.
+    ///
+    /// Shared with [`crate::meter_values`]' standalone `MeterValues` adapter through
+    /// `build_meter_values`: a reading is a reading, and two mappings of the same measurands into
+    /// the same wire type would be two places for a unit bug to hide.
     fn sampled_values(sample: MeterSample) -> Vec<SampledValue> {
         let mut values = vec![sampled_value(
             sample.energy_wh as f64,
@@ -250,7 +254,7 @@ mod ocpp_2_1 {
     /// Builds the TransactionEvent `meterValue` list from a transaction's most recent sample -
     /// empty if it never got one (e.g. `Started`, or a transaction that ended before charging
     /// began). See `docs/ROADMAP.md` §10.
-    pub(super) fn build_meter_values(
+    pub(crate) fn build_meter_values(
         sample: Option<MeterSample>,
         timestamp: DateTime<Utc>,
     ) -> Vec<MeterValue> {
@@ -709,7 +713,7 @@ mod ocpp_2_1 {
 /// SamplePeriodic`) exists identically in both versions. Close to a copy of the 2.1 module, just
 /// targeting `OCPP2_0_1Client`.
 #[cfg(feature = "ocpp_2_0_1")]
-mod ocpp_2_0_1 {
+pub(crate) mod ocpp_2_0_1 {
     pub use with_clock::Ocpp2_0_1TransactionNotifier;
 
     use crate::state::{
@@ -820,7 +824,7 @@ mod ocpp_2_0_1 {
         }
     }
 
-    pub(super) fn build_meter_values(
+    pub(crate) fn build_meter_values(
         sample: Option<MeterSample>,
         timestamp: DateTime<Utc>,
     ) -> Vec<MeterValue> {
@@ -1240,7 +1244,7 @@ mod ocpp_2_0_1 {
 /// for identifiers exceeding 1.6J's 20-byte bound) lives in [`crate::id_tag`], shared with every
 /// other 1.6J adapter that sends an identifier on the wire.
 #[cfg(feature = "ocpp_1_6")]
-mod ocpp_1_6 {
+pub(crate) mod ocpp_1_6 {
     use crate::state::{MeterSample, StopReason, TransactionId};
     use alloc::collections::BTreeMap;
     use alloc::string::ToString;
@@ -1250,7 +1254,9 @@ mod ocpp_1_6 {
     use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::common::{Measurand, Reason, SampledValueItem};
+    use ocpp_client::ocpp_types::v16::common::{
+        Measurand, MeterValueItem, Reason, SampledValueItem,
+    };
 
     pub(super) fn map_stop_reason(reason: StopReason) -> Reason {
         match reason {
@@ -1269,6 +1275,18 @@ mod ocpp_1_6 {
 
     /// Builds one `sampledValue` per measurand present in `sample`, mirroring
     /// [`super::ocpp_2_1::sampled_values`] but for 1.6J's string-valued `SampledValueItem`.
+    /// Builds the 1.6J `meterValue` body for `sample`, shared with [`crate::meter_values`]'
+    /// standalone `MeterValues` adapter for the same reason the 2.x builders are.
+    pub(crate) fn build_meter_values(
+        sample: MeterSample,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<MeterValueItem> {
+        vec![MeterValueItem {
+            timestamp: timestamp.to_rfc3339(),
+            sampled_value: sampled_values(sample),
+        }]
+    }
+
     fn sampled_values(sample: MeterSample) -> Vec<SampledValueItem> {
         let mut values = vec![sampled_value(
             sample.energy_wh.to_string(),

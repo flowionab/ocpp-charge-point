@@ -1110,6 +1110,20 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::meter_values::MeterValuesNotifier for FixedBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn send_meter_values(
+            &self,
+            _evse_id: usize,
+            _connector_id: usize,
+            _sample: crate::state::MeterSample,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::smart_charging::SetChargingProfileHandler for FixedBootNotifier {
         async fn register_set_charging_profile_handler(
             &self,

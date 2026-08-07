@@ -413,7 +413,7 @@ mod tests {
 
         let entries = report_base_entries(&model, ReportBase::FullInventory);
 
-        assert_eq!(entries.len(), 2); // the two built-in defaults
+        assert_eq!(entries.len(), 3); // the three built-in defaults
     }
 
     #[test]
@@ -432,9 +432,9 @@ mod tests {
 
         let entries = report_base_entries(&model, ReportBase::ConfigurationInventory);
 
-        // Both built-in defaults are ReadWrite, so they're included; the freshly registered
+        // Every built-in default is ReadWrite, so they're all included; the freshly registered
         // ReadOnly-only variable is not.
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert!(
             entries
                 .iter()

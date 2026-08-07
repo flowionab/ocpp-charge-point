@@ -1288,6 +1288,16 @@ mod ocpp_1_6 {
             variable: "AuthorizeRemoteStart",
             instance: None,
         },
+        // dm_components_vars.csv:60 - 1.6's "ClockAlignedDataInterval" became
+        // "AlignedDataCtrlr.Interval". This one is live rather than decorative: it is what
+        // `crate::meter_values::run_aligned_meter_values` reads on every cycle, so a 1.6J CSMS
+        // configuring it through `ChangeConfiguration` actually changes when readings arrive.
+        StandardKeyAlias {
+            key: "ClockAlignedDataInterval",
+            component: "AlignedDataCtrlr",
+            variable: "Interval",
+            instance: None,
+        },
         // dm_components_vars.csv:260 - 1.6's "MeterValueSampleInterval" became
         // "SampledDataCtrlr.TxUpdatedInterval".
         StandardKeyAlias {

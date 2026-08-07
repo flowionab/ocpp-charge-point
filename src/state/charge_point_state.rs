@@ -564,6 +564,16 @@ impl ChargePointState {
         // `ConnectorState` itself, so `transition.changed` alone wouldn't notice it - without
         // folding it into the returned value here, the actor's watch channel would never
         // publish it (see `ChargePointEffect::StateChanged`).
+        // Recorded for every sample, whatever the connector is doing: clock-aligned MeterValues
+        // (B1.1) are due on the wall clock whether or not a transaction is running, so the
+        // reading has to outlive the session that produced it. The transaction's own
+        // `last_meter_sample` is still only updated while charging - see `apply_meter_sample`.
+        let sample_recorded = meter_sample.is_some_and(|sample| {
+            let Some(slot) = evse.latest_meter_samples.get_mut(connector_id) else {
+                return false;
+            };
+            set_if_changed(slot, Some(sample))
+        });
         // A newly computed limit reaches hardware only when it actually differs from the one
         // already requested for this connector: the projection re-evaluates on every state
         // change, and re-issuing an unchanged limit would put a hardware call on the path of
@@ -603,7 +613,7 @@ impl ChargePointState {
             }
             false
         });
-        transition.changed || cost_recorded || limit_changed || limit_confirmed
+        transition.changed || cost_recorded || limit_changed || limit_confirmed || sample_recorded
     }
 
     /// Every `evse_id` a [`ResetTarget`] covers - every EVSE, for
@@ -1293,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn a_meter_reading_with_no_active_transaction_is_ignored() {
+    fn a_meter_reading_with_no_active_transaction_reports_nothing_but_is_still_recorded() {
         let mut state = ChargePointState::new([1]);
 
         let effects = apply_connector_event(
@@ -1304,7 +1314,50 @@ mod tests {
             }),
         );
 
-        assert!(effects.is_empty());
+        // No transaction to report against - this must not fabricate a `TransactionEvent`.
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
+        // But the reading itself is kept: clock-aligned MeterValues (B1.1) are due whether or not
+        // anything is charging, so a reading taken between sessions is exactly what they report.
+        assert_eq!(
+            state.evses[0].latest_meter_samples[0].map(|sample| sample.energy_wh),
+            Some(1_500)
+        );
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn the_latest_meter_reading_outlives_the_transaction_that_produced_it() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::MeterValueSampled(MeterSample {
+                energy_wh: 4_200,
+                ..Default::default()
+            }),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+
+        assert!(state.evses[0].transactions[0].is_none());
+        assert_eq!(
+            state.evses[0].latest_meter_samples[0].map(|sample| sample.energy_wh),
+            Some(4_200),
+            "the meter register does not reset when a session ends, and neither should the \
+             reading standalone MeterValues reports"
+        );
     }
 
     #[test]

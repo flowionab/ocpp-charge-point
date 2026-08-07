@@ -8,6 +8,7 @@ use ocpp_charge_point::hardware::{ChargePoint, Connector, Evse};
 use ocpp_charge_point::local_authorization_list::{
     GetLocalListVersionHandler, SendLocalListHandler,
 };
+use ocpp_charge_point::meter_values::MeterValuesNotifier;
 use ocpp_charge_point::provisioning::{
     BootNotificationOutcome, BootNotifier, HeartbeatSender, TokioBackoff,
 };
@@ -233,6 +234,23 @@ impl CostUpdatedHandler for AlwaysAcceptBootNotifier {
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {
+    }
+}
+
+// Standalone MeterValues (docs/ROADMAP.md §10). This sample never configures
+// `AlignedDataCtrlr.Interval`, so the loop `setup` spawns stays parked and this is never called -
+// it exists because `setup`'s bound list requires the CSMS type to be able to send one.
+#[async_trait::async_trait]
+impl MeterValuesNotifier for AlwaysAcceptBootNotifier {
+    type Error = std::convert::Infallible;
+
+    async fn send_meter_values(
+        &self,
+        _evse_id: usize,
+        _connector_id: usize,
+        _sample: ocpp_charge_point::state::MeterSample,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 

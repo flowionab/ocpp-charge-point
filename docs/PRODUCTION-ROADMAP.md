@@ -102,7 +102,7 @@ close — mostly missing one version each.
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: authorization cache, certificates, network profiles. |
-| Test suite | 🚧 | 658 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Test suite | 🚧 | 672 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -162,7 +162,7 @@ version.
 | Authorize | ✅ | ✅ | ✅ | |
 | StartTransaction / StopTransaction | ✅ | — | — | |
 | TransactionEvent | — | ✅ | ✅ | |
-| **MeterValues** (standalone) | ✅ | ⬜ | ⬜ | 2.x sends meter data inside `TransactionEvent` only; periodic/clock-aligned non-transaction sampling needs the standalone message. |
+| **MeterValues** (standalone) | ✅ | ✅ | ✅ | Driven by `AlignedDataCtrlr.Interval`; 1.6J previously had it only *inside* a transaction. |
 | DataTransfer | ✅ | ✅ | ✅ | |
 | ChangeAvailability | ✅ | ✅ | ✅ | |
 | Reset | ✅ | ✅ | ✅ | |
@@ -176,8 +176,56 @@ version.
 
 **B1 tasks:**
 
-- [ ] **B1.1** Standalone `MeterValues` for 2.0.1 and 2.1, driven by
-      `AlignedDataCtrlr` / `SampledDataCtrlr` device-model variables.
+- [x] **B1.1** Standalone `MeterValues` — `src/meter_values.rs`, on all three versions, driven by
+      `AlignedDataCtrlr`/`Interval`.
+
+      **What was actually missing.** 2.x carries meter data inside `TransactionEvent`, which covers
+      everything a *session* measures; what no version could express was OCPP's clock-aligned
+      data — readings due on the wall clock whether or not anything is charging, so a CSMS can
+      bill standing consumption and reconcile a meter across sessions. 1.6J's standalone
+      `MeterValues` existed but only *inside* the transaction notifier, so readings taken between
+      sessions had nowhere to go either.
+
+      That needed a reading which outlives its transaction: `EvseState::latest_meter_samples`
+      records every `MeterValueSampled` regardless of connector state, alongside (not instead of)
+      `Transaction::last_meter_sample`, which still only moves while charging. One existing test
+      asserted a sample with no transaction produced *no effects at all*; it now asserts the
+      correct behaviour instead — no fabricated `TransactionEvent`, but the reading is kept.
+
+      **`AlignedDataCtrlr.Interval` is live, not decorative.** It is a new built-in device-model
+      default (`0` — OCPP's own "disabled", so a charge point nobody configured sends nothing
+      rather than picking a drumbeat this crate invented), aliased from 1.6J's
+      `ClockAlignedDataInterval`, and read fresh on every cycle exactly as `run_heartbeat` reads
+      `HeartbeatInterval` — so enabling or changing it via `SetVariables`/`ChangeConfiguration`
+      takes effect on the next cycle without a reboot. While disabled the loop re-checks once a
+      minute rather than exiting, which is what makes runtime enabling work at all. This is the
+      second variable rescued from the inert-variable trap §2 flagged.
+
+      **Alignment is to the wall clock**, computed against midnight UTC: a 900-second interval
+      fires at :00/:15/:30/:45, not 900 seconds after whichever moment this charge point happened
+      to boot — two charge points on a site then report at the same instants, which is what makes
+      their readings comparable. A boundary that is exactly now sleeps a full interval rather than
+      spinning.
+
+      The three adapters reuse `crate::transactions`' existing per-version meter-value builders
+      rather than carrying a second copy of the measurand mapping — two mappings of the same
+      measurands into the same wire type would be two places for a unit bug to hide. 2.x's
+      `MeterValuesRequest` addresses an EVSE with no connector field at all (the spec's shape, not
+      a simplification made here); 1.6J's addresses a flat `connectorId`, so it keeps the connector
+      half and resolves it through `crate::topology`, dropping — with a warning — a reading whose
+      address doesn't exist in the topology rather than letting it fall back to connector `0`,
+      which in 1.6J means the charge point itself and would misattribute the energy.
+
+      Deliberately **not** wrapped in an offline queue, unlike the status/transaction/security
+      streams: a reading whose entire meaning is "this is the value at 10:15" is worth much less an
+      hour later, and the register it came from is cumulative anyway, so the next aligned reading
+      subsumes a lost one.
+
+      **Not done: `SampledDataCtrlr`/`TxUpdatedInterval` is still inert.** It governs how often
+      *transaction* meter data is reported, and this crate never polls hardware — the integrator
+      pushes readings in — so the sampling rate is the binding's choice today. Throttling what
+      reaches the CSMS to that interval is real, contained work in the outbound path (where a clock
+      exists), and it is left outstanding rather than half-done.
 - [ ] **B1.2** Authorization cache (2.x `AuthCacheCtrlr`, 1.6J
       `AuthorizationCacheEnabled`) + `ClearCache` on all three versions.
 - [ ] **B1.3** `TriggerMessage` wire adapters for 1.6J and 2.0.1.
@@ -1956,10 +2004,10 @@ UpdateDynamicSchedule — see [D1](#61-d1--missing-action-wrappers).
 |--------|-------|--------|
 | Device-model rows in the 2.1 appendix | 438 | `docs/OCPP-2.1/Appendices_CSV_v2.1/dm_components_vars.csv` |
 | …marked Required | 122, across 23 components | same |
-| …registered by this crate | 2 (`AuthCtrlr.AuthorizeRemoteStart`, `OCPPCommCtrlr.HeartbeatInterval`) | `src/state/device_model.rs` |
-| 1.6J standard config keys aliased | 12 | `src/device_model.rs` |
+| …registered by this crate | 3 (`AlignedDataCtrlr.Interval`, `AuthCtrlr.AuthorizeRemoteStart`, `OCPPCommCtrlr.HeartbeatInterval`) | `src/state/device_model.rs` |
+| 1.6J standard config keys aliased | 13 | `src/device_model.rs` |
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
-| Protocol trait bounds on `setup()`'s CSMS parameter | 24 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 658 | `#[test]` + `#[tokio::test]`, re-counted at the E2.7 commit (646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Protocol trait bounds on `setup()`'s CSMS parameter | 25 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
+| Test functions in `src/` | 672 | `#[test]` + `#[tokio::test]`, re-counted at the B1.1 commit (658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |
