@@ -99,10 +99,10 @@ close — mostly missing one version each.
 | Actor model, version-independent state | ✅ | `ChargePointState` owns transactions, reservations, local auth list, cost, reset, device model — all mutated only via `ChargePointEvent`. |
 | Hardware abstraction | 🚧 | `ChargePoint` / `Evse` / `Connector`: lock, unlock, contactor, reboot. **No capability model, no current-limit hook, no file transfer, no display, no RTC.** |
 | `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. Until the [G3.1](#93-g3--time) follow-up, this held only for a build with *no version feature* — every OCPP adapter was `std`-gated dead code, so a bare-metal build could not actually speak OCPP. All three version adapters are now reachable without `std`. |
-| Offline queueing | 🚧 | `OfflineQueue` exists and is used by Availability / Transactions / Security. Bounded (G2.1) and in-RAM; the rest of the crate's collections aren't audited yet — see [G2](#92-g2--bounded-memory). |
+| Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
-| Persistence | ⬜ | **Nothing survives a restart.** `VariableAttribute::persistent` is recorded and ignored. |
-| Test suite | 🚧 | 514 test functions in `src/`, one integration test (`tests/connect_2_1_websocket.rs`). Strong unit coverage, near-zero end-to-end. |
+| Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: authorization cache, charging profiles, certificates, network profiles. |
+| Test suite | 🚧 | 564 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -983,12 +983,52 @@ mid-transaction currently loses the transaction.
       connector is always sent even if an identical one was already delivered
       before the cut. Re-reporting a status the CSMS already knows is the safe
       direction; suppressing one it doesn't is not.
-- [ ] **E4.4** Power-cut test harness — kill the process at N points across
-      a transaction lifecycle and assert recovery at each. Partially covered:
-      `persistence::tests` has one end-to-end cut (drop the actor mid-charge,
-      spawn a fresh one, assert the energy is still reported) plus unit coverage
-      of the write policy, corrupt/stale records and a storage-less charge
-      point. The systematic N-point sweep is still open.
+- [x] **E4.4** Power-cut test harness — [`tests/power_cut_recovery.rs`](../tests/power_cut_recovery.rs).
+      The lifecycle (plug → lock → present → authorize → contactor closed → *n* meter samples →
+      stop → contactor open → unlock) is driven once **per cut point**, cutting after 0 steps,
+      after 1, after 2, … and asserting the same invariants at each. A "cut" drops the actor and
+      every task holding RAM state; only the `Storage` handle crosses into the next boot, and the
+      new boot runs `restore_transactions` and nothing else before the assertions.
+
+      Four sweeps, each stating a different half of the guarantee:
+
+      - **Exact recovery** (write threshold 0, so every sample is durable): a cut recovers a
+        transaction *iff* one was in flight, the recovered close-out carries exactly the energy
+        delivered before the cut, and it is closed out with `PowerLoss` rather than resumed.
+      - **Bounded loss** (default 100 Wh threshold, samples stepping 40 Wh so most are
+        deliberately *not* written): the recovered reading is never higher than what was
+        delivered and never lower by more than the threshold — the exact promise E3.2's flash-wear
+        trade-off makes, now asserted rather than asserted-about.
+      - **No id reuse**, sweeping all cut points against **one** storage so each boot lands on the
+        previous cut's leftovers, the way a field unit accumulates history: every recovered
+        transaction id across the whole sweep is unique.
+      - **End to end to the CSMS**: the in-flight record (E2.1) and the offline transaction-event
+        queue (E2.8/E4.3) running *together*, with the CSMS unreachable before the cut and back
+        after it. At every cut point the CSMS ends up seeing the session's `Started` exactly once
+        (replayed from the durable backlog), exactly one `Ended` carrying the delivered energy,
+        and every event in non-decreasing `seqNo` order. Each half is covered on its own
+        elsewhere; nothing tested them composed, which is where a real bug would hide.
+
+      Every reboot additionally asserts recovery is **not** repeatable — a second boot recovers
+      nothing — since re-reporting a recovered session would show up at the CSMS as a duplicate
+      transaction.
+
+      **The harness was verified against real regressions, not just observed to pass.** Four
+      mutations were applied to `src/persistence.rs` in turn and each was caught: `Started` no
+      longer written immediately (fails at the authorize cut point), recovery no longer clearing
+      the record it took ownership of (fails the double-report assertion), the transaction-id
+      counter no longer persisted (fails the id-reuse sweep), and a restored offline backlog
+      silently dropped (fails *only* the composed sweep — the one the other three miss). Writing
+      the harness also surfaced a modelling error worth recording: the first draft's pre-cut boot
+      skipped `restore_transactions`, and ids restarted from 0 — a reminder that
+      `restore_transactions`'s documented "must run before any new transaction can start" ordering
+      is load-bearing, not advisory.
+
+      Not swept, deliberately: a torn *mid-write* record (that is `AtomicStorage`'s guarantee,
+      tested directly in `src/hardware/storage.rs`, and `InMemoryStorage` is atomic by
+      construction), and the three E2 rows nothing writes during a transaction (local auth list,
+      reservations, device model) — a per-step sweep of those would repeat one storage round-trip
+      at every cut point and prove nothing their own end-to-end tests don't.
 
 ---
 
@@ -1498,7 +1538,11 @@ missing is proof that the pieces work *together* over a real socket.
       reconnect, verify ordering and no duplication.
 - [ ] **H2.4** Version-projection tests — same internal event sequence,
       three protocol versions, assert each wire shape.
-- [ ] **H2.5** Power-cut recovery ([E4.4](#74-e4--recovery)).
+- [x] **H2.5** Power-cut recovery — done by [E4.4](#74-e4--recovery)'s sweep
+      ([`tests/power_cut_recovery.rs`](../tests/power_cut_recovery.rs)), which is an integration
+      test over the public API rather than an in-crate one. It drives the actor and the
+      persistence tasks directly rather than a socket, so [H2.1](#102-h2--integration-testing)'s
+      mock-CSMS harness would still add the wire-level half.
 - [ ] **H2.6** A simulated-hardware charge point in `examples/`, usable as
       an integrator's starting point and as a soak-test subject.
 
@@ -1615,7 +1659,7 @@ Four honest caveats on the exit criteria, none blocking M2:
   a capability subset. The capability contract is `--lib`-only, and CI checks
   it that way.
 
-### M2 — Durability
+### M2 — Durability — ✅ complete (2026-08-07)
 
 [E1](#71-e1--storage-trait)–[E4](#74-e4--recovery) · [G2](#92-g2--bounded-memory) bounded memory · [G3](#93-g3--time) time handling
 
@@ -1627,6 +1671,32 @@ This is the gap between "a demo" and "a product". It's ahead of most
 message coverage on purpose — a charger that handles 86 messages and loses
 transactions on power loss is not shippable; one that handles 25 and never
 loses a transaction is.
+
+All three exit conditions are met, and the first one is now *swept* rather than
+sampled: [E4.4](#74-e4--recovery)'s
+[`tests/power_cut_recovery.rs`](../tests/power_cut_recovery.rs) cuts at every point across a
+session and asserts recovery at each, including the record and the offline queue composed, and
+the harness itself was validated against four injected regressions. [G2](#92-g2--bounded-memory)
+bounds every growable collection with measured, ceiling-asserted figures
+([`docs/MEMORY.md`](MEMORY.md)); [G3](#93-g3--time) handles a missing RTC, CSMS clock sync and
+mid-transaction clock jumps.
+
+Three honest caveats, none of them a hole in the exit criteria:
+
+- **Four E2 rows remain RAM-only**, every one blocked on a functional block that does not exist
+  yet: authorization cache ([B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)),
+  charging profiles ([B2.1](#b2--smart-charging-r11)), certificates
+  ([B4.1](#b4--certificates-and-iso-15118-r1-r13)), network profiles
+  ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle)).
+  Each should land with its block, not before it.
+- **Durability is opt-in per concern.** Every `*_persistence` / `*_persisted` registration on
+  `ChargePointBuilder` is a separate call an integrator has to make; `setup()`'s
+  "everything on" wrapper does not wire any of them, because it has no `Storage` to wire them
+  to. A charge point that never calls them runs exactly as it did before workstream E.
+- **"No billable energy lost" is bounded by the write threshold, not zero**, by design
+  ([E3.2](#73-e3--crash-consistency)) — at the 100 Wh default a cut can lose up to 100 Wh, which
+  E4.4 now asserts as a bound rather than leaving as prose. An integrator wanting exactness sets
+  the threshold to 0 and accepts the flash wear.
 
 ### M3 — Protocol completeness, core
 
@@ -1754,5 +1824,5 @@ UpdateDynamicSchedule — see [D1](#61-d1--missing-action-wrappers).
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 21 (+ `Clone`/`Send`/`Sync`/`'static`) | `src/setup.rs:51` |
-| Test functions in `src/` | 514 | `#[test]` + `#[tokio::test]` (the previously-recorded 668 was wrong — a re-count at the M2 boot-reason commit gave 496) |
-| Integration tests | 1 | `tests/` |
+| Test functions in `src/` | 564 | `#[test]` + `#[tokio::test]`, re-counted at the E2.10 commit (496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |
