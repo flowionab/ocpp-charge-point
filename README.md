@@ -208,6 +208,22 @@ std/tokio users get all four for free (`TokioExecutor`, `TokioBackoff`, `SystemC
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) §0 for the detailed history of what's been abstracted and what's still tracked.
 
+### 📏 Memory footprint
+
+Every collection that can grow is bounded by a configured maximum (`state::StateLimits` for the local authorization list and device model, `offline_queue::OfflineQueue`'s capacity for the offline report queues), so peak memory is a property of your configuration rather than of how much a CSMS sends you.
+
+Measured worst-case retained heap, filled to those bounds:
+
+| Configuration | Retained heap |
+| --- | --- |
+| Tight AC wallbox (1 connector, 25 list entries, 64 device model variables) | **~43 KB** |
+| Crate defaults (2 connectors, 100 entries, 256 variables) | **~160 KB** |
+| DC site (4 EVSEs × 2 connectors, 500 entries, 512 variables) | **~346 KB** |
+
+These are 64-bit host figures and a conservative upper bound for a 32-bit MCU, which holds less. They exclude task stacks, transport/TLS buffers, and allocator overhead.
+
+[`docs/MEMORY.md`](docs/MEMORY.md) has the full breakdown, the per-unit costs for sizing your own configuration, and one finding worth reading before writing a hardware binding: **how you group device model variables across components changes their cost by up to 5.6×**. The numbers come from `cargo test --test memory_budget -- --nocapture`, which also gates against regressions.
+
 ---
 
 ## 🔌 Supported Protocols

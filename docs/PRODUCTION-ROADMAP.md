@@ -1036,9 +1036,11 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
       callback deliberately does *not* do that (it only logs) since raising
       a security event from the security-event queue's own overflow would
       feed back into the same queue and risk an unbounded loop the moment
-      that queue is also full. The 100-message default remains a documented
-      estimate, not a measured RAM budget (that's G2.3). G2.2, below, has
-      since audited every other collection in `ChargePointState`.
+      that queue is also full. G2.2, below, has since audited every other
+      collection in `ChargePointState`, and G2.3 has measured what all of them
+      actually retain - the 100-message default costs ~3 KB (status), ~24 KB
+      (transaction) and ~21 KB (security) when full, per
+      [`docs/MEMORY.md`](MEMORY.md), so it is no longer a bare estimate.
 - [x] **G2.2** Audited every collection in `ChargePointState`; the two that
       could grow without limit are now bounded by a caller-configurable
       maximum, carried in `crate::state::StateLimits` and passed once at
@@ -1107,16 +1109,51 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
       Still open, and explicitly *not* this entry: an over-long record is
       still fully deserialized before being truncated, so the transient
       allocation is unbounded even though the retained state isn't - bounding
-      that is [F5.2](#85-f5--hardening)'s job. The defaults above are
-      documented estimates rather than measured RAM budgets (G2.3), and
-      neither maximum is advertised to the CSMS yet via the device model
+      that is [F5.2](#85-f5--hardening)'s job. G2.3 has since priced both
+      defaults (~110 B per local list entry, ~375 B per device model variable
+      clustered OCPP-style - see [`docs/MEMORY.md`](MEMORY.md)), so they are
+      measured rather than estimated; what remains is that neither maximum is
+      advertised to the CSMS yet via the device model
       variables OCPP has for it (`LocalAuthListCtrlr.Entries` /
       `ItemsPerMessage` in 2.x, `LocalAuthListMaxLength` /
       `SendLocalListMaxLength` in 1.6J), so a CSMS discovers the bound by
       being refused rather than by reading it - worth landing with the
       `GetBaseReport` work in §2.
-- [ ] **G2.3** Document peak RAM per configuration so integrators can size
-      the part.
+- [x] **G2.3** [`docs/MEMORY.md`](MEMORY.md) documents worst-case retained
+      heap per configuration, and the numbers are **measured, not estimated**:
+      [`tests/memory_budget.rs`](../tests/memory_budget.rs) installs a counting
+      `GlobalAlloc` and reads live requested bytes around each structure, filled
+      to its configured bounds (local list full of 36-character id tokens,
+      device model full, every connector holding a transaction *and* a
+      reservation, all three offline queues full). It runs as part of
+      `cargo test`, and asserts a ceiling per configuration - so a change that
+      meaningfully grows retained state fails the build instead of being found
+      on a device. Headline figures: ~43 KB for a tightened single-connector
+      wallbox, ~160 KB at this crate's defaults, ~346 KB for a 4-EVSE DC site
+      (64-bit host; a 32-bit MCU holds 0.5-0.85x of each type, so those are
+      conservative upper bounds - `size_of` for both targets is tabulated,
+      the 32-bit column measured via `cargo check --target
+      thumbv7em-none-eabihf`). The doc is explicit about what the figures
+      exclude and who owns it: allocator bookkeeping, task stacks, transport
+      and TLS buffers, transient (de)serialization.
+
+      **The finding worth acting on:** the device model dominates every
+      configuration, and its per-variable cost swings **5.6x** purely on how
+      variables are grouped across components - 2090 B/variable at one variable
+      per component versus 374 B at eight, because
+      `BTreeMap<Component, BTreeMap<Variable, VariableDefinition>>` allocates
+      each node at its full branching factor however few entries it holds.
+      OCPP's own `*Ctrlr` clustering is the cheap shape, so a binding that
+      follows the spec's naming gets the good case for free while one that
+      invents a component per sensor pays up to 2 KB a variable. Same reason
+      the ~5 KB "empty state" floor is almost entirely the two built-in default
+      variables sitting on two separate components, and barely moves between a
+      1-connector and an 8-connector charge point. If that 5.6x ever needs
+      closing rather than documenting, the fix is a flatter key
+      (`BTreeMap<(Component, Variable), _>`) - worth weighing against
+      `GetBaseReport`'s need to iterate per component, and deliberately *not*
+      done here: G2.3 was to measure and document, not to redesign the model
+      on the strength of a first measurement.
 - [ ] **G2.4** Measure flash cost per Cargo feature — that's the whole
       point of [C1](#51-c1--cargo-feature-per-functional-block), and it should be a number in the README.
 
