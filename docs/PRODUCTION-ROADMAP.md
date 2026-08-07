@@ -102,7 +102,7 @@ close — mostly missing one version each.
 | Offline queueing | 🚧 | `OfflineQueue` exists and is used by Availability / Transactions / Security. Bounded (G2.1) and in-RAM; the rest of the crate's collections aren't audited yet — see [G2](#92-g2--bounded-memory). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | ⬜ | **Nothing survives a restart.** `VariableAttribute::persistent` is recorded and ignored. |
-| Test suite | 🚧 | 668 test functions in `src/`, one integration test (`tests/connect_2_1_websocket.rs`). Strong unit coverage, near-zero end-to-end. |
+| Test suite | 🚧 | 514 test functions in `src/`, one integration test (`tests/connect_2_1_websocket.rs`). Strong unit coverage, near-zero end-to-end. |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -632,7 +632,7 @@ mid-transaction currently loses the transaction.
 | Authorization cache | Offline authorization | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
 | Reservations | Survive a reboot inside the reservation window | R§8 |
 | Charging profiles | Load limits must not vanish on reboot | [B2.1](#b2--smart-charging-r11) |
-| Offline message queue | Transaction-event queue now durable (`src/persistence.rs`, `ChargePointBuilder::transaction_events_persisted`); status and security queues still RAM-only | [G2](#92-g2--bounded-memory) |
+| Offline message queue | All three queues now durable (`src/persistence.rs`; `ChargePointBuilder::transaction_events_persisted` / `status_notifications_persisted` / `security_events_persisted`) | [G2](#92-g2--bounded-memory) |
 | Certificates and keys | Security profile 2/3 | [B4.1](#b4--certificates-and-iso-15118-r1-r13) |
 | Security event log | `SecurityLogWasCleared` is only meaningful against a durable log | [F4](#84-f4--security-events) |
 | Network profiles | Recover connectivity after a bad profile switch | [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) |
@@ -649,7 +649,7 @@ mid-transaction currently loses the transaction.
       instead of restarting it. The transaction-id counter is persisted
       separately (`ocpp-cp/txn/next-id`), written *before* the transaction that
       consumed it, so a cut between the two can only skip an id, never reuse one.
-- [x] **E2.8** (partial) Offline message queue — `QueueStore`/
+- [x] **E2.8** Offline message queue — `QueueStore`/
       `run_persisted_offline_queue` in `src/persistence.rs`, built on top of
       `offline_queue::OfflineQueue`'s new `snapshot`/`restore_backlog`. A
       queue's backlog is written as one whole-queue JSON snapshot per storage
@@ -657,23 +657,50 @@ mid-transaction currently loses the transaction.
       owner, so there's no per-entry addressing to gain the way
       `TransactionStore` needs per-connector keys), versioned with its own
       `persistence::QUEUE_SCHEMA_VERSION`, discarded on decode failure or a
-      mismatched version exactly like `PersistedTransaction`. Only the
-      **transaction-event queue** is actually wired up
-      (`ChargePointBuilder::transaction_events_persisted`) — that's the one
-      E4.3 and the CSMS's `TransactionEvent` ordering guarantee care about
-      most, and the only one whose message type (`TransactionEventOccurred`)
-      this module has a `serde`-able mirror for
-      (`PersistedQueuedTransactionEvent`, converting `TransactionEventKind`
-      losslessly by hand since that enum lives in `crate::state` and isn't
-      `serde`-derived). The status and security queues remain RAM-only: their
-      message types carry `crate::state` enums (`ConnectorState`,
-      `ConnectorStatus`, `SecurityEventType`) with far more variants, and
-      hand-mirroring those wasn't justified for this pass — the underlying
-      `QueueStore`/`run_persisted_offline_queue`/`restore_offline_queue`
-      machinery is generic over any message type with a `serde`-able
-      representation (`P: From<M> + Serialize + DeserializeOwned`, `M:
-      From<P>`), so wiring the other two is a follow-up in the same shape as
-      `transaction_events_persisted`, not a redesign.
+      mismatched version exactly like `PersistedTransaction`. **All three
+      queues are now wired up** — `transaction_events_persisted`,
+      `status_notifications_persisted` and `security_events_persisted` on
+      `ChargePointBuilder`. The `QueueStore`/`run_persisted_offline_queue`/
+      `restore_offline_queue` machinery is generic over any message type with a
+      `serde`-able representation (`P: From<M> + Serialize + DeserializeOwned`,
+      `M: From<P>`); each queue supplies a hand-written mirror type, since the
+      message types carry `crate::state` enums that aren't `serde`-derived:
+      `PersistedQueuedTransactionEvent` (mirroring `TransactionEventKind`),
+      `PersistedQueuedStatusChange` (mirroring `ConnectorStatus`'s 5 and
+      `ConnectorState`'s 13 variants) and `PersistedQueuedSecurityEvent`
+      (mirroring `SecurityEventType`'s 18 unit variants plus its
+      `Other(String)` payload variant). Every mirror's `From` impls match
+      exhaustively with no catch-all arm, so adding a variant to any of those
+      state enums is a compile error at the mirror rather than a silent
+      data-loss bug, and a round-trip test drives every variant of each.
+
+      Per-queue behaviour differences are preserved across the persisted
+      variants, and each is a correctness point rather than a detail: the
+      status and security queues keep the default `OverflowPolicy::DropOldest`
+      (only the transaction queue opts into `DropNewest`); the status queue
+      still sends through `DedupedStatusNotifier`; and the security queue's
+      overflow callback still deliberately does *not* raise `MemoryExhaustion`,
+      since doing so from the security-event queue's own overflow feeds back
+      into that same queue (G2.1) — a regression test now guards that
+      specifically.
+
+      **A latent bug this slice had to fix first.** Persisting the status queue
+      was pointless while `DedupedStatusNotifier::notify_status`
+      (`src/availability.rs`) wrote its `last_sent` cache *before* awaiting the
+      inner notifier and never rolled the entry back on failure. Composed with
+      `flush_offline_queue` — which peeks the front message, sends, and pops
+      only on `Ok` — the first failed attempt cached the status as sent, so
+      every retry of that same queued message was judged a duplicate, returned
+      `Ok(())` without sending, and was popped as delivered. The
+      send-fails-then-retry path is the only reason the queue exists, so the
+      bug fired precisely when the queue mattered, silently and with no error
+      surfaced; it affected the plain `status_notifications` path too, not just
+      the persisted one. The cache is now written only after `inner` accepts
+      the notification. The remaining window — two concurrent same-connector
+      calls both seeing "not cached" and both sending, since the
+      `BlockingMutex`/`RefCell` guard cannot be held across the `.await` — is
+      documented on the type rather than papered over; the current wiring (one
+      forwarder task per queue) never produces it.
 
       Write policy: a whole-queue snapshot write is not free (its cost scales
       with the queue's current depth, unlike `TransactionStore`'s
@@ -885,18 +912,28 @@ mid-transaction currently loses the transaction.
       see E2.12 for why an uncommanded restart honestly maps to `Unknown`
       instead. OCPP 1.6J's adapter accepts and drops `reason` — that
       protocol's `BootNotification.req` has no such field.
-- [x] **E4.3** (partial) Replay the offline queue after reboot, preserving
-      order — `persistence::restore_transaction_event_queue`, called from
-      `ChargePointBuilder::transaction_events_persisted` before the live
-      forwarder/subscription is wired up, so a message that arrives during
+- [x] **E4.3** Replay the offline queue after reboot, preserving order —
+      `persistence::restore_transaction_event_queue`,
+      `restore_status_notification_queue` and `restore_security_event_queue`,
+      each called from its `ChargePointBuilder::*_persisted` method before the
+      live forwarder/subscription is wired up, so a message that arrives during
       start-up can never be delivered ahead of an older one the restored
       backlog contains. Restoration goes through
       `OfflineQueue::restore_backlog`, which pushes the persisted messages
       one at a time in their stored order, preserving `TransactionEvent`
       sequencing exactly. Covered end-to-end by
-      `persistence::tests::a_queue_interrupted_by_a_power_cut_replays_its_backlog_in_order_after_reboot`.
-      Scoped to the transaction-event queue only, matching E2.8's partial
-      status above — status/security queue replay is still open.
+      `persistence::tests::a_queue_interrupted_by_a_power_cut_replays_its_backlog_in_order_after_reboot`
+      for the generic machinery, by per-queue power-cut replay tests in
+      `persistence::tests` that drive the *real* message and mirror types
+      through the real wrappers, and through the builder itself by
+      `builder::tests::status_notifications_persisted_survives_a_reboot_and_replays_in_order`
+      and its security-event counterpart. All three queues, no carve-out.
+
+      One consequence worth stating: `DedupedStatusNotifier`'s cache is not
+      persisted, so after a reboot the first restored status change for a
+      connector is always sent even if an identical one was already delivered
+      before the cut. Re-reporting a status the CSMS already knows is the safe
+      direction; suppressing one it doesn't is not.
 - [ ] **E4.4** Power-cut test harness — kill the process at N points across
       a transaction lifecycle and assert recovery at each. Partially covered:
       `persistence::tests` has one end-to-end cut (drop the actor mid-charge,
@@ -1199,7 +1236,7 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
 
 ### 10.2 H2 — Integration testing
 
-668 unit tests, one integration test. Unit coverage is genuinely good; what's
+514 unit tests, one integration test. Unit coverage is genuinely good; what's
 missing is proof that the pieces work *together* over a real socket.
 
 - [ ] **H2.1** Mock CSMS harness — scripted request/response over a real
@@ -1295,10 +1332,12 @@ persistence into `ChargePointState`/the offline queue) remain untouched in M3
 and M2 respectively. `set_current_limit` therefore has a dispatch path and a
 fail-safe error path, but nothing yet *calls* it. (Since updated by M2's first
 slice: E2.1/E2.2, E3.2, E3.3 and E4.1 are now done — the in-flight transaction
-is persisted and recovered. A later slice added E2.8/E4.3 for the
-transaction-event offline queue specifically — see those entries for what's
-covered and what isn't. The rest of E2's table, and the status/security
-offline queues, are still RAM-only.)
+is persisted and recovered. Later slices closed E2.3, E2.4, E2.6, E2.12 and
+E4.2, then E2.8/E4.3 for all three offline queues — transaction-event, status
+and security. The rest of E2's table is still RAM-only, and four of its five
+remaining rows are blocked on blocks that don't exist yet: authorization cache
+on B1.2, charging profiles on B2.1, certificates on B4.1, network profiles on
+B1.8/A9.)
 
 The single source of truth is `CAPABILITY_GATES` in
 `src/hardware/capabilities.rs`: capability field ↔ Cargo feature ↔ 2.1
@@ -1465,5 +1504,5 @@ UpdateDynamicSchedule — see [D1](#61-d1--missing-action-wrappers).
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 21 (+ `Clone`/`Send`/`Sync`/`'static`) | `src/setup.rs:51` |
-| Test functions in `src/` | 668 | `#[test]` + `#[tokio::test]` |
+| Test functions in `src/` | 514 | `#[test]` + `#[tokio::test]` (the previously-recorded 668 was wrong — a re-count at the M2 boot-reason commit gave 496) |
 | Integration tests | 1 | `tests/` |

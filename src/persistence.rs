@@ -47,10 +47,11 @@ use crate::clock::Clock;
 use crate::hardware::{AtomicStorage, Storage};
 use crate::offline_queue::{OfflineQueue, flush_offline_queue};
 use crate::state::{
-    BootReasonCause, ChargePointEvent, ChargePointState, Component, LocalListEntry, MeterSample,
+    BootReasonCause, ChargePointEvent, ChargePointState, Component, ConnectorState,
+    ConnectorStatus, ConnectorStatusChanged, LocalListEntry, MeterSample,
     RecoveredDeviceModelAttribute, RecoveredReservation, RecoveredTransaction, Reservation,
-    Transaction, TransactionEventKind, TransactionEventOccurred, TransactionUpdateReason, Variable,
-    VariableAttributeType,
+    SecurityEvent, SecurityEventType, Transaction, TransactionEventKind, TransactionEventOccurred,
+    TransactionUpdateReason, Variable, VariableAttributeType,
 };
 use crate::sync::{BroadcastReceiver, WatchReceiver};
 
@@ -1001,6 +1002,376 @@ pub async fn flush_and_persist_transaction_event_queue<S, F, Fut, E>(
         Fut,
         E,
     >(queue, store, send)
+    .await
+}
+
+/// A `serde`-able mirror of [`ConnectorStatus`], since the original enum lives in `crate::state`
+/// and isn't (and, per its module's ownership, shouldn't need to be) `serde`-derived just for this
+/// module's benefit. Exhaustively matched both ways below, so the conversion can never fail or
+/// silently reinterpret a variant, and so a new [`ConnectorStatus`] variant is a compile error
+/// here rather than a silent data-loss bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedConnectorStatus {
+    Available,
+    Occupied,
+    Reserved,
+    Unavailable,
+    Faulted,
+}
+
+impl From<ConnectorStatus> for PersistedConnectorStatus {
+    fn from(status: ConnectorStatus) -> Self {
+        match status {
+            ConnectorStatus::Available => Self::Available,
+            ConnectorStatus::Occupied => Self::Occupied,
+            ConnectorStatus::Reserved => Self::Reserved,
+            ConnectorStatus::Unavailable => Self::Unavailable,
+            ConnectorStatus::Faulted => Self::Faulted,
+        }
+    }
+}
+
+impl From<PersistedConnectorStatus> for ConnectorStatus {
+    fn from(status: PersistedConnectorStatus) -> Self {
+        match status {
+            PersistedConnectorStatus::Available => Self::Available,
+            PersistedConnectorStatus::Occupied => Self::Occupied,
+            PersistedConnectorStatus::Reserved => Self::Reserved,
+            PersistedConnectorStatus::Unavailable => Self::Unavailable,
+            PersistedConnectorStatus::Faulted => Self::Faulted,
+        }
+    }
+}
+
+/// A `serde`-able mirror of [`ConnectorState`], for the same reason [`PersistedConnectorStatus`]
+/// mirrors [`ConnectorStatus`] - see that type's docs. Exhaustively matched both ways, with no
+/// catch-all arm, so a new [`ConnectorState`] variant fails to compile here instead of silently
+/// losing data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedConnectorState {
+    Available,
+    Connected,
+    Locked,
+    Authorizing,
+    Starting,
+    Charging,
+    Stopping,
+    Finishing,
+    Unavailable,
+    Faulted,
+    FaultedSafe,
+    Unlocking,
+    Reserved,
+}
+
+impl From<ConnectorState> for PersistedConnectorState {
+    fn from(state: ConnectorState) -> Self {
+        match state {
+            ConnectorState::Available => Self::Available,
+            ConnectorState::Connected => Self::Connected,
+            ConnectorState::Locked => Self::Locked,
+            ConnectorState::Authorizing => Self::Authorizing,
+            ConnectorState::Starting => Self::Starting,
+            ConnectorState::Charging => Self::Charging,
+            ConnectorState::Stopping => Self::Stopping,
+            ConnectorState::Finishing => Self::Finishing,
+            ConnectorState::Unavailable => Self::Unavailable,
+            ConnectorState::Faulted => Self::Faulted,
+            ConnectorState::FaultedSafe => Self::FaultedSafe,
+            ConnectorState::Unlocking => Self::Unlocking,
+            ConnectorState::Reserved => Self::Reserved,
+        }
+    }
+}
+
+impl From<PersistedConnectorState> for ConnectorState {
+    fn from(state: PersistedConnectorState) -> Self {
+        match state {
+            PersistedConnectorState::Available => Self::Available,
+            PersistedConnectorState::Connected => Self::Connected,
+            PersistedConnectorState::Locked => Self::Locked,
+            PersistedConnectorState::Authorizing => Self::Authorizing,
+            PersistedConnectorState::Starting => Self::Starting,
+            PersistedConnectorState::Charging => Self::Charging,
+            PersistedConnectorState::Stopping => Self::Stopping,
+            PersistedConnectorState::Finishing => Self::Finishing,
+            PersistedConnectorState::Unavailable => Self::Unavailable,
+            PersistedConnectorState::Faulted => Self::Faulted,
+            PersistedConnectorState::FaultedSafe => Self::FaultedSafe,
+            PersistedConnectorState::Unlocking => Self::Unlocking,
+            PersistedConnectorState::Reserved => Self::Reserved,
+        }
+    }
+}
+
+/// The on-disk representation of one queued [`ConnectorStatusChanged`] - the `P` type parameter
+/// [`restore_offline_queue`]/[`run_persisted_offline_queue`]/[`flush_and_persist_offline_queue`]
+/// are instantiated with for the offline status-notification queue (E2.8/E4.3). `status` and
+/// `connector_state` go through [`PersistedConnectorStatus`]/[`PersistedConnectorState`] for the
+/// reason documented there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedQueuedStatusChange {
+    evse_id: usize,
+    connector_id: usize,
+    status: PersistedConnectorStatus,
+    connector_state: PersistedConnectorState,
+}
+
+impl From<ConnectorStatusChanged> for PersistedQueuedStatusChange {
+    fn from(changed: ConnectorStatusChanged) -> Self {
+        Self {
+            evse_id: changed.evse_id,
+            connector_id: changed.connector_id,
+            status: changed.status.into(),
+            connector_state: changed.connector_state.into(),
+        }
+    }
+}
+
+impl From<PersistedQueuedStatusChange> for ConnectorStatusChanged {
+    fn from(persisted: PersistedQueuedStatusChange) -> Self {
+        Self {
+            evse_id: persisted.evse_id,
+            connector_id: persisted.connector_id,
+            status: persisted.status.into(),
+            connector_state: persisted.connector_state.into(),
+        }
+    }
+}
+
+/// [`restore_offline_queue`], specialized to the offline status-notification queue - see
+/// [`crate::builder::ChargePointBuilder::transaction_events_persisted`] for the transaction-event
+/// equivalent this mirrors.
+pub async fn restore_status_notification_queue<S: Storage>(
+    queue: &OfflineQueue<ConnectorStatusChanged>,
+    store: &QueueStore<S>,
+) -> usize {
+    restore_offline_queue::<ConnectorStatusChanged, PersistedQueuedStatusChange, S>(queue, store)
+        .await
+}
+
+/// [`run_persisted_offline_queue`], specialized to the offline status-notification queue - see
+/// [`restore_status_notification_queue`].
+pub async fn run_persisted_status_notification_queue<S, F, Fut, E, H, HFut>(
+    events: BroadcastReceiver<ConnectorStatusChanged>,
+    queue: &OfflineQueue<ConnectorStatusChanged>,
+    store: &QueueStore<S>,
+    send: F,
+    on_overflow: H,
+) where
+    S: Storage,
+    F: FnMut(ConnectorStatusChanged) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+    H: FnMut(ConnectorStatusChanged) -> HFut,
+    HFut: Future<Output = ()>,
+{
+    run_persisted_offline_queue::<
+        ConnectorStatusChanged,
+        PersistedQueuedStatusChange,
+        S,
+        F,
+        Fut,
+        E,
+        H,
+        HFut,
+    >(events, queue, store, send, on_overflow)
+    .await
+}
+
+/// [`flush_and_persist_offline_queue`], specialized to the offline status-notification queue - see
+/// [`restore_status_notification_queue`].
+pub async fn flush_and_persist_status_notification_queue<S, F, Fut, E>(
+    queue: &OfflineQueue<ConnectorStatusChanged>,
+    store: &QueueStore<S>,
+    send: F,
+) where
+    S: Storage,
+    F: FnMut(ConnectorStatusChanged) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+{
+    flush_and_persist_offline_queue::<
+        ConnectorStatusChanged,
+        PersistedQueuedStatusChange,
+        S,
+        F,
+        Fut,
+        E,
+    >(queue, store, send)
+    .await
+}
+
+/// A `serde`-able mirror of [`SecurityEventType`], since the original enum lives in
+/// `crate::state` and isn't (and, per its module's ownership, shouldn't need to be) `serde`-
+/// derived just for this module's benefit. Exhaustively matched both ways below, including the
+/// `Other` payload variant, so the conversion can never fail or silently reinterpret a variant,
+/// and so a new [`SecurityEventType`] variant is a compile error here rather than a silent
+/// data-loss bug.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedSecurityEventType {
+    FirmwareUpdated,
+    FailedToAuthenticateAtCsms,
+    CsmsFailedToAuthenticate,
+    SettingSystemTime,
+    StartupOfTheDevice,
+    ResetOrReboot,
+    SecurityLogWasCleared,
+    ReconfigurationOfSecurityParameters,
+    MemoryExhaustion,
+    InvalidMessages,
+    AttemptedReplayAttacks,
+    TamperDetectionActivated,
+    InvalidFirmwareSignature,
+    InvalidFirmwareSigningCertificate,
+    InvalidCsmsCertificate,
+    InvalidChargingStationCertificate,
+    InvalidTlsVersion,
+    InvalidTlsCipherSuite,
+    Other(String),
+}
+
+impl From<SecurityEventType> for PersistedSecurityEventType {
+    fn from(event_type: SecurityEventType) -> Self {
+        match event_type {
+            SecurityEventType::FirmwareUpdated => Self::FirmwareUpdated,
+            SecurityEventType::FailedToAuthenticateAtCsms => Self::FailedToAuthenticateAtCsms,
+            SecurityEventType::CsmsFailedToAuthenticate => Self::CsmsFailedToAuthenticate,
+            SecurityEventType::SettingSystemTime => Self::SettingSystemTime,
+            SecurityEventType::StartupOfTheDevice => Self::StartupOfTheDevice,
+            SecurityEventType::ResetOrReboot => Self::ResetOrReboot,
+            SecurityEventType::SecurityLogWasCleared => Self::SecurityLogWasCleared,
+            SecurityEventType::ReconfigurationOfSecurityParameters => {
+                Self::ReconfigurationOfSecurityParameters
+            }
+            SecurityEventType::MemoryExhaustion => Self::MemoryExhaustion,
+            SecurityEventType::InvalidMessages => Self::InvalidMessages,
+            SecurityEventType::AttemptedReplayAttacks => Self::AttemptedReplayAttacks,
+            SecurityEventType::TamperDetectionActivated => Self::TamperDetectionActivated,
+            SecurityEventType::InvalidFirmwareSignature => Self::InvalidFirmwareSignature,
+            SecurityEventType::InvalidFirmwareSigningCertificate => {
+                Self::InvalidFirmwareSigningCertificate
+            }
+            SecurityEventType::InvalidCsmsCertificate => Self::InvalidCsmsCertificate,
+            SecurityEventType::InvalidChargingStationCertificate => {
+                Self::InvalidChargingStationCertificate
+            }
+            SecurityEventType::InvalidTlsVersion => Self::InvalidTlsVersion,
+            SecurityEventType::InvalidTlsCipherSuite => Self::InvalidTlsCipherSuite,
+            SecurityEventType::Other(value) => Self::Other(value),
+        }
+    }
+}
+
+impl From<PersistedSecurityEventType> for SecurityEventType {
+    fn from(event_type: PersistedSecurityEventType) -> Self {
+        match event_type {
+            PersistedSecurityEventType::FirmwareUpdated => Self::FirmwareUpdated,
+            PersistedSecurityEventType::FailedToAuthenticateAtCsms => {
+                Self::FailedToAuthenticateAtCsms
+            }
+            PersistedSecurityEventType::CsmsFailedToAuthenticate => Self::CsmsFailedToAuthenticate,
+            PersistedSecurityEventType::SettingSystemTime => Self::SettingSystemTime,
+            PersistedSecurityEventType::StartupOfTheDevice => Self::StartupOfTheDevice,
+            PersistedSecurityEventType::ResetOrReboot => Self::ResetOrReboot,
+            PersistedSecurityEventType::SecurityLogWasCleared => Self::SecurityLogWasCleared,
+            PersistedSecurityEventType::ReconfigurationOfSecurityParameters => {
+                Self::ReconfigurationOfSecurityParameters
+            }
+            PersistedSecurityEventType::MemoryExhaustion => Self::MemoryExhaustion,
+            PersistedSecurityEventType::InvalidMessages => Self::InvalidMessages,
+            PersistedSecurityEventType::AttemptedReplayAttacks => Self::AttemptedReplayAttacks,
+            PersistedSecurityEventType::TamperDetectionActivated => Self::TamperDetectionActivated,
+            PersistedSecurityEventType::InvalidFirmwareSignature => Self::InvalidFirmwareSignature,
+            PersistedSecurityEventType::InvalidFirmwareSigningCertificate => {
+                Self::InvalidFirmwareSigningCertificate
+            }
+            PersistedSecurityEventType::InvalidCsmsCertificate => Self::InvalidCsmsCertificate,
+            PersistedSecurityEventType::InvalidChargingStationCertificate => {
+                Self::InvalidChargingStationCertificate
+            }
+            PersistedSecurityEventType::InvalidTlsVersion => Self::InvalidTlsVersion,
+            PersistedSecurityEventType::InvalidTlsCipherSuite => Self::InvalidTlsCipherSuite,
+            PersistedSecurityEventType::Other(value) => Self::Other(value),
+        }
+    }
+}
+
+/// The on-disk representation of one queued [`SecurityEvent`] - the `P` type parameter
+/// [`restore_offline_queue`]/[`run_persisted_offline_queue`]/[`flush_and_persist_offline_queue`]
+/// are instantiated with for the offline security-event queue (E2.8/E4.3). `event_type` goes
+/// through [`PersistedSecurityEventType`] for the reason documented there; `tech_info` reuses
+/// `Option<String>`'s own `Serialize`/`Deserialize` impl directly.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PersistedQueuedSecurityEvent {
+    event_type: PersistedSecurityEventType,
+    tech_info: Option<String>,
+}
+
+impl From<SecurityEvent> for PersistedQueuedSecurityEvent {
+    fn from(event: SecurityEvent) -> Self {
+        Self {
+            event_type: event.event_type.into(),
+            tech_info: event.tech_info,
+        }
+    }
+}
+
+impl From<PersistedQueuedSecurityEvent> for SecurityEvent {
+    fn from(persisted: PersistedQueuedSecurityEvent) -> Self {
+        Self {
+            event_type: persisted.event_type.into(),
+            tech_info: persisted.tech_info,
+        }
+    }
+}
+
+/// [`restore_offline_queue`], specialized to the offline security-event queue - see
+/// [`restore_status_notification_queue`] for the sibling this mirrors.
+pub async fn restore_security_event_queue<S: Storage>(
+    queue: &OfflineQueue<SecurityEvent>,
+    store: &QueueStore<S>,
+) -> usize {
+    restore_offline_queue::<SecurityEvent, PersistedQueuedSecurityEvent, S>(queue, store).await
+}
+
+/// [`run_persisted_offline_queue`], specialized to the offline security-event queue - see
+/// [`restore_security_event_queue`].
+pub async fn run_persisted_security_event_queue<S, F, Fut, E, H, HFut>(
+    events: BroadcastReceiver<SecurityEvent>,
+    queue: &OfflineQueue<SecurityEvent>,
+    store: &QueueStore<S>,
+    send: F,
+    on_overflow: H,
+) where
+    S: Storage,
+    F: FnMut(SecurityEvent) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+    H: FnMut(SecurityEvent) -> HFut,
+    HFut: Future<Output = ()>,
+{
+    run_persisted_offline_queue::<SecurityEvent, PersistedQueuedSecurityEvent, S, F, Fut, E, H, HFut>(
+        events, queue, store, send, on_overflow,
+    )
+    .await
+}
+
+/// [`flush_and_persist_offline_queue`], specialized to the offline security-event queue - see
+/// [`restore_security_event_queue`].
+pub async fn flush_and_persist_security_event_queue<S, F, Fut, E>(
+    queue: &OfflineQueue<SecurityEvent>,
+    store: &QueueStore<S>,
+    send: F,
+) where
+    S: Storage,
+    F: FnMut(SecurityEvent) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+{
+    flush_and_persist_offline_queue::<SecurityEvent, PersistedQueuedSecurityEvent, S, F, Fut, E>(
+        queue, store, send,
+    )
     .await
 }
 
@@ -2383,6 +2754,257 @@ mod tests {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.write_str("send failed")
         }
+    }
+
+    // --- status-notification queue persistence (E2.8/E4.3) ---
+
+    #[test]
+    fn every_connector_status_variant_round_trips_through_its_persisted_mirror() {
+        let all = [
+            ConnectorStatus::Available,
+            ConnectorStatus::Occupied,
+            ConnectorStatus::Reserved,
+            ConnectorStatus::Unavailable,
+            ConnectorStatus::Faulted,
+        ];
+        for status in all {
+            let persisted: PersistedConnectorStatus = status.into();
+            assert_eq!(ConnectorStatus::from(persisted), status);
+        }
+    }
+
+    #[test]
+    fn every_connector_state_variant_round_trips_through_its_persisted_mirror() {
+        let all = [
+            ConnectorState::Available,
+            ConnectorState::Connected,
+            ConnectorState::Locked,
+            ConnectorState::Authorizing,
+            ConnectorState::Starting,
+            ConnectorState::Charging,
+            ConnectorState::Stopping,
+            ConnectorState::Finishing,
+            ConnectorState::Unavailable,
+            ConnectorState::Faulted,
+            ConnectorState::FaultedSafe,
+            ConnectorState::Unlocking,
+            ConnectorState::Reserved,
+        ];
+        for state in all {
+            let persisted: PersistedConnectorState = state.into();
+            assert_eq!(ConnectorState::from(persisted), state);
+        }
+    }
+
+    #[test]
+    fn a_status_change_round_trips_through_its_persisted_mirror() {
+        let changed = ConnectorStatusChanged {
+            evse_id: 1,
+            connector_id: 2,
+            status: ConnectorStatus::Occupied,
+            connector_state: ConnectorState::Charging,
+        };
+        let persisted: PersistedQueuedStatusChange = changed.into();
+        assert_eq!(ConnectorStatusChanged::from(persisted), changed);
+    }
+
+    /// The end-to-end guarantee E4.3 exists for, applied to the status-notification queue: a
+    /// `StatusNotification` queued while offline survives a power cut and is replayed, in order,
+    /// once the process restarts and the connection recovers - exercised through the real
+    /// [`ConnectorStatusChanged`]/[`PersistedQueuedStatusChange`] types and the real
+    /// `restore_status_notification_queue`/`run_persisted_status_notification_queue` wrappers,
+    /// unlike [`a_queue_interrupted_by_a_power_cut_replays_its_backlog_in_order_after_reboot`]
+    /// (which cheats with `M = P = i32`).
+    #[tokio::test]
+    async fn a_status_notification_queue_interrupted_by_a_power_cut_replays_its_backlog_in_order_after_reboot()
+     {
+        use crate::offline_queue::OfflineQueue;
+        use crate::sync::broadcast_channel;
+
+        let first = ConnectorStatusChanged {
+            evse_id: 0,
+            connector_id: 0,
+            status: ConnectorStatus::Occupied,
+            connector_state: ConnectorState::Connected,
+        };
+        let second = ConnectorStatusChanged {
+            evse_id: 0,
+            connector_id: 0,
+            status: ConnectorStatus::Occupied,
+            connector_state: ConnectorState::Charging,
+        };
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = QueueStore::new(storage.clone(), "status");
+
+        // --- before the cut: two status changes queued while "offline" (every send fails).
+        let queue: OfflineQueue<ConnectorStatusChanged> = OfflineQueue::new();
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        let forwarder = tokio::spawn(async move {
+            run_persisted_status_notification_queue(
+                receiver,
+                &queue,
+                &store,
+                |_message: ConnectorStatusChanged| async { Err::<(), _>(TestSendError) },
+                |_dropped| async {},
+            )
+            .await;
+        });
+        sender.send(first);
+        sender.send(second);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        forwarder.await.unwrap();
+
+        // --- the cut: nothing but `storage` survives.
+        let persisted_store = QueueStore::new(storage.clone(), "status");
+
+        // --- after the reboot: a fresh queue restores the backlog, in order, and delivers it once
+        // the connection is back up.
+        let restored_queue: OfflineQueue<ConnectorStatusChanged> = OfflineQueue::new();
+        assert_eq!(
+            restore_status_notification_queue(&restored_queue, &persisted_store).await,
+            2
+        );
+        let delivered = alloc::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flush_delivered = delivered.clone();
+        flush_offline_queue(&restored_queue, move |message: ConnectorStatusChanged| {
+            let delivered = flush_delivered.clone();
+            async move {
+                delivered.lock().unwrap().push(message);
+                Ok::<(), TestSendError>(())
+            }
+        })
+        .await;
+
+        assert_eq!(*delivered.lock().unwrap(), alloc::vec![first, second]);
+    }
+
+    // --- security-event queue persistence (E2.8/E4.3) ---
+
+    #[test]
+    fn every_security_event_type_variant_round_trips_through_its_persisted_mirror() {
+        let all = [
+            SecurityEventType::FirmwareUpdated,
+            SecurityEventType::FailedToAuthenticateAtCsms,
+            SecurityEventType::CsmsFailedToAuthenticate,
+            SecurityEventType::SettingSystemTime,
+            SecurityEventType::StartupOfTheDevice,
+            SecurityEventType::ResetOrReboot,
+            SecurityEventType::SecurityLogWasCleared,
+            SecurityEventType::ReconfigurationOfSecurityParameters,
+            SecurityEventType::MemoryExhaustion,
+            SecurityEventType::InvalidMessages,
+            SecurityEventType::AttemptedReplayAttacks,
+            SecurityEventType::TamperDetectionActivated,
+            SecurityEventType::InvalidFirmwareSignature,
+            SecurityEventType::InvalidFirmwareSigningCertificate,
+            SecurityEventType::InvalidCsmsCertificate,
+            SecurityEventType::InvalidChargingStationCertificate,
+            SecurityEventType::InvalidTlsVersion,
+            SecurityEventType::InvalidTlsCipherSuite,
+            SecurityEventType::Other("VendorSpecificThing".into()),
+        ];
+        for event_type in all {
+            let persisted: PersistedSecurityEventType = event_type.clone().into();
+            assert_eq!(SecurityEventType::from(persisted), event_type);
+        }
+    }
+
+    #[test]
+    fn a_security_event_round_trips_through_its_persisted_mirror_with_tech_info() {
+        let event = SecurityEvent {
+            event_type: SecurityEventType::TamperDetectionActivated,
+            tech_info: Some("door switch tripped".into()),
+        };
+        let persisted: PersistedQueuedSecurityEvent = event.clone().into();
+        assert_eq!(SecurityEvent::from(persisted), event);
+    }
+
+    #[test]
+    fn a_security_event_round_trips_through_its_persisted_mirror_without_tech_info() {
+        let event = SecurityEvent {
+            event_type: SecurityEventType::Other("VendorThing".into()),
+            tech_info: None,
+        };
+        let persisted: PersistedQueuedSecurityEvent = event.clone().into();
+        assert_eq!(SecurityEvent::from(persisted), event);
+    }
+
+    /// The end-to-end guarantee E4.3 exists for, applied to the security-event queue: a
+    /// `SecurityEventNotification` queued while offline survives a power cut and is replayed, in
+    /// order, once the process restarts and the connection recovers - exercised through the real
+    /// [`SecurityEvent`]/[`PersistedQueuedSecurityEvent`] types and the real
+    /// `restore_security_event_queue`/`run_persisted_security_event_queue` wrappers, unlike
+    /// [`a_queue_interrupted_by_a_power_cut_replays_its_backlog_in_order_after_reboot`] (which
+    /// cheats with `M = P = i32`).
+    #[tokio::test]
+    async fn a_security_event_queue_interrupted_by_a_power_cut_replays_its_backlog_in_order_after_reboot()
+     {
+        use crate::offline_queue::OfflineQueue;
+        use crate::sync::broadcast_channel;
+
+        let first = SecurityEvent {
+            event_type: SecurityEventType::TamperDetectionActivated,
+            tech_info: Some("door switch tripped".into()),
+        };
+        let second = SecurityEvent {
+            event_type: SecurityEventType::Other("VendorThing".into()),
+            tech_info: None,
+        };
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = QueueStore::new(storage.clone(), "security");
+
+        // --- before the cut: two security events queued while "offline" (every send fails).
+        let queue: OfflineQueue<SecurityEvent> = OfflineQueue::new();
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        let first_clone = first.clone();
+        let second_clone = second.clone();
+        let forwarder = tokio::spawn(async move {
+            run_persisted_security_event_queue(
+                receiver,
+                &queue,
+                &store,
+                |_message: SecurityEvent| async { Err::<(), _>(TestSendError) },
+                |_dropped| async {},
+            )
+            .await;
+        });
+        sender.send(first_clone);
+        sender.send(second_clone);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(sender);
+        forwarder.await.unwrap();
+
+        // --- the cut: nothing but `storage` survives.
+        let persisted_store = QueueStore::new(storage.clone(), "security");
+
+        // --- after the reboot: a fresh queue restores the backlog, in order, and delivers it once
+        // the connection is back up.
+        let restored_queue: OfflineQueue<SecurityEvent> = OfflineQueue::new();
+        assert_eq!(
+            restore_security_event_queue(&restored_queue, &persisted_store).await,
+            2
+        );
+        let delivered = alloc::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flush_delivered = delivered.clone();
+        flush_offline_queue(&restored_queue, move |message: SecurityEvent| {
+            let delivered = flush_delivered.clone();
+            async move {
+                delivered.lock().unwrap().push(message);
+                Ok::<(), TestSendError>(())
+            }
+        })
+        .await;
+
+        assert_eq!(*delivered.lock().unwrap(), alloc::vec![first, second]);
     }
 
     // --- local authorization list persistence (E2.4) ---

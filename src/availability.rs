@@ -53,6 +53,24 @@ pub trait StatusNotifier {
 /// `ChargePointState` started reporting every transition. A version with its own richer status
 /// (e.g. [`crate::availability::Ocpp1_6StatusNotifier`]) should **not** be wrapped in this - it
 /// needs every call, including ones where `status` repeats but `connector_state` doesn't.
+///
+/// An entry is only recorded once `inner` has actually accepted the notification (returned
+/// `Ok`) - never merely attempted. This matters when this type is composed with an offline-queue
+/// retry loop (see [`crate::offline_queue`]): a call whose send fails must leave the cache exactly
+/// as it was, so a later retry of that same status is treated as a fresh, un-cached change and
+/// actually goes out, rather than being wrongly seen as a duplicate of itself and silently
+/// dropped from the queue as if delivered.
+///
+/// This does mean two *concurrent* `notify_status` calls for the same `(evse_id, connector_id)`
+/// with the same `status` can both observe "not yet cached" and both reach `inner` - the
+/// duplicate-check and the cache write are no longer one atomic step under the lock, since the
+/// write now happens only after awaiting `inner`, and the lock (a `BlockingMutex` over a
+/// `RefCell`) cannot be held across that `.await`. In practice this window is not one the current
+/// wiring opens: every caller in this crate (see [`crate::builder::ChargePointBuilder`]) drives a
+/// given connector's status through a single actor-owned broadcast, consumed by exactly one
+/// forwarder task per queue, so same-connector calls are never actually concurrent. A caller that
+/// does invoke this type concurrently for the same connector should be aware of the resulting
+/// at-most-one-extra-duplicate-send possibility rather than assume it away.
 pub struct DedupedStatusNotifier<N> {
     inner: N,
     last_sent: LastSentStatuses,
@@ -84,22 +102,20 @@ impl<N: StatusNotifier + Sync> StatusNotifier for DedupedStatusNotifier<N> {
         status: ConnectorStatus,
         connector_state: ConnectorState,
     ) -> Result<(), Self::Error> {
-        let changed = self.last_sent.lock(|cache| {
-            let mut cache = cache.borrow_mut();
-            if cache.get(&(evse_id, connector_id)) == Some(&status) {
-                false
-            } else {
-                cache.insert((evse_id, connector_id), status);
-                true
-            }
-        });
-        if changed {
-            self.inner
-                .notify_status(evse_id, connector_id, status, connector_state)
-                .await
-        } else {
-            Ok(())
+        let is_duplicate = self
+            .last_sent
+            .lock(|cache| cache.borrow().get(&(evse_id, connector_id)) == Some(&status));
+        if is_duplicate {
+            return Ok(());
         }
+        self.inner
+            .notify_status(evse_id, connector_id, status, connector_state)
+            .await?;
+        // Only recorded now that `inner` has actually accepted it - see this type's docs for why
+        // a failed send must not reach this point.
+        self.last_sent
+            .lock(|cache| cache.borrow_mut().insert((evse_id, connector_id), status));
+        Ok(())
     }
 }
 
@@ -320,8 +336,10 @@ mod tests {
 mod deduped_status_notifier_tests {
     use super::tests::RecordingStatusNotifier;
     use super::{DedupedStatusNotifier, StatusNotifier};
-    use crate::state::{ConnectorState, ConnectorStatus};
+    use crate::state::{ConnectorState, ConnectorStatus, ConnectorStatusChanged};
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::watch;
 
     type SeenReceiver = watch::Receiver<Vec<(usize, usize, ConnectorStatus, ConnectorState)>>;
@@ -332,6 +350,176 @@ mod deduped_status_notifier_tests {
             DedupedStatusNotifier::new(RecordingStatusNotifier { seen: seen_tx }),
             seen_rx,
         )
+    }
+
+    /// The error [`FlakyRecordingNotifier::notify_status`] returns while `should_fail` is set.
+    #[derive(Debug)]
+    struct NotifyError;
+
+    impl core::fmt::Display for NotifyError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("status notification failed")
+        }
+    }
+
+    impl core::error::Error for NotifyError {}
+
+    /// A `StatusNotifier` whose `notify_status` fails or succeeds depending on `should_fail`,
+    /// counting every attempt (successful or not) via `attempts` and recording only the
+    /// successful ones via `seen` - used to prove [`DedupedStatusNotifier`] only commits an entry
+    /// once a send actually succeeds, and retries (rather than swallows) one that failed.
+    struct FlakyRecordingNotifier {
+        should_fail: Arc<AtomicBool>,
+        attempts: Arc<AtomicUsize>,
+        seen: watch::Sender<Vec<(usize, usize, ConnectorStatus, ConnectorState)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StatusNotifier for FlakyRecordingNotifier {
+        type Error = NotifyError;
+
+        async fn notify_status(
+            &self,
+            evse_id: usize,
+            connector_id: usize,
+            status: ConnectorStatus,
+            connector_state: ConnectorState,
+        ) -> Result<(), Self::Error> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.should_fail.load(Ordering::SeqCst) {
+                return Err(NotifyError);
+            }
+            self.seen
+                .send_modify(|seen| seen.push((evse_id, connector_id, status, connector_state)));
+            Ok(())
+        }
+    }
+
+    fn flaky_notifier() -> (
+        DedupedStatusNotifier<FlakyRecordingNotifier>,
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+        SeenReceiver,
+    ) {
+        let should_fail = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (seen_tx, seen_rx) = watch::channel(Vec::new());
+        let notifier = DedupedStatusNotifier::new(FlakyRecordingNotifier {
+            should_fail: should_fail.clone(),
+            attempts: attempts.clone(),
+            seen: seen_tx,
+        });
+        (notifier, should_fail, attempts, seen_rx)
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_leaves_the_cache_untouched_so_a_retry_of_the_same_status_still_sends() {
+        let (notifier, should_fail, attempts, seen) = flaky_notifier();
+
+        let first = notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await;
+        assert!(first.is_err());
+
+        should_fail.store(false, Ordering::SeqCst);
+        let second = notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await;
+        assert!(second.is_ok());
+
+        // Both attempts reached the inner notifier - the failed one did not get wrongly cached
+        // as delivered, so the retry was not mistaken for a duplicate.
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(seen.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_successful_identical_notifications_are_still_deduped_to_one() {
+        let (notifier, should_fail, attempts, seen) = flaky_notifier();
+        should_fail.store(false, Ordering::SeqCst);
+
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await
+            .unwrap();
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await
+            .unwrap();
+
+        // The second call is a genuine duplicate of a *successfully delivered* status, so it must
+        // still be suppressed - the fix must not regress dedup itself.
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_different_status_after_a_failure_still_sends() {
+        let (notifier, should_fail, _attempts, seen) = flaky_notifier();
+
+        let first = notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await;
+        assert!(first.is_err());
+
+        should_fail.store(false, Ordering::SeqCst);
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Available, ConnectorState::Available)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.borrow(),
+            alloc::vec![(0, 0, ConnectorStatus::Available, ConnectorState::Available)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_status_change_lost_to_a_failed_send_is_retried_through_the_offline_queue_rather_than_swallowed()
+     {
+        use crate::offline_queue::{OfflineQueue, flush_offline_queue};
+
+        let (notifier, should_fail, _attempts, seen) = flaky_notifier();
+        let queue = OfflineQueue::new();
+
+        // The connector goes Available -> Occupied while the CSMS is unreachable: queued, and
+        // the first flush attempt fails - the message must stay on the queue, not be popped.
+        queue.push(ConnectorStatusChanged {
+            evse_id: 0,
+            connector_id: 0,
+            status: ConnectorStatus::Occupied,
+            connector_state: ConnectorState::Connected,
+        });
+        flush_offline_queue(&queue, |changed: ConnectorStatusChanged| {
+            notifier.notify_status(
+                changed.evse_id,
+                changed.connector_id,
+                changed.status,
+                changed.connector_state,
+            )
+        })
+        .await;
+        assert_eq!(queue.len(), 1, "the failed send must not be popped");
+        assert!(seen.borrow().is_empty());
+
+        // Connectivity returns; the same message is retried and must actually reach the CSMS this
+        // time, not be treated as a duplicate of its own failed attempt.
+        should_fail.store(false, Ordering::SeqCst);
+        flush_offline_queue(&queue, |changed: ConnectorStatusChanged| {
+            notifier.notify_status(
+                changed.evse_id,
+                changed.connector_id,
+                changed.status,
+                changed.connector_state,
+            )
+        })
+        .await;
+
+        assert!(queue.is_empty());
+        assert_eq!(
+            *seen.borrow(),
+            alloc::vec![(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)]
+        );
     }
 
     #[tokio::test]

@@ -34,11 +34,14 @@ use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListH
 use crate::offline_queue::{OfflineQueue, OverflowPolicy, run_with_offline_queue};
 use crate::persistence::{
     BootReasonStore, DeviceModelStore, LocalAuthorizationListStore, QueueStore, ReservationStore,
-    TransactionStore, flush_and_persist_transaction_event_queue, restore_device_model,
-    restore_local_authorization_list, restore_reservations, restore_transaction_event_queue,
-    restore_transactions, run_device_model_persistence, run_local_authorization_list_persistence,
-    run_persisted_transaction_event_queue, run_reservation_persistence,
-    run_transaction_persistence,
+    TransactionStore, flush_and_persist_security_event_queue,
+    flush_and_persist_status_notification_queue, flush_and_persist_transaction_event_queue,
+    restore_device_model, restore_local_authorization_list, restore_reservations,
+    restore_security_event_queue, restore_status_notification_queue,
+    restore_transaction_event_queue, restore_transactions, run_device_model_persistence,
+    run_local_authorization_list_persistence, run_persisted_security_event_queue,
+    run_persisted_status_notification_queue, run_persisted_transaction_event_queue,
+    run_reservation_persistence, run_transaction_persistence,
 };
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
 use crate::remote_control::{
@@ -443,6 +446,94 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Like [`Self::status_notifications`], but the offline queue is durable: whatever's still
+    /// queued when the process loses power is restored, **in order**, from `store` at the next
+    /// boot - `docs/PRODUCTION-ROADMAP.md` §7.2/§7.4 (E2.8, E4.3). `store` may be built over
+    /// [`crate::hardware::NoStorage`], in which case this behaves exactly like
+    /// [`Self::status_notifications`].
+    ///
+    /// The dedup cache that [`DedupedStatusNotifier`] wraps `csms` in starts **empty** every
+    /// boot, including this one - it is not itself persisted. That means the first status forwarded
+    /// after a restart is always sent, even if it repeats whatever was last sent before the
+    /// power was lost. That is deliberate: re-reporting a status the CSMS already has is
+    /// harmless, while the alternative (persisting the dedup cache too, to suppress that resend)
+    /// risks silently dropping a status the CSMS never actually received - the wrong failure mode
+    /// for a durability feature to introduce.
+    pub async fn status_notifications_persisted<N, S>(
+        mut self,
+        csms: &N,
+        store: QueueStore<S>,
+    ) -> Self
+    where
+        N: StatusNotifier + ReconnectHandler + Clone + Send + Sync + 'static,
+        S: crate::hardware::Storage + Send + Sync + 'static,
+    {
+        let Some(status_changes) = self.take_status_changes() else {
+            return self;
+        };
+
+        // `DropOldest` (the default), same reasoning as `Self::status_notifications`.
+        let status_queue = Arc::new(OfflineQueue::new());
+        // Restore before any live traffic is wired up - so an event that arrives during start-up
+        // can never be delivered ahead of an older one the backlog restores.
+        restore_status_notification_queue(&status_queue, &store).await;
+        let store = Arc::new(store);
+        let status_notifier = Arc::new(DedupedStatusNotifier::new(csms.clone()));
+        let forwarder_queue = status_queue.clone();
+        let forwarder_store = store.clone();
+        let forwarder_notifier = status_notifier.clone();
+        let overflow_actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            run_persisted_status_notification_queue(
+                status_changes,
+                &forwarder_queue,
+                &forwarder_store,
+                move |changed| {
+                    let notifier = forwarder_notifier.clone();
+                    async move {
+                        notifier
+                            .notify_status(
+                                changed.evse_id,
+                                changed.connector_id,
+                                changed.status,
+                                changed.connector_state,
+                            )
+                            .await
+                    }
+                },
+                move |_dropped| {
+                    let actor = overflow_actor.clone();
+                    async move { report_memory_exhaustion(&actor).await }
+                },
+            )
+            .await;
+        }));
+        csms.register_reconnect_handler(move || {
+            let queue = status_queue.clone();
+            let store = store.clone();
+            let notifier = status_notifier.clone();
+            async move {
+                flush_and_persist_status_notification_queue(&queue, &store, move |changed| {
+                    let notifier = notifier.clone();
+                    async move {
+                        notifier
+                            .notify_status(
+                                changed.evse_id,
+                                changed.connector_id,
+                                changed.status,
+                                changed.connector_state,
+                            )
+                            .await
+                    }
+                })
+                .await;
+            }
+        })
+        .await;
+
+        self
+    }
+
     /// Registers the Transactions functional block: every transaction lifecycle event is
     /// forwarded to `csms` via TransactionEvent, queued and retried in order if the connection is
     /// currently down, and flushed on reconnect.
@@ -664,6 +755,77 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             let csms = reconnect_csms.clone();
             async move {
                 crate::offline_queue::flush_offline_queue(&queue, move |event| {
+                    let notifier = csms.clone();
+                    async move {
+                        notifier
+                            .notify_security_event(&event.event_type, event.tech_info.as_deref())
+                            .await
+                    }
+                })
+                .await;
+            }
+        })
+        .await;
+
+        self
+    }
+
+    /// Like [`Self::security_events`], but the offline queue is durable: whatever's still queued
+    /// when the process loses power is restored, **in order**, from `store` at the next boot -
+    /// `docs/PRODUCTION-ROADMAP.md` §7.2/§7.4 (E2.8, E4.3). `store` may be built over
+    /// [`crate::hardware::NoStorage`], in which case this behaves exactly like
+    /// [`Self::security_events`].
+    pub async fn security_events_persisted<N, S>(mut self, csms: &N, store: QueueStore<S>) -> Self
+    where
+        N: SecurityEventNotifier + ReconnectHandler + Clone + Send + Sync + 'static,
+        S: crate::hardware::Storage + Send + Sync + 'static,
+    {
+        let Some(security_events) = self.take_security_events() else {
+            return self;
+        };
+
+        // `DropOldest` (the default), same reasoning as `Self::security_events`.
+        let security_queue = Arc::new(OfflineQueue::new());
+        // Restore before any live traffic is wired up - so an event that arrives during start-up
+        // can never be delivered ahead of an older one the backlog restores.
+        restore_security_event_queue(&security_queue, &store).await;
+        let store = Arc::new(store);
+        let forwarder_queue = security_queue.clone();
+        let forwarder_store = store.clone();
+        let forwarder_csms = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            run_persisted_security_event_queue(
+                security_events,
+                &forwarder_queue,
+                &forwarder_store,
+                move |event| {
+                    let notifier = forwarder_csms.clone();
+                    async move {
+                        notifier
+                            .notify_security_event(&event.event_type, event.tech_info.as_deref())
+                            .await
+                    }
+                },
+                // Deliberately does NOT call `report_memory_exhaustion` here, same reason as
+                // `Self::security_events` - see the comment at that call site.
+                move |dropped: SecurityEvent| async move {
+                    tracing::error!(
+                        event_type = ?dropped.event_type,
+                        "offline security-event queue overflowed; dropping the oldest queued \
+                         security event notification rather than risk an unbounded feedback loop \
+                         by reporting MemoryExhaustion through this same queue"
+                    );
+                },
+            )
+            .await;
+        }));
+        let reconnect_csms = csms.clone();
+        csms.register_reconnect_handler(move || {
+            let queue = security_queue.clone();
+            let store = store.clone();
+            let csms = reconnect_csms.clone();
+            async move {
+                flush_and_persist_security_event_queue(&queue, &store, move |event| {
                     let notifier = csms.clone();
                     async move {
                         notifier
@@ -1173,6 +1335,61 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A [`TestEvse`] with two connectors instead of one - used by tests that need two distinct
+    /// `(evse_id, connector_id)` addresses on the same charge point (e.g. to drive two
+    /// independent status changes without either one deduping the other away).
+    pub(crate) struct TestEvseWithTwoConnectors {
+        pub(crate) connectors: [TestConnector; 2],
+    }
+
+    #[async_trait::async_trait]
+    impl Evse<TestConnector> for TestEvseWithTwoConnectors {
+        type Error = TestConnectorError;
+
+        async fn connectors(&self) -> &[TestConnector] {
+            &self.connectors
+        }
+
+        async fn reboot(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Like [`IdleTestChargePoint`], but with two connectors on its one EVSE - see
+    /// [`TestEvseWithTwoConnectors`].
+    pub(crate) struct IdleTwoConnectorTestChargePoint {
+        pub(crate) evses: [TestEvseWithTwoConnectors; 1],
+    }
+
+    #[async_trait::async_trait]
+    impl ChargePoint<TestEvseWithTwoConnectors, TestConnector> for IdleTwoConnectorTestChargePoint {
+        type StartError = Infallible;
+
+        async fn vendor_name(&self) -> &str {
+            "Test vendor"
+        }
+
+        async fn model_name(&self) -> &str {
+            "Test model"
+        }
+
+        async fn evses(&self) -> &[TestEvseWithTwoConnectors] {
+            &self.evses
+        }
+
+        async fn capabilities(&self) -> crate::hardware::Capabilities {
+            crate::hardware::Capabilities::default()
+        }
+
+        async fn start(
+            &self,
+            _events: HardwareEventSender,
+            _commands: HardwareCommandReceiver,
+        ) -> Result<(), Self::StartError> {
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
     impl Connector for TestConnector {
         type Error = TestConnectorError;
@@ -1210,11 +1427,17 @@ mod tests {
     use super::ChargePointBuilder;
     use super::test_support::{TestChargePoint, TestConnector, TestEvse};
     use crate::executor::TokioExecutor;
+    use crate::hardware::{InMemoryStorage, NoStorage};
+    use crate::persistence::QueueStore;
     use crate::provisioning::BootNotificationOutcome;
     use crate::provisioning::TokioBackoff;
     use crate::provisioning::test_support::FixedBootNotifier;
-    use crate::state::{BootReasonCause, ConnectorState, RegistrationStatus};
+    use crate::security::{SecurityEventNotifier, report_security_event};
+    use crate::state::{BootReasonCause, ConnectorState, RegistrationStatus, SecurityEvent};
+    use alloc::boxed::Box;
     use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, Ordering};
 
     fn accepted_boot_notifier() -> FixedBootNotifier {
@@ -1415,6 +1638,614 @@ mod tests {
         // Exactly one StatusNotification per status change: the repeat `status_notifications`
         // registration must not have spawned a second forwarder.
         assert_eq!(calls.load(Ordering::SeqCst) - before, 1);
+    }
+
+    type BoxedReconnectCallback =
+        Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+    /// What [`FlakyStatusCsms::notify_status`] delivered - `(evse_id, connector_id, status,
+    /// connector_state)` - factored into a named alias per `clippy::type_complexity`.
+    type DeliveredStatus = (usize, usize, crate::state::ConnectorStatus, ConnectorState);
+
+    /// A `StatusNotifier` + `ReconnectHandler` fake whose `notify_status` fails or succeeds
+    /// depending on `should_fail`, and whose "reconnect" fires only when a test calls
+    /// `fire_reconnect` - standing in for `ocpp-client`'s real reconnect signal (a dropped and
+    /// restored WebSocket), mirroring `crate::connection::tests::FakeReconnectingClient`. Used to
+    /// drive `status_notifications_persisted`'s end-to-end reboot-survival test: `should_fail` is
+    /// set while the connection is "down", so every delivery attempt is queued and persisted
+    /// rather than lost.
+    #[derive(Clone, Default)]
+    struct FlakyStatusCsms {
+        should_fail: Arc<AtomicBool>,
+        delivered: Arc<std::sync::Mutex<alloc::vec::Vec<DeliveredStatus>>>,
+        callback: Arc<tokio::sync::Mutex<Option<BoxedReconnectCallback>>>,
+    }
+
+    /// The error [`FlakyStatusCsms::notify_status`] and [`FlakySecurityCsms::notify_security_event`]
+    /// return while `should_fail` is set.
+    #[derive(Debug)]
+    struct FlakyCsmsError;
+
+    impl core::fmt::Display for FlakyCsmsError {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("flaky test CSMS refused the request")
+        }
+    }
+
+    impl core::error::Error for FlakyCsmsError {}
+
+    impl FlakyStatusCsms {
+        /// Fires whatever reconnect handler `status_notifications_persisted` registered, as if
+        /// the connection had just come back up.
+        async fn fire_reconnect(&self) {
+            let future = {
+                let mut lock = self.callback.lock().await;
+                let callback = lock.as_mut().expect("no reconnect handler registered");
+                callback()
+            };
+            future.await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::availability::StatusNotifier for FlakyStatusCsms {
+        type Error = FlakyCsmsError;
+
+        async fn notify_status(
+            &self,
+            evse_id: usize,
+            connector_id: usize,
+            status: crate::state::ConnectorStatus,
+            connector_state: ConnectorState,
+        ) -> Result<(), Self::Error> {
+            if self.should_fail.load(Ordering::SeqCst) {
+                return Err(FlakyCsmsError);
+            }
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((evse_id, connector_id, status, connector_state));
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connection::ReconnectHandler for FlakyStatusCsms {
+        async fn register_reconnect_handler<F, FF>(&self, mut callback: F)
+        where
+            F: FnMut() -> FF + Send + Sync + 'static,
+            FF: Future<Output = ()> + Send + 'static,
+        {
+            let mut lock = self.callback.lock().await;
+            *lock = Some(Box::new(move || {
+                Box::pin(callback()) as Pin<Box<dyn Future<Output = ()> + Send>>
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn status_notifications_persisted_survives_a_reboot_and_replays_in_order() {
+        use super::test_support::{IdleTwoConnectorTestChargePoint, TestEvseWithTwoConnectors};
+
+        let storage = Arc::new(InMemoryStorage::new());
+
+        // --- before the cut: a cable connects on connector 0 (Available -> Occupied) while the
+        // CSMS connection is down - the resulting `StatusNotification` gets queued and persisted
+        // instead of lost. A *second* status change then happens on the very same connector while
+        // the first is still stuck in the queue (`LockConfirmed`, Connected -> Locked - still
+        // `Occupied`, so wire-visible to `ChargePointState` but not to a version whose own status
+        // doesn't distinguish it): this used to be the shape that lost data, because
+        // `DedupedStatusNotifier` recorded a status as sent as soon as it was *attempted*, even on
+        // a failed send - so retrying the first message would see its own already-cached status
+        // and be wrongly treated as a duplicate rather than re-attempted, and the genuinely new
+        // second message would be deduped against that same wrongly-cached entry too, vanishing
+        // both from the queue without either ever reaching the CSMS. `DedupedStatusNotifier` now
+        // only records an entry once `inner` actually accepts it, so this is exercised here
+        // rather than sidestepped: exactly one `StatusNotification` for connector 0 (the restored
+        // `Occupied`) must still reach the CSMS below, with the second, merely-internal transition
+        // correctly deduped away once delivery succeeds - not lost before it ever sends.
+        let charge_point1 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms1 = FlakyStatusCsms {
+            should_fail: Arc::new(AtomicBool::new(true)),
+            ..Default::default()
+        };
+        let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
+            .await
+            .unwrap()
+            .status_notifications_persisted(&csms1, QueueStore::new(storage.clone(), "status"))
+            .await;
+        builder1
+            .runtime
+            .actor()
+            .send(crate::state::ChargePointEvent::Evse {
+                evse_id: 0,
+                event: crate::state::EvseEvent::Connector {
+                    connector_id: 0,
+                    event: crate::state::ConnectorEvent::CableConnected,
+                },
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        // The second, same-connector, still-`Occupied` transition described above - queued right
+        // behind the first while the connection is still down.
+        builder1
+            .runtime
+            .actor()
+            .send(crate::state::ChargePointEvent::Evse {
+                evse_id: 0,
+                event: crate::state::EvseEvent::Connector {
+                    connector_id: 0,
+                    event: crate::state::ConnectorEvent::LockConfirmed,
+                },
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        drop(builder1);
+
+        // --- the cut: nothing but `storage` survives.
+
+        // --- after the reboot: a fresh charge point, with the CSMS connection now up from the
+        // start, restores the backlog into its queue and then raises one more, brand new status
+        // change (connector 1 faults) - each message's *first and only* delivery attempt this
+        // boot succeeds, so both are forwarded, in the order they were queued: the restored one
+        // first, then the new one.
+        let charge_point2 = IdleTwoConnectorTestChargePoint {
+            evses: [TestEvseWithTwoConnectors {
+                connectors: [
+                    TestConnector {
+                        locked: Arc::new(AtomicBool::new(false)),
+                        lock_succeeds: true,
+                    },
+                    TestConnector {
+                        locked: Arc::new(AtomicBool::new(false)),
+                        lock_succeeds: true,
+                    },
+                ],
+            }],
+        };
+        let csms2 = FlakyStatusCsms::default();
+        let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
+            .await
+            .unwrap()
+            .status_notifications_persisted(&csms2, QueueStore::new(storage.clone(), "status"))
+            .await
+            .build();
+        runtime2
+            .actor()
+            .send(crate::state::ChargePointEvent::Evse {
+                evse_id: 0,
+                event: crate::state::EvseEvent::Connector {
+                    connector_id: 1,
+                    event: crate::state::ConnectorEvent::FaultDetected,
+                },
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        let delivered = csms2.delivered.lock().unwrap().clone();
+        assert_eq!(
+            delivered.len(),
+            2,
+            "both the restored and the new status change arrived"
+        );
+        assert_eq!(
+            delivered[0],
+            (
+                0,
+                0,
+                crate::state::ConnectorStatus::Occupied,
+                ConnectorState::Connected
+            ),
+            "the restored status change is delivered first"
+        );
+        assert_eq!(
+            delivered[1],
+            (
+                0,
+                1,
+                crate::state::ConnectorStatus::Faulted,
+                ConnectorState::Faulted
+            ),
+            "the newly raised status change is delivered second, preserving queue order"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_notifications_persisted_flushes_the_backlog_on_reconnect() {
+        // Complements `status_notifications_persisted_survives_a_reboot_and_replays_in_order`,
+        // which proves the restored backlog is delivered once a *new* status change arrives.
+        // This proves the other trigger `status_notifications_persisted` wires up - the
+        // `ReconnectHandler` callback - actually flushes (and re-persists) the queue too, using
+        // `FlakyStatusCsms::fire_reconnect`.
+        let storage = Arc::new(InMemoryStorage::new());
+
+        let charge_point1 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms1 = FlakyStatusCsms {
+            should_fail: Arc::new(AtomicBool::new(true)),
+            ..Default::default()
+        };
+        let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
+            .await
+            .unwrap()
+            .status_notifications_persisted(&csms1, QueueStore::new(storage.clone(), "status"))
+            .await;
+        builder1
+            .runtime
+            .actor()
+            .send(crate::state::ChargePointEvent::Evse {
+                evse_id: 0,
+                event: crate::state::EvseEvent::Connector {
+                    connector_id: 0,
+                    event: crate::state::ConnectorEvent::CableConnected,
+                },
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        drop(builder1);
+
+        let charge_point2 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms2 = FlakyStatusCsms::default();
+        let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
+            .await
+            .unwrap()
+            .status_notifications_persisted(&csms2, QueueStore::new(storage.clone(), "status"))
+            .await
+            .build();
+        let _ = &runtime2;
+        csms2.fire_reconnect().await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            csms2.delivered.lock().unwrap().clone(),
+            alloc::vec![(
+                0,
+                0,
+                crate::state::ConnectorStatus::Occupied,
+                ConnectorState::Connected
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn registering_status_notifications_persisted_twice_forwards_each_status_change_once() {
+        // Mirrors `registering_status_notifications_twice_forwards_each_status_change_once`
+        // exactly, but through the persisted registration method - the repeat registration must
+        // still be a no-op, not a second forwarder.
+        let (charge_point, _locked) = test_charge_point(true);
+        let calls = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let csms = CountingStatusCsms {
+            calls: calls.clone(),
+        };
+
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .status_notifications_persisted(&csms, QueueStore::new(NoStorage, "status"))
+            .await
+            .status_notifications_persisted(&csms, QueueStore::new(NoStorage, "status"))
+            .await
+            .build();
+
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let before = calls.load(Ordering::SeqCst);
+
+        runtime
+            .actor()
+            .send(crate::state::ChargePointEvent::Evse {
+                evse_id: 0,
+                event: crate::state::EvseEvent::Connector {
+                    connector_id: 0,
+                    event: crate::state::ConnectorEvent::FaultDetected,
+                },
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst) - before, 1);
+    }
+
+    /// A `SecurityEventNotifier` + `ReconnectHandler` fake, otherwise identical to
+    /// [`FlakyStatusCsms`] - see that type's docs. Used to drive
+    /// `security_events_persisted`'s end-to-end reboot-survival test.
+    #[derive(Clone, Default)]
+    struct FlakySecurityCsms {
+        should_fail: Arc<AtomicBool>,
+        delivered: Arc<std::sync::Mutex<alloc::vec::Vec<SecurityEvent>>>,
+        callback: Arc<tokio::sync::Mutex<Option<BoxedReconnectCallback>>>,
+    }
+
+    impl FlakySecurityCsms {
+        async fn fire_reconnect(&self) {
+            let future = {
+                let mut lock = self.callback.lock().await;
+                let callback = lock.as_mut().expect("no reconnect handler registered");
+                callback()
+            };
+            future.await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SecurityEventNotifier for FlakySecurityCsms {
+        type Error = FlakyCsmsError;
+
+        async fn notify_security_event(
+            &self,
+            event_type: &crate::state::SecurityEventType,
+            tech_info: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            if self.should_fail.load(Ordering::SeqCst) {
+                return Err(FlakyCsmsError);
+            }
+            self.delivered.lock().unwrap().push(SecurityEvent {
+                event_type: event_type.clone(),
+                tech_info: tech_info.map(alloc::string::ToString::to_string),
+            });
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connection::ReconnectHandler for FlakySecurityCsms {
+        async fn register_reconnect_handler<F, FF>(&self, mut callback: F)
+        where
+            F: FnMut() -> FF + Send + Sync + 'static,
+            FF: Future<Output = ()> + Send + 'static,
+        {
+            let mut lock = self.callback.lock().await;
+            *lock = Some(Box::new(move || {
+                Box::pin(callback()) as Pin<Box<dyn Future<Output = ()> + Send>>
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn security_events_persisted_survives_a_reboot_and_replays_in_order() {
+        let storage = Arc::new(InMemoryStorage::new());
+
+        let first = SecurityEvent {
+            event_type: crate::state::SecurityEventType::TamperDetectionActivated,
+            tech_info: Some("door switch tripped".into()),
+        };
+        let second = SecurityEvent {
+            event_type: crate::state::SecurityEventType::Other("VendorThing".into()),
+            tech_info: None,
+        };
+
+        // --- before the cut: two security events raised while the CSMS connection is down - both
+        // get queued and persisted instead of lost.
+        let charge_point1 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms1 = FlakySecurityCsms {
+            should_fail: Arc::new(AtomicBool::new(true)),
+            ..Default::default()
+        };
+        let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
+            .await
+            .unwrap()
+            .security_events_persisted(&csms1, QueueStore::new(storage.clone(), "security"))
+            .await;
+        report_security_event(&builder1.runtime.actor(), first.clone()).await;
+        report_security_event(&builder1.runtime.actor(), second.clone()).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        drop(builder1);
+
+        // --- the cut: nothing but `storage` survives.
+
+        // --- after the reboot: a fresh charge point restores the backlog and delivers it, in
+        // order, once the connection is confirmed back up via `fire_reconnect`.
+        let charge_point2 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms2 = FlakySecurityCsms::default();
+        let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
+            .await
+            .unwrap()
+            .security_events_persisted(&csms2, QueueStore::new(storage.clone(), "security"))
+            .await
+            .build();
+        let _ = &runtime2;
+        csms2.fire_reconnect().await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            csms2.delivered.lock().unwrap().clone(),
+            alloc::vec![first, second]
+        );
+    }
+
+    /// A `SecurityEventNotifier` + `ReconnectHandler` fake counting every `notify_security_event`
+    /// call it receives - the security equivalent of [`CountingStatusCsms`], used to prove that
+    /// registering `security_events_persisted` twice results in exactly one
+    /// SecurityEventNotification per raised event, not two.
+    #[derive(Clone, Default)]
+    struct CountingSecurityCsms {
+        calls: Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SecurityEventNotifier for CountingSecurityCsms {
+        type Error = core::convert::Infallible;
+
+        async fn notify_security_event(
+            &self,
+            _event_type: &crate::state::SecurityEventType,
+            _tech_info: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connection::ReconnectHandler for CountingSecurityCsms {
+        async fn register_reconnect_handler<F, FF>(&self, _callback: F)
+        where
+            F: FnMut() -> FF + Send + Sync + 'static,
+            FF: Future<Output = ()> + Send + 'static,
+        {
+            // No transport to reconnect in this fixture - nothing to register against.
+        }
+    }
+
+    #[tokio::test]
+    async fn registering_security_events_persisted_twice_reports_each_event_once() {
+        let charge_point = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms = CountingSecurityCsms::default();
+
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .security_events_persisted(&csms, QueueStore::new(NoStorage, "security"))
+            .await
+            .security_events_persisted(&csms, QueueStore::new(NoStorage, "security"))
+            .await
+            .build();
+
+        report_security_event(
+            &runtime.actor(),
+            SecurityEvent {
+                event_type: crate::state::SecurityEventType::TamperDetectionActivated,
+                tech_info: None,
+            },
+        )
+        .await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        // Exactly one SecurityEventNotification for the one raised event: the repeat
+        // `security_events_persisted` registration must not have spawned a second forwarder.
+        assert_eq!(csms.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn security_events_persisted_overflow_does_not_raise_memory_exhaustion() {
+        // Guards the single most important behaviour `security_events_persisted` must carry over
+        // from `security_events`: unlike the status/transaction queues, this queue's overflow
+        // handler must NOT raise a `MemoryExhaustion` security event, since that event would feed
+        // straight back into this same queue and, if it's already full, overflow again - an
+        // unbounded loop.
+        let charge_point = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms = FlakySecurityCsms {
+            should_fail: Arc::new(AtomicBool::new(true)),
+            ..Default::default()
+        };
+
+        let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap();
+        // An independent observer subscription, alongside the one
+        // `security_events_persisted` consumes below - so this test sees every real security
+        // event raised on the actor, including any `MemoryExhaustion` the overflow handler might
+        // (incorrectly) raise.
+        let mut observer = builder.runtime.subscribe_security_events();
+
+        let runtime = builder
+            .security_events_persisted(&csms, QueueStore::new(NoStorage, "security"))
+            .await
+            .build();
+
+        // The queue's default capacity is `crate::offline_queue::DEFAULT_CAPACITY` (100); with
+        // the CSMS connection down for the whole test, nothing ever drains, so the 101st raised
+        // event overflows it exactly once.
+        for i in 0..(crate::offline_queue::DEFAULT_CAPACITY + 1) {
+            report_security_event(
+                &runtime.actor(),
+                SecurityEvent {
+                    event_type: crate::state::SecurityEventType::Other(alloc::format!("event-{i}")),
+                    tech_info: None,
+                },
+            )
+            .await;
+        }
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut seen_memory_exhaustion = false;
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(core::time::Duration::from_millis(50), observer.recv()).await
+        {
+            if event.event_type == crate::state::SecurityEventType::MemoryExhaustion {
+                seen_memory_exhaustion = true;
+            }
+        }
+        assert!(
+            !seen_memory_exhaustion,
+            "the security-event queue's own overflow must never raise MemoryExhaustion - see \
+             `ChargePointBuilder::security_events_persisted`'s doc comment"
+        );
     }
 
     #[cfg(all(
