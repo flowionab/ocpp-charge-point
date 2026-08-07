@@ -260,6 +260,20 @@ pub enum ConnectorEvent {
     /// Charging has stopped (locally, remotely, or the EV finished) and the contactor should
     /// open. Not used for hardware-fault-driven stops - those go through `FaultDetected`.
     ChargingStopped(StopReason),
+    /// The **EV** stopped drawing energy while charging - a full battery, or a vehicle-side pause.
+    /// Drives the connector into
+    /// [`ConnectorState::SuspendedEv`](crate::state::ConnectorState::SuspendedEv) and the
+    /// transaction's charging state to match, ending neither. Pushed in by the hardware binding,
+    /// which is the only thing that can tell which side stopped drawing
+    /// (`docs/PRODUCTION-ROADMAP.md` B1.5).
+    ChargingSuspendedByEv,
+    /// The **EVSE** stopped supplying energy while charging - a smart-charging limit of 0 A, load
+    /// management, or a local supply constraint. Drives the connector into
+    /// [`ConnectorState::SuspendedEvse`](crate::state::ConnectorState::SuspendedEvse).
+    ChargingSuspendedByEvse,
+    /// Energy is flowing again after a suspension from either side. A no-op on a connector that
+    /// isn't suspended.
+    ChargingResumed,
     /// Hardware sampled a meter reading. Reported to the CSMS (via the active transaction's
     /// next TransactionEvent) only while the connector is actually `Charging`; ignored
     /// otherwise. See `docs/ROADMAP.md` §10.

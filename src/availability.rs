@@ -1347,6 +1347,10 @@ mod ocpp_1_6 {
     /// dedicated 1.6J status (1.6J has no Authorize-before-charging step baked into connector
     /// status the way this crate's state machine does) so it maps to `Preparing`, the same as
     /// `Connected`/`Locked` - all three mean "occupied, not charging yet".
+    ///
+    /// `SuspendedEV`/`SuspendedEVSE` are the two statuses this mapping could not produce before
+    /// B1.5, because the connector state machine had no way to distinguish which side stopped the
+    /// energy flow. It does now, and 1.6J is the version that can say so directly.
     pub(super) fn map_status(state: ConnectorState) -> StatusNotificationRequestStatus {
         match state {
             ConnectorState::Available => StatusNotificationRequestStatus::Available,
@@ -1355,6 +1359,11 @@ mod ocpp_1_6 {
             | ConnectorState::Authorizing
             | ConnectorState::Starting => StatusNotificationRequestStatus::Preparing,
             ConnectorState::Charging => StatusNotificationRequestStatus::Charging,
+            // The one place 1.6J is *richer* than 2.x's connector status: it has wire statuses for
+            // which side paused the energy flow, where 2.x moved that onto the transaction's
+            // `chargingState`. B1.5's whole point is that this crate now knows the difference.
+            ConnectorState::SuspendedEv => StatusNotificationRequestStatus::SuspendedEV,
+            ConnectorState::SuspendedEvse => StatusNotificationRequestStatus::SuspendedEVSE,
             ConnectorState::Stopping | ConnectorState::Finishing | ConnectorState::Unlocking => {
                 StatusNotificationRequestStatus::Finishing
             }
@@ -1455,6 +1464,16 @@ mod ocpp_1_6 {
             assert_eq!(
                 map_status(ConnectorState::Charging),
                 StatusNotificationRequestStatus::Charging
+            );
+            // The two statuses this mapping could not produce before B1.5 - 1.6J says which side
+            // paused the energy flow directly, where 2.x moved that onto the transaction.
+            assert_eq!(
+                map_status(ConnectorState::SuspendedEv),
+                StatusNotificationRequestStatus::SuspendedEV
+            );
+            assert_eq!(
+                map_status(ConnectorState::SuspendedEvse),
+                StatusNotificationRequestStatus::SuspendedEVSE
             );
             assert_eq!(
                 map_status(ConnectorState::Stopping),

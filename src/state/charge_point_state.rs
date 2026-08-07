@@ -814,9 +814,30 @@ fn advance_transaction(
             *slot = Some(transaction.clone());
             Some((TransactionEventKind::Started, transaction))
         }
-        (ConnectorState::Starting, ConnectorState::Charging) => {
+        // Every move between "energy is flowing" and "energy is paused, by one side or the
+        // other" is a charging-state change on the same running transaction - which is how 2.x
+        // expresses suspension at all (its connector status has no `SuspendedEV`; 1.6J's does,
+        // reported separately by that version's StatusNotification adapter). Reaching `Charging`
+        // from a suspended state is a resume, not a new transaction, so this arm covers all of
+        // them together rather than special-casing the first one.
+        (
+            ConnectorState::Starting
+            | ConnectorState::Charging
+            | ConnectorState::SuspendedEv
+            | ConnectorState::SuspendedEvse,
+            ConnectorState::Charging | ConnectorState::SuspendedEv | ConnectorState::SuspendedEvse,
+            // Only an actual move between those states counts. A connector can self-loop
+            // (`Charging` -> `Charging` when a meter sample is applied, say), and reporting a
+            // charging-state change for that would bump `seqNo` and send the CSMS an Updated event
+            // saying nothing changed.
+        ) if previous_state != new_state => {
+            let charging_state = match new_state {
+                ConnectorState::SuspendedEv => TransactionChargingState::SuspendedEV,
+                ConnectorState::SuspendedEvse => TransactionChargingState::SuspendedEVSE,
+                _ => TransactionChargingState::Charging,
+            };
             let transaction = slot.as_mut()?;
-            transaction.charging_state = TransactionChargingState::Charging;
+            transaction.charging_state = charging_state;
             transaction.seq_no += 1;
             Some((
                 TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged),
@@ -826,7 +847,13 @@ fn advance_transaction(
         // Normally reached only from `Charging` (`ChargingStopped`). A CSMS-initiated `Reset`
         // (Immediate) can also interrupt a transaction that's still `Starting` (contactor not
         // yet confirmed closed) - see `ConnectorEvent::ResetRequested`.
-        (ConnectorState::Charging | ConnectorState::Starting, ConnectorState::Stopping) => {
+        (
+            ConnectorState::Charging
+            | ConnectorState::SuspendedEv
+            | ConnectorState::SuspendedEvse
+            | ConnectorState::Starting,
+            ConnectorState::Stopping,
+        ) => {
             let transaction = slot.as_mut()?;
             transaction.stop_reason = event_stop_reason;
             None
@@ -2058,6 +2085,103 @@ mod tests {
             effect,
             ChargePointEffect::HardwareCommand(HardwareCommand::SetCurrentLimit { .. })
         )));
+    }
+
+    #[test]
+    fn suspending_and_resuming_reports_the_transactions_charging_state_each_way() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        for (event, expected) in [
+            (
+                ConnectorEvent::ChargingSuspendedByEv,
+                TransactionChargingState::SuspendedEV,
+            ),
+            (
+                ConnectorEvent::ChargingSuspendedByEvse,
+                TransactionChargingState::SuspendedEVSE,
+            ),
+            (
+                ConnectorEvent::ChargingResumed,
+                TransactionChargingState::Charging,
+            ),
+        ] {
+            let effects = apply_connector_event(&mut state, event);
+
+            let reported = effects
+                .iter()
+                .find_map(|effect| match effect {
+                    ChargePointEffect::TransactionEvent(occurred) => Some(occurred),
+                    _ => None,
+                })
+                .expect("a suspension or resume is a charging-state change on the transaction");
+            assert_eq!(
+                reported.kind,
+                TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged)
+            );
+            assert_eq!(reported.transaction.charging_state, expected);
+            // The transaction keeps running throughout - this is a pause, not a stop.
+            assert!(reported.transaction.stop_reason.is_none());
+            assert!(state.evses[0].transactions[0].is_some());
+        }
+    }
+
+    #[test]
+    fn a_suspension_reports_no_status_notification_change_to_2_x_but_does_report_the_transition() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ChargingSuspendedByEv);
+
+        // The coarse status stays `Occupied` (2.x has no suspended connector status), but the
+        // notification still carries the full `ConnectorState`, which is what lets the 1.6J
+        // adapter report `SuspendedEV` - see `ConnectorStatusChanged::connector_state`.
+        let status = effects
+            .iter()
+            .find_map(|effect| match effect {
+                ChargePointEffect::StatusNotification(changed) => Some(changed),
+                _ => None,
+            })
+            .expect("every connector transition reports a status notification");
+        assert_eq!(status.status, crate::state::ConnectorStatus::Occupied);
+        assert_eq!(status.connector_state, ConnectorState::SuspendedEv);
+    }
+
+    #[test]
+    fn a_meter_reading_while_suspended_is_still_recorded_against_the_transaction() {
+        // A suspended session is still a session: the meter register can move (standing losses,
+        // a trickle) and the reading must not be dropped just because energy isn't flowing.
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        apply_connector_event(&mut state, ConnectorEvent::ChargingSuspendedByEv);
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::MeterValueSampled(MeterSample {
+                energy_wh: 5_000,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(
+            state.evses[0].latest_meter_samples[0].map(|sample| sample.energy_wh),
+            Some(5_000)
+        );
     }
 
     #[test]

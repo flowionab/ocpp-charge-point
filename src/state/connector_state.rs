@@ -17,6 +17,19 @@ pub enum ConnectorState {
     Starting,
     /// The contactor is closed and energy is flowing.
     Charging,
+    /// The contactor is closed but the **EV** has stopped drawing energy - a full battery, or a
+    /// vehicle-side pause. The transaction is still running and the cable still locked; only the
+    /// energy flow has paused, and the EV can resume it on its own.
+    ///
+    /// Reported by the hardware binding, which is the only thing that can tell *which side*
+    /// stopped drawing (`docs/PRODUCTION-ROADMAP.md` B1.5). 1.6J has a wire status for this;
+    /// 2.x moved the distinction onto the transaction's `chargingState`, so both versions can
+    /// express it - see [`ConnectorStatus`] for why this crate's connector *status* cannot.
+    SuspendedEv,
+    /// The contactor is closed but the **EVSE** has stopped supplying energy - a smart-charging
+    /// limit of 0 A, load management, or a local supply constraint. The transaction is still
+    /// running; the charge point resumes it when whatever imposed the pause lifts.
+    SuspendedEvse,
     /// Charging has stopped and the contactor is opening; the cable is still locked.
     Stopping,
     /// The contactor is open and the connector has been unlocked; the cable may still be
@@ -62,6 +75,8 @@ impl ConnectorState {
             | Self::Authorizing
             | Self::Starting
             | Self::Charging
+            | Self::SuspendedEv
+            | Self::SuspendedEvse
             | Self::Stopping
             | Self::Finishing
             | Self::Unlocking => ConnectorStatus::Occupied,
@@ -91,9 +106,22 @@ impl ConnectorState {
             }
             (Self::Authorizing, ConnectorEvent::AuthorizationDenied) => (Self::Locked, None),
             (Self::Starting, ConnectorEvent::ContactorClosed) => (Self::Charging, None),
-            (Self::Charging, ConnectorEvent::ChargingStopped(_)) => {
-                (Self::Stopping, Some(ConnectorCommand::OpenContactor))
+            // Suspension is a pause *within* a running transaction, not a stop: the contactor
+            // stays closed and the cable stays locked, so the way out is either a resume or the
+            // same `ChargingStopped` path any charging connector takes.
+            (Self::Charging | Self::SuspendedEvse, ConnectorEvent::ChargingSuspendedByEv) => {
+                (Self::SuspendedEv, None)
             }
+            (Self::Charging | Self::SuspendedEv, ConnectorEvent::ChargingSuspendedByEvse) => {
+                (Self::SuspendedEvse, None)
+            }
+            (Self::SuspendedEv | Self::SuspendedEvse, ConnectorEvent::ChargingResumed) => {
+                (Self::Charging, None)
+            }
+            (
+                Self::Charging | Self::SuspendedEv | Self::SuspendedEvse,
+                ConnectorEvent::ChargingStopped(_),
+            ) => (Self::Stopping, Some(ConnectorCommand::OpenContactor)),
             // A CSMS-initiated `Reset` (Immediate) interrupts any state where a cable is
             // engaged, reusing the exact same fail-safe stop (open contactor, then unlock via
             // `Stopping`/`Finishing`) as a normal charging stop rather than a parallel path
@@ -106,7 +134,9 @@ impl ConnectorState {
                 | Self::Locked
                 | Self::Authorizing
                 | Self::Starting
-                | Self::Charging,
+                | Self::Charging
+                | Self::SuspendedEv
+                | Self::SuspendedEvse,
                 ConnectorEvent::ResetRequested,
             ) => (Self::Stopping, Some(ConnectorCommand::OpenContactor)),
             (Self::Stopping, ConnectorEvent::ContactorOpened) => {
@@ -131,5 +161,139 @@ impl ConnectorState {
         let changed = *self != next;
         *self = next;
         ConnectorTransition { changed, command }
+    }
+}
+
+#[cfg(test)]
+mod suspension_tests {
+    use super::*;
+    use crate::state::{ConnectorStatus, StopReason};
+
+    fn charging() -> ConnectorState {
+        ConnectorState::Charging
+    }
+
+    #[test]
+    fn either_side_can_suspend_charging_and_resume_it() {
+        let mut connector = charging();
+
+        let transition = connector.apply(ConnectorEvent::ChargingSuspendedByEv);
+        assert!(transition.changed);
+        assert_eq!(connector, ConnectorState::SuspendedEv);
+        // Suspension is a pause, not a stop: nothing is asked of the contactor.
+        assert!(transition.command.is_none());
+
+        assert!(connector.apply(ConnectorEvent::ChargingResumed).changed);
+        assert_eq!(connector, ConnectorState::Charging);
+
+        assert!(
+            connector
+                .apply(ConnectorEvent::ChargingSuspendedByEvse)
+                .changed
+        );
+        assert_eq!(connector, ConnectorState::SuspendedEvse);
+        assert!(connector.apply(ConnectorEvent::ChargingResumed).changed);
+        assert_eq!(connector, ConnectorState::Charging);
+    }
+
+    #[test]
+    fn a_suspension_can_change_sides_without_passing_through_charging() {
+        // The EV stops drawing, then the EVSE cuts supply too (or the reverse) - a real sequence,
+        // and reporting a spurious "charging" in between would be wrong.
+        let mut connector = charging();
+        connector.apply(ConnectorEvent::ChargingSuspendedByEv);
+
+        assert!(
+            connector
+                .apply(ConnectorEvent::ChargingSuspendedByEvse)
+                .changed
+        );
+        assert_eq!(connector, ConnectorState::SuspendedEvse);
+
+        assert!(
+            connector
+                .apply(ConnectorEvent::ChargingSuspendedByEv)
+                .changed
+        );
+        assert_eq!(connector, ConnectorState::SuspendedEv);
+    }
+
+    #[test]
+    fn resuming_a_connector_that_is_not_suspended_does_nothing() {
+        let mut connector = ConnectorState::Locked;
+        let transition = connector.apply(ConnectorEvent::ChargingResumed);
+        assert!(!transition.changed);
+        assert_eq!(connector, ConnectorState::Locked);
+    }
+
+    #[test]
+    fn a_suspended_connector_stops_through_the_same_path_a_charging_one_does() {
+        for suspended in [
+            ConnectorEvent::ChargingSuspendedByEv,
+            ConnectorEvent::ChargingSuspendedByEvse,
+        ] {
+            let mut connector = charging();
+            connector.apply(suspended);
+
+            let transition = connector.apply(ConnectorEvent::ChargingStopped(StopReason::Local));
+
+            assert_eq!(connector, ConnectorState::Stopping);
+            assert!(matches!(
+                transition.command,
+                Some(ConnectorCommand::OpenContactor)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_suspended_connector_still_faults_and_still_resets_fail_safe() {
+        let mut connector = charging();
+        connector.apply(ConnectorEvent::ChargingSuspendedByEv);
+        let transition = connector.apply(ConnectorEvent::FaultDetected);
+        assert_eq!(connector, ConnectorState::Faulted);
+        assert!(matches!(
+            transition.command,
+            Some(ConnectorCommand::OpenContactor)
+        ));
+
+        let mut connector = charging();
+        connector.apply(ConnectorEvent::ChargingSuspendedByEvse);
+        let transition = connector.apply(ConnectorEvent::ResetRequested);
+        assert_eq!(connector, ConnectorState::Stopping);
+        assert!(matches!(
+            transition.command,
+            Some(ConnectorCommand::OpenContactor)
+        ));
+    }
+
+    #[test]
+    fn a_suspended_connector_is_still_occupied_to_2_x() {
+        // 2.x's connector status has no suspended value at all - it moved the distinction onto
+        // the transaction's chargingState - so both suspended states must stay `Occupied` here.
+        assert_eq!(
+            ConnectorState::SuspendedEv.availability_status(),
+            ConnectorStatus::Occupied
+        );
+        assert_eq!(
+            ConnectorState::SuspendedEvse.availability_status(),
+            ConnectorStatus::Occupied
+        );
+    }
+
+    #[test]
+    fn charging_cannot_be_suspended_before_it_starts() {
+        for state in [
+            ConnectorState::Locked,
+            ConnectorState::Authorizing,
+            ConnectorState::Starting,
+        ] {
+            let mut connector = state;
+            assert!(
+                !connector
+                    .apply(ConnectorEvent::ChargingSuspendedByEv)
+                    .changed
+            );
+            assert_eq!(connector, state);
+        }
     }
 }

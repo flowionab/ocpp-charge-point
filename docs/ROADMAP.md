@@ -114,9 +114,9 @@ Not a functional block, but a prerequisite for all of them.
   reads the richer `ConnectorState` directly (not the already-collapsed
   `ConnectorStatus`) to produce 1.6J's fuller status enum
   (`Preparing`/`Charging`/`Finishing`/`Unavailable`/`Faulted`/
-  `Reserved`/`Available` - `SuspendedEV`/`SuspendedEVSE` have no mapping
-  yet since nothing in this crate's connector state machine currently
-  distinguishes them).
+  `Reserved`/`Available`, and - since B1.5 - `SuspendedEV`/`SuspendedEVSE`,
+  which the connector state machine now distinguishes via
+  `ConnectorState::SuspendedEv`/`SuspendedEvse`).
 
   The emission-cadence gap this first landed with is now closed too:
   `ChargePointState::apply_connector_event` fires `StatusNotification`
@@ -1024,10 +1024,13 @@ Operational availability of charge point / EVSE / connector.
   exists, and OCPP's `Scheduled` status (deferring a `ChangeAvailability`
   until an in-progress transaction ends, rather than interrupting it) isn't
   modeled - `SetUnavailable` always applies immediately, even mid-transaction.
-- Version notes: status enum values differ between 1.6J and 2.0.1/2.1
-  (`Reserved`, `SuspendedEV`, `SuspendedEVSE` etc. only exist from 2.x
-  onward at connector level in some cases) — the internal enum must be a
-  superset that downgrades cleanly.
+- Version notes: status enum values differ between 1.6J and 2.0.1/2.1, and not
+  in the direction the old note here assumed: **1.6J is the richer one** for
+  suspension. It has `SuspendedEV`/`SuspendedEVSE` connector statuses, while
+  2.x dropped them from connector status and moved the distinction onto the
+  transaction's `chargingState`. This crate's `ConnectorState` carries the
+  distinction (B1.5) and each adapter reports it where its own version expects
+  it - 1.6J in the status, 2.x in the `TransactionEvent`.
 
 ## 8. Reservation
 

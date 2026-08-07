@@ -102,7 +102,7 @@ close — mostly missing one version each.
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: authorization cache, certificates, network profiles. |
-| Test suite | 🚧 | 684 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Test suite | 🚧 | 694 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -158,7 +158,7 @@ version.
 |---------|:----:|:-----:|:---:|-------|
 | BootNotification | ✅ | ✅ | ✅ | |
 | Heartbeat | ✅ | ✅ | ✅ | |
-| StatusNotification | ✅ | ✅ | ✅ | 1.6J needs `SuspendedEV`/`SuspendedEVSE` — the internal connector state machine can't distinguish them yet. |
+| StatusNotification | ✅ | ✅ | ✅ | |
 | Authorize | ✅ | ✅ | ✅ | |
 | StartTransaction / StopTransaction | ✅ | — | — | |
 | TransactionEvent | — | ✅ | ✅ | |
@@ -264,8 +264,35 @@ version.
       Registration is `ChargePointBuilder::trigger_message`, separate from `remote_control`:
       `TriggerMessage` needs a CSMS type that can *send* the triggered messages, and folding that
       bound into `remote_control` would force it on callers who only wanted `UnlockConnector`.
-- [ ] **B1.5** Distinguish `SuspendedEV` / `SuspendedEVSE` in
-      `ConnectorState`, and map them on all three versions.
+- [x] **B1.5** `ConnectorState` gained `SuspendedEv` and `SuspendedEvse`, reached from `Charging`
+      via new `ConnectorEvent::ChargingSuspendedByEv`/`ChargingSuspendedByEvse` and left via
+      `ChargingResumed` — pushed in by the hardware binding, which is the only thing that can tell
+      *which side* stopped the energy flow.
+
+      **Suspension is a pause inside a running transaction, not a stop.** The contactor stays
+      closed, the cable stays locked, and the transaction keeps its id and `seqNo`. A suspended
+      connector can also change sides directly (EV pauses, then the EVSE cuts supply too) without
+      passing through `Charging` — reporting a spurious "charging" in between would be wrong — and
+      still stops, faults and resets through exactly the paths a charging connector does, so no
+      fail-safe path gained a second variant to keep in step.
+
+      **The two versions express it in different places, which is the whole reason this needed a
+      connector-level distinction rather than a mapping.** 1.6J has wire statuses for it, so
+      `availability::ocpp_1_6::map_status` now produces `SuspendedEV`/`SuspendedEVSE` — the two
+      values it could never reach before. 2.x moved the distinction onto the transaction's
+      `chargingState`, so the connector *status* stays `Occupied` and
+      `advance_transaction` reports a `TransactionEvent(Updated, ChargingStateChanged)` carrying
+      `SuspendedEV`/`SuspendedEVSE` instead. `TransactionChargingState` already had both variants;
+      they were simply unreachable, and the 2.x adapters already mapped them.
+
+      One subtlety the tests pinned down: widening the charging-state arm to cover suspension made
+      it match `Charging` → `Charging` self-loops too (a meter sample applied mid-charge doesn't
+      change connector state), which bumped `seqNo` and would have sent the CSMS an `Updated`
+      event saying nothing had changed. Guarded on an actual state change; an existing test caught
+      it.
+
+      A meter reading taken while suspended is still recorded — a suspended session is still a
+      session, and the register can move.
 - [ ] **B1.6** Complete the 1.6J standard configuration key table —
       12 of ~46 aliased today; all *required* keys must be readable and the
       writable ones must take effect.
@@ -2045,5 +2072,5 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 26 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 684 | `#[test]` + `#[tokio::test]`, re-counted at the B1.3/B1.4 commit (672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 694 | `#[test]` + `#[tokio::test]`, re-counted at the B1.5 commit (684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |
