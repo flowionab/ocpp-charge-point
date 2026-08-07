@@ -33,16 +33,18 @@ use crate::hardware::{Capabilities, warn_on_feature_mismatches};
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
 use crate::offline_queue::{OfflineQueue, OverflowPolicy, run_with_offline_queue};
 use crate::persistence::{
-    BootReasonStore, ChargingProfileSnapshotStore, DeviceModelStore, LocalAuthorizationListStore,
-    QueueStore, ReservationStore, TransactionStore, flush_and_persist_security_event_queue,
-    flush_and_persist_status_notification_queue, flush_and_persist_transaction_event_queue,
+    AuthorizationCacheStore, BootReasonStore, ChargingProfileSnapshotStore, DeviceModelStore,
+    LocalAuthorizationListStore, QueueStore, ReservationStore, TransactionStore,
+    flush_and_persist_security_event_queue, flush_and_persist_status_notification_queue,
+    flush_and_persist_transaction_event_queue, restore_authorization_cache,
     restore_charging_profiles, restore_device_model, restore_local_authorization_list,
     restore_reservations, restore_security_event_queue, restore_security_log,
     restore_status_notification_queue, restore_transaction_event_queue, restore_transactions,
-    run_charging_profile_persistence, run_device_model_persistence,
-    run_local_authorization_list_persistence, run_persisted_security_event_queue,
-    run_persisted_status_notification_queue, run_persisted_transaction_event_queue,
-    run_reservation_persistence, run_security_log_persistence, run_transaction_persistence,
+    run_authorization_cache_persistence, run_charging_profile_persistence,
+    run_device_model_persistence, run_local_authorization_list_persistence,
+    run_persisted_security_event_queue, run_persisted_status_notification_queue,
+    run_persisted_transaction_event_queue, run_reservation_persistence,
+    run_security_log_persistence, run_transaction_persistence,
 };
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
 use crate::remote_control::{
@@ -298,6 +300,34 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self.executor.spawn(Box::pin(async move {
             crate::meter_values::run_aligned_meter_values(&notifier, &backoff, &clock, &actor)
                 .await;
+        }));
+
+        self
+    }
+
+    /// Registers durable authorization-cache state (`docs/PRODUCTION-ROADMAP.md` §7.2, E2.5):
+    /// recovers the decisions the CSMS had already made before the charge point last lost power,
+    /// then persists every subsequent change through `storage` for the life of the process.
+    ///
+    /// **Call this before [`Self::authorization`]**, so the cache is in place before anything can
+    /// present an identifier - the case this exists for is a charge point that reboots *while its
+    /// CSMS is unreachable*, where an empty cache means every card is refused until the link comes
+    /// back. `storage` may be [`crate::hardware::NoStorage`], in which case this behaves exactly
+    /// as if it were never called.
+    ///
+    /// Nothing is filtered by age at boot; entry expiry is evaluated at lookup instead - see
+    /// [`crate::persistence::restore_authorization_cache`] for why that is the correct place for
+    /// it.
+    pub async fn authorization_cache_persistence<S>(self, storage: S) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+    {
+        let store = Arc::new(AuthorizationCacheStore::new(storage));
+        restore_authorization_cache(&self.runtime.actor(), &store).await;
+
+        let state_changes = self.runtime.actor().subscribe();
+        self.executor.spawn(Box::pin(async move {
+            run_authorization_cache_persistence(state_changes, &store).await;
         }));
 
         self
@@ -2500,6 +2530,75 @@ mod tests {
         assert_eq!(
             restore_security_log(&restored_again, &SecurityLogStore::new(storage)).await,
             2
+        );
+    }
+
+    /// E2.5's end-to-end guarantee at the builder level: a charge point that reboots while its
+    /// CSMS is unreachable still recognises the cards it knew, and knows them *before* the
+    /// authorization block can be asked about one.
+    #[tokio::test]
+    async fn authorization_cache_persistence_survives_a_reboot_and_restores_before_authorization() {
+        use crate::authorization::offline_decision;
+        use crate::state::{AuthorizationStatus, ChargePointEvent, IdToken, IdTokenKind};
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let known = IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        };
+
+        // --- before the cut: the CSMS accepts a card while the charge point is online.
+        let charge_point1 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
+            .await
+            .unwrap()
+            .authorization_cache_persistence(storage.clone())
+            .await;
+        let _ = builder1
+            .runtime
+            .actor()
+            .send(ChargePointEvent::AuthorizationCached {
+                id_token: known.clone(),
+                status: AuthorizationStatus::Accepted,
+                cached_at: chrono::DateTime::from_timestamp(1_800_000_000, 0),
+            })
+            .await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        drop(builder1);
+
+        // --- after the reboot: the cache is back before anything could present an identifier.
+        let charge_point2 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
+            .await
+            .unwrap()
+            .authorization_cache_persistence(storage.clone())
+            .await
+            .build();
+
+        assert_eq!(
+            offline_decision(
+                &runtime2.actor().state(),
+                &known,
+                chrono::DateTime::from_timestamp(1_800_000_060, 0)
+            ),
+            AuthorizationStatus::Accepted,
+            "a card the CSMS accepted before the cut must still charge while it stays unreachable"
         );
     }
 

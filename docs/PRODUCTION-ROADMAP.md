@@ -101,8 +101,8 @@ close — mostly missing one version each.
 | `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. Until the [G3.1](#93-g3--time) follow-up, this held only for a build with *no version feature* — every OCPP adapter was `std`-gated dead code, so a bare-metal build could not actually speak OCPP. All three version adapters are now reachable without `std`. |
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
-| Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: authorization cache, certificates, network profiles. |
-| Test suite | 🚧 | 717 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the authorization cache, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: certificates, network profiles. |
+| Test suite | 🚧 | 725 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -266,9 +266,8 @@ version.
       caching is switched off entirely, where accepting would imply a cache this charge point is
       keeping clear.
 
-      **E2.5 (persisting the cache) is now unblocked** and is the natural follow-up: today the
-      cache is RAM-only, so a reboot loses exactly the decisions an offline charge point would
-      have needed.
+      Persisting the cache ([E2.5](#72-e2--what-must-survive)) followed immediately, so a reboot
+      no longer loses exactly the decisions an offline charge point would have needed.
 - [x] **B1.3 / B1.4** `TriggerMessage` wire adapters for all three versions, in
       `src/remote_control.rs` beside the protocol-agnostic `handle_trigger_message` that has been
       waiting for them. **B1.4's upstream dependency was already satisfied**: 2.1's
@@ -873,7 +872,7 @@ mid-transaction currently loses the transaction.
 | Transaction sequence numbers / `seqNo` | 2.x `TransactionEvent` ordering | R§5 |
 | Device model attributes marked `persistent` | Already flagged in the model, now acted on | R§2 |
 | Local authorization list + version number | Re-download after every boot is unacceptable offline | R§4 |
-| Authorization cache | Offline authorization — **now unblocked**: [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)'s cache exists, so E2.5 is ordinary work | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
+| Authorization cache | Offline authorization survives a reboot (`persistence::AuthorizationCacheStore`; `ChargePointBuilder::authorization_cache_persistence`) | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
 | Reservations | Survive a reboot inside the reservation window | R§8 |
 | Charging profiles | Load limits survive a reboot (`persistence::ChargingProfileSnapshotStore`; `ChargePointBuilder::charging_profile_persistence`) | [B2.1](#b2--smart-charging-r11) |
 | Offline message queue | All three queues now durable (`src/persistence.rs`; `ChargePointBuilder::transaction_events_persisted` / `status_notifications_persisted` / `security_events_persisted`) | [G2](#92-g2--bounded-memory) |
@@ -1133,11 +1132,36 @@ mid-transaction currently loses the transaction.
 - [ ] **E2.9, E2.11** Certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)) and network
       profiles ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle))
       remain blocked on functional blocks that don't exist yet.
-- [ ] **E2.5** Authorization cache. **No longer blocked** —
-      [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)'s cache landed, and
-      `ChargePointEvent::PersistedAuthorizationCacheRestored` is already in place for a restore to
-      use. Until it does, a reboot loses exactly the decisions an offline charge point would have
-      needed, which is the case the cache exists for.
+- [x] **E2.5** Authorization cache — `persistence::AuthorizationCacheStore`/
+      `restore_authorization_cache`/`run_authorization_cache_persistence`, wired via
+      `ChargePointBuilder::authorization_cache_persistence`. Unblocked by
+      [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) and closed
+      immediately after it, for the same reason [E2.7](#72-e2--what-must-survive) was: the gap it
+      left was precisely the case the feature exists for. A charge point that reboots *while its
+      CSMS is unreachable* would have come back refusing every card, including ones the CSMS had
+      already accepted minutes earlier.
+
+      One whole-cache JSON snapshot per change, versioned and discarded on decode failure or
+      version mismatch like every other record here. `AuthorizationCacheEntry` derives `serde`
+      directly rather than through a mirror type, matching `LocalListEntry` beside it: every field
+      is a scalar or an already-derived state type, so there is no closed wire enum for a mirror
+      to protect against drifting.
+
+      **Nothing is filtered by age at boot, deliberately** — unlike
+      [E2.6](#72-e2--what-must-survive)'s reservations and [E2.7](#72-e2--what-must-survive)'s
+      charging profiles. A cache entry's expiry is evaluated at *lookup* against
+      `AuthCacheCtrlr`/`LifeTime`, which is a non-persistent device-model variable back at its
+      default until the CSMS re-sends it; filtering at boot would apply whatever lifetime happens
+      to be configured *now* to decisions cached under a different one, and would need a clock the
+      charge point may not have. Expiry at lookup is correct either way.
+
+      `ClearCache` is a change like any other, so the cleared state is what persists: an operator
+      who cleared the cache does not get it back on the next boot. A restore beyond the configured
+      bound keeps the most recently authorized entries, dropping from the oldest end.
+
+      Ordering is load-bearing and asserted rather than documented and hoped for: register this
+      before `authorization`, and the builder test checks a card accepted before the cut still
+      authorizes after it — verified to fail when the restore call is removed.
 - [x] **E2.7** Charging profiles — `persistence::ChargingProfileSnapshotStore`/
       `restore_charging_profiles`/`run_charging_profile_persistence`, wired via
       `ChargePointBuilder::charging_profile_persistence`. Unblocked by
@@ -1972,13 +1996,13 @@ mid-transaction clock jumps.
 
 Three honest caveats, none of them a hole in the exit criteria:
 
-- **Three E2 rows remain RAM-only.** Two are still blocked on functional blocks that do not exist
-  yet: certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)) and network profiles
+- **Two E2 rows remain RAM-only**, both still blocked on functional blocks that do not exist yet:
+  certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)) and network profiles
   ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle)).
-  The third, the authorization cache ([E2.5](#72-e2--what-must-survive)), stopped being blocked
-  when [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) landed and is now
-  simply outstanding - the same shape charging profiles ([E2.7](#72-e2--what-must-survive)) was in
-  after B2, which was closed immediately rather than left behind a shipped block.
+  Every row whose block exists is durable: charging profiles
+  ([E2.7](#72-e2--what-must-survive)) landed with B2 and the authorization cache
+  ([E2.5](#72-e2--what-must-survive)) with B1.2, each closed immediately rather than left as a
+  durability gap behind a shipped block.
 - **Durability is opt-in per concern.** Every `*_persistence` / `*_persisted` registration on
   `ChargePointBuilder` is a separate call an integrator has to make; `setup()`'s
   "everything on" wrapper does not wire any of them, because it has no `Storage` to wire them
@@ -2116,5 +2140,5 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 27 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 717 | `#[test]` + `#[tokio::test]`, re-counted at the B1.2 commit (694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 725 | `#[test]` + `#[tokio::test]`, re-counted at the E2.5 commit (717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

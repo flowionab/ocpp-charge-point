@@ -48,10 +48,10 @@ use crate::hardware::{AtomicStorage, Storage};
 use crate::offline_queue::{OfflineQueue, flush_offline_queue};
 use crate::security::{SecurityEventLog, SecurityLogEntry};
 use crate::state::{
-    BootReasonCause, ChargePointEvent, ChargePointState, ChargingProfile, ChargingProfileId,
-    ChargingProfileKind, ChargingProfilePurpose, ChargingProfileScope, ChargingRateUnit,
-    ChargingSchedule, ChargingSchedulePeriod, Component, ConnectorState, ConnectorStatus,
-    ConnectorStatusChanged, InstalledChargingProfile, LocalListEntry, MeterSample,
+    AuthorizationCacheEntry, BootReasonCause, ChargePointEvent, ChargePointState, ChargingProfile,
+    ChargingProfileId, ChargingProfileKind, ChargingProfilePurpose, ChargingProfileScope,
+    ChargingRateUnit, ChargingSchedule, ChargingSchedulePeriod, Component, ConnectorState,
+    ConnectorStatus, ConnectorStatusChanged, InstalledChargingProfile, LocalListEntry, MeterSample,
     RecoveredDeviceModelAttribute, RecoveredReservation, RecoveredTransaction, RecurrencyKind,
     Reservation, SecurityEvent, SecurityEventType, Transaction, TransactionEventKind,
     TransactionEventOccurred, TransactionId, TransactionUpdateReason, Variable,
@@ -1385,6 +1385,177 @@ pub async fn flush_and_persist_security_event_queue<S, F, Fut, E>(
         queue, store, send,
     )
     .await
+}
+
+// --- authorization cache persistence (E2.5, docs/PRODUCTION-ROADMAP.md §7.2) ---
+
+/// The version stamped into every [`PersistedAuthorizationCache`] record. Independent of the
+/// other schema constants here - see [`SCHEMA_VERSION`]'s docs.
+pub const AUTH_CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// The key the whole authorization cache is written under - one whole-cache snapshot, for the
+/// same reason [`LOCAL_AUTH_LIST_KEY`] holds one whole list.
+const AUTH_CACHE_KEY: &str = "ocpp-cp/auth-cache";
+
+/// The authorization cache as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedAuthorizationCache {
+    /// The [`AUTH_CACHE_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// The cached decisions, least recently authorized first - the order
+    /// [`crate::state::AuthorizationCache`] evicts in, preserved so a restore keeps the same
+    /// eviction order the running charge point had.
+    pub entries: Vec<AuthorizationCacheEntry>,
+}
+
+/// A borrowing twin of [`PersistedAuthorizationCache`], mirroring [`SerializablePersistedQueue`]'s
+/// role.
+#[derive(serde::Serialize)]
+struct SerializablePersistedAuthorizationCache<'a> {
+    schema_version: u32,
+    entries: &'a [AuthorizationCacheEntry],
+}
+
+/// Reads and writes the authorization cache, as one whole-cache snapshot, through a [`Storage`].
+///
+/// Every method degrades rather than failing, exactly like [`TransactionStore`].
+#[derive(Debug, Clone)]
+pub struct AuthorizationCacheStore<S> {
+    storage: S,
+}
+
+impl<S: Storage> AuthorizationCacheStore<S> {
+    /// Creates a store over `storage`.
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Writes `entries` as the whole cache, replacing whatever snapshot was there. Returns whether
+    /// the write reached storage.
+    pub async fn save(&self, entries: &[AuthorizationCacheEntry]) -> bool {
+        let Ok(encoded) = serde_json::to_vec(&SerializablePersistedAuthorizationCache {
+            schema_version: AUTH_CACHE_SCHEMA_VERSION,
+            entries,
+        }) else {
+            tracing::error!("failed to encode the authorization cache for storage");
+            return false;
+        };
+        match self.storage.set(AUTH_CACHE_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist the authorization cache; offline authorization will not \
+                     survive a restart"
+                );
+                false
+            }
+        }
+    }
+
+    /// Reads back the persisted cache, least recently authorized first, or an empty `Vec` if there
+    /// is none, it can't be read, or it was written by an incompatible
+    /// [`AUTH_CACHE_SCHEMA_VERSION`] - discarded rather than guessed at, exactly like
+    /// [`TransactionStore::load`].
+    pub async fn load(&self) -> Vec<AuthorizationCacheEntry> {
+        let encoded = match self.storage.get(AUTH_CACHE_KEY).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read the persisted authorization cache; treating it as absent"
+                );
+                return Vec::new();
+            }
+        };
+        let record: PersistedAuthorizationCache = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "the persisted authorization cache could not be decoded; discarding it"
+                );
+                return Vec::new();
+            }
+        };
+        if record.schema_version != AUTH_CACHE_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = AUTH_CACHE_SCHEMA_VERSION,
+                "discarding a persisted authorization cache written by an incompatible schema \
+                 version"
+            );
+            return Vec::new();
+        }
+        record.entries
+    }
+}
+
+impl<S: Storage + Send + Sync> AuthorizationCacheStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does.
+    pub fn new_atomic(storage: S) -> Self {
+        AuthorizationCacheStore::new(AtomicStorage::new(storage))
+    }
+}
+
+/// Recovers the authorization cache the charge point had when it last lost power, and hands it to
+/// the state machine as a single [`ChargePointEvent::PersistedAuthorizationCacheRestored`].
+///
+/// Call this once at boot, **before** anything can present an identifier - the whole point is that
+/// a charge point which reboots while offline still recognises the cards it knew.
+///
+/// Unlike [`restore_reservations`] and [`restore_charging_profiles`], nothing is filtered by age
+/// here, and deliberately so: a cache entry's expiry is evaluated at *lookup* against
+/// `AuthCacheCtrlr`/`LifeTime`, which is itself a non-persistent device-model variable and is back
+/// at its default until the CSMS re-sends it. Filtering at boot would apply whatever lifetime
+/// happened to be configured *now* to decisions cached under a different one, and would need a
+/// clock this charge point may not have. Expiry at lookup handles it correctly either way.
+///
+/// Returns the number of entries handed to the state machine (the bound may still drop the oldest
+/// - see the event's docs).
+pub async fn restore_authorization_cache<S: Storage>(
+    actor: &ChargePointActor,
+    store: &AuthorizationCacheStore<S>,
+) -> usize {
+    let entries = store.load().await;
+    let recovered = entries.len();
+    if recovered > 0 {
+        tracing::info!(
+            count = recovered,
+            "recovering the authorization cache from durable storage"
+        );
+    }
+    let _ = actor
+        .send(ChargePointEvent::PersistedAuthorizationCacheRestored { entries })
+        .await;
+    recovered
+}
+
+/// Persists the authorization cache whenever it changes, forever.
+///
+/// Every change is written, with no debounce: the cache changes once per CSMS authorization
+/// decision - a card presented, not a meter sampled - which is nowhere near often enough for flash
+/// wear to be the binding concern. `ClearCache` is a change like any other, so an operator who
+/// clears the cache does not get it back on the next boot.
+pub async fn run_authorization_cache_persistence<S: Storage>(
+    mut state_changes: WatchReceiver<ChargePointState>,
+    store: &AuthorizationCacheStore<S>,
+) {
+    let mut last: Vec<AuthorizationCacheEntry> = Vec::new();
+    loop {
+        state_changes.changed().await;
+        let entries = state_changes
+            .borrow()
+            .authorization_cache
+            .entries()
+            .to_vec();
+        if entries != last {
+            store.save(&entries).await;
+            last = entries;
+        }
+    }
 }
 
 // --- charging profile persistence (E2.7, docs/PRODUCTION-ROADMAP.md §7.2) ---
@@ -3776,6 +3947,183 @@ mod tests {
         .await;
 
         assert_eq!(*delivered.lock().unwrap(), alloc::vec![first, second]);
+    }
+
+    // --- authorization cache persistence (E2.5) ---
+
+    fn cache_entry(value: &str, cached_at: Option<DateTime<Utc>>) -> AuthorizationCacheEntry {
+        AuthorizationCacheEntry {
+            id_token: IdToken {
+                value: value.into(),
+                kind: IdTokenKind::ISO14443,
+            },
+            status: crate::state::AuthorizationStatus::Accepted,
+            cached_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_authorization_cache_round_trips_through_storage() {
+        let store = AuthorizationCacheStore::new(InMemoryStorage::new());
+        let entries = alloc::vec![
+            cache_entry("A", DateTime::from_timestamp(1_800_000_000, 0)),
+            // An entry cached with no usable clock keeps its `None`, which is what makes it
+            // non-expiring - it must not acquire a timestamp on the way through storage.
+            cache_entry("B", None),
+        ];
+
+        assert!(store.save(&entries).await);
+        assert_eq!(store.load().await, entries);
+    }
+
+    #[tokio::test]
+    async fn an_authorization_cache_from_an_incompatible_schema_version_is_discarded() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = AuthorizationCacheStore::new(storage.clone());
+        let encoded = serde_json::to_vec(&PersistedAuthorizationCache {
+            schema_version: AUTH_CACHE_SCHEMA_VERSION + 1,
+            entries: alloc::vec![cache_entry("A", None)],
+        })
+        .unwrap();
+        storage.set(AUTH_CACHE_KEY, &encoded).await.unwrap();
+
+        assert_eq!(store.load().await, alloc::vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_authorization_cache_is_discarded_rather_than_panicking() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = AuthorizationCacheStore::new(storage.clone());
+        storage.set(AUTH_CACHE_KEY, b"not json").await.unwrap();
+
+        assert_eq!(store.load().await, alloc::vec![]);
+    }
+
+    /// The end-to-end guarantee E2.5 exists for: a charge point that reboots while its CSMS is
+    /// unreachable still recognises the cards it knew.
+    #[tokio::test]
+    async fn the_authorization_cache_survives_a_power_cut_and_still_answers_offline() {
+        use crate::executor::TokioExecutor;
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let known = IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        };
+
+        // --- before the cut: the CSMS accepts a card, and the decision is persisted.
+        let before = ChargePointActor::spawn([1], &TokioExecutor);
+        let store = AuthorizationCacheStore::new(storage.clone());
+        let state_changes = before.subscribe();
+        tokio::spawn(async move {
+            run_authorization_cache_persistence(state_changes, &store).await;
+        });
+        let _ = before
+            .send(ChargePointEvent::AuthorizationCached {
+                id_token: known.clone(),
+                status: crate::state::AuthorizationStatus::Accepted,
+                cached_at: DateTime::from_timestamp(1_800_000_000, 0),
+            })
+            .await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        drop(before);
+
+        // --- after the reboot, with the CSMS still unreachable: the card is still recognised.
+        let after = ChargePointActor::spawn([1], &TokioExecutor);
+        let store = AuthorizationCacheStore::new(storage.clone());
+        assert_eq!(restore_authorization_cache(&after, &store).await, 1);
+
+        assert_eq!(
+            crate::authorization::offline_decision(
+                &after.state(),
+                &known,
+                DateTime::from_timestamp(1_800_000_060, 0)
+            ),
+            crate::state::AuthorizationStatus::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_cache_is_persisted_too_rather_than_coming_back_on_the_next_boot() {
+        use crate::executor::TokioExecutor;
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let store = AuthorizationCacheStore::new(storage.clone());
+        let state_changes = actor.subscribe();
+        tokio::spawn(async move {
+            run_authorization_cache_persistence(state_changes, &store).await;
+        });
+
+        let _ = actor
+            .send(ChargePointEvent::AuthorizationCached {
+                id_token: IdToken {
+                    value: "A".into(),
+                    kind: IdTokenKind::ISO14443,
+                },
+                status: crate::state::AuthorizationStatus::Accepted,
+                cached_at: None,
+            })
+            .await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let _ = actor
+            .send(ChargePointEvent::AuthorizationCacheCleared)
+            .await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            AuthorizationCacheStore::new(storage).load().await,
+            alloc::vec![],
+            "an operator who cleared the cache must not have it back after a reboot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_cache_beyond_the_bound_keeps_the_most_recently_authorized_entries() {
+        use crate::executor::TokioExecutor;
+        use crate::state::StateLimits;
+
+        let store = AuthorizationCacheStore::new(InMemoryStorage::new());
+        store
+            .save(&alloc::vec![
+                cache_entry("oldest", None),
+                cache_entry("middle", None),
+                cache_entry("newest", None),
+            ])
+            .await;
+        let actor = ChargePointActor::spawn_with_limits(
+            [1],
+            &TokioExecutor,
+            StateLimits::default().with_max_authorization_cache_entries(2),
+        );
+
+        restore_authorization_cache(&actor, &store).await;
+
+        let values: Vec<String> = actor
+            .state()
+            .authorization_cache
+            .entries()
+            .iter()
+            .map(|entry| entry.id_token.value.clone())
+            .collect();
+        assert_eq!(values, alloc::vec!["middle", "newest"]);
+    }
+
+    #[tokio::test]
+    async fn a_charge_point_without_storage_recovers_no_authorization_cache() {
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let store = AuthorizationCacheStore::new(NoStorage);
+        store.save(&alloc::vec![cache_entry("A", None)]).await;
+
+        assert_eq!(restore_authorization_cache(&actor, &store).await, 0);
     }
 
     // --- charging profile persistence (E2.7) ---

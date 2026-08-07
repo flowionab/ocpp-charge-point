@@ -762,9 +762,12 @@ Deciding whether an identifier is allowed to start/continue charging.
   `AuthCacheCtrlr`/`Enabled` and `AuthCacheCtrlr`/`LifeTime` gating both. That
   is also the first thing that consults the local list at all (see §4).
   `ClearCache` is wired on all three versions. Still missing: group id tokens,
-  `idTokenInfo`'s richer fields (e.g. `evseId`-scoped validity), and persisting
-  the cache across a reboot (E2.5 - RAM-only today, so a restart loses exactly
-  the decisions an offline charge point would need).
+  `idTokenInfo`'s richer fields (e.g. `evseId`-scoped validity), The cache is durable
+  (`persistence::AuthorizationCacheStore`, wired via
+  `ChargePointBuilder::authorization_cache_persistence`), so a charge point that
+  reboots while its CSMS is unreachable still recognises the cards it knew;
+  entry expiry stays a lookup-time question rather than a boot-time filter,
+  since `AuthCacheCtrlr`/`LifeTime` is itself not persistent.
 - Version notes: 1.6J's `Authorize.req`/`.conf` maps closely; 2.1 adds
   richer `IdTokenInfo` (groups, restrictions) that must downgrade to
   1.6J's flatter `idTagInfo`.

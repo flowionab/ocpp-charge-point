@@ -34,7 +34,12 @@ use crate::state::{AuthorizationStatus, IdToken};
 pub const DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES: usize = 50;
 
 /// One remembered decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `serde`-derived directly rather than through a mirror type in [`crate::persistence`], like
+/// [`LocalListEntry`](crate::state::LocalListEntry) beside it: every field is either a scalar or
+/// another already-derived state type, so there is no closed wire enum here for a mirror to
+/// protect against drifting.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizationCacheEntry {
     /// The identifier the decision was about.
     pub id_token: IdToken,
