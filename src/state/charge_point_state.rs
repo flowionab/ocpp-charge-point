@@ -7,9 +7,10 @@ use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
     ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
-    IdToken, LocalAuthorizationList, MeterSample, PendingReset, RegistrationStatus, ResetKind,
-    ResetTarget, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
-    TransactionEventOccurred, TransactionId, TransactionUpdateReason,
+    IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, PendingReset, RegistrationStatus,
+    ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
+    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
+    TransactionUpdateReason,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -85,16 +86,31 @@ pub enum LifecycleState {
 impl ChargePointState {
     /// Creates a fresh charge point with one EVSE per entry in `connector_counts` (each value is
     /// that EVSE's connector count), starting in [`LifecycleState::Booting`] with no
-    /// registration, no transactions, and an empty local authorization list.
+    /// registration, no transactions, and an empty local authorization list. Uses this crate's
+    /// default [`StateLimits`]; see [`Self::with_limits`] to bound the growable collections
+    /// differently.
     pub fn new(connector_counts: impl IntoIterator<Item = usize>) -> Self {
+        Self::with_limits(connector_counts, StateLimits::default())
+    }
+
+    /// [`Self::new`] with caller-chosen maxima for the growable collections (the local
+    /// authorization list and the device model) - see [`StateLimits`] and
+    /// `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2). The limits are fixed for the life of the state;
+    /// nothing a CSMS or a hardware binding sends can raise them.
+    pub fn with_limits(
+        connector_counts: impl IntoIterator<Item = usize>,
+        limits: StateLimits,
+    ) -> Self {
         Self {
             lifecycle: LifecycleState::Booting,
             registration: None,
             evses: connector_counts.into_iter().map(EvseState::new).collect(),
             next_transaction_id: 0,
-            local_authorization_list: LocalAuthorizationList::new(),
+            local_authorization_list: LocalAuthorizationList::with_max_entries(
+                limits.max_local_authorization_list_entries,
+            ),
             pending_reset: None,
-            device_model: DeviceModel::new(),
+            device_model: DeviceModel::with_max_variables(limits.max_device_model_variables),
             capabilities: Capabilities::default(),
             time_sync: None,
         }
@@ -134,7 +150,7 @@ impl ChargePointState {
                 registration_changed || lifecycle_changed
             }
             ChargePointEvent::LocalListUpdated { version, entries } => {
-                self.local_authorization_list = LocalAuthorizationList { version, entries };
+                self.replace_local_authorization_list(version, entries, &mut effects);
                 true
             }
             ChargePointEvent::SecurityEventOccurred(event) => {
@@ -167,9 +183,12 @@ impl ChargePointState {
                     characteristics,
                     attributes,
                 } => {
+                    // `false` means the model is at its configured maximum and the registration
+                    // was refused (and logged) - reporting no change keeps that consistent with
+                    // every other no-op event, rather than waking subscribers for nothing. See
+                    // `DeviceModel::register` and `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2).
                     self.device_model
-                        .register(component, variable, characteristics, attributes);
-                    true
+                        .register(component, variable, characteristics, attributes)
                 }
                 DeviceModelEvent::AttributeValueSet {
                     component,
@@ -224,7 +243,7 @@ impl ChargePointState {
                 counter_changed || recovered_any
             }
             ChargePointEvent::PersistedLocalAuthorizationListRestored { version, entries } => {
-                self.local_authorization_list = LocalAuthorizationList { version, entries };
+                self.replace_local_authorization_list(version, entries, &mut effects);
                 true
             }
             ChargePointEvent::PersistedReservationsRestored { reservations } => {
@@ -490,6 +509,40 @@ impl ChargePointState {
     /// Every `evse_id` a [`ResetTarget`] covers - every EVSE, for
     /// [`ResetTarget::ChargePoint`], or the one addressed EVSE (if it exists) for
     /// [`ResetTarget::Evse`].
+    /// Replaces the local authorization list, enforcing its configured maximum (see
+    /// [`StateLimits::max_local_authorization_list_entries`]). Truncation means authorization
+    /// decisions the CSMS believes are cached have been silently dropped, so it raises a
+    /// `MemoryExhaustion` security event as well as logging - the same treatment a saturated
+    /// [`crate::offline_queue::OfflineQueue`] gets (G2.1), for the same reason: the CSMS is the
+    /// only party that can act on it.
+    ///
+    /// In practice this never truncates a live `SendLocalList` -
+    /// [`crate::local_authorization_list::handle_send_local_list`] refuses an over-long update
+    /// before it becomes an event. The reachable case is a list restored from durable storage that
+    /// was written by a build configured with a larger maximum.
+    fn replace_local_authorization_list(
+        &mut self,
+        version: i64,
+        entries: Vec<LocalListEntry>,
+        effects: &mut Vec<ChargePointEffect>,
+    ) {
+        let dropped = self.local_authorization_list.replace(version, entries);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                max_entries = self.local_authorization_list.max_entries,
+                "truncated the local authorization list to its configured maximum"
+            );
+            effects.push(ChargePointEffect::SecurityEventOccurred(SecurityEvent {
+                event_type: SecurityEventType::MemoryExhaustion,
+                tech_info: Some(alloc::format!(
+                    "dropped {dropped} local authorization list entries beyond the configured maximum of {}",
+                    self.local_authorization_list.max_entries
+                )),
+            }));
+        }
+    }
+
     fn target_evse_ids(&self, target: ResetTarget) -> Vec<usize> {
         match target {
             ResetTarget::ChargePoint => (0..self.evses.len()).collect(),
@@ -1465,6 +1518,124 @@ mod tests {
         assert_eq!(state.local_authorization_list.version, 1);
         assert_eq!(state.local_authorization_list.entries, alloc::vec![entry]);
         assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    /// G2.2 (docs/PRODUCTION-ROADMAP.md §9.2): the state machine is the last line of defence for
+    /// the local authorization list's bound - `handle_send_local_list` already rejects an
+    /// over-long CSMS update, so the only way to get here is a restore from durable storage
+    /// written by a build with a larger limit.
+    #[test]
+    fn a_local_list_update_beyond_the_maximum_is_truncated_and_reported_as_memory_exhaustion() {
+        let mut state = ChargePointState::with_limits(
+            [1],
+            StateLimits::default().with_max_local_authorization_list_entries(1),
+        );
+        let entries = alloc::vec![
+            crate::state::LocalListEntry {
+                id_token: test_id_token(),
+                status: crate::state::AuthorizationStatus::Accepted,
+            },
+            crate::state::LocalListEntry {
+                id_token: IdToken {
+                    value: "second".into(),
+                    kind: IdTokenKind::ISO14443,
+                },
+                status: crate::state::AuthorizationStatus::Accepted,
+            },
+        ];
+
+        let effects = state.apply(ChargePointEvent::LocalListUpdated {
+            version: 4,
+            entries: entries.clone(),
+        });
+
+        assert_eq!(
+            state.local_authorization_list.entries,
+            entries[..1].to_vec()
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ChargePointEffect::SecurityEventOccurred(event)
+                if event.event_type == crate::state::SecurityEventType::MemoryExhaustion
+        )));
+    }
+
+    #[test]
+    fn a_restored_local_list_beyond_the_maximum_is_truncated_too() {
+        let mut state = ChargePointState::with_limits(
+            [1],
+            StateLimits::default().with_max_local_authorization_list_entries(1),
+        );
+
+        let effects = state.apply(ChargePointEvent::PersistedLocalAuthorizationListRestored {
+            version: 9,
+            entries: alloc::vec![
+                crate::state::LocalListEntry {
+                    id_token: test_id_token(),
+                    status: crate::state::AuthorizationStatus::Accepted,
+                },
+                crate::state::LocalListEntry {
+                    id_token: IdToken {
+                        value: "second".into(),
+                        kind: IdTokenKind::ISO14443,
+                    },
+                    status: crate::state::AuthorizationStatus::Accepted,
+                },
+            ],
+        });
+
+        assert_eq!(state.local_authorization_list.entries.len(), 1);
+        assert_eq!(state.local_authorization_list.version, 9);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ChargePointEffect::SecurityEventOccurred(event)
+                if event.event_type == crate::state::SecurityEventType::MemoryExhaustion
+        )));
+    }
+
+    /// G2.2: the device model's bound applies to whatever a hardware binding registers during
+    /// `ChargePoint::start`, so a binding with a runaway registration loop can't grow state
+    /// without limit.
+    #[test]
+    fn registering_a_device_model_variable_beyond_the_maximum_is_refused() {
+        let mut state = ChargePointState::with_limits(
+            [1],
+            StateLimits::default().with_max_device_model_variables(1),
+        );
+        let before = state.device_model.len();
+
+        let effects = state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::VariableRegistered {
+                component: crate::state::Component {
+                    name: "Custom".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: "Setting".into(),
+                    instance: None,
+                },
+                characteristics: crate::state::VariableCharacteristics {
+                    data_type: crate::state::VariableDataType::String,
+                    unit: None,
+                    min_limit: None,
+                    max_limit: None,
+                    values_list: None,
+                    supports_monitoring: false,
+                },
+                attributes: alloc::vec![crate::state::VariableAttribute {
+                    attribute_type: crate::state::VariableAttributeType::Actual,
+                    value: "x".into(),
+                    mutability: crate::state::VariableMutability::ReadWrite,
+                    persistent: false,
+                    constant: false,
+                    requires_reboot: false,
+                }],
+            },
+        ));
+
+        assert_eq!(state.device_model.len(), before);
+        assert!(effects.is_empty());
     }
 
     #[test]

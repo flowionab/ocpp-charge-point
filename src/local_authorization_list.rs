@@ -27,10 +27,9 @@ pub enum LocalListUpdate {
 }
 
 /// The outcome of a CSMS-initiated `SendLocalList` request, matching (a subset of) OCPP's
-/// `SendLocalListStatusEnum`. The wire `Failed` value isn't reachable directly - the list is a
-/// plain in-memory `Vec`, so nothing about applying an update (once the version check passes)
-/// can fail - but 2.x's `SendLocalListStatusEnum` has no `NotSupported` variant, so
-/// [`NotSupported`](Self::NotSupported) maps to wire `Failed` there anyway (1.6J has a real
+/// `SendLocalListStatusEnum`. Wire `Failed` is reached two ways: directly by
+/// [`TooManyEntries`](Self::TooManyEntries), and - because 2.x's `SendLocalListStatusEnum` has no
+/// `NotSupported` variant - by [`NotSupported`](Self::NotSupported) under 2.0.1/2.1 (1.6J has a real
 /// `NotSupported` wire value and uses it). See `crate::refusal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendLocalListOutcome {
@@ -39,18 +38,32 @@ pub enum SendLocalListOutcome {
     /// A differential update whose `version` doesn't immediately follow the charge point's
     /// current version - only a full update may (re)set an arbitrary version.
     VersionMismatch,
+    /// The resulting list would hold more entries than
+    /// [`crate::state::StateLimits::max_local_authorization_list_entries`] allows, so the update
+    /// was refused outright and the current list left untouched - see
+    /// [`handle_send_local_list`] and `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2). Maps to wire
+    /// `Failed` in every protocol version.
+    TooManyEntries,
     /// The local authorization list capability is registered (the `local-auth-list` Cargo
     /// feature is on) but runtime-absent (`Capabilities::local_auth_list` is `false`) - see
     /// `crate::refusal` (docs/PRODUCTION-ROADMAP.md §5.5, C5).
     NotSupported,
 }
 
-/// Handles a CSMS-initiated `SendLocalList` request against `actor`. A `Full` update always
-/// succeeds, replacing the list outright and adopting `version` regardless of the current one. A
+/// Handles a CSMS-initiated `SendLocalList` request against `actor`. A `Full` update replaces the
+/// list outright and adopts `version` regardless of the current one. A
 /// `Differential` update only succeeds if `version` is exactly the charge point's current
 /// version + 1 - anything else means an earlier update was missed (or the CSMS is out of sync),
 /// and the differential can't be safely applied on top of an unknown base, so it's rejected with
 /// `VersionMismatch` rather than silently corrupting the list.
+///
+/// Either kind is refused with [`SendLocalListOutcome::TooManyEntries`] if the resulting list would
+/// exceed [`crate::state::StateLimits::max_local_authorization_list_entries`] (G2.2,
+/// `docs/PRODUCTION-ROADMAP.md` §9.2) - refused *outright*, leaving the current list exactly as it
+/// was, rather than applied up to the bound: a partially applied list would reject id tokens the
+/// CSMS believes are cached, which is worse for a driver at an offline charge point than a `Failed`
+/// the CSMS can see and act on. A differential update that only replaces or removes entries stays
+/// within the bound and is accepted even on a full list.
 pub async fn handle_send_local_list(
     actor: &ChargePointActor,
     version: i64,
@@ -65,6 +78,7 @@ pub async fn handle_send_local_list(
     }
     let current = state.local_authorization_list;
 
+    let max_entries = current.max_entries;
     let entries = match update {
         LocalListUpdate::Full(entries) => entries,
         LocalListUpdate::Differential(changes) => {
@@ -74,6 +88,18 @@ pub async fn handle_send_local_list(
             apply_differential(current.entries, changes)
         }
     };
+
+    // G2.2 (docs/PRODUCTION-ROADMAP.md §9.2): the list is bounded, so refuse an update that
+    // wouldn't fit rather than letting the state machine truncate it - see this function's docs
+    // for why a partially applied list is the worse failure.
+    if entries.len() > max_entries {
+        tracing::warn!(
+            requested = entries.len(),
+            max_entries,
+            "refusing a SendLocalList update larger than the configured maximum"
+        );
+        return SendLocalListOutcome::TooManyEntries;
+    }
 
     let _ = actor
         .send(ChargePointEvent::LocalListUpdated { version, entries })
@@ -165,7 +191,16 @@ mod tests {
     /// Spawns an actor with the `local_auth_list` capability declared present - mirrors
     /// `crate::reservation::tests::spawn_with_reservation`.
     async fn spawn_with_local_auth_list<const N: usize>(evses: [usize; N]) -> ChargePointActor {
-        let actor = ChargePointActor::spawn(evses, &TokioExecutor);
+        spawn_with_local_auth_list_limited(evses, crate::state::StateLimits::default()).await
+    }
+
+    /// [`spawn_with_local_auth_list`] with caller-chosen [`crate::state::StateLimits`], for the
+    /// bounded-list tests (G2.2, docs/PRODUCTION-ROADMAP.md §9.2).
+    async fn spawn_with_local_auth_list_limited<const N: usize>(
+        evses: [usize; N],
+        limits: crate::state::StateLimits,
+    ) -> ChargePointActor {
+        let actor = ChargePointActor::spawn_with_limits(evses, &TokioExecutor, limits);
         actor
             .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
                 local_auth_list: true,
@@ -287,6 +322,115 @@ mod tests {
             "a refused update must not mutate the list"
         );
     }
+
+    // G2.2 (docs/PRODUCTION-ROADMAP.md §9.2): the list is bounded, and an update that would
+    // exceed the bound is refused outright rather than applied in part - a silently truncated
+    // authorization list would reject id tokens the CSMS believes are cached.
+    #[tokio::test]
+    async fn a_full_update_beyond_the_maximum_is_refused_and_leaves_the_list_untouched() {
+        let actor = spawn_with_local_auth_list_limited(
+            [1],
+            crate::state::StateLimits::default().with_max_local_authorization_list_entries(2),
+        )
+        .await;
+        handle_send_local_list(
+            &actor,
+            1,
+            LocalListUpdate::Full(vec![entry("A", AuthorizationStatus::Accepted)]),
+        )
+        .await;
+
+        let outcome = handle_send_local_list(
+            &actor,
+            2,
+            LocalListUpdate::Full(vec![
+                entry("B", AuthorizationStatus::Accepted),
+                entry("C", AuthorizationStatus::Accepted),
+                entry("D", AuthorizationStatus::Accepted),
+            ]),
+        )
+        .await;
+
+        assert_eq!(outcome, SendLocalListOutcome::TooManyEntries);
+        assert_eq!(handle_get_local_list_version(&actor), 1);
+        assert_eq!(
+            actor.state().local_authorization_list.entries,
+            vec![entry("A", AuthorizationStatus::Accepted)],
+            "a refused update must not mutate the list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_differential_update_that_would_overflow_the_maximum_is_refused() {
+        let actor = spawn_with_local_auth_list_limited(
+            [1],
+            crate::state::StateLimits::default().with_max_local_authorization_list_entries(2),
+        )
+        .await;
+        handle_send_local_list(
+            &actor,
+            1,
+            LocalListUpdate::Full(vec![
+                entry("A", AuthorizationStatus::Accepted),
+                entry("B", AuthorizationStatus::Accepted),
+            ]),
+        )
+        .await;
+
+        let outcome = handle_send_local_list(
+            &actor,
+            2,
+            LocalListUpdate::Differential(vec![LocalListChange::Upsert(entry(
+                "C",
+                AuthorizationStatus::Accepted,
+            ))]),
+        )
+        .await;
+
+        assert_eq!(outcome, SendLocalListOutcome::TooManyEntries);
+        assert_eq!(handle_get_local_list_version(&actor), 1);
+        assert_eq!(actor.state().local_authorization_list.entries.len(), 2);
+    }
+
+    /// A differential update that stays within the bound is still accepted once the list is full -
+    /// replacing an existing entry, or removing one, doesn't grow anything.
+    #[tokio::test]
+    async fn a_differential_update_on_a_full_list_that_does_not_grow_it_is_accepted() {
+        let actor = spawn_with_local_auth_list_limited(
+            [1],
+            crate::state::StateLimits::default().with_max_local_authorization_list_entries(2),
+        )
+        .await;
+        handle_send_local_list(
+            &actor,
+            1,
+            LocalListUpdate::Full(vec![
+                entry("A", AuthorizationStatus::Accepted),
+                entry("B", AuthorizationStatus::Accepted),
+            ]),
+        )
+        .await;
+
+        let outcome = handle_send_local_list(
+            &actor,
+            2,
+            LocalListUpdate::Differential(vec![
+                LocalListChange::Upsert(entry("A", AuthorizationStatus::Rejected)),
+                LocalListChange::Remove(id_token("B")),
+                LocalListChange::Upsert(entry("C", AuthorizationStatus::Accepted)),
+            ]),
+        )
+        .await;
+
+        assert_eq!(outcome, SendLocalListOutcome::Accepted);
+        assert_eq!(
+            actor.state().local_authorization_list.entries,
+            vec![
+                entry("A", AuthorizationStatus::Rejected),
+                entry("C", AuthorizationStatus::Accepted),
+            ]
+        );
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]
@@ -368,6 +512,10 @@ mod ocpp_2_1 {
         match outcome {
             SendLocalListOutcome::Accepted => SendLocalListStatusEnum::Accepted,
             SendLocalListOutcome::VersionMismatch => SendLocalListStatusEnum::VersionMismatch,
+            // G2.2 (docs/PRODUCTION-ROADMAP.md §9.2): the list is bounded and this update didn't
+            // fit. `Failed` is the only wire value that says so - there is no "too big" status in
+            // any protocol version.
+            SendLocalListOutcome::TooManyEntries => SendLocalListStatusEnum::Failed,
             // 2.x's `SendLocalListStatusEnum` has no `NotSupported` variant - `Failed` is the
             // closest available "no", per crate::refusal's decision table (docs/PRODUCTION-ROADMAP.md
             // §5.5).
@@ -439,6 +587,10 @@ mod ocpp_2_1 {
             assert_eq!(
                 map_outcome(SendLocalListOutcome::VersionMismatch),
                 SendLocalListStatusEnum::VersionMismatch
+            );
+            assert_eq!(
+                map_outcome(SendLocalListOutcome::TooManyEntries),
+                SendLocalListStatusEnum::Failed
             );
             assert_eq!(
                 map_outcome(SendLocalListOutcome::NotSupported),
@@ -648,6 +800,10 @@ mod ocpp_2_0_1 {
         match outcome {
             SendLocalListOutcome::Accepted => SendLocalListStatusEnum::Accepted,
             SendLocalListOutcome::VersionMismatch => SendLocalListStatusEnum::VersionMismatch,
+            // G2.2 (docs/PRODUCTION-ROADMAP.md §9.2): the list is bounded and this update didn't
+            // fit. `Failed` is the only wire value that says so - there is no "too big" status in
+            // any protocol version.
+            SendLocalListOutcome::TooManyEntries => SendLocalListStatusEnum::Failed,
             // 2.x's `SendLocalListStatusEnum` has no `NotSupported` variant - `Failed` is the
             // closest available "no", per crate::refusal's decision table (docs/PRODUCTION-ROADMAP.md
             // §5.5).
@@ -714,6 +870,10 @@ mod ocpp_2_0_1 {
             assert_eq!(
                 map_outcome(SendLocalListOutcome::VersionMismatch),
                 SendLocalListStatusEnum::VersionMismatch
+            );
+            assert_eq!(
+                map_outcome(SendLocalListOutcome::TooManyEntries),
+                SendLocalListStatusEnum::Failed
             );
             assert_eq!(
                 map_outcome(SendLocalListOutcome::NotSupported),
@@ -922,6 +1082,9 @@ mod ocpp_1_6 {
         match outcome {
             SendLocalListOutcome::Accepted => SendLocalListResponseStatus::Accepted,
             SendLocalListOutcome::VersionMismatch => SendLocalListResponseStatus::VersionMismatch,
+            // See the 2.x `map_outcome`: `Failed` is the only wire value for "the list is bounded
+            // and this didn't fit" (G2.2, docs/PRODUCTION-ROADMAP.md §9.2).
+            SendLocalListOutcome::TooManyEntries => SendLocalListResponseStatus::Failed,
             SendLocalListOutcome::NotSupported => SendLocalListResponseStatus::NotSupported,
         }
     }
@@ -984,6 +1147,10 @@ mod ocpp_1_6 {
             assert_eq!(
                 map_outcome(SendLocalListOutcome::VersionMismatch),
                 SendLocalListResponseStatus::VersionMismatch
+            );
+            assert_eq!(
+                map_outcome(SendLocalListOutcome::TooManyEntries),
+                SendLocalListResponseStatus::Failed
             );
             assert_eq!(
                 map_outcome(SendLocalListOutcome::NotSupported),

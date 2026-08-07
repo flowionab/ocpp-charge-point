@@ -1036,15 +1036,85 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
       callback deliberately does *not* do that (it only logs) since raising
       a security event from the security-event queue's own overflow would
       feed back into the same queue and risk an unbounded loop the moment
-      that queue is also full. Still open: G2.2's audit of every other
-      unbounded collection (local auth list, transaction history, device
-      model, charging profiles) hasn't happened, so `OfflineQueue` is the
-      only bounded collection in the crate so far, and the 100-message
-      default is a documented estimate, not a measured RAM budget (that's
-      G2.3).
-- [ ] **G2.2** Audit every other unbounded collection in
-      `ChargePointState` (local auth list, transaction history, device
-      model, charging profiles) for a configured maximum.
+      that queue is also full. The 100-message default remains a documented
+      estimate, not a measured RAM budget (that's G2.3). G2.2, below, has
+      since audited every other collection in `ChargePointState`.
+- [x] **G2.2** Audited every collection in `ChargePointState`; the two that
+      could grow without limit are now bounded by a caller-configurable
+      maximum, carried in `crate::state::StateLimits` and passed once at
+      construction (`ChargePointState::with_limits`,
+      `ChargePointActor::spawn_with_limits`,
+      `ChargePointRuntime::new_with_limits`,
+      `ChargePointBuilder::start_with_limits`). There is deliberately no way
+      to raise a limit at runtime - a bound a remote peer can move is not a
+      bound - and the non-`_with_limits` constructors keep using
+      `StateLimits::default()`, so no existing call site moved.
+
+      **Local authorization list** (`LocalAuthorizationList.entries`, grown by
+      CSMS `SendLocalList`): bounded by
+      `max_local_authorization_list_entries`, default 100 entries (a few KB;
+      sized for a private/fleet site's whole card population, which is what
+      offline authorization actually exists for - a public site can't usefully
+      cache "every driver who might arrive" at any bound). An update that
+      wouldn't fit is refused *outright* with the new
+      `SendLocalListOutcome::TooManyEntries` -> wire `Failed` in all three
+      protocol versions - rather than applied up to the bound: a partially
+      applied list rejects id tokens the CSMS believes are cached, which is
+      worse for a driver at an offline charge point than a `Failed` the CSMS
+      can see and retry with a shorter list. A differential update that only
+      replaces or removes entries doesn't grow the list and is still accepted
+      when full. `ChargePointState::apply` enforces the same bound by
+      truncating, which is the last line of defence rather than the normal
+      path: the reachable case is a list restored from durable storage written
+      by a build configured with a larger maximum (a firmware update that
+      lowered it). Because truncation silently loses authorization decisions,
+      it raises a `MemoryExhaustion` security event - the same treatment a
+      saturated `OfflineQueue` gets in G2.1, for the same reason: the CSMS is
+      the only party that can act on it. Storage then converges on the
+      truncated list, since the restore is a state change like any other and
+      `run_local_authorization_list_persistence` writes it back at the same
+      version.
+
+      **Device model** (`DeviceModel.components`, grown by
+      `DeviceModelEvent::VariableRegistered`): bounded by
+      `max_device_model_variables`, default 256 `(Component, Variable)` pairs
+      - generous headroom over this crate's own registrations (the built-in
+      defaults plus one `*Ctrlr.Available` per `CAPABILITY_GATES` entry) for
+      whatever a hardware binding adds. Not CSMS-driven (`SetVariables` only
+      writes attributes that already exist, and is unaffected by this bound);
+      the growth path is an integrator's binding, so a registration past the
+      maximum is refused and logged rather than being a protocol-visible
+      error, and `apply` reports no state change for it. Redefining an
+      already-registered variable never grows the model and is always allowed,
+      including at the maximum. A configured maximum below what
+      `DeviceModel::new` itself registers is raised to fit the built-in
+      defaults - dropping those would leave `GetVariables`/`GetBaseReport`
+      reporting an incomplete model rather than bound anything worth bounding.
+
+      **Audited and deliberately left alone**, because they are bounded by
+      construction rather than by a configured maximum: `evses`, and each
+      `EvseState`'s `connectors`/`transactions`/`reservations`/`running_costs`
+      - all sized once from the hardware binding's topology and never grown
+      (the state machine's invariants allow one active transaction and one
+      reservation per connector). **Transaction history**: there is none to
+      bound - `ChargePointState` holds only the current transaction per
+      connector, and `crate::persistence`'s `TransactionStore` keeps one
+      record per connector, not a log. **Charging profiles**: Smart Charging
+      isn't implemented yet (§4 D-workstream), so there is no collection to
+      bound; whoever lands `SetChargingProfile` must add a `StateLimits`
+      entry with it. The offline report queues carry their own bound (G2.1).
+
+      Still open, and explicitly *not* this entry: an over-long record is
+      still fully deserialized before being truncated, so the transient
+      allocation is unbounded even though the retained state isn't - bounding
+      that is [F5.2](#85-f5--hardening)'s job. The defaults above are
+      documented estimates rather than measured RAM budgets (G2.3), and
+      neither maximum is advertised to the CSMS yet via the device model
+      variables OCPP has for it (`LocalAuthListCtrlr.Entries` /
+      `ItemsPerMessage` in 2.x, `LocalAuthListMaxLength` /
+      `SendLocalListMaxLength` in 1.6J), so a CSMS discovers the bound by
+      being refused rather than by reading it - worth landing with the
+      `GetBaseReport` work in §2.
 - [ ] **G2.3** Document peak RAM per configuration so integrators can size
       the part.
 - [ ] **G2.4** Measure flash cost per Cargo feature — that's the whole

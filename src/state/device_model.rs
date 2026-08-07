@@ -164,9 +164,14 @@ impl VariableDefinition {
 /// [`crate::hardware::HardwareEventSender::send`] during
 /// [`crate::hardware::ChargePoint::start`], the same way it pushes any other
 /// [`crate::state::ChargePointEvent`].
+/// The model is bounded at construction by [`DeviceModel::max_variables`] (see
+/// [`crate::state::StateLimits`]) so a hardware binding that registers variables in a loop - or one
+/// driven by a runaway sensor enumeration - can't grow state without limit
+/// (`docs/PRODUCTION-ROADMAP.md` §9.2, G2.2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceModel {
     components: BTreeMap<Component, BTreeMap<Variable, VariableDefinition>>,
+    max_variables: usize,
 }
 
 impl DeviceModel {
@@ -174,25 +179,61 @@ impl DeviceModel {
     /// this type's own docs) - deliberately a minimal,
     /// non-exhaustive set. Integrators extend it with
     /// [`DeviceModelEvent::VariableRegistered`](crate::state::DeviceModelEvent::VariableRegistered)
-    /// for whatever components their hardware actually exposes.
+    /// for whatever components their hardware actually exposes. Holds at most
+    /// [`DEFAULT_MAX_DEVICE_MODEL_VARIABLES`](crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES)
+    /// variables.
     pub fn new() -> Self {
+        Self::with_max_variables(crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES)
+    }
+
+    /// A device model as [`new`](Self::new), holding at most `max_variables` `(Component,
+    /// Variable)` pairs.
+    ///
+    /// The bound is raised to whatever the built-in defaults themselves occupy if `max_variables`
+    /// is smaller: a limit low enough to drop this crate's own defaults would leave
+    /// `GetVariables`/`GetBaseReport` reporting an incomplete model rather than bound anything worth
+    /// bounding. It is *not* raised for the `*Ctrlr.Available` capability-gate variables
+    /// [`crate::device_model::capability_gate_events`] registers afterwards - those come through
+    /// [`Self::register`] like any other registration, and a caller who sets a limit that can't fit
+    /// them gets the documented refusal (and a warning) for the ones that don't fit.
+    pub fn with_max_variables(max_variables: usize) -> Self {
         let mut model = Self {
             components: BTreeMap::new(),
+            max_variables: usize::MAX,
         };
         model.register_defaults();
+        model.max_variables = max_variables.max(model.len()).max(1);
         model
     }
 
     /// Registers (or replaces) the full definition of `variable` on `component`. The only way to
     /// add or redefine a variable - see this method's caller,
     /// [`crate::state::ChargePointState::apply`].
+    ///
+    /// Returns whether the model was actually changed. A registration that would push the model
+    /// past [`max_variables`](Self::max_variables) is refused (and logged) rather than applied;
+    /// redefining an *already registered* variable is always allowed, since it doesn't grow the
+    /// model.
     pub fn register(
         &mut self,
         component: Component,
         variable: Variable,
         characteristics: VariableCharacteristics,
         attributes: Vec<VariableAttribute>,
-    ) {
+    ) -> bool {
+        let known = self
+            .components
+            .get(&component)
+            .is_some_and(|variables| variables.contains_key(&variable));
+        if !known && self.len() >= self.max_variables {
+            tracing::warn!(
+                component = component.name.as_str(),
+                variable = variable.name.as_str(),
+                max_variables = self.max_variables,
+                "refusing to register a device model variable - the configured maximum is reached"
+            );
+            return false;
+        }
         self.components.entry(component).or_default().insert(
             variable,
             VariableDefinition {
@@ -200,6 +241,26 @@ impl DeviceModel {
                 attributes,
             },
         );
+        true
+    }
+
+    /// How many `(Component, Variable)` pairs are registered, counting this crate's own built-in
+    /// defaults. Bounded by [`max_variables`](Self::max_variables).
+    pub fn len(&self) -> usize {
+        self.components.values().map(BTreeMap::len).sum()
+    }
+
+    /// Whether nothing at all is registered. Never true for a model from [`Self::new`], which
+    /// registers this crate's built-in defaults.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The most `(Component, Variable)` pairs this model may hold, fixed for the life of the charge
+    /// point. See [`crate::state::StateLimits::max_device_model_variables`], which is where callers
+    /// configure it.
+    pub fn max_variables(&self) -> usize {
+        self.max_variables
     }
 
     /// The full definition of `variable` on `component`, if registered.
@@ -503,6 +564,76 @@ mod tests {
         );
 
         assert!(!changed);
+    }
+
+    // G2.2 (docs/PRODUCTION-ROADMAP.md §9.2)
+    #[test]
+    fn a_fresh_model_uses_the_default_maximum() {
+        let model = DeviceModel::new();
+
+        assert_eq!(
+            model.max_variables(),
+            crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES
+        );
+        assert_eq!(model.len(), 2, "the two built-in defaults");
+    }
+
+    #[test]
+    fn registering_past_the_maximum_is_refused_and_leaves_the_model_alone() {
+        let mut model = DeviceModel::with_max_variables(3);
+        assert!(model.register(
+            component("Custom"),
+            variable("First"),
+            characteristics(),
+            vec![attribute("1", VariableMutability::ReadWrite)],
+        ));
+
+        let registered = model.register(
+            component("Custom"),
+            variable("Second"),
+            characteristics(),
+            vec![attribute("2", VariableMutability::ReadWrite)],
+        );
+
+        assert!(!registered);
+        assert_eq!(model.len(), 3);
+        assert_eq!(model.get(&component("Custom"), &variable("Second")), None);
+    }
+
+    /// Redefining an already-registered variable doesn't grow the model, so the bound must not
+    /// block it - otherwise a full model could never have a value's characteristics corrected.
+    #[test]
+    fn redefining_an_existing_variable_is_allowed_at_the_maximum() {
+        let mut model = DeviceModel::with_max_variables(2);
+
+        let registered = model.register(
+            component("OCPPCommCtrlr"),
+            variable("HeartbeatInterval"),
+            characteristics(),
+            vec![attribute("120", VariableMutability::ReadWrite)],
+        );
+
+        assert!(registered);
+        assert_eq!(model.len(), 2);
+        assert_eq!(
+            model
+                .get(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval"))
+                .unwrap()
+                .attribute(VariableAttributeType::Actual)
+                .unwrap()
+                .value,
+            "120"
+        );
+    }
+
+    /// A maximum below what the built-in defaults occupy is raised to fit them - see
+    /// [`DeviceModel::with_max_variables`].
+    #[test]
+    fn a_maximum_below_the_built_in_defaults_is_raised_to_fit_them() {
+        let model = DeviceModel::with_max_variables(0);
+
+        assert_eq!(model.max_variables(), 2);
+        assert_eq!(model.len(), 2);
     }
 
     #[test]

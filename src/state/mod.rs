@@ -7,6 +7,7 @@ mod device_model;
 mod event;
 mod evse_state;
 mod id_token;
+mod limits;
 mod local_authorization_list;
 mod meter_sample;
 mod registration_status;
@@ -32,6 +33,9 @@ pub use self::event::{
 };
 pub use self::evse_state::{EvseState, EvseStatus};
 pub use self::id_token::{IdToken, IdTokenKind};
+pub use self::limits::{
+    DEFAULT_MAX_DEVICE_MODEL_VARIABLES, DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, StateLimits,
+};
 pub use self::local_authorization_list::{LocalAuthorizationList, LocalListEntry};
 pub use self::meter_sample::MeterSample;
 pub use self::registration_status::RegistrationStatus;

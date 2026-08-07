@@ -147,6 +147,29 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         E: Evse<C>,
         C: Connector,
     {
+        Self::start_with_limits(charge_point, executor, crate::state::StateLimits::default()).await
+    }
+
+    /// [`Self::start`] with caller-chosen bounds on the state's growable collections (the local
+    /// authorization list and the device model) - see [`crate::state::StateLimits`] and
+    /// `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2). Limits have to be supplied here, before the
+    /// hardware binding's `start` gets to register anything, because they are fixed for the life of
+    /// the state; there is deliberately no way to raise one later.
+    ///
+    /// A binding that registers more device model variables than
+    /// [`StateLimits::max_device_model_variables`](crate::state::StateLimits::max_device_model_variables)
+    /// allows gets the surplus registrations refused and logged - raise the limit rather than let
+    /// the model silently miss components.
+    pub async fn start_with_limits<E, C>(
+        charge_point: T,
+        executor: X,
+        limits: crate::state::StateLimits,
+    ) -> Result<Self, T::StartError>
+    where
+        T: ChargePoint<E, C>,
+        E: Evse<C>,
+        C: Connector,
+    {
         let vendor_name = charge_point.vendor_name().await.to_string();
         let model_name = charge_point.model_name().await.to_string();
         let capabilities = charge_point.capabilities().await;
@@ -166,7 +189,8 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             connector_counts.push(evse.connectors().await.len());
         }
 
-        let runtime = ChargePointRuntime::new(charge_point, connector_counts, &executor);
+        let runtime =
+            ChargePointRuntime::new_with_limits(charge_point, connector_counts, &executor, limits);
         // Subscribe before starting the hardware so status/transaction/authorization events fired
         // during `start()` (e.g. a connector that's already occupied at boot) are buffered rather
         // than lost.
@@ -1526,6 +1550,49 @@ mod tests {
         assert_eq!(
             runtime.state().registration,
             Some(RegistrationStatus::Accepted)
+        );
+    }
+
+    // G2.2 (docs/PRODUCTION-ROADMAP.md §9.2): the whole point of `start_with_limits` is that a
+    // caller's bounds reach the state the actor owns, and that the default path still gets this
+    // crate's documented defaults.
+    #[tokio::test]
+    async fn start_with_limits_bounds_the_growable_collections() {
+        let (charge_point, _locked) = test_charge_point(true);
+
+        let runtime = ChargePointBuilder::start_with_limits(
+            charge_point,
+            TokioExecutor,
+            crate::state::StateLimits::default()
+                .with_max_local_authorization_list_entries(7)
+                .with_max_device_model_variables(64),
+        )
+        .await
+        .unwrap()
+        .build();
+
+        let state = runtime.state();
+        assert_eq!(state.local_authorization_list.max_entries, 7);
+        assert_eq!(state.device_model.max_variables(), 64);
+    }
+
+    #[tokio::test]
+    async fn start_uses_this_crates_default_limits() {
+        let (charge_point, _locked) = test_charge_point(true);
+
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .build();
+
+        let state = runtime.state();
+        assert_eq!(
+            state.local_authorization_list.max_entries,
+            crate::state::DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES
+        );
+        assert_eq!(
+            state.device_model.max_variables(),
+            crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES
         );
     }
 

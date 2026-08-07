@@ -26,9 +26,25 @@ impl<T> ChargePointRuntime<T> {
         connector_counts: impl IntoIterator<Item = usize>,
         executor: &dyn Executor,
     ) -> Self {
+        Self::new_with_limits(
+            hardware,
+            connector_counts,
+            executor,
+            crate::state::StateLimits::default(),
+        )
+    }
+
+    /// [`Self::new`] with caller-chosen bounds on the state's growable collections - see
+    /// [`crate::state::StateLimits`] and `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2).
+    pub fn new_with_limits(
+        hardware: T,
+        connector_counts: impl IntoIterator<Item = usize>,
+        executor: &dyn Executor,
+        limits: crate::state::StateLimits,
+    ) -> Self {
         Self {
             hardware,
-            actor: ChargePointActor::spawn(connector_counts, executor),
+            actor: ChargePointActor::spawn_with_limits(connector_counts, executor, limits),
         }
     }
 

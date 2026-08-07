@@ -1502,6 +1502,17 @@ impl<S: Storage + Send + Sync> LocalAuthorizationListStore<AtomicStorage<S>> {
 /// `handle_get_local_list_version` can be reached by a CSMS request - see
 /// `crate::builder::ChargePointBuilder::local_authorization_list_persistence`.
 ///
+/// A recovered list longer than
+/// [`crate::state::StateLimits::max_local_authorization_list_entries`] is truncated to it by the
+/// state machine, which raises a `MemoryExhaustion` security event when that happens (G2.2,
+/// `docs/PRODUCTION-ROADMAP.md` §9.2) - reachable when a firmware update lowers the configured
+/// maximum below what the previous build had already written. Storage converges on the truncated
+/// list: the restore is a state change like any other, so
+/// [`run_local_authorization_list_persistence`] writes the now-shorter list back at the same
+/// version. Note that the over-long record is still fully deserialized before being truncated -
+/// bounding the *allocation* rather than the retained list is F5.2's job
+/// (`docs/PRODUCTION-ROADMAP.md` §8.5), not this function's.
+///
 /// Returns whether a list was actually recovered.
 pub async fn restore_local_authorization_list<S: Storage>(
     actor: &ChargePointActor,

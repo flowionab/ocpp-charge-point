@@ -80,7 +80,23 @@ impl ChargePointActor {
         connector_counts: impl IntoIterator<Item = usize>,
         executor: &dyn Executor,
     ) -> Self {
-        let state = ChargePointState::new(connector_counts);
+        Self::spawn_with_limits(
+            connector_counts,
+            executor,
+            crate::state::StateLimits::default(),
+        )
+    }
+
+    /// [`Self::spawn`] with caller-chosen bounds on the state's growable collections - see
+    /// [`crate::state::StateLimits`] and `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2). Integrators
+    /// going through [`crate::builder::ChargePointBuilder`] pass limits to
+    /// [`crate::builder::ChargePointBuilder::start_with_limits`] instead.
+    pub fn spawn_with_limits(
+        connector_counts: impl IntoIterator<Item = usize>,
+        executor: &dyn Executor,
+        limits: crate::state::StateLimits,
+    ) -> Self {
+        let state = ChargePointState::with_limits(connector_counts, limits);
         let mailbox = Chan::new();
         let (updates, state_receiver) = watch_channel(state.clone());
         let commands = broadcast_channel();
