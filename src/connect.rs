@@ -106,6 +106,7 @@ where
         executor,
         backoff,
         crate::clock::SystemMonotonicClock,
+        crate::clock::SystemClock,
     )
     .await
     .map_err(ConnectAndSetupError::Start)

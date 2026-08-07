@@ -210,15 +210,15 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) §0 for the detailed history of what's 
 
 ### 📏 Memory and flash footprint
 
-Every collection that can grow is bounded by a configured maximum (`state::StateLimits` for the local authorization list and device model, `offline_queue::OfflineQueue`'s capacity for the offline report queues, `security::SecurityEventLog`'s capacity for the durable security log), so peak memory is a property of your configuration rather than of how much a CSMS sends you.
+Every collection that can grow is bounded by a configured maximum (`state::StateLimits` for the local authorization list and device model, `offline_queue::OfflineQueue`'s capacity for the offline report queues, `security::SecurityEventLog`'s capacity for the durable security log, `state::StateLimits::max_charging_profiles` for charging profiles), so peak memory is a property of your configuration rather than of how much a CSMS sends you.
 
 Measured worst-case retained heap, filled to those bounds:
 
 | Configuration | Retained heap |
 | --- | --- |
-| Tight AC wallbox (1 connector, 25 list entries, 64 device model variables) | **~48 KB** |
-| Crate defaults (2 connectors, 100 entries, 256 variables) | **~171 KB** |
-| DC site (4 EVSEs × 2 connectors, 500 entries, 512 variables) | **~391 KB** |
+| Tight AC wallbox (1 connector, 25 list entries, 64 device model variables) | **~53 KB** |
+| Crate defaults (2 connectors, 100 entries, 256 variables) | **~176 KB** |
+| DC site (4 EVSEs × 2 connectors, 500 entries, 512 variables) | **~396 KB** |
 
 These are 64-bit host figures and a conservative upper bound for a 32-bit MCU, which holds less. They exclude task stacks, transport/TLS buffers, and allocator overhead.
 

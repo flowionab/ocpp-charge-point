@@ -201,9 +201,9 @@ first: without it there is no load management.
 
 | Message | 1.6J | 2.0.1 | 2.1 |
 |---------|:----:|:-----:|:---:|
-| SetChargingProfile | ⬜ | ⬜ | ⬜ |
-| ClearChargingProfile | ⬜ | ⬜ | ⬜ |
-| GetCompositeSchedule | ⬜ | ⬜ | ⬜ |
+| SetChargingProfile | ✅ | ✅ | ✅ |
+| ClearChargingProfile | ✅ | ✅ | ✅ |
+| GetCompositeSchedule | ✅ | ✅ | ✅ |
 | GetChargingProfiles / ReportChargingProfiles | — | ⬜ | ⬜ |
 | NotifyChargingLimit / ClearedChargingLimit | — | ⬜ | ⬜ |
 | NotifyEVChargingNeeds / NotifyEVChargingSchedule | — | ⬜ | ⬜ |
@@ -214,20 +214,114 @@ first: without it there is no load management.
 
 **B2 tasks:**
 
-- [ ] **B2.1** Charging profile store in `ChargePointState` (stack levels,
-      purposes, validity windows, recurrency).
-- [ ] **B2.2** Schedule composition: profile stack → composite schedule at
-      time `t`, with the 1.6J/2.x precedence rules.
-- [x] **B2.3** **New hardware hook** — `Connector::set_current_limit` (or an
-      `Evse`-level power limit). Nothing in `crate::hardware` can express
-      "limit to N amps" today. Breaking change to the integrator surface;
-      batch it with [C2](#52-c2--runtime-capability-declaration)'s
-      `Capabilities` change and [E1](#71-e1--storage-trait)'s storage hook
-      so integrators absorb *one* break.
-- [ ] **B2.4** Composite schedule → hardware limit projection, re-evaluated
-      on profile change, schedule period boundary, and transaction start.
-- [ ] **B2.5** Per-version adapters for each message above.
-- [ ] **B2.6** 2.1 dynamic schedule updates and priority charging.
+- [x] **B2.1** Charging profile store in `ChargePointState` (stack levels,
+      purposes, validity windows, recurrency) - `src/state/charging_profile.rs`.
+      `ChargingProfileStore` holds `InstalledChargingProfile`s (a profile plus the
+      `ChargingProfileScope` - one EVSE, or charge-point-wide, which is OCPP's `evseId`/
+      `connectorId` `0` sentinel made explicit), mutated only through
+      `ChargePointEvent::ChargingProfileSet`/`ChargingProfilesCleared` like every other piece of
+      state here.
+
+      The model carries the **superset** across versions, per `CLAUDE.md`: five purposes (2.1's
+      `PriorityCharging` and the external-constraints purpose included), up to three schedules per
+      profile (2.x) rather than 1.6J's one, and `ChargingProfileKind`/`RecurrencyKind` in full.
+      Two install rules, both from the spec and both applied before the bound is checked so a
+      replacement is never refused for being one too many: same profile id replaces (whatever
+      scope it was at), and same `(scope, purpose, stackLevel)` replaces (the CSMS is addressing
+      one slot).
+
+      **Bounded per G2.2**: `StateLimits::max_charging_profiles`, default 16. A profile beyond it
+      is *refused*, not evicted - unlike the offline queues, where dropping the oldest message is
+      the lesser evil. Silently forgetting a *limit* would let the charge point draw more current
+      than the CSMS last told it to, which is a safety question rather than a data-loss one.
+      `tests/memory_budget.rs` measures the full store (~296 B per profile at eight schedule
+      periods); the ceilings moved with it.
+- [x] **B2.2** Schedule composition: profile stack → composite schedule at
+      time `t`, with the 1.6J/2.x precedence rules - `crate::smart_charging::compose`, a pure
+      function of the profiles plus a `CompositionContext`, so every rule is testable without a
+      clock, a CSMS or hardware (28 tests).
+
+      Three rules, applied per instant: **applicability** (validity window, schedule coverage
+      anchored per kind, and - for transaction-scoped purposes - an actually-running transaction,
+      with a `TxProfile` naming a different transaction ignored); **selection** (highest purpose
+      wins, so `TxProfile` beats `TxDefaultProfile` whatever their stack levels, then highest
+      stack level within a purpose); **capping** (the installation limit and external constraints
+      bound the result, lowest binding - and a cap with nothing to cap *is* the limit). Instants
+      where the result is unchanged are merged, so a cap that moves without ever binding doesn't
+      split the composite.
+
+      Two deliberate refusals to guess. **Unit conversion**: amps↔watts needs the supply voltage
+      and phase count, which this crate does not have; a caller supplies `SupplyCharacteristics`
+      or a schedule in the other unit is skipped, never mis-scaled (assuming 230 V single-phase on
+      a 400 V three-phase supply would over-limit by 5×, which is a safety problem, not a billing
+      one). **`Relative` anchoring**: those schedules start with their transaction, and
+      `Transaction` carries no timestamps by design (E2.1's clock-free state machine), so the
+      start time comes from the caller - `None` skips the profile rather than anchoring it to a
+      guess.
+
+      A composition-boundary cap (512) bounds the work a pathological profile set can demand of an
+      MCU, and logs when it truncates rather than silently shortening the answer.
+- [x] **B2.3** **New hardware hook** — `Connector::set_current_limit`, batched with
+      [C2](#52-c2--runtime-capability-declaration)'s `Capabilities` change and
+      [E1](#71-e1--storage-trait)'s storage hook so integrators absorbed *one* break. Its
+      signature widened to `Option<u32>` when [B2.4](#b2--smart-charging-r11) gave it its first
+      caller — see that entry for why the change was taken then rather than later.
+- [x] **B2.4** Composite schedule → hardware limit projection, re-evaluated
+      on profile change, schedule period boundary, and transaction start -
+      `crate::smart_charging::run_charging_limit_projection` (state-change driven) and
+      `run_charging_limit_schedule` (period-boundary driven), registered together by
+      `ChargePointBuilder::smart_charging`.
+
+      **Two loops rather than one**, because the two triggers are unrelated and this crate has no
+      `select!` that works on both `no_std` and std without a new dependency. The overlap is free:
+      the state machine only dispatches `HardwareCommand::SetCurrentLimit` when the computed limit
+      *differs* from what the connector was last asked for, so whichever loop gets there first
+      wins and the other's duplicate dies in `ChargePointState`. The timer loop sleeps until the
+      exact next boundary (via `Backoff`, capped at 15 minutes) rather than polling.
+
+      **`Connector::set_current_limit` changed signature to `Option<u32>`.** A limit that stops
+      applying has to be *removed*, and only the hardware knows its own maximum - a `u32`-only
+      hook would have forced every integrator to guess one. `None` means "no CSMS-imposed limit
+      any more"; a suspend-charging 0 A period is `Some(0)`, and the two must not be conflated.
+      The change was taken now, while the hook still had no caller at all (M1 landed it unwired),
+      rather than after integrators had built against it.
+
+      Per-connector `EvseState::charging_limits` (requested) and `applied_charging_limits`
+      (hardware-confirmed) are separate side tables: the projection compares against the
+      requested one, and a CSMS-facing report should quote the confirmed one.
+- [x] **B2.5** Per-version adapters - *for the three messages that make load management work*:
+      `SetChargingProfile`, `ClearChargingProfile` and `GetCompositeSchedule`, on **all three
+      versions** (`src/smart_charging/ocpp_1_6.rs`, `ocpp_2_0_1.rs`, `ocpp_2_1.rs`), each with a
+      protocol-agnostic handler underneath (`handlers.rs`) that decides the outcome against the
+      real store *before* dispatching, so the CSMS's status is what actually happened.
+
+      Version-specific work, rather than three copies of one mapping: **1.6J** has no EVSE
+      concept, so its flat `connectorId` resolves through `crate::topology` to the owning EVSE
+      (the same documented reduction the other 1.6J handlers make) and its single schedule per
+      profile means no rate unit to choose between; it is also the one version whose
+      `transactionId` is already an integer, so `TxProfile` matching is exact rather than a parse
+      of a free-form string. **2.0.1** lacks `PriorityCharging` entirely (it reports as a plain
+      `TxProfile` - lossy, tested as such) and its period `limit` is mandatory, so no period is
+      ever dropped. **2.1** allows a period with no `limit` at all (its DER cases), which is
+      dropped rather than invented, and its dynamic-schedule/price-schedule fields are read past
+      rather than half-interpreted.
+
+      One cross-version rule earns its own mention: an `Absolute` schedule with no
+      `startSchedule` (1.6J permits it) is stamped with the instant the profile *arrived*, in the
+      handler, since re-anchoring at every evaluation would make a schedule with a duration
+      restart forever instead of ending.
+
+      **Not done, and each needs its own slice**: `GetChargingProfiles`/`ReportChargingProfiles`
+      (the protocol-agnostic `handle_get_charging_profiles` and the wire-side purpose/scope
+      mappings exist and are tested; the multi-part report sender does not),
+      `NotifyChargingLimit`/`ClearedChargingLimit`, and
+      `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`.
+- [ ] **B2.6** 2.1 dynamic schedule updates and priority charging. Untouched. The model already
+      carries `ChargingProfilePurpose::PriorityCharging` and the 2.1 adapter maps it both ways, so
+      the store and composition are ready; what is missing is the messages
+      (`UsePriorityCharging`, `NotifyPriorityCharging`, `PullDynamicScheduleUpdate`,
+      `UpdateDynamicSchedule`) and the dynamic-schedule fields the 2.1 adapter currently reads
+      past.
 
 ### B3 — Firmware management (R§12)
 
@@ -437,7 +531,7 @@ to omit a handler, and unworkable at ~80.
       [C2](#52-c2--runtime-capability-declaration).
 - [x] **C4.4** Keep `setup()` working as a thin "everything on" wrapper —
       no break for existing users. Done: `setup()` keeps its exact signature
-      and 21-trait bound, and is now just the builder chain with every block
+      and (now) 24-trait bound, and is now just the builder chain with every block
       registered. Its two original tests pass unchanged, and
       `connect_and_setup` is untouched.
 
@@ -631,7 +725,7 @@ mid-transaction currently loses the transaction.
 | Local authorization list + version number | Re-download after every boot is unacceptable offline | R§4 |
 | Authorization cache | Offline authorization | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
 | Reservations | Survive a reboot inside the reservation window | R§8 |
-| Charging profiles | Load limits must not vanish on reboot | [B2.1](#b2--smart-charging-r11) |
+| Charging profiles | Load limits must not vanish on reboot — **now unblocked**: [B2.1](#b2--smart-charging-r11)'s store exists, so E2.7 is ordinary work rather than blocked work | [B2.1](#b2--smart-charging-r11) |
 | Offline message queue | All three queues now durable (`src/persistence.rs`; `ChargePointBuilder::transaction_events_persisted` / `status_notifications_persisted` / `security_events_persisted`) | [G2](#92-g2--bounded-memory) |
 | Certificates and keys | Security profile 2/3 | [B4.1](#b4--certificates-and-iso-15118-r1-r13) |
 | Security event log | Durable and size-bounded (`src/security.rs`, `src/persistence.rs`; `ChargePointBuilder::security_log_persisted`) | [F4](#84-f4--security-events) |
@@ -886,10 +980,17 @@ mid-transaction currently loses the transaction.
       the blocks that would (`GetLog`, customer-information erasure) are [B5.1](#b5--diagnostics-and-monitoring-r14)/[B5.5](#b5--diagnostics-and-monitoring-r14) - which is
       the honest remaining half of [F4.3](#84-f4--security-events): the durable log exists, the `GetLog` reader
       does not.
-- [ ] **E2.5, E2.7, E2.9, E2.11** One task per remaining row above. All four are blocked on
-      functional blocks that don't exist yet (authorization cache on [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment), charging profiles
-      on [B2.1](#b2--smart-charging-r11), certificates on [B4.1](#b4--certificates-and-iso-15118-r1-r13), network profiles on [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle)), so E2's table is
-      now complete as far as this milestone can take it.
+- [ ] **E2.5, E2.9, E2.11** One task per remaining row above. All three are blocked on functional
+      blocks that don't exist yet: authorization cache on
+      [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment), certificates on
+      [B4.1](#b4--certificates-and-iso-15118-r1-r13), network profiles on
+      [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle).
+- [ ] **E2.7** Charging profiles. **No longer blocked** — [B2.1](#b2--smart-charging-r11)'s
+      `ChargingProfileStore` now exists, so this is ordinary work in the shape every other row
+      already has (a `ChargingProfileStore` snapshot through `hardware::Storage`, restored at
+      boot before the projection first evaluates). Until it lands, a power cut loses every
+      installed load limit, and the charge point comes back unlimited until the CSMS notices and
+      re-sends — worth doing before a site relies on load management.
 
 ### 7.3 E3 — Crash consistency
 
@@ -1683,12 +1784,13 @@ mid-transaction clock jumps.
 
 Three honest caveats, none of them a hole in the exit criteria:
 
-- **Four E2 rows remain RAM-only**, every one blocked on a functional block that does not exist
-  yet: authorization cache ([B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)),
-  charging profiles ([B2.1](#b2--smart-charging-r11)), certificates
-  ([B4.1](#b4--certificates-and-iso-15118-r1-r13)), network profiles
+- **Four E2 rows remain RAM-only.** Three are blocked on functional blocks that do not exist yet:
+  authorization cache ([B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)),
+  certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)), network profiles
   ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle)).
-  Each should land with its block, not before it.
+  The fourth, charging profiles ([E2.7](#72-e2--what-must-survive)), stopped being blocked the
+  moment [B2.1](#b2--smart-charging-r11) landed and is now the one durability gap that is simply
+  outstanding rather than waiting on anything.
 - **Durability is opt-in per concern.** Every `*_persistence` / `*_persisted` registration on
   `ChargePointBuilder` is a separate call an integrator has to make; `setup()`'s
   "everything on" wrapper does not wire any of them, because it has no `Storage` to wire them
@@ -1738,38 +1840,38 @@ Method: every `.on_*(` / `.send_*(` call inside a `mod ocpp_1_6` /
 `ocpp-client` 0.2.0 generates per version. Re-run it after any coverage
 work; it's the honest number.
 
-### A.1 OCPP 1.6J — 19 of 28 wired
+### A.1 OCPP 1.6J — 22 of 28 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ChangeConfiguration, DataTransfer, GetConfiguration,
-GetLocalListVersion, Heartbeat, MeterValues, RemoteStartTransaction,
-RemoteStopTransaction, ReserveNow, Reset, SendLocalList, StartTransaction,
-StatusNotification, StopTransaction, UnlockConnector
+ClearChargingProfile, GetCompositeSchedule, GetLocalListVersion, Heartbeat,
+MeterValues, RemoteStartTransaction, RemoteStopTransaction, ReserveNow, Reset,
+SendLocalList, SetChargingProfile, StartTransaction, StatusNotification,
+StopTransaction, UnlockConnector
 
-**Missing:** ClearCache, ClearChargingProfile, DiagnosticsStatusNotification,
-FirmwareStatusNotification, GetCompositeSchedule, GetDiagnostics,
-SetChargingProfile, TriggerMessage, UpdateFirmware
+**Missing:** ClearCache, DiagnosticsStatusNotification,
+FirmwareStatusNotification, GetDiagnostics, TriggerMessage, UpdateFirmware
 
-### A.2 OCPP 2.0.1 — 21 of 63 wired
+### A.2 OCPP 2.0.1 — 24 of 63 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
-ChangeAvailability, CostUpdated, DataTransfer, GetBaseReport,
-GetLocalListVersion, GetReport, GetVariables, Heartbeat, NotifyReport,
-RequestStartTransaction, RequestStopTransaction, ReserveNow, Reset,
-SendLocalList, SetVariables, StatusNotification, TransactionEvent,
-UnlockConnector
+ChangeAvailability, ClearChargingProfile, CostUpdated, DataTransfer,
+GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
+GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
+RequestStopTransaction, ReserveNow, Reset, SendLocalList, SetChargingProfile,
+SetVariables, StatusNotification, TransactionEvent, UnlockConnector
 
-**Missing:** CertificateSigned, ClearCache, ClearChargingProfile,
+**Missing:** CertificateSigned, ClearCache,
 ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
 CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
 Get15118EVCertificate, GetCertificateStatus, GetChargingProfiles,
-GetCompositeSchedule, GetDisplayMessages, GetInstalledCertificateIds,
+GetDisplayMessages, GetInstalledCertificateIds,
 GetLog, GetMonitoringReport, GetTransactionStatus, InstallCertificate,
 LogStatusNotification, MeterValues, NotifyChargingLimit,
 NotifyCustomerInformation, NotifyDisplayMessages, NotifyEVChargingNeeds,
 NotifyEVChargingSchedule, NotifyEvent, NotifyMonitoringReport,
 PublishFirmware, PublishFirmwareStatusNotification, ReportChargingProfiles,
-ReservationStatusUpdate, SetChargingProfile, SetDisplayMessage,
+ReservationStatusUpdate, SetDisplayMessage,
 SetMonitoringBase, SetMonitoringLevel, SetNetworkProfile,
 SetVariableMonitoring, SignCertificate, TriggerMessage, UnpublishFirmware,
 UpdateFirmware
@@ -1778,22 +1880,22 @@ UpdateFirmware
 `ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
 [D1](#61-d1--missing-action-wrappers).
 
-### A.3 OCPP 2.1 — 22 of 86 wired
+### A.3 OCPP 2.1 — 25 of 86 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
-ChangeAvailability, CostUpdated, DataTransfer, GetBaseReport,
-GetLocalListVersion, GetReport, GetVariables, Heartbeat, NotifyReport,
-RequestStartTransaction, RequestStopTransaction, ReserveNow, Reset,
-SecurityEventNotification, SendLocalList, SetVariables, StatusNotification,
+ChangeAvailability, ClearChargingProfile, CostUpdated, DataTransfer,
+GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
+GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
+RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
+SendLocalList, SetChargingProfile, SetVariables, StatusNotification,
 TransactionEvent, UnlockConnector
 
 **Missing:** AFRRSignal, AdjustPeriodicEventStream, BatterySwap,
-CertificateSigned, ChangeTransactionTariff, ClearCache,
-ClearChargingProfile, ClearDERControl, ClearDisplayMessage, ClearTariffs,
+CertificateSigned, ChangeTransactionTariff, ClearCache, ClearDERControl, ClearDisplayMessage, ClearTariffs,
 ClearVariableMonitoring, ClearedChargingLimit, ClosePeriodicEventStream,
 CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
 Get15118EVCertificate, GetCertificateChainStatus, GetCertificateStatus,
-GetChargingProfiles, GetCompositeSchedule, GetDisplayMessages,
+GetChargingProfiles, GetDisplayMessages,
 GetInstalledCertificateIds, GetLog, GetMonitoringReport,
 GetPeriodicEventStream, GetTariffs, GetTransactionStatus,
 InstallCertificate, LogStatusNotification, MeterValues,
@@ -1804,7 +1906,7 @@ NotifyMonitoringReport, NotifyPeriodicEventStream, NotifyPriorityCharging,
 NotifySettlement, NotifyWebPaymentStarted, OpenPeriodicEventStream,
 PublishFirmware, PublishFirmwareStatusNotification,
 PullDynamicScheduleUpdate, ReportChargingProfiles, ReportDERControl,
-RequestBatterySwap, ReservationStatusUpdate, SetChargingProfile,
+RequestBatterySwap, ReservationStatusUpdate,
 SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel, SetNetworkProfile,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware,
 UsePriorityCharging, VatNumberValidation
@@ -1823,6 +1925,6 @@ UpdateDynamicSchedule — see [D1](#61-d1--missing-action-wrappers).
 | 1.6J standard config keys aliased | 12 | `src/device_model.rs` |
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
-| Protocol trait bounds on `setup()`'s CSMS parameter | 21 (+ `Clone`/`Send`/`Sync`/`'static`) | `src/setup.rs:51` |
-| Test functions in `src/` | 564 | `#[test]` + `#[tokio::test]`, re-counted at the E2.10 commit (496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Protocol trait bounds on `setup()`'s CSMS parameter | 24 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
+| Test functions in `src/` | 646 | `#[test]` + `#[tokio::test]`, re-counted at the B2 commit (564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

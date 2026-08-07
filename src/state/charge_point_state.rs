@@ -5,12 +5,12 @@ use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
-    AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
-    IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, PendingReset, RegistrationStatus,
-    ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
-    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
-    TransactionUpdateReason,
+    AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargingProfileStore,
+    ConnectorEvent, ConnectorState, ConnectorStatusChanged, DeviceModel, DeviceModelEvent,
+    EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
+    MeterSample, PendingReset, RegistrationStatus, ResetKind, ResetTarget, SecurityEvent,
+    SecurityEventType, StateLimits, StopReason, Transaction, TransactionChargingState,
+    TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -61,6 +61,9 @@ pub struct ChargePointState {
     /// Conservatively empty ([`Capabilities::default`]) until `ChargePointBuilder::start` captures
     /// the real value - see `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
     pub capabilities: Capabilities,
+    /// Every charging profile the CSMS has installed, across every scope - the Smart Charging
+    /// functional block's state. See [`ChargingProfileStore`] and `docs/ROADMAP.md` §11.
+    pub charging_profiles: ChargingProfileStore,
     /// This charge point's best current estimate of the CSMS's clock, established by
     /// BootNotification/Heartbeat's `currentTime` - see [`TimeSyncAnchor`] and
     /// [`ChargePointEvent::TimeSynced`]. `None` until the first exchange that carried a
@@ -112,6 +115,7 @@ impl ChargePointState {
             pending_reset: None,
             device_model: DeviceModel::with_max_variables(limits.max_device_model_variables),
             capabilities: Capabilities::default(),
+            charging_profiles: ChargingProfileStore::with_limit(limits.max_charging_profiles),
             time_sync: None,
         }
     }
@@ -175,6 +179,27 @@ impl ChargePointState {
                     }
                 }
                 true
+            }
+            ChargePointEvent::ChargingProfileSet { scope, profile } => {
+                let id = profile.id;
+                match self.charging_profiles.install(scope, *profile) {
+                    Ok(()) => true,
+                    Err(rejection) => {
+                        // Reached only if a caller dispatched this without asking the store first
+                        // (`crate::smart_charging::handle_set_charging_profile` does ask, so the
+                        // CSMS never sees an optimistic Accepted); logged rather than panicking,
+                        // per `apply`'s documented tolerance for events that don't apply.
+                        tracing::warn!(
+                            profile_id = id.0,
+                            ?rejection,
+                            "a charging profile was refused by the store"
+                        );
+                        false
+                    }
+                }
+            }
+            ChargePointEvent::ChargingProfilesCleared { criteria } => {
+                self.charging_profiles.clear(&criteria) > 0
             }
             ChargePointEvent::DeviceModel(event) => match event {
                 DeviceModelEvent::VariableRegistered {
@@ -387,6 +412,14 @@ impl ChargePointState {
             ConnectorEvent::CostUpdated(total_cost) => Some(*total_cost),
             _ => None,
         };
+        let computed_limit = match &event {
+            ConnectorEvent::CurrentLimitComputed(limit_ma) => Some(*limit_ma),
+            _ => None,
+        };
+        let confirmed_limit = match &event {
+            ConnectorEvent::CurrentLimitConfirmed(limit_ma) => Some(*limit_ma),
+            _ => None,
+        };
         let transition = connector.apply(event);
         let new_state = *connector;
         if let Some(slot) = evse.reservations.get_mut(connector_id) {
@@ -491,6 +524,33 @@ impl ChargePointState {
         // `ConnectorState` itself, so `transition.changed` alone wouldn't notice it - without
         // folding it into the returned value here, the actor's watch channel would never
         // publish it (see `ChargePointEffect::StateChanged`).
+        // A newly computed limit reaches hardware only when it actually differs from the one
+        // already requested for this connector: the projection re-evaluates on every state
+        // change, and re-issuing an unchanged limit would put a hardware call on the path of
+        // every meter sample.
+        let limit_changed = computed_limit.is_some_and(|limit_ma| {
+            let Some(slot) = evse.charging_limits.get_mut(connector_id) else {
+                return false;
+            };
+            if *slot == limit_ma {
+                return false;
+            }
+            *slot = limit_ma;
+            effects.push(ChargePointEffect::HardwareCommand(
+                HardwareCommand::SetCurrentLimit {
+                    evse_id,
+                    connector_id,
+                    limit_ma,
+                },
+            ));
+            true
+        });
+        let limit_confirmed = confirmed_limit.is_some_and(|limit_ma| {
+            let Some(slot) = evse.applied_charging_limits.get_mut(connector_id) else {
+                return false;
+            };
+            set_if_changed(slot, limit_ma)
+        });
         let cost_recorded = cost_update.is_some_and(|total_cost| {
             if evse
                 .transactions
@@ -503,7 +563,7 @@ impl ChargePointState {
             }
             false
         });
-        transition.changed || cost_recorded
+        transition.changed || cost_recorded || limit_changed || limit_confirmed
     }
 
     /// Every `evse_id` a [`ResetTarget`] covers - every EVSE, for
@@ -1771,6 +1831,140 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
 
         assert_eq!(state.evses[0].running_costs[0], Some(4.5));
+    }
+
+    fn test_charging_profile(id: i32) -> crate::state::ChargingProfile {
+        use crate::state::{
+            ChargingProfileId, ChargingProfileKind, ChargingProfilePurpose, ChargingRateUnit,
+            ChargingSchedule, ChargingSchedulePeriod,
+        };
+        crate::state::ChargingProfile {
+            id: ChargingProfileId(id),
+            stack_level: 0,
+            purpose: ChargingProfilePurpose::TxDefault,
+            kind: ChargingProfileKind::Absolute,
+            recurrency: None,
+            valid_from: None,
+            valid_to: None,
+            transaction_id: None,
+            schedules: alloc::vec![ChargingSchedule {
+                id: 1,
+                start_schedule: None,
+                duration_secs: None,
+                rate_unit: ChargingRateUnit::Amps,
+                min_charging_rate: None,
+                periods: alloc::vec![ChargingSchedulePeriod {
+                    start_period_secs: 0,
+                    limit: 16.0,
+                    number_phases: None,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn setting_and_clearing_a_charging_profile_goes_through_the_store() {
+        use crate::state::{ChargingProfileCriteria, ChargingProfileId, ChargingProfileScope};
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::Evse(0),
+            profile: alloc::boxed::Box::new(test_charging_profile(1)),
+        });
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+        assert_eq!(state.charging_profiles.len(), 1);
+
+        // Criteria that match nothing leave the store alone, and report no state change.
+        let effects = state.apply(ChargePointEvent::ChargingProfilesCleared {
+            criteria: ChargingProfileCriteria {
+                id: Some(ChargingProfileId(99)),
+                ..Default::default()
+            },
+        });
+        assert!(!effects.contains(&ChargePointEffect::StateChanged));
+        assert_eq!(state.charging_profiles.len(), 1);
+
+        let effects = state.apply(ChargePointEvent::ChargingProfilesCleared {
+            criteria: ChargingProfileCriteria::default(),
+        });
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+        assert!(state.charging_profiles.is_empty());
+    }
+
+    #[test]
+    fn a_profile_the_store_refuses_is_logged_rather_than_applied() {
+        use crate::state::ChargingProfileScope;
+        let mut state = ChargePointState::new([1]);
+        let mut without_schedule = test_charging_profile(1);
+        without_schedule.schedules.clear();
+
+        let effects = state.apply(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::Evse(0),
+            profile: alloc::boxed::Box::new(without_schedule),
+        });
+
+        assert!(effects.is_empty());
+        assert!(state.charging_profiles.is_empty());
+    }
+
+    #[test]
+    fn a_computed_current_limit_reaches_hardware_once_per_actual_change() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed(Some(16_000)),
+        );
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::SetCurrentLimit {
+                evse_id: 0,
+                connector_id: 0,
+                limit_ma: Some(16_000),
+            }
+        )));
+        assert_eq!(state.evses[0].charging_limits[0], Some(16_000));
+
+        // The same limit again is not re-issued to hardware.
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed(Some(16_000)),
+        );
+        assert!(effects.is_empty());
+
+        // Dropping the limit entirely is a real change, and is dispatched as such - hardware
+        // has to be told to stop limiting, not left holding the last value forever.
+        let effects = apply_connector_event(&mut state, ConnectorEvent::CurrentLimitComputed(None));
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::SetCurrentLimit {
+                evse_id: 0,
+                connector_id: 0,
+                limit_ma: None,
+            }
+        )));
+        assert_eq!(state.evses[0].charging_limits[0], None);
+    }
+
+    #[test]
+    fn a_confirmed_current_limit_is_recorded_separately_from_the_requested_one() {
+        let mut state = ChargePointState::new([1]);
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed(Some(16_000)),
+        );
+        assert_eq!(state.evses[0].applied_charging_limits[0], None);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitConfirmed(Some(16_000)),
+        );
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+        assert_eq!(state.evses[0].applied_charging_limits[0], Some(16_000));
+        // Confirming does not re-issue the hardware command that asked for it.
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            ChargePointEffect::HardwareCommand(HardwareCommand::SetCurrentLimit { .. })
+        )));
     }
 
     #[test]

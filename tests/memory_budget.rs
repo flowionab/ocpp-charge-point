@@ -37,9 +37,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ocpp_charge_point::offline_queue::OfflineQueue;
 use ocpp_charge_point::security::{SecurityEventLog, SecurityLogEntry};
 use ocpp_charge_point::state::{
-    AuthorizationStatus, ChargePointEvent, Component, ConnectorState, ConnectorStatus,
-    ConnectorStatusChanged, DeviceModelEvent, IdToken, IdTokenKind, LocalListEntry, MeterSample,
-    Reservation, ReservationId, SecurityEvent, SecurityEventType, StateLimits, Transaction,
+    AuthorizationStatus, ChargePointEvent, ChargingProfile, ChargingProfileId, ChargingProfileKind,
+    ChargingProfilePurpose, ChargingProfileScope, ChargingRateUnit, ChargingSchedule,
+    ChargingSchedulePeriod, Component, ConnectorState, ConnectorStatus, ConnectorStatusChanged,
+    DeviceModelEvent, IdToken, IdTokenKind, LocalListEntry, MeterSample, Reservation,
+    ReservationId, SecurityEvent, SecurityEventType, StateLimits, Transaction,
     TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
     Variable, VariableAttribute, VariableAttributeType, VariableCharacteristics, VariableDataType,
     VariableMutability,
@@ -97,6 +99,10 @@ struct Configuration {
     /// The capacity each of the three offline queues (status, transaction, security) is configured
     /// with - `crate::offline_queue::DEFAULT_CAPACITY` (100) unless the integrator picks otherwise.
     queue_capacity: usize,
+    /// How many schedule periods each installed charging profile carries. Eight covers a
+    /// day-shaped tariff (overnight cheap, morning peak, midday, evening peak, ...) without
+    /// pretending a CSMS sends one period per minute.
+    periods_per_profile: usize,
     /// The capacity the durable security log (E2.10) is configured with -
     /// `crate::security::DEFAULT_SECURITY_LOG_CAPACITY` (50) unless the integrator picks
     /// otherwise. Sized independently of `queue_capacity`: the log retains history whether or not
@@ -287,6 +293,45 @@ fn full_security_queue(capacity: usize) -> OfflineQueue<SecurityEvent> {
     queue
 }
 
+/// Fills the charging profile store to its configured bound (B2.1), each profile carrying
+/// `periods_per_profile` schedule periods - the worst case a CSMS can drive the store to.
+fn fill_charging_profiles(
+    state: &mut ChargePointState,
+    profiles: usize,
+    periods_per_profile: usize,
+) -> usize {
+    for index in 0..profiles {
+        state.apply(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::Evse(0),
+            profile: Box::new(ChargingProfile {
+                id: ChargingProfileId(index as i32),
+                stack_level: index as u32,
+                purpose: ChargingProfilePurpose::TxDefault,
+                kind: ChargingProfileKind::Absolute,
+                recurrency: None,
+                valid_from: None,
+                valid_to: None,
+                transaction_id: None,
+                schedules: vec![ChargingSchedule {
+                    id: index as i32,
+                    start_schedule: None,
+                    duration_secs: Some(86_400),
+                    rate_unit: ChargingRateUnit::Amps,
+                    min_charging_rate: Some(6.0),
+                    periods: (0..periods_per_profile)
+                        .map(|period| ChargingSchedulePeriod {
+                            start_period_secs: (period * 3_600) as u32,
+                            limit: 16.0,
+                            number_phases: Some(3),
+                        })
+                        .collect(),
+                }],
+            }),
+        });
+    }
+    state.charging_profiles.len()
+}
+
 /// A worst-case security log: `capacity` recorded entries, each carrying `techInfo` text and a
 /// timestamp - the same filling as [`full_security_queue`], since the log records exactly the
 /// events that queue forwards.
@@ -313,6 +358,8 @@ struct Measurement {
     device_model: usize,
     device_model_variables: usize,
     connectors: usize,
+    charging_profiles: usize,
+    installed_profiles: usize,
     status_queue: usize,
     transaction_queue: usize,
     security_queue: usize,
@@ -321,7 +368,11 @@ struct Measurement {
 
 impl Measurement {
     fn state_total(&self) -> usize {
-        self.empty_state + self.local_list + self.device_model + self.connectors
+        self.empty_state
+            + self.local_list
+            + self.device_model
+            + self.connectors
+            + self.charging_profiles
     }
 
     fn queue_total(&self) -> usize {
@@ -359,6 +410,15 @@ fn measure(configuration: &Configuration) -> Measurement {
 
     let (connectors, _) = retained(|| fill_connectors(&mut state));
 
+    let mut installed_profiles = 0;
+    let (charging_profiles, _) = retained(|| {
+        installed_profiles = fill_charging_profiles(
+            &mut state,
+            configuration.limits.max_charging_profiles,
+            configuration.periods_per_profile,
+        );
+    });
+
     let (status_queue, status) = retained(|| full_status_queue(configuration.queue_capacity));
     let (transaction_queue, transactions) =
         retained(|| full_transaction_queue(configuration.queue_capacity));
@@ -374,6 +434,8 @@ fn measure(configuration: &Configuration) -> Measurement {
         device_model,
         device_model_variables,
         connectors,
+        charging_profiles,
+        installed_profiles,
         status_queue,
         transaction_queue,
         security_queue,
@@ -393,6 +455,7 @@ fn configurations() -> Vec<Configuration> {
                 .with_max_local_authorization_list_entries(25)
                 .with_max_device_model_variables(64),
             queue_capacity: 25,
+            periods_per_profile: 8,
             security_log_capacity: 25,
         },
         Configuration {
@@ -401,6 +464,7 @@ fn configurations() -> Vec<Configuration> {
             connector_counts: &[2],
             limits: StateLimits::default(),
             queue_capacity: 100,
+            periods_per_profile: 8,
             security_log_capacity: ocpp_charge_point::security::DEFAULT_SECURITY_LOG_CAPACITY,
         },
         Configuration {
@@ -411,6 +475,7 @@ fn configurations() -> Vec<Configuration> {
                 .with_max_local_authorization_list_entries(500)
                 .with_max_device_model_variables(512),
             queue_capacity: 200,
+            periods_per_profile: 8,
             security_log_capacity: 200,
         },
     ]
@@ -439,7 +504,7 @@ fn device_model_shape_comparison(variables: usize, shapes: &[usize]) -> Vec<(usi
 /// above the measured figure, so ordinary drift doesn't fail the build but a change that
 /// meaningfully grows retained state does - the point of measuring at all (G2.3). Raise a ceiling
 /// only together with `docs/MEMORY.md`'s table.
-const CEILINGS: [usize; 3] = [54_000, 200_000, 432_000];
+const CEILINGS: [usize; 3] = [66_000, 220_000, 495_000];
 
 #[test]
 fn retained_heap_per_configuration_stays_within_its_documented_budget() {
@@ -498,6 +563,10 @@ fn retained_heap_per_configuration_stays_within_its_documented_budget() {
         );
         println!("  busy connectors            {:>7} B", measured.connectors);
         println!(
+            "  charging profiles ({:>2})     {:>7} B",
+            measured.installed_profiles, measured.charging_profiles
+        );
+        println!(
             "  status queue               {:>7} B",
             measured.status_queue
         );
@@ -534,6 +603,12 @@ fn retained_heap_per_configuration_stays_within_its_documented_budget() {
             configuration.name,
             measured.total(),
             ceiling
+        );
+
+        // The profile store's bound must bind too (G2.2), for the same reason.
+        assert_eq!(
+            measured.installed_profiles, configuration.limits.max_charging_profiles,
+            "the charging profile store should be full at its configured maximum"
         );
 
         // Every bound must actually bind: the device model must have accepted exactly its

@@ -191,7 +191,7 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         enabled: |c| c.smart_charging,
         ctrlr_component: Some("SmartChargingCtrlr"),
         feature_profile_1_6: Some("SmartCharging"),
-        has_handler: false,
+        has_handler: true,
     },
     CapabilityGate {
         name: "has_display",

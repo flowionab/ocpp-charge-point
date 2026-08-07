@@ -25,6 +25,19 @@ pub const DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES: usize = 100;
 /// refused.
 pub const DEFAULT_MAX_DEVICE_MODEL_VARIABLES: usize = 256;
 
+/// Default maximum number of charging profiles the store holds (see
+/// [`StateLimits::max_charging_profiles`]).
+///
+/// 16 covers what a real installation actually stacks - an installation limit, a couple of
+/// TxDefault profiles at different stack levels, one TxProfile per simultaneously-charging
+/// connector, and an external-constraints profile - across a small-to-mid-size charge point,
+/// while bounding the store to a few KB (a profile is a handful of scalars plus its schedule
+/// periods). A CSMS that legitimately drives more (a large DC site with per-connector schedules)
+/// should raise it via [`StateLimits::with_max_charging_profiles`] rather than have
+/// `SetChargingProfile` refused; see `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2) for why the bound
+/// exists at all.
+pub const DEFAULT_MAX_CHARGING_PROFILES: usize = 16;
+
 /// The configured maxima for every growable collection in [`crate::state::ChargePointState`], so a
 /// charge point's peak memory is a function of its configuration rather than of how much a CSMS or
 /// a hardware binding decides to push at it - see `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2). Passed
@@ -61,6 +74,14 @@ pub struct StateLimits {
     /// crate's own defaults would break `GetVariables`/`GetBaseReport` rather than bound anything
     /// worth bounding.
     pub max_device_model_variables: usize,
+    /// The most charging profiles the store may hold across every scope. A `SetChargingProfile`
+    /// that would exceed it is refused with
+    /// [`ChargingProfileRejection::TooManyProfiles`](crate::state::ChargingProfileRejection::TooManyProfiles)
+    /// rather than evicting one the CSMS still believes is installed - unlike the offline queues,
+    /// where dropping the oldest message is the lesser evil, silently forgetting a *limit* would
+    /// let the charge point draw more current than the CSMS last told it to. Replacing an
+    /// already-installed profile is always allowed, even at the bound. Clamped to at least 1.
+    pub max_charging_profiles: usize,
 }
 
 impl StateLimits {
@@ -70,7 +91,14 @@ impl StateLimits {
         Self {
             max_local_authorization_list_entries: DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES,
             max_device_model_variables: DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
+            max_charging_profiles: DEFAULT_MAX_CHARGING_PROFILES,
         }
+    }
+
+    /// Overrides [`Self::max_charging_profiles`].
+    pub const fn with_max_charging_profiles(mut self, max: usize) -> Self {
+        self.max_charging_profiles = max;
+        self
     }
 
     /// Overrides [`Self::max_local_authorization_list_entries`].

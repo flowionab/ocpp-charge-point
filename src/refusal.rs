@@ -87,7 +87,7 @@ pub struct RefusalGate {
 /// The messages this crate registers a handler for today whose underlying functional block can
 /// genuinely be runtime-absent while still compiled in - see [`RefusalGate`] and the module docs'
 /// decision table. Mirrors [`crate::hardware::capabilities::CAPABILITY_GATES`]' `has_handler:
-/// true` rows (`reservation`, `local_auth_list`, `tariff_and_cost`).
+/// true` rows (`reservation`, `local_auth_list`, `tariff_and_cost`, `smart_charging`).
 pub const REFUSAL_GATES: &[RefusalGate] = &[
     RefusalGate {
         message: "ReserveNow",
@@ -113,6 +113,26 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         message: "CostUpdated",
         capability: |c| c.tariff_and_cost,
         shape: RefusalShape::CallError,
+    },
+    RefusalGate {
+        message: "SetChargingProfile",
+        capability: |c| c.smart_charging,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "ClearChargingProfile",
+        capability: |c| c.smart_charging,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "GetCompositeSchedule",
+        capability: |c| c.smart_charging,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "GetChargingProfiles",
+        capability: |c| c.smart_charging,
+        shape: RefusalShape::CallResultStatus,
     },
 ];
 

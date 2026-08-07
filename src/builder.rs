@@ -253,6 +253,75 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self.capabilities
     }
 
+    /// Registers the Smart Charging functional block (`docs/ROADMAP.md` §11,
+    /// `docs/PRODUCTION-ROADMAP.md` B2): the `SetChargingProfile`, `ClearChargingProfile` and
+    /// `GetCompositeSchedule` handlers, plus the two background loops that project the composite
+    /// schedule onto [`crate::hardware::Connector::set_current_limit`].
+    ///
+    /// `projection` is shared between the loops and the `GetCompositeSchedule` handler on purpose:
+    /// what the CSMS is told the charge point *will* do has to come from the same composition that
+    /// decides what it actually does. Construct it with
+    /// [`ChargingLimitProjection::with_supply`](crate::smart_charging::ChargingLimitProjection::with_supply)
+    /// when the installation's voltage and phase count are known - without it, a profile
+    /// denominated in watts is skipped rather than converted, since this crate will not guess a
+    /// supply it cannot see.
+    ///
+    /// `clock` stamps the installation instant onto a schedule the CSMS left unanchored and drives
+    /// composition's "now"; `backoff` is what the period-boundary loop sleeps on - the same
+    /// caller-supplied primitives [`Self::provisioning`] takes, for the same no_std reason.
+    ///
+    /// Registered by [`crate::setup::setup`] only when the hardware declares
+    /// [`Capabilities::smart_charging`](crate::hardware::Capabilities::smart_charging) - a charge
+    /// point that cannot limit its current has nothing to project a schedule onto (C3.1).
+    pub async fn smart_charging<N, K, B>(
+        self,
+        csms: &N,
+        projection: Arc<crate::smart_charging::ChargingLimitProjection>,
+        clock: K,
+        backoff: B,
+    ) -> Self
+    where
+        N: crate::smart_charging::SetChargingProfileHandler
+            + crate::smart_charging::ClearChargingProfileHandler
+            + crate::smart_charging::GetCompositeScheduleHandler
+            + Send
+            + Sync
+            + 'static,
+        K: crate::clock::Clock + Clone + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+    {
+        csms.register_set_charging_profile_handler(self.runtime.actor())
+            .await;
+        csms.register_clear_charging_profile_handler(self.runtime.actor())
+            .await;
+        csms.register_get_composite_schedule_handler(self.runtime.actor(), projection.clone())
+            .await;
+
+        let state_driven_actor = self.runtime.actor();
+        let state_driven_projection = projection.clone();
+        let state_driven_clock = clock.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::smart_charging::run_charging_limit_projection(
+                &state_driven_actor,
+                &state_driven_projection,
+                &state_driven_clock,
+            )
+            .await;
+        }));
+        let timer_actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            crate::smart_charging::run_charging_limit_schedule(
+                &timer_actor,
+                &projection,
+                &clock,
+                &backoff,
+            )
+            .await;
+        }));
+
+        self
+    }
+
     /// Registers durable boot-reason state (`docs/PRODUCTION-ROADMAP.md` §7.2/§7.4: the
     /// boot-reason row of E2, and E4.2): loads whatever cause `crate::reset::handle_reset`
     /// recorded before this boot (if any), so [`Self::provisioning`] sends the honest
@@ -1497,7 +1566,7 @@ pub(crate) mod test_support {
             Ok(())
         }
 
-        async fn set_current_limit(&self, _limit_ma: u32) -> Result<(), Self::Error> {
+        async fn set_current_limit(&self, _limit_ma: Option<u32>) -> Result<(), Self::Error> {
             Ok(())
         }
     }

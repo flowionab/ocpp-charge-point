@@ -23,6 +23,23 @@ pub struct EvseState {
     /// with no carried-over cost from a previous one on the same connector. See
     /// `docs/ROADMAP.md` §9.
     pub running_costs: Vec<Option<f64>>,
+    /// The current limit most recently *requested* of each connector's hardware, in milliamps,
+    /// indexed the same as `connectors`. `None` means no installed charging profile imposes a
+    /// limit on that connector - see [`ConnectorEvent::CurrentLimitComputed`](crate::state::ConnectorEvent::CurrentLimitComputed)
+    /// and `docs/ROADMAP.md` §11.
+    ///
+    /// This is what the projection compares against to decide whether hardware needs telling at
+    /// all, so it is deliberately the *requested* value rather than the confirmed one: a
+    /// connector whose hardware failed to apply a limit is driven into `Faulted` by the usual
+    /// hardware-error path, and re-requesting the same failing limit on every state change would
+    /// add nothing.
+    pub charging_limits: Vec<Option<u32>>,
+    /// The current limit each connector's hardware most recently *confirmed* applying, in
+    /// milliamps, indexed the same as `connectors` - see
+    /// [`ConnectorEvent::CurrentLimitConfirmed`](crate::state::ConnectorEvent::CurrentLimitConfirmed).
+    /// Lags `charging_limits` by one hardware round-trip, and is what a CSMS-facing report should
+    /// quote when it wants to say what the connector is *actually* limited to.
+    pub applied_charging_limits: Vec<Option<u32>>,
 }
 
 /// One EVSE's own availability/fault status, independent of any individual connector's state.
@@ -47,6 +64,8 @@ impl EvseState {
             transactions: vec![None; connector_count],
             reservations: vec![None; connector_count],
             running_costs: vec![None; connector_count],
+            charging_limits: vec![None; connector_count],
+            applied_charging_limits: vec![None; connector_count],
         }
     }
 

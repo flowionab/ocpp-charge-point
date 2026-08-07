@@ -36,26 +36,33 @@ pub trait Connector {
 
     /// Limits the current this connector may draw to at most `limit_ma` milliamps (matching
     /// [`MeterSample::current_ma`](crate::state::MeterSample::current_ma)'s unit, for enough
-    /// resolution to be useful at typical EV charging currents). Requested via
+    /// resolution to be useful at typical EV charging currents), or removes any
+    /// previously-applied limit when `limit_ma` is `None`. Requested via
     /// [`HardwareCommand::SetCurrentLimit`](crate::state::HardwareCommand::SetCurrentLimit).
     ///
-    /// This is a hardware hook only (`docs/PRODUCTION-ROADMAP.md` §"B2 — Smart charging",
-    /// B2.3): nothing in this crate today decides *what* limit to request - there is no
-    /// charging-profile store or composite-schedule evaluation yet (B2.1/B2.2/B2.4), and no
-    /// OCPP `SetChargingProfile` handling wired up to call this. Implementors should simply
-    /// clamp the connector's contactor to the requested limit (or the nearest limit the
+    /// `None` means "no CSMS-imposed limit applies any more - go back to whatever this connector
+    /// can do on its own". It is **not** "stop charging": a zero limit is expressed as
+    /// `Some(0)`, which OCPP uses to suspend charging without ending the transaction, and the two
+    /// must not be conflated. Only the hardware knows its own maximum, which is why this crate
+    /// asks for the limit to be *removed* rather than naming a number it would have to invent.
+    ///
+    /// Called by the charging-limit projection (`docs/PRODUCTION-ROADMAP.md` B2.4) whenever the
+    /// composite schedule's limit for this connector changes - a profile installed or cleared, a
+    /// schedule period boundary passing, or a transaction starting or ending. The crate never
+    /// calls it unless [`Capabilities::smart_charging`](crate::hardware::Capabilities::smart_charging)
+    /// was declared `true`.
+    ///
+    /// Implementors should clamp the connector to the requested limit (or the nearest limit the
     /// hardware can actually enforce, if it can't hit `limit_ma` exactly) and return `Err` -
     /// never panic or retry internally - if the limit can't be honoured at all, which drives the
     /// connector into [`ConnectorState::Faulted`](crate::state::ConnectorState::Faulted) the
     /// same as any other hardware failure (see `CLAUDE.md`'s error-handling guidance).
     ///
-    /// **Breaking change:** this is a new required method on an existing trait, batched with
+    /// **Breaking change:** this method arrived with
     /// [`ChargePoint::capabilities`](crate::hardware::ChargePoint::capabilities) and
-    /// [`Storage`](crate::hardware::Storage) so integrators absorb one break instead of three
-    /// (`docs/PRODUCTION-ROADMAP.md` §5.2 C2.2). A connector with no way to limit current at all
-    /// should simply return `Err` for every call - the crate never calls this unless
-    /// [`Capabilities::smart_charging`](crate::hardware::Capabilities::smart_charging) was
-    /// declared `true`, once the profile/schedule machinery (B2.1/B2.2/B2.4) that would trigger
-    /// it exists.
-    async fn set_current_limit(&self, limit_ma: u32) -> Result<(), Self::Error>;
+    /// [`Storage`](crate::hardware::Storage) (`docs/PRODUCTION-ROADMAP.md` §5.2 C2.2) taking a
+    /// bare `u32`; it takes an `Option<u32>` from B2 onwards. The change was made while the hook
+    /// still had no caller at all rather than after one existed, since a signature with no way to
+    /// say "the limit is gone" would have forced every integrator to guess at their own maximum.
+    async fn set_current_limit(&self, limit_ma: Option<u32>) -> Result<(), Self::Error>;
 }

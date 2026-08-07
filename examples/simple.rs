@@ -19,6 +19,10 @@ use ocpp_charge_point::reservation::{CancelReservationHandler, ReserveNowHandler
 use ocpp_charge_point::reset::ResetHandler;
 use ocpp_charge_point::security::SecurityEventNotifier;
 use ocpp_charge_point::setup;
+use ocpp_charge_point::smart_charging::{
+    ChargingLimitProjection, ClearChargingProfileHandler, GetCompositeScheduleHandler,
+    SetChargingProfileHandler,
+};
 use ocpp_charge_point::state::{
     AuthorizationStatus, BootReasonCause, ChargePointEvent, ConnectorEvent, ConnectorStatus,
     EvseEvent, IdToken, RegistrationStatus, Transaction, TransactionEventKind,
@@ -232,6 +236,37 @@ impl CostUpdatedHandler for AlwaysAcceptBootNotifier {
     }
 }
 
+// Smart Charging (docs/ROADMAP.md §11). This sample charge point declares no `smart_charging`
+// capability, so `setup` never registers these - they exist because `setup`'s "everything on"
+// bound list still requires the CSMS type to be *able* to handle them.
+#[async_trait::async_trait]
+impl SetChargingProfileHandler for AlwaysAcceptBootNotifier {
+    async fn register_set_charging_profile_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClearChargingProfileHandler for AlwaysAcceptBootNotifier {
+    async fn register_clear_charging_profile_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetCompositeScheduleHandler for AlwaysAcceptBootNotifier {
+    async fn register_get_composite_schedule_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+        _projection: std::sync::Arc<ChargingLimitProjection>,
+    ) {
+    }
+}
+
 #[async_trait::async_trait]
 impl ReconnectHandler for AlwaysAcceptBootNotifier {
     async fn register_reconnect_handler<F, FF>(&self, _callback: F)
@@ -344,7 +379,7 @@ impl Connector for SampleConnector {
         Ok(())
     }
 
-    async fn set_current_limit(&self, _limit_ma: u32) -> Result<(), Self::Error> {
+    async fn set_current_limit(&self, _limit_ma: Option<u32>) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -364,6 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         TokioExecutor,
         TokioBackoff,
         ocpp_charge_point::clock::SystemMonotonicClock,
+        ocpp_charge_point::clock::SystemClock,
     )
     .await?;
     runtime

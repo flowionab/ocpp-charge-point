@@ -1165,7 +1165,48 @@ Charging profiles and schedule negotiation.
 - Internal state needed: charging profile store, schedule composition
   logic, external limit inputs (local/grid), a schedule → hardware current
   limit projection.
-- Status: ⬜ not started.
+- Status: 🚧 partial — the load-management spine is complete on all three
+  versions. `state::ChargingProfileStore` (bounded by
+  `StateLimits::max_charging_profiles`, mutated only via
+  `ChargePointEvent::ChargingProfileSet`/`ChargingProfilesCleared`) holds a
+  version-independent profile model carrying the superset of what the three
+  versions express: five purposes, up to three schedules per profile,
+  absolute/recurring/relative kinds, validity windows.
+  `smart_charging::compose` turns whatever applies to a connector into one
+  composite curve - purpose precedence (`TxProfile` beats `TxDefaultProfile`
+  whatever their stack levels), stack level within a purpose, then the
+  installation limit and external constraints as caps, with a cap that has
+  nothing to cap becoming the limit itself. It is pure, so all of that is
+  tested without a clock, a CSMS or hardware.
+
+  `smart_charging::run_charging_limit_projection`/`run_charging_limit_schedule`
+  push the result at `hardware::Connector::set_current_limit` - one loop on
+  state changes, one on schedule period boundaries, deduped by the state
+  machine so only a genuine change reaches hardware. That hook's signature
+  widened to `Option<u32>` here: a limit that stops applying must be
+  *removed*, and only the hardware knows its own maximum (a suspend-charging
+  0 A period stays `Some(0)` - the two must not be conflated).
+
+  `SetChargingProfile`, `ClearChargingProfile` and `GetCompositeSchedule` are
+  wired end-to-end for 1.6J, 2.0.1 and 2.1, each through a protocol-agnostic
+  handler that decides the outcome against the real store before dispatching.
+  1.6J needs its flat `connectorId` resolved through `crate::topology` to the
+  owning EVSE (its profiles then scope per-EVSE, the same reduction the other
+  1.6J handlers make); 2.0.1 has no `PriorityCharging` to report (it degrades
+  to `TxProfile`); 2.1 permits a period with no limit at all, which is dropped
+  rather than invented.
+
+  Two things this block deliberately refuses to guess: amps↔watts conversion
+  without caller-supplied `SupplyCharacteristics` (a wrong voltage/phase
+  assumption over-limits by 5× - a safety question, not a billing one), and a
+  `Relative` schedule's anchor when the transaction's start time isn't known.
+
+  Still missing: `GetChargingProfiles`/`ReportChargingProfiles` (the store-side
+  query exists; the multi-part report sender doesn't), `NotifyChargingLimit`/
+  `ClearedChargingLimit`, `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`,
+  2.1's dynamic schedule updates and priority-charging messages, and
+  persistence of the profile store across a reboot (E2.7 - the store is
+  RAM-only today, so load limits do not survive a power cut).
 - Version notes: 2.1 adds richer profile purposes and DER-linked limits
   **(verify vs 2.1 spec)**; 1.6J smart charging is optional-profile and a
   strict subset.

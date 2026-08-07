@@ -50,7 +50,8 @@ Measured on a 64-bit host. See [32-bit targets](#32-bit-targets) below — a
 Each row is filled to its configured worst case: the local authorization list
 full of 36-character id tokens (OCPP 2.x's maximum), the device model full at its
 configured maximum, every connector holding both an active transaction and a
-reservation, all three offline queues full, and the durable security log full.
+reservation, all three offline queues full, the durable security log full, and
+the charging profile store full.
 
 | | Tight AC wallbox | Crate defaults | DC site |
 | --- | --- | --- | --- |
@@ -59,19 +60,27 @@ reservation, all three offline queues full, and the durable security log full.
 | `max_device_model_variables` | 64 | 256 | 512 |
 | Offline queue capacity (each of 3) | 25 | 100 | 200 |
 | Security log capacity | 25 | 50 | 200 |
+| `max_charging_profiles` | 16 | 16 | 16 |
 | Empty state (incl. built-in device model) | 5.0 KB | 5.2 KB | 6.6 KB |
 | Local authorization list, full | 3.1 KB | 10.9 KB | 52.5 KB |
 | Device model, full | 22.4 KB | 95.8 KB | 190.7 KB |
 | Busy connectors (transaction + reservation each) | 0.1 KB | 0.3 KB | 1.0 KB |
+| Charging profiles, full (8 periods each) | 4.7 KB | 4.7 KB | 4.7 KB |
 | Status queue, full | 0.8 KB | 3.1 KB | 6.1 KB |
 | Transaction queue, full | 6.0 KB | 23.8 KB | 47.6 KB |
 | Security queue, full | 5.1 KB | 20.5 KB | 41.1 KB |
 | Security log, full | 5.6 KB | 11.3 KB | 45.2 KB |
-| **Total retained** | **48.3 KB** | **171.0 KB** | **391.0 KB** |
+| **Total retained** | **53.1 KB** | **175.8 KB** | **396.0 KB** |
 
-Read that as: the crate's own defaults need roughly **171 KB of heap** in the
+Read that as: the crate's own defaults need roughly **176 KB of heap** in the
 worst case, and a deliberately tightened single-connector wallbox fits in
-roughly **48 KB**. Neither figure includes the exclusions above.
+roughly **53 KB**. Neither figure includes the exclusions above.
+
+The charging profile store is the one row that does not scale with the
+configuration: `max_charging_profiles` defaults to 16 whatever the topology, so a
+big site pays the same ~5 KB a wallbox does. Raise it on a site whose CSMS
+actually drives per-connector schedules — at ~296 B per profile (eight schedule
+periods each), even quadrupling it costs under 15 KB.
 
 The security log is the one row an integrator sizes on a different axis from the
 rest: it retains history whether or not those events ever reached the CSMS, so
@@ -94,6 +103,7 @@ Derived from the same measurements, so you can price a bound before setting it:
 | Queued transaction event | ~240 B | id token plus the deque slot |
 | Queued security event | ~205 B | with `techInfo` text; less without |
 | Security log entry | ~226 B | queued security event plus a recorded-at timestamp |
+| Charging profile | ~296 B | with 8 schedule periods; a period is ~24 B of that |
 
 An offline queue's `VecDeque` grows by doubling, so a queue configured with
 capacity 100 ends up with 128 slots allocated. Round a configured capacity up to

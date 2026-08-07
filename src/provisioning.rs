@@ -1110,6 +1110,34 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::smart_charging::SetChargingProfileHandler for FixedBootNotifier {
+        async fn register_set_charging_profile_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::smart_charging::ClearChargingProfileHandler for FixedBootNotifier {
+        async fn register_clear_charging_profile_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::smart_charging::GetCompositeScheduleHandler for FixedBootNotifier {
+        async fn register_get_composite_schedule_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+            _projection: alloc::sync::Arc<crate::smart_charging::ChargingLimitProjection>,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::connection::ReconnectHandler for FixedBootNotifier {
         async fn register_reconnect_handler<F, FF>(&self, _callback: F)
         where

@@ -5,9 +5,10 @@ use chrono::{DateTime, Utc};
 use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::{
-    Component, ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry,
-    MeterSample, RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent,
-    StopReason, Transaction, Variable, VariableAttributeType,
+    ChargingProfile, ChargingProfileCriteria, ChargingProfileScope, Component, ConnectorState,
+    ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry, MeterSample, RegistrationStatus,
+    Reservation, ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, Variable,
+    VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -58,6 +59,27 @@ pub enum ChargePointEvent {
         /// Whether to interrupt anything in progress right away, or wait for `target` to go
         /// idle first.
         kind: ResetKind,
+    },
+    /// The CSMS installed a charging profile (OCPP `SetChargingProfile`). Applied through
+    /// [`crate::state::ChargingProfileStore::install`], so the replacement rules and the
+    /// [`StateLimits::max_charging_profiles`](crate::state::StateLimits::max_charging_profiles)
+    /// bound both hold however the profile arrived. A profile the store refuses is logged and
+    /// dropped here; `crate::smart_charging::handle_set_charging_profile` checks acceptance
+    /// against the store itself before dispatching this, so the CSMS gets the real answer rather
+    /// than an optimistic one.
+    ChargingProfileSet {
+        /// Where the profile was installed - one EVSE, or the whole charge point.
+        scope: ChargingProfileScope,
+        /// The profile itself. Boxed to keep [`ChargePointEvent`] small: a profile with its
+        /// schedules is by far the largest thing any variant carries, and every event on the
+        /// actor's mailbox would otherwise pay for it.
+        profile: alloc::boxed::Box<ChargingProfile>,
+    },
+    /// Charging profiles were cleared - by the CSMS (OCPP `ClearChargingProfile`), or by the
+    /// charge point itself when a transaction ended and its `TxProfile`s stopped applying.
+    ChargingProfilesCleared {
+        /// Which profiles to clear - see [`ChargingProfileCriteria`].
+        criteria: ChargingProfileCriteria,
     },
     /// An event mutating the Component/Variable device model (OCPP `GetVariables`/
     /// `SetVariables`, or 1.6J's `GetConfiguration`/`ChangeConfiguration` projection onto it) -
@@ -258,11 +280,19 @@ pub enum ConnectorEvent {
     /// connector has confirmed its contactor is open (`FaultedSafe`); otherwise a no-op.
     FaultCleared,
     /// Hardware confirmed the current limit was applied, in response to a
-    /// [`HardwareCommand::SetCurrentLimit`]. Carries the limit that was applied, in milliamps.
-    /// This is a hardware hook only - nothing in this crate emits `SetCurrentLimit` yet (see
-    /// that variant's docs); reserved for the charging-profile machinery
-    /// (`docs/PRODUCTION-ROADMAP.md` §"B2 — Smart charging" B2.1/B2.2/B2.4) to drive later.
-    CurrentLimitConfirmed(u32),
+    /// [`HardwareCommand::SetCurrentLimit`]. Carries the limit that was applied, in milliamps, or
+    /// `None` if the previously-applied limit was removed - see
+    /// [`crate::hardware::Connector::set_current_limit`].
+    CurrentLimitConfirmed(Option<u32>),
+    /// The charging-limit projection computed a new limit for this connector from the composite
+    /// schedule (`docs/PRODUCTION-ROADMAP.md` B2.4, [`crate::smart_charging`]): `Some(limit_ma)`
+    /// to limit the connector's draw, `None` when no installed profile imposes one any more.
+    ///
+    /// Recorded on [`crate::state::EvseState::charging_limits`] and dispatched to hardware as a
+    /// [`HardwareCommand::SetCurrentLimit`] - but only when it actually differs from the limit
+    /// already requested for this connector, so a projection that re-evaluates on every state
+    /// change doesn't re-issue the same limit to hardware over and over.
+    CurrentLimitComputed(Option<u32>),
 }
 
 /// A side effect of applying a [`ChargePointEvent`], to be carried out by the actor's caller
@@ -433,17 +463,16 @@ pub enum HardwareCommand {
         /// The targeted EVSE's index.
         evse_id: usize,
     },
-    /// Limit the connector's current draw to `limit_ma` milliamps. Dispatched via
-    /// [`crate::hardware::Connector::set_current_limit`]. This is a hardware hook only
-    /// (`docs/PRODUCTION-ROADMAP.md` §"B2 — Smart charging" B2.3) - nothing in this crate's
-    /// state machine emits this yet; that's the charging-profile store and composite-schedule
-    /// evaluation (B2.1/B2.2/B2.4), still to come.
+    /// Limit the connector's current draw to `limit_ma` milliamps, or remove any applied limit
+    /// when it is `None`. Dispatched via [`crate::hardware::Connector::set_current_limit`], and
+    /// emitted by [`ConnectorEvent::CurrentLimitComputed`] when the composite schedule's limit
+    /// for this connector changes (`docs/PRODUCTION-ROADMAP.md` §"B2 — Smart charging").
     SetCurrentLimit {
         /// The targeted connector's EVSE index.
         evse_id: usize,
         /// The targeted connector's index within its EVSE.
         connector_id: usize,
-        /// The current limit to apply, in milliamps.
-        limit_ma: u32,
+        /// The current limit to apply, in milliamps, or `None` to remove the applied limit.
+        limit_ma: Option<u32>,
     },
 }

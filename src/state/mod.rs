@@ -1,6 +1,7 @@
 mod authorization_status;
 mod boot_reason;
 mod charge_point_state;
+mod charging_profile;
 mod connector_state;
 mod connector_status;
 mod device_model;
@@ -19,6 +20,12 @@ mod transaction;
 pub use self::authorization_status::AuthorizationStatus;
 pub use self::boot_reason::BootReasonCause;
 pub use self::charge_point_state::{ChargePointState, LifecycleState, TimeSyncAnchor};
+pub use self::charging_profile::{
+    ChargingProfile, ChargingProfileCriteria, ChargingProfileId, ChargingProfileKind,
+    ChargingProfilePurpose, ChargingProfileRejection, ChargingProfileScope, ChargingProfileStore,
+    ChargingRateUnit, ChargingSchedule, ChargingSchedulePeriod, InstalledChargingProfile,
+    RecurrencyKind,
+};
 pub use self::connector_state::ConnectorState;
 pub use self::connector_status::ConnectorStatus;
 pub use self::device_model::{
@@ -34,7 +41,8 @@ pub use self::event::{
 pub use self::evse_state::{EvseState, EvseStatus};
 pub use self::id_token::{IdToken, IdTokenKind};
 pub use self::limits::{
-    DEFAULT_MAX_DEVICE_MODEL_VARIABLES, DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, StateLimits,
+    DEFAULT_MAX_CHARGING_PROFILES, DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
+    DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, StateLimits,
 };
 pub use self::local_authorization_list::{LocalAuthorizationList, LocalListEntry};
 pub use self::meter_sample::MeterSample;

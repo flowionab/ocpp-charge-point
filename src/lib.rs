@@ -53,6 +53,7 @@ pub mod reservation;
 pub mod reset;
 mod runtime;
 pub mod security;
+pub mod smart_charging;
 // `setup()` is the "everything on" wrapper (see its module docs): it bounds its CSMS type by
 // every functional block's traits at once, including the three that are genuinely gated behind
 // Cargo features today (reservation, local-auth-list, tariff-cost). Compiling it with any of

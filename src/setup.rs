@@ -18,6 +18,9 @@ use crate::reporting::{GetBaseReportHandler, GetReportHandler};
 use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::reset::ResetHandler;
 use crate::security::SecurityEventNotifier;
+use crate::smart_charging::{
+    ClearChargingProfileHandler, GetCompositeScheduleHandler, SetChargingProfileHandler,
+};
 use crate::transactions::TransactionNotifier;
 
 /// Starts the hardware, then runs the Provisioning functional block's BootNotification
@@ -29,24 +32,27 @@ use crate::transactions::TransactionNotifier;
 /// request via Authorize, and forward every reported security event via
 /// SecurityEventNotification, for as long as the process runs.
 ///
-/// `executor`/`backoff`/`monotonic` are caller-supplied (rather than defaulting to tokio) so this
+/// `executor`/`backoff`/`monotonic`/`clock` are caller-supplied (rather than defaulting to tokio) so this
 /// function doesn't hard-depend on an async runtime - std/tokio users can pass
 /// [`crate::executor::TokioExecutor`]/[`crate::provisioning::TokioBackoff`]/
-/// [`crate::clock::SystemMonotonicClock`]; embedded targets supply their own. `monotonic` anchors
+/// [`crate::clock::SystemMonotonicClock`]/[`crate::clock::SystemClock`]; embedded targets supply
+/// their own. `clock` is what the Smart Charging block composes schedules against (B2), and
+/// `monotonic` anchors
 /// BootNotification/Heartbeat `currentTime` sync - see
 /// [`crate::builder::ChargePointBuilder::provisioning`]'s docs.
 ///
 /// This is a thin "everything on" wrapper around [`ChargePointBuilder`], registering every
 /// functional block it exposes in the same order this function has always used. Callers whose
 /// CSMS client only implements a subset of blocks - or who want to skip a block outright - should
-/// use [`ChargePointBuilder`] directly instead; `N`'s single 21-trait bound below is exactly the
+/// use [`ChargePointBuilder`] directly instead; `N`'s single 24-trait bound below is exactly the
 /// limitation the builder exists to remove.
-pub async fn setup<T, E, C, N, X, B, M>(
+pub async fn setup<T, E, C, N, X, B, M, K>(
     charge_point: T,
     csms: N,
     executor: X,
     backoff: B,
     monotonic: M,
+    clock: K,
 ) -> Result<ChargePointRuntime<T>, T::StartError>
 where
     T: ChargePoint<E, C>,
@@ -72,6 +78,9 @@ where
         + GetReportHandler
         + SecurityEventNotifier
         + CostUpdatedHandler
+        + SetChargingProfileHandler
+        + ClearChargingProfileHandler
+        + GetCompositeScheduleHandler
         + ReconnectHandler
         + Clone
         + Send
@@ -80,10 +89,11 @@ where
     X: Executor,
     B: Backoff + Clone + Send + Sync + 'static,
     M: MonotonicClock + Clone + Send + Sync + 'static,
+    K: crate::clock::Clock + Clone + Send + Sync + 'static,
 {
     let mut builder = ChargePointBuilder::start(charge_point, executor)
         .await?
-        .provisioning(&csms, backoff, monotonic)
+        .provisioning(&csms, backoff.clone(), monotonic)
         .await
         .status_notifications(&csms)
         .await
@@ -116,6 +126,16 @@ where
     }
     if capabilities.tariff_and_cost {
         builder = builder.cost(&csms).await;
+    }
+    if capabilities.smart_charging {
+        builder = builder
+            .smart_charging(
+                &csms,
+                alloc::sync::Arc::new(crate::smart_charging::ChargingLimitProjection::new()),
+                clock,
+                backoff,
+            )
+            .await;
     }
 
     Ok(builder.build())
@@ -159,6 +179,7 @@ mod tests {
             TokioExecutor,
             TokioBackoff,
             crate::clock::SystemMonotonicClock,
+            crate::clock::SystemClock,
         )
         .await
         .unwrap();
@@ -186,6 +207,7 @@ mod tests {
             TokioExecutor,
             TokioBackoff,
             crate::clock::SystemMonotonicClock,
+            crate::clock::SystemClock,
         )
         .await
         .unwrap();
@@ -210,6 +232,7 @@ mod tests {
         reservation_registered: Arc<AtomicBool>,
         local_auth_list_registered: Arc<AtomicBool>,
         cost_registered: Arc<AtomicBool>,
+        smart_charging_registered: Arc<AtomicBool>,
     }
 
     impl RecordingCsms {
@@ -219,6 +242,7 @@ mod tests {
                 reservation_registered: Arc::new(AtomicBool::new(false)),
                 local_auth_list_registered: Arc::new(AtomicBool::new(false)),
                 cost_registered: Arc::new(AtomicBool::new(false)),
+                smart_charging_registered: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -395,6 +419,35 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::smart_charging::SetChargingProfileHandler for RecordingCsms {
+        async fn register_set_charging_profile_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+            self.smart_charging_registered.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::smart_charging::ClearChargingProfileHandler for RecordingCsms {
+        async fn register_clear_charging_profile_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::smart_charging::GetCompositeScheduleHandler for RecordingCsms {
+        async fn register_get_composite_schedule_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+            _projection: alloc::sync::Arc<crate::smart_charging::ChargingLimitProjection>,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::connection::ReconnectHandler for RecordingCsms {
         async fn register_reconnect_handler<F, FF>(&self, _callback: F)
         where
@@ -466,6 +519,7 @@ mod tests {
                     TokioExecutor,
                     TokioBackoff,
                     crate::clock::SystemMonotonicClock,
+                    crate::clock::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -477,6 +531,7 @@ mod tests {
                         "reservation" => csms.reservation_registered.load(Ordering::SeqCst),
                         "local_auth_list" => csms.local_auth_list_registered.load(Ordering::SeqCst),
                         "tariff_and_cost" => csms.cost_registered.load(Ordering::SeqCst),
+                        "smart_charging" => csms.smart_charging_registered.load(Ordering::SeqCst),
                         other => panic!("gate `{other}` claims has_handler but isn't wired here"),
                     };
                     assert_eq!(

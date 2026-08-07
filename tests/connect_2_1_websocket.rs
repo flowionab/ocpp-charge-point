@@ -84,7 +84,7 @@ impl Connector for TestConnector {
         Ok(())
     }
 
-    async fn set_current_limit(&self, _limit_ma: u32) -> Result<(), Self::Error> {
+    async fn set_current_limit(&self, _limit_ma: Option<u32>) -> Result<(), Self::Error> {
         Ok(())
     }
 }
