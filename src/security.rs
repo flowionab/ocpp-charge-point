@@ -11,6 +11,9 @@ use crate::state::{ChargePointEvent, SecurityEvent, SecurityEventType};
 use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
 
+#[cfg(feature = "ocpp_2_1")]
+pub use self::ocpp_2_1::Ocpp2_1SecurityEventNotifier;
+
 /// The OCPP wire `type` string for `event_type` - the standardized values, or the raw
 /// vendor-specific string for `Other`. Only 2.1 has an adapter to use this today - `ocpp-client`
 /// 0.2.0 doesn't implement `SecurityEventNotification` for 2.0.1 at all (see the `ocpp_2_0_1`
@@ -260,16 +263,13 @@ mod report_tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    // `SecurityEventNotificationRequest` needs a timestamp; producing one without a
-    // caller-supplied `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so
-    // this impl needs both `ocpp_2_1` and `std`.
-    #[cfg(feature = "std")]
-    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
-    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
-    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
-    // this timestamp today, so no `is_synchronized` check applies here.
-    mod with_system_clock {
-        use crate::clock::{Clock, SystemClock};
+    pub use with_clock::Ocpp2_1SecurityEventNotifier;
+
+    // `SecurityEventNotificationRequest` needs a timestamp, produced from a caller-supplied
+    // `Clock` - see `crate::clock::is_synchronized`'s docs for the policy on an unsynchronized
+    // reading (send it as-is, warn, never fabricate or drop it).
+    mod with_clock {
+        use crate::clock::{Clock, is_synchronized};
         use crate::security::SecurityEventNotifier;
         use crate::security::wire_type;
         use crate::state::SecurityEventType;
@@ -278,6 +278,84 @@ mod ocpp_2_1 {
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
         use ocpp_client::ocpp_types::v21::SecurityEventNotificationRequest;
 
+        /// Builds the `SecurityEventNotificationRequest` for `event_type`/`tech_info`,
+        /// timestamped from `clock.now()`. Pure (no network I/O), so a fixed [`Clock`] fake can
+        /// assert the exact timestamp that reaches the wire request.
+        fn build_security_event_notification_request<C: Clock>(
+            clock: &C,
+            event_type: &SecurityEventType,
+            tech_info: Option<&str>,
+        ) -> SecurityEventNotificationRequest {
+            let now = clock.now();
+            if !is_synchronized(&now) {
+                tracing::warn!(
+                    timestamp = %now,
+                    "SecurityEventNotification timestamp sourced from an unsynchronized clock"
+                );
+            }
+            SecurityEventNotificationRequest {
+                custom_data: None,
+                // Silently dropped if it doesn't fit OCPP's 255-byte bound - the caller
+                // supplied `techInfo` is free-form technical detail, not something we can
+                // truncate safely mid-UTF-8, and dropping it still delivers the (bounded,
+                // always-fitting) `type` below.
+                tech_info: tech_info.and_then(|info| heapless::String::try_from(info).ok()),
+                timestamp: now.to_rfc3339(),
+                // Falls back to a fixed literal if a vendor-supplied `Other` string exceeds
+                // OCPP's 50-byte bound - every standardized value fits by construction.
+                r#type: heapless::String::try_from(wire_type(event_type).as_str())
+                    .unwrap_or_else(|_| heapless::String::try_from("Other").unwrap()),
+            }
+        }
+
+        /// Wraps an `OCPP2_1Client` with a caller-supplied [`Clock`] for the
+        /// SecurityEventNotification timestamp - the no_std-reachable counterpart to this
+        /// module's `std`-only `OCPP2_1Client` impl below, which exists alongside this (not
+        /// instead of it) so no existing `std` caller needs a source change.
+        pub struct Ocpp2_1SecurityEventNotifier<C> {
+            client: OCPP2_1Client,
+            clock: C,
+        }
+
+        impl<C: Clock> Ocpp2_1SecurityEventNotifier<C> {
+            /// Wraps `client`, sourcing every SecurityEventNotification timestamp from `clock`.
+            pub fn with_clock(client: OCPP2_1Client, clock: C) -> Self {
+                Self { client, clock }
+            }
+        }
+
+        #[cfg(feature = "std")]
+        impl Ocpp2_1SecurityEventNotifier<crate::clock::SystemClock> {
+            /// Wraps `client`, sourcing every SecurityEventNotification timestamp from
+            /// [`crate::clock::SystemClock`].
+            pub fn new(client: OCPP2_1Client) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Send + Sync> SecurityEventNotifier for Ocpp2_1SecurityEventNotifier<C> {
+            type Error = ClientError<OCPP2_1Error>;
+
+            async fn notify_security_event(
+                &self,
+                event_type: &SecurityEventType,
+                tech_info: Option<&str>,
+            ) -> Result<(), Self::Error> {
+                let request =
+                    build_security_event_notification_request(&self.clock, event_type, tech_info);
+                self.client
+                    .send_security_event_notification(request)
+                    .await?;
+                Ok(())
+            }
+        }
+
+        /// The `std` convenience: `OCPP2_1Client` itself implements `SecurityEventNotifier`
+        /// directly (sourcing its timestamp from [`crate::clock::SystemClock`]) so existing
+        /// callers that pass a bare client - e.g. [`crate::connect::connect_and_setup`] - need no
+        /// source change.
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl SecurityEventNotifier for OCPP2_1Client {
             type Error = ClientError<OCPP2_1Error>;
@@ -287,21 +365,58 @@ mod ocpp_2_1 {
                 event_type: &SecurityEventType,
                 tech_info: Option<&str>,
             ) -> Result<(), Self::Error> {
-                self.send_security_event_notification(SecurityEventNotificationRequest {
-                    custom_data: None,
-                    // Silently dropped if it doesn't fit OCPP's 255-byte bound - the caller
-                    // supplied `techInfo` is free-form technical detail, not something we can
-                    // truncate safely mid-UTF-8, and dropping it still delivers the (bounded,
-                    // always-fitting) `type` below.
-                    tech_info: tech_info.and_then(|info| heapless::String::try_from(info).ok()),
-                    timestamp: SystemClock.now().to_rfc3339(),
-                    // Falls back to a fixed literal if a vendor-supplied `Other` string exceeds
-                    // OCPP's 50-byte bound - every standardized value fits by construction.
-                    r#type: heapless::String::try_from(wire_type(event_type).as_str())
-                        .unwrap_or_else(|_| heapless::String::try_from("Other").unwrap()),
-                })
-                .await?;
+                let request = build_security_event_notification_request(
+                    &crate::clock::SystemClock,
+                    event_type,
+                    tech_info,
+                );
+                self.send_security_event_notification(request).await?;
                 Ok(())
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use chrono::{DateTime, Utc};
+
+            /// A [`Clock`] that always reads a fixed, caller-chosen instant.
+            struct FixedClock(DateTime<Utc>);
+
+            impl Clock for FixedClock {
+                fn now(&self) -> DateTime<Utc> {
+                    self.0
+                }
+            }
+
+            #[test]
+            fn a_fixed_clocks_reading_reaches_the_wire_request_timestamp() {
+                let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let clock = FixedClock(fixed);
+
+                let request = build_security_event_notification_request(
+                    &clock,
+                    &SecurityEventType::TamperDetectionActivated,
+                    None,
+                );
+
+                assert_eq!(request.timestamp, fixed.to_rfc3339());
+            }
+
+            #[test]
+            fn an_unsynchronized_clocks_reading_is_still_sent_not_substituted_or_dropped() {
+                let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+                assert!(!is_synchronized(&unset_rtc.now()));
+
+                let request = build_security_event_notification_request(
+                    &unset_rtc,
+                    &SecurityEventType::TamperDetectionActivated,
+                    None,
+                );
+
+                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
             }
         }
     }

@@ -7,6 +7,10 @@ use alloc::boxed::Box;
 
 #[cfg(feature = "ocpp_1_6")]
 pub use self::ocpp_1_6::Ocpp1_6TransactionNotifier;
+#[cfg(feature = "ocpp_2_0_1")]
+pub use self::ocpp_2_0_1::Ocpp2_0_1TransactionNotifier;
+#[cfg(feature = "ocpp_2_1")]
+pub use self::ocpp_2_1::Ocpp2_1TransactionNotifier;
 
 /// Reports a transaction lifecycle event to the CSMS via TransactionEvent. Implemented per
 /// protocol version (see the `ocpp_2_1` module), mirroring
@@ -129,6 +133,8 @@ mod tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
+    pub use with_clock::Ocpp2_1TransactionNotifier;
+
     use crate::state::{
         MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
         TransactionUpdateReason,
@@ -141,10 +147,6 @@ mod ocpp_2_1 {
         TransactionEventEnum, TriggerReasonEnum,
     };
 
-    // The four functions below are only consumed by `with_system_clock` (`std`-gated) and by
-    // this module's own tests; without either, they're legitimately unused.
-
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_event_type(kind: TransactionEventKind) -> TransactionEventEnum {
         match kind {
             TransactionEventKind::Started => TransactionEventEnum::Started,
@@ -153,7 +155,6 @@ mod ocpp_2_1 {
         }
     }
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_charging_state(state: TransactionChargingState) -> ChargingStateEnum {
         match state {
             TransactionChargingState::EvConnected => ChargingStateEnum::EVConnected,
@@ -164,7 +165,6 @@ mod ocpp_2_1 {
         }
     }
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_stop_reason(reason: StopReason) -> ReasonEnum {
         match reason {
             StopReason::Local => ReasonEnum::Local,
@@ -179,7 +179,6 @@ mod ocpp_2_1 {
     /// The OCPP `triggerReason` a TransactionEvent carries isn't part of our internal
     /// `Transaction`/`TransactionEventKind` model (see CLAUDE.md's version-adapter principle) -
     /// it's derived here from the event kind and, for `Ended`, the transaction's stop reason.
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn trigger_reason_for(
         kind: TransactionEventKind,
         transaction: &Transaction,
@@ -209,7 +208,6 @@ mod ocpp_2_1 {
 
     /// Builds one `sampledValue` per measurand present in `sample` - always the energy register,
     /// plus power/current/voltage/SoC when the hardware reported them.
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     fn sampled_values(sample: MeterSample) -> Vec<SampledValue> {
         let mut values = vec![sampled_value(
             sample.energy_wh as f64,
@@ -236,7 +234,6 @@ mod ocpp_2_1 {
         values
     }
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     fn sampled_value(value: f64, measurand: MeasurandEnum) -> SampledValue {
         SampledValue {
             value,
@@ -253,7 +250,6 @@ mod ocpp_2_1 {
     /// Builds the TransactionEvent `meterValue` list from a transaction's most recent sample -
     /// empty if it never got one (e.g. `Started`, or a transaction that ended before charging
     /// began). See `docs/ROADMAP.md` §10.
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn build_meter_values(
         sample: Option<MeterSample>,
         timestamp: DateTime<Utc>,
@@ -268,20 +264,15 @@ mod ocpp_2_1 {
         }]
     }
 
-    // `TransactionEventRequest` needs a timestamp; producing one without a caller-supplied
-    // `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so this impl - unlike
-    // the rest of this file - needs both `ocpp_2_1` and `std`.
-    #[cfg(feature = "std")]
-    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
-    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
-    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
-    // this timestamp today, so no `is_synchronized` check applies here.
-    mod with_system_clock {
+    // `TransactionEventRequest` needs a timestamp, produced from a caller-supplied `Clock` - see
+    // `crate::clock::is_synchronized`'s docs for the policy on an unsynchronized reading (send it
+    // as-is, warn, never fabricate or drop it).
+    mod with_clock {
         use super::{
             build_meter_values, map_charging_state, map_event_type, map_stop_reason,
             trigger_reason_for,
         };
-        use crate::clock::{Clock, SystemClock};
+        use crate::clock::{Clock, is_synchronized};
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::TransactionNotifier;
         use alloc::boxed::Box;
@@ -290,6 +281,134 @@ mod ocpp_2_1 {
         use ocpp_client::ocpp_types::v21::TransactionEventRequest;
         use ocpp_client::ocpp_types::v21::common::{EVSE, Transaction as WireTransaction};
 
+        /// Builds the `TransactionEventRequest` for `kind`/`transaction`, timestamped from
+        /// `clock.now()`. Pure (no network I/O), so a fixed [`Clock`] fake can assert the exact
+        /// timestamp that reaches the wire request without needing a live `OCPP2_1Client` - see
+        /// this module's tests. Warns (see `crate::clock::is_synchronized`'s docs) but still
+        /// builds and returns the request when `clock` reads as unsynchronized - never
+        /// substitutes, clamps, or omits the reading.
+        fn build_transaction_event_request<C: Clock>(
+            clock: &C,
+            evse_id: usize,
+            connector_id: usize,
+            kind: TransactionEventKind,
+            transaction: Transaction,
+        ) -> TransactionEventRequest {
+            let now = clock.now();
+            if !is_synchronized(&now) {
+                tracing::warn!(
+                    timestamp = %now,
+                    "TransactionEvent timestamp sourced from an unsynchronized clock"
+                );
+            }
+            let meter_value = build_meter_values(transaction.last_meter_sample, now);
+            TransactionEventRequest {
+                custom_data: None,
+                cost_details: None,
+                event_type: map_event_type(kind),
+                evse_sleep: None,
+                meter_value: if meter_value.is_empty() {
+                    None
+                } else {
+                    Some(meter_value)
+                },
+                timestamp: now.to_rfc3339(),
+                trigger_reason: trigger_reason_for(kind, &transaction),
+                seq_no: transaction.seq_no as i64,
+                preconditioning_status: None,
+                transaction_info: WireTransaction {
+                    // The transaction id is an internal `u64` formatted as decimal, always
+                    // well within the wire field's 36-byte bound.
+                    transaction_id: heapless::String::try_from(transaction.id.0)
+                        .expect("u64 transaction id always fits in a 36-byte wire field"),
+                    charging_state: Some(map_charging_state(transaction.charging_state)),
+                    time_spent_charging: None,
+                    stopped_reason: transaction.stop_reason.map(map_stop_reason),
+                    remote_start_id: None,
+                    operation_mode: None,
+                    tariff_id: None,
+                    transaction_limit: None,
+                    custom_data: None,
+                },
+                offline: None,
+                number_of_phases_used: None,
+                cable_max_current: None,
+                reservation_id: None,
+                evse: Some(EVSE {
+                    id: evse_id as i64,
+                    connector_id: Some(connector_id as i64),
+                    custom_data: None,
+                }),
+                id_token: None,
+            }
+        }
+
+        async fn send_transaction_event<C: Clock>(
+            client: &OCPP2_1Client,
+            clock: &C,
+            evse_id: usize,
+            connector_id: usize,
+            kind: TransactionEventKind,
+            transaction: Transaction,
+        ) -> Result<(), ClientError<OCPP2_1Error>> {
+            let request =
+                build_transaction_event_request(clock, evse_id, connector_id, kind, transaction);
+            client.send_transaction_event(request).await?;
+            Ok(())
+        }
+
+        /// Wraps an `OCPP2_1Client` with a caller-supplied [`Clock`] for the TransactionEvent
+        /// timestamp - the no_std-reachable counterpart to this module's `std`-only `OCPP2_1Client`
+        /// impl below, which exists alongside this (not instead of it) so no existing `std` caller
+        /// needs a source change.
+        pub struct Ocpp2_1TransactionNotifier<C> {
+            client: OCPP2_1Client,
+            clock: C,
+        }
+
+        impl<C: Clock> Ocpp2_1TransactionNotifier<C> {
+            /// Wraps `client`, sourcing every TransactionEvent timestamp from `clock`.
+            pub fn with_clock(client: OCPP2_1Client, clock: C) -> Self {
+                Self { client, clock }
+            }
+        }
+
+        #[cfg(feature = "std")]
+        impl Ocpp2_1TransactionNotifier<crate::clock::SystemClock> {
+            /// Wraps `client`, sourcing every TransactionEvent timestamp from
+            /// [`crate::clock::SystemClock`].
+            pub fn new(client: OCPP2_1Client) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Send + Sync> TransactionNotifier for Ocpp2_1TransactionNotifier<C> {
+            type Error = ClientError<OCPP2_1Error>;
+
+            async fn notify_transaction_event(
+                &self,
+                evse_id: usize,
+                connector_id: usize,
+                kind: TransactionEventKind,
+                transaction: Transaction,
+            ) -> Result<(), Self::Error> {
+                send_transaction_event(
+                    &self.client,
+                    &self.clock,
+                    evse_id,
+                    connector_id,
+                    kind,
+                    transaction,
+                )
+                .await
+            }
+        }
+
+        /// The `std` convenience: `OCPP2_1Client` itself implements `TransactionNotifier` directly
+        /// (sourcing its timestamp from [`crate::clock::SystemClock`]) so existing callers that
+        /// pass a bare client - e.g. [`crate::connect::connect_and_setup`] - need no source change.
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl TransactionNotifier for OCPP2_1Client {
             type Error = ClientError<OCPP2_1Error>;
@@ -301,49 +420,80 @@ mod ocpp_2_1 {
                 kind: TransactionEventKind,
                 transaction: Transaction,
             ) -> Result<(), Self::Error> {
-                let now = SystemClock.now();
-                let meter_value = build_meter_values(transaction.last_meter_sample, now);
-                self.send_transaction_event(TransactionEventRequest {
-                    custom_data: None,
-                    cost_details: None,
-                    event_type: map_event_type(kind),
-                    evse_sleep: None,
-                    meter_value: if meter_value.is_empty() {
-                        None
-                    } else {
-                        Some(meter_value)
-                    },
-                    timestamp: now.to_rfc3339(),
-                    trigger_reason: trigger_reason_for(kind, &transaction),
-                    seq_no: transaction.seq_no as i64,
-                    preconditioning_status: None,
-                    transaction_info: WireTransaction {
-                        // The transaction id is an internal `u64` formatted as decimal, always
-                        // well within the wire field's 36-byte bound.
-                        transaction_id: heapless::String::try_from(transaction.id.0)
-                            .expect("u64 transaction id always fits in a 36-byte wire field"),
-                        charging_state: Some(map_charging_state(transaction.charging_state)),
-                        time_spent_charging: None,
-                        stopped_reason: transaction.stop_reason.map(map_stop_reason),
-                        remote_start_id: None,
-                        operation_mode: None,
-                        tariff_id: None,
-                        transaction_limit: None,
-                        custom_data: None,
-                    },
-                    offline: None,
-                    number_of_phases_used: None,
-                    cable_max_current: None,
-                    reservation_id: None,
-                    evse: Some(EVSE {
-                        id: evse_id as i64,
-                        connector_id: Some(connector_id as i64),
-                        custom_data: None,
-                    }),
+                send_transaction_event(
+                    self,
+                    &crate::clock::SystemClock,
+                    evse_id,
+                    connector_id,
+                    kind,
+                    transaction,
+                )
+                .await
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::state::{TransactionChargingState, TransactionId};
+            use chrono::{DateTime, Utc};
+
+            /// A [`Clock`] that always reads a fixed, caller-chosen instant - mirrors
+            /// `crate::persistence::tests::FixedClock`.
+            struct FixedClock(DateTime<Utc>);
+
+            impl Clock for FixedClock {
+                fn now(&self) -> DateTime<Utc> {
+                    self.0
+                }
+            }
+
+            fn transaction() -> Transaction {
+                Transaction {
+                    id: TransactionId(7),
                     id_token: None,
-                })
-                .await?;
-                Ok(())
+                    charging_state: TransactionChargingState::Charging,
+                    stop_reason: None,
+                    seq_no: 0,
+                    last_meter_sample: None,
+                }
+            }
+
+            #[test]
+            fn a_fixed_clocks_reading_reaches_the_wire_request_timestamp() {
+                let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let clock = FixedClock(fixed);
+
+                let request = build_transaction_event_request(
+                    &clock,
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction(),
+                );
+
+                assert_eq!(request.timestamp, fixed.to_rfc3339());
+            }
+
+            #[test]
+            fn an_unsynchronized_clocks_reading_is_still_sent_not_substituted_or_dropped() {
+                let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+                assert!(!is_synchronized(&unset_rtc.now()));
+
+                // Guards the policy documented on `crate::clock::is_synchronized`: an
+                // unsynchronized reading must reach the built request unchanged, never
+                // substituted, clamped, or omitted.
+                let request = build_transaction_event_request(
+                    &unset_rtc,
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction(),
+                );
+
+                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
             }
         }
     }
@@ -560,6 +710,8 @@ mod ocpp_2_1 {
 /// targeting `OCPP2_0_1Client`.
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
+    pub use with_clock::Ocpp2_0_1TransactionNotifier;
+
     use crate::state::{
         MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
         TransactionUpdateReason,
@@ -572,7 +724,6 @@ mod ocpp_2_0_1 {
         TransactionEventEnum, TriggerReasonEnum,
     };
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_event_type(kind: TransactionEventKind) -> TransactionEventEnum {
         match kind {
             TransactionEventKind::Started => TransactionEventEnum::Started,
@@ -581,7 +732,6 @@ mod ocpp_2_0_1 {
         }
     }
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_charging_state(state: TransactionChargingState) -> ChargingStateEnum {
         match state {
             TransactionChargingState::EvConnected => ChargingStateEnum::EVConnected,
@@ -592,7 +742,6 @@ mod ocpp_2_0_1 {
         }
     }
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_stop_reason(reason: StopReason) -> ReasonEnum {
         match reason {
             StopReason::Local => ReasonEnum::Local,
@@ -605,7 +754,6 @@ mod ocpp_2_0_1 {
     }
 
     /// Mirrors [`super::ocpp_2_1::trigger_reason_for`].
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn trigger_reason_for(
         kind: TransactionEventKind,
         transaction: &Transaction,
@@ -633,7 +781,6 @@ mod ocpp_2_0_1 {
         }
     }
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     fn sampled_values(sample: MeterSample) -> Vec<SampledValue> {
         let mut values = vec![sampled_value(
             sample.energy_wh as f64,
@@ -660,7 +807,6 @@ mod ocpp_2_0_1 {
         values
     }
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     fn sampled_value(value: f64, measurand: MeasurandEnum) -> SampledValue {
         SampledValue {
             value,
@@ -674,7 +820,6 @@ mod ocpp_2_0_1 {
         }
     }
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn build_meter_values(
         sample: Option<MeterSample>,
         timestamp: DateTime<Utc>,
@@ -689,17 +834,15 @@ mod ocpp_2_0_1 {
         }]
     }
 
-    #[cfg(feature = "std")]
-    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
-    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
-    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
-    // this timestamp today, so no `is_synchronized` check applies here.
-    mod with_system_clock {
+    // `TransactionEventRequest` needs a timestamp, produced from a caller-supplied `Clock` - see
+    // `crate::clock::is_synchronized`'s docs for the policy on an unsynchronized reading (send it
+    // as-is, warn, never fabricate or drop it). Mirrors `super::ocpp_2_1::with_clock`.
+    mod with_clock {
         use super::{
             build_meter_values, map_charging_state, map_event_type, map_stop_reason,
             trigger_reason_for,
         };
-        use crate::clock::{Clock, SystemClock};
+        use crate::clock::{Clock, is_synchronized};
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::TransactionNotifier;
         use alloc::boxed::Box;
@@ -708,6 +851,122 @@ mod ocpp_2_0_1 {
         use ocpp_client::ocpp_types::v201::TransactionEventRequest;
         use ocpp_client::ocpp_types::v201::common::{EVSE, Transaction as WireTransaction};
 
+        /// Mirrors `super::ocpp_2_1::with_clock::build_transaction_event_request` - pure, so a
+        /// fixed [`Clock`] fake can assert the exact timestamp reaching the wire request.
+        fn build_transaction_event_request<C: Clock>(
+            clock: &C,
+            evse_id: usize,
+            connector_id: usize,
+            kind: TransactionEventKind,
+            transaction: Transaction,
+        ) -> TransactionEventRequest {
+            let now = clock.now();
+            if !is_synchronized(&now) {
+                tracing::warn!(
+                    timestamp = %now,
+                    "TransactionEvent timestamp sourced from an unsynchronized clock"
+                );
+            }
+            let meter_value = build_meter_values(transaction.last_meter_sample, now);
+            TransactionEventRequest {
+                custom_data: None,
+                event_type: map_event_type(kind),
+                meter_value: if meter_value.is_empty() {
+                    None
+                } else {
+                    Some(meter_value)
+                },
+                timestamp: now.to_rfc3339(),
+                trigger_reason: trigger_reason_for(kind, &transaction),
+                seq_no: transaction.seq_no as i64,
+                transaction_info: WireTransaction {
+                    // The transaction id is an internal `u64` formatted as decimal, always
+                    // well within the wire field's 36-byte bound.
+                    transaction_id: heapless::String::try_from(transaction.id.0)
+                        .expect("u64 transaction id always fits in a 36-byte wire field"),
+                    charging_state: Some(map_charging_state(transaction.charging_state)),
+                    time_spent_charging: None,
+                    stopped_reason: transaction.stop_reason.map(map_stop_reason),
+                    remote_start_id: None,
+                    custom_data: None,
+                },
+                offline: None,
+                number_of_phases_used: None,
+                cable_max_current: None,
+                reservation_id: None,
+                evse: Some(EVSE {
+                    id: evse_id as i64,
+                    connector_id: Some(connector_id as i64),
+                    custom_data: None,
+                }),
+                id_token: None,
+            }
+        }
+
+        async fn send_transaction_event<C: Clock>(
+            client: &OCPP2_0_1Client,
+            clock: &C,
+            evse_id: usize,
+            connector_id: usize,
+            kind: TransactionEventKind,
+            transaction: Transaction,
+        ) -> Result<(), ClientError<OCPP2_0_1Error>> {
+            let request =
+                build_transaction_event_request(clock, evse_id, connector_id, kind, transaction);
+            client.send_transaction_event(request).await?;
+            Ok(())
+        }
+
+        /// Wraps an `OCPP2_0_1Client` with a caller-supplied [`Clock`] for the TransactionEvent
+        /// timestamp - mirrors `super::ocpp_2_1::with_clock::Ocpp2_1TransactionNotifier`.
+        pub struct Ocpp2_0_1TransactionNotifier<C> {
+            client: OCPP2_0_1Client,
+            clock: C,
+        }
+
+        impl<C: Clock> Ocpp2_0_1TransactionNotifier<C> {
+            /// Wraps `client`, sourcing every TransactionEvent timestamp from `clock`.
+            pub fn with_clock(client: OCPP2_0_1Client, clock: C) -> Self {
+                Self { client, clock }
+            }
+        }
+
+        #[cfg(feature = "std")]
+        impl Ocpp2_0_1TransactionNotifier<crate::clock::SystemClock> {
+            /// Wraps `client`, sourcing every TransactionEvent timestamp from
+            /// [`crate::clock::SystemClock`].
+            pub fn new(client: OCPP2_0_1Client) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Send + Sync> TransactionNotifier for Ocpp2_0_1TransactionNotifier<C> {
+            type Error = ClientError<OCPP2_0_1Error>;
+
+            async fn notify_transaction_event(
+                &self,
+                evse_id: usize,
+                connector_id: usize,
+                kind: TransactionEventKind,
+                transaction: Transaction,
+            ) -> Result<(), Self::Error> {
+                send_transaction_event(
+                    &self.client,
+                    &self.clock,
+                    evse_id,
+                    connector_id,
+                    kind,
+                    transaction,
+                )
+                .await
+            }
+        }
+
+        /// The `std` convenience: `OCPP2_0_1Client` itself implements `TransactionNotifier`
+        /// directly (sourcing its timestamp from [`crate::clock::SystemClock`]) so existing
+        /// callers that pass a bare client need no source change.
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl TransactionNotifier for OCPP2_0_1Client {
             type Error = ClientError<OCPP2_0_1Error>;
@@ -719,43 +978,76 @@ mod ocpp_2_0_1 {
                 kind: TransactionEventKind,
                 transaction: Transaction,
             ) -> Result<(), Self::Error> {
-                let now = SystemClock.now();
-                let meter_value = build_meter_values(transaction.last_meter_sample, now);
-                self.send_transaction_event(TransactionEventRequest {
-                    custom_data: None,
-                    event_type: map_event_type(kind),
-                    meter_value: if meter_value.is_empty() {
-                        None
-                    } else {
-                        Some(meter_value)
-                    },
-                    timestamp: now.to_rfc3339(),
-                    trigger_reason: trigger_reason_for(kind, &transaction),
-                    seq_no: transaction.seq_no as i64,
-                    transaction_info: WireTransaction {
-                        // The transaction id is an internal `u64` formatted as decimal, always
-                        // well within the wire field's 36-byte bound.
-                        transaction_id: heapless::String::try_from(transaction.id.0)
-                            .expect("u64 transaction id always fits in a 36-byte wire field"),
-                        charging_state: Some(map_charging_state(transaction.charging_state)),
-                        time_spent_charging: None,
-                        stopped_reason: transaction.stop_reason.map(map_stop_reason),
-                        remote_start_id: None,
-                        custom_data: None,
-                    },
-                    offline: None,
-                    number_of_phases_used: None,
-                    cable_max_current: None,
-                    reservation_id: None,
-                    evse: Some(EVSE {
-                        id: evse_id as i64,
-                        connector_id: Some(connector_id as i64),
-                        custom_data: None,
-                    }),
+                send_transaction_event(
+                    self,
+                    &crate::clock::SystemClock,
+                    evse_id,
+                    connector_id,
+                    kind,
+                    transaction,
+                )
+                .await
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use crate::state::{TransactionChargingState, TransactionId};
+            use chrono::{DateTime, Utc};
+
+            /// A [`Clock`] that always reads a fixed, caller-chosen instant.
+            struct FixedClock(DateTime<Utc>);
+
+            impl Clock for FixedClock {
+                fn now(&self) -> DateTime<Utc> {
+                    self.0
+                }
+            }
+
+            fn transaction() -> Transaction {
+                Transaction {
+                    id: TransactionId(7),
                     id_token: None,
-                })
-                .await?;
-                Ok(())
+                    charging_state: TransactionChargingState::Charging,
+                    stop_reason: None,
+                    seq_no: 0,
+                    last_meter_sample: None,
+                }
+            }
+
+            #[test]
+            fn a_fixed_clocks_reading_reaches_the_wire_request_timestamp() {
+                let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let clock = FixedClock(fixed);
+
+                let request = build_transaction_event_request(
+                    &clock,
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction(),
+                );
+
+                assert_eq!(request.timestamp, fixed.to_rfc3339());
+            }
+
+            #[test]
+            fn an_unsynchronized_clocks_reading_is_still_sent_not_substituted_or_dropped() {
+                let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+                assert!(!is_synchronized(&unset_rtc.now()));
+
+                let request = build_transaction_event_request(
+                    &unset_rtc,
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction(),
+                );
+
+                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
             }
         }
     }
@@ -1015,42 +1307,58 @@ mod ocpp_1_6 {
         }
     }
 
-    /// Wraps an `OCPP1_6Client` with the charge point's connector topology and a cache of
-    /// CSMS-assigned transaction ids - see this module's top-level docs.
-    pub struct Ocpp1_6TransactionNotifier {
+    /// Wraps an `OCPP1_6Client` with the charge point's connector topology, a cache of
+    /// CSMS-assigned transaction ids, and a caller-supplied [`crate::clock::Clock`] for the
+    /// `StartTransaction`/`MeterValues`/`StopTransaction` timestamp - see this module's top-level
+    /// docs. `C` defaults to nothing in particular; embedded/no_std callers construct with
+    /// [`Self::with_clock`] and an RTC-backed `Clock`, while `std` callers keep using
+    /// [`Self::new`] (sourcing the timestamp from [`crate::clock::SystemClock`]) unchanged.
+    pub struct Ocpp1_6TransactionNotifier<C> {
         client: OCPP1_6Client,
         connector_counts: Vec<usize>,
         csms_transaction_ids:
             BlockingMutex<CriticalSectionRawMutex, RefCell<BTreeMap<TransactionId, i64>>>,
+        clock: C,
     }
 
-    impl Ocpp1_6TransactionNotifier {
+    impl<C: crate::clock::Clock> Ocpp1_6TransactionNotifier<C> {
         /// Wraps `client`, capturing `connector_counts` (each EVSE's connector count, in
         /// `evse_id` order) for translating connector addresses, starting with no cached
-        /// CSMS-assigned transaction ids.
-        pub fn new(
+        /// CSMS-assigned transaction ids, and sourcing every wire timestamp from `clock`.
+        pub fn with_clock(
             client: OCPP1_6Client,
             connector_counts: impl IntoIterator<Item = usize>,
+            clock: C,
         ) -> Self {
             Self {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),
                 csms_transaction_ids: BlockingMutex::new(RefCell::new(BTreeMap::new())),
+                clock,
             }
         }
     }
 
-    // `StartTransactionRequest`/`StopTransactionRequest` need a timestamp; producing one without
-    // a caller-supplied `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so
-    // this impl - unlike the rest of this file - needs both `ocpp_1_6` and `std`.
     #[cfg(feature = "std")]
-    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
-    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
-    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
-    // this timestamp today, so no `is_synchronized` check applies here.
-    mod with_system_clock {
+    impl Ocpp1_6TransactionNotifier<crate::clock::SystemClock> {
+        /// Wraps `client`, capturing `connector_counts` (each EVSE's connector count, in
+        /// `evse_id` order) for translating connector addresses, starting with no cached
+        /// CSMS-assigned transaction ids, and sourcing every wire timestamp from
+        /// [`crate::clock::SystemClock`].
+        pub fn new(
+            client: OCPP1_6Client,
+            connector_counts: impl IntoIterator<Item = usize>,
+        ) -> Self {
+            Self::with_clock(client, connector_counts, crate::clock::SystemClock)
+        }
+    }
+
+    // `StartTransactionRequest`/`StopTransactionRequest`/`MeterValuesRequest` need a timestamp,
+    // produced from `self.clock` - see `crate::clock::is_synchronized`'s docs for the policy on
+    // an unsynchronized reading (send it as-is, warn, never fabricate or drop it).
+    mod with_clock {
         use super::{Ocpp1_6TransactionNotifier, map_stop_reason, sampled_values};
-        use crate::clock::{Clock, SystemClock};
+        use crate::clock::{Clock, is_synchronized};
         use crate::id_tag::map_id_tag;
         use crate::state::{Transaction, TransactionEventKind};
         use crate::topology::flatten_ocpp_1_6_connector_id;
@@ -1065,7 +1373,7 @@ mod ocpp_1_6 {
         };
 
         #[async_trait::async_trait]
-        impl TransactionNotifier for Ocpp1_6TransactionNotifier {
+        impl<C: Clock + Send + Sync> TransactionNotifier for Ocpp1_6TransactionNotifier<C> {
             type Error = ClientError<OCPP1_6Error>;
 
             async fn notify_transaction_event(
@@ -1082,7 +1390,14 @@ mod ocpp_1_6 {
                     // `Ocpp1_6StatusNotifier::notify_status`'s identical handling.
                     return Ok(());
                 };
-                let now = SystemClock.now();
+                let now = self.clock.now();
+                if !is_synchronized(&now) {
+                    tracing::warn!(
+                        timestamp = %now,
+                        ?kind,
+                        "1.6J transaction timestamp sourced from an unsynchronized clock"
+                    );
+                }
                 let meter_reading = transaction
                     .last_meter_sample
                     .map(|s| s.energy_wh)
@@ -1200,9 +1515,41 @@ mod ocpp_1_6 {
         fn ocpp1_6_transaction_notifier_can_be_constructed_from_a_client_and_topology() {
             // Compile-level check that `Ocpp1_6TransactionNotifier::new` accepts the same
             // topology shape `Ocpp1_6StatusNotifier` does - actual wiring is exercised via
-            // `with_system_clock`'s impl, only reachable with a live `OCPP1_6Client`.
-            fn assert_ctor<F: Fn(OCPP1_6Client, [usize; 2]) -> Ocpp1_6TransactionNotifier>(_: F) {}
+            // `with_clock`'s impl, only reachable with a live `OCPP1_6Client`.
+            fn assert_ctor<
+                F: Fn(
+                    OCPP1_6Client,
+                    [usize; 2],
+                ) -> Ocpp1_6TransactionNotifier<crate::clock::SystemClock>,
+            >(
+                _: F,
+            ) {
+            }
             assert_ctor(Ocpp1_6TransactionNotifier::new);
+        }
+
+        /// A [`crate::clock::Clock`] that always reads a fixed, caller-chosen instant.
+        struct FixedClock(chrono::DateTime<chrono::Utc>);
+
+        impl crate::clock::Clock for FixedClock {
+            fn now(&self) -> chrono::DateTime<chrono::Utc> {
+                self.0
+            }
+        }
+
+        #[test]
+        fn ocpp1_6_transaction_notifier_can_be_constructed_with_a_caller_supplied_clock() {
+            // Compile-level check that `with_clock` accepts a non-`SystemClock` fake, unlocking
+            // the no_std path `crate::clock::SystemClock` (a `std`-only type) can't reach - the
+            // actual timestamp behavior is exercised end-to-end via
+            // `with_clock`'s tests (only reachable with a live `OCPP1_6Client`).
+            fn assert_ctor<
+                F: Fn(OCPP1_6Client, [usize; 2], FixedClock) -> Ocpp1_6TransactionNotifier<FixedClock>,
+            >(
+                _: F,
+            ) {
+            }
+            assert_ctor(Ocpp1_6TransactionNotifier::with_clock);
         }
     }
 }

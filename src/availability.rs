@@ -16,6 +16,10 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 #[cfg(feature = "ocpp_1_6")]
 pub use self::ocpp_1_6::{Ocpp1_6ChangeAvailabilityHandler, Ocpp1_6StatusNotifier};
+#[cfg(feature = "ocpp_2_0_1")]
+pub use self::ocpp_2_0_1::Ocpp2_0_1StatusNotifier;
+#[cfg(feature = "ocpp_2_1")]
+pub use self::ocpp_2_1::Ocpp2_1StatusNotifier;
 
 /// Reports a connector's status to the CSMS via StatusNotification. Implemented per protocol
 /// version (see the `ocpp_2_1`/`ocpp_1_6` modules), mirroring
@@ -693,6 +697,8 @@ mod change_availability_tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
+    pub use with_clock::Ocpp2_1StatusNotifier;
+
     use crate::actor::ChargePointActor;
     use crate::availability::{
         AvailabilityTarget, ChangeAvailabilityHandler, ChangeAvailabilityOutcome,
@@ -706,9 +712,6 @@ mod ocpp_2_1 {
     };
     use ocpp_client::ocpp_types::v21::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 
-    // Only consumed by `with_system_clock` below (`std`-gated) and by this module's own tests;
-    // without either, it's legitimately unused.
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_status(status: ConnectorStatus) -> ConnectorStatusEnum {
         match status {
             ConnectorStatus::Available => ConnectorStatusEnum::Available,
@@ -719,24 +722,92 @@ mod ocpp_2_1 {
         }
     }
 
-    // `StatusNotificationRequest` needs a timestamp; producing one without a caller-supplied
-    // `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so this impl - unlike
-    // the rest of this file - needs both `ocpp_2_1` and `std`.
-    #[cfg(feature = "std")]
-    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
-    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
-    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
-    // this timestamp today, so no `is_synchronized` check applies here.
-    mod with_system_clock {
+    // `StatusNotificationRequest` needs a timestamp, produced from a caller-supplied `Clock` -
+    // see `crate::clock::is_synchronized`'s docs for the policy on an unsynchronized reading
+    // (send it as-is, warn, never fabricate or drop it).
+    mod with_clock {
         use super::map_status;
         use crate::availability::StatusNotifier;
-        use crate::clock::{Clock, SystemClock};
+        use crate::clock::{Clock, is_synchronized};
         use crate::state::{ConnectorState, ConnectorStatus};
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
         use ocpp_client::ocpp_types::v21::StatusNotificationRequest;
 
+        /// Builds the `StatusNotificationRequest` for `status`, timestamped from `clock.now()`.
+        /// Pure (no network I/O), so a fixed [`Clock`] fake can assert the exact timestamp that
+        /// reaches the wire request.
+        fn build_status_notification_request<C: Clock>(
+            clock: &C,
+            evse_id: usize,
+            connector_id: usize,
+            status: ConnectorStatus,
+        ) -> StatusNotificationRequest {
+            let now = clock.now();
+            if !is_synchronized(&now) {
+                tracing::warn!(
+                    timestamp = %now,
+                    "StatusNotification timestamp sourced from an unsynchronized clock"
+                );
+            }
+            StatusNotificationRequest {
+                custom_data: None,
+                timestamp: now.to_rfc3339(),
+                connector_status: map_status(status),
+                evse_id: evse_id as i64,
+                connector_id: connector_id as i64,
+            }
+        }
+
+        /// Wraps an `OCPP2_1Client` with a caller-supplied [`Clock`] for the StatusNotification
+        /// timestamp - the no_std-reachable counterpart to this module's `std`-only
+        /// `OCPP2_1Client` impl below, which exists alongside this (not instead of it) so no
+        /// existing `std` caller needs a source change.
+        pub struct Ocpp2_1StatusNotifier<C> {
+            client: OCPP2_1Client,
+            clock: C,
+        }
+
+        impl<C: Clock> Ocpp2_1StatusNotifier<C> {
+            /// Wraps `client`, sourcing every StatusNotification timestamp from `clock`.
+            pub fn with_clock(client: OCPP2_1Client, clock: C) -> Self {
+                Self { client, clock }
+            }
+        }
+
+        #[cfg(feature = "std")]
+        impl Ocpp2_1StatusNotifier<crate::clock::SystemClock> {
+            /// Wraps `client`, sourcing every StatusNotification timestamp from
+            /// [`crate::clock::SystemClock`].
+            pub fn new(client: OCPP2_1Client) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Send + Sync> StatusNotifier for Ocpp2_1StatusNotifier<C> {
+            type Error = ClientError<OCPP2_1Error>;
+
+            async fn notify_status(
+                &self,
+                evse_id: usize,
+                connector_id: usize,
+                status: ConnectorStatus,
+                _connector_state: ConnectorState,
+            ) -> Result<(), Self::Error> {
+                let request =
+                    build_status_notification_request(&self.clock, evse_id, connector_id, status);
+                self.client.send_status_notification(request).await?;
+                Ok(())
+            }
+        }
+
+        /// The `std` convenience: `OCPP2_1Client` itself implements `StatusNotifier` directly
+        /// (sourcing its timestamp from [`crate::clock::SystemClock`]) so existing callers that
+        /// pass a bare client - e.g. [`crate::connect::connect_and_setup`] - need no source
+        /// change.
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl StatusNotifier for OCPP2_1Client {
             type Error = ClientError<OCPP2_1Error>;
@@ -751,15 +822,53 @@ mod ocpp_2_1 {
                 // module).
                 _connector_state: ConnectorState,
             ) -> Result<(), Self::Error> {
-                self.send_status_notification(StatusNotificationRequest {
-                    custom_data: None,
-                    timestamp: SystemClock.now().to_rfc3339(),
-                    connector_status: map_status(status),
-                    evse_id: evse_id as i64,
-                    connector_id: connector_id as i64,
-                })
-                .await?;
+                let request = build_status_notification_request(
+                    &crate::clock::SystemClock,
+                    evse_id,
+                    connector_id,
+                    status,
+                );
+                self.send_status_notification(request).await?;
                 Ok(())
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use chrono::{DateTime, Utc};
+
+            /// A [`Clock`] that always reads a fixed, caller-chosen instant.
+            struct FixedClock(DateTime<Utc>);
+
+            impl Clock for FixedClock {
+                fn now(&self) -> DateTime<Utc> {
+                    self.0
+                }
+            }
+
+            #[test]
+            fn a_fixed_clocks_reading_reaches_the_wire_request_timestamp() {
+                let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let clock = FixedClock(fixed);
+
+                let request =
+                    build_status_notification_request(&clock, 0, 0, ConnectorStatus::Available);
+
+                assert_eq!(request.timestamp, fixed.to_rfc3339());
+            }
+
+            #[test]
+            fn an_unsynchronized_clocks_reading_is_still_sent_not_substituted_or_dropped() {
+                let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+                assert!(!is_synchronized(&unset_rtc.now()));
+
+                let request =
+                    build_status_notification_request(&unset_rtc, 0, 0, ConnectorStatus::Available);
+
+                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
             }
         }
     }
@@ -905,6 +1014,8 @@ mod ocpp_2_1 {
 /// close to a copy of the 2.1 one, just targeting `OCPP2_0_1Client`.
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
+    pub use with_clock::Ocpp2_0_1StatusNotifier;
+
     use crate::actor::ChargePointActor;
     use crate::availability::{
         AvailabilityTarget, ChangeAvailabilityHandler, ChangeAvailabilityOutcome,
@@ -918,7 +1029,6 @@ mod ocpp_2_0_1 {
     };
     use ocpp_client::ocpp_types::v201::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(super) fn map_status(status: ConnectorStatus) -> ConnectorStatusEnum {
         match status {
             ConnectorStatus::Available => ConnectorStatusEnum::Available,
@@ -929,21 +1039,86 @@ mod ocpp_2_0_1 {
         }
     }
 
-    #[cfg(feature = "std")]
-    // G3.1 (`docs/PRODUCTION-ROADMAP.md` §9.3): locked to `SystemClock`, which is always
-    // OS-backed and real on any target where `std` is available - unlike `crate::persistence`'s
-    // caller-injectable `Clock` (see `run_transaction_persistence`), there is no no-RTC path to
-    // this timestamp today, so no `is_synchronized` check applies here.
-    mod with_system_clock {
+    // `StatusNotificationRequest` needs a timestamp, produced from a caller-supplied `Clock` -
+    // see `crate::clock::is_synchronized`'s docs for the policy on an unsynchronized reading
+    // (send it as-is, warn, never fabricate or drop it). Mirrors `super::ocpp_2_1::with_clock`.
+    mod with_clock {
         use super::map_status;
         use crate::availability::StatusNotifier;
-        use crate::clock::{Clock, SystemClock};
+        use crate::clock::{Clock, is_synchronized};
         use crate::state::{ConnectorState, ConnectorStatus};
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
         use ocpp_client::ocpp_types::v201::StatusNotificationRequest;
 
+        fn build_status_notification_request<C: Clock>(
+            clock: &C,
+            evse_id: usize,
+            connector_id: usize,
+            status: ConnectorStatus,
+        ) -> StatusNotificationRequest {
+            let now = clock.now();
+            if !is_synchronized(&now) {
+                tracing::warn!(
+                    timestamp = %now,
+                    "StatusNotification timestamp sourced from an unsynchronized clock"
+                );
+            }
+            StatusNotificationRequest {
+                custom_data: None,
+                timestamp: now.to_rfc3339(),
+                connector_status: map_status(status),
+                evse_id: evse_id as i64,
+                connector_id: connector_id as i64,
+            }
+        }
+
+        /// Wraps an `OCPP2_0_1Client` with a caller-supplied [`Clock`] for the StatusNotification
+        /// timestamp - mirrors `super::ocpp_2_1::with_clock::Ocpp2_1StatusNotifier`.
+        pub struct Ocpp2_0_1StatusNotifier<C> {
+            client: OCPP2_0_1Client,
+            clock: C,
+        }
+
+        impl<C: Clock> Ocpp2_0_1StatusNotifier<C> {
+            /// Wraps `client`, sourcing every StatusNotification timestamp from `clock`.
+            pub fn with_clock(client: OCPP2_0_1Client, clock: C) -> Self {
+                Self { client, clock }
+            }
+        }
+
+        #[cfg(feature = "std")]
+        impl Ocpp2_0_1StatusNotifier<crate::clock::SystemClock> {
+            /// Wraps `client`, sourcing every StatusNotification timestamp from
+            /// [`crate::clock::SystemClock`].
+            pub fn new(client: OCPP2_0_1Client) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Send + Sync> StatusNotifier for Ocpp2_0_1StatusNotifier<C> {
+            type Error = ClientError<OCPP2_0_1Error>;
+
+            async fn notify_status(
+                &self,
+                evse_id: usize,
+                connector_id: usize,
+                status: ConnectorStatus,
+                _connector_state: ConnectorState,
+            ) -> Result<(), Self::Error> {
+                let request =
+                    build_status_notification_request(&self.clock, evse_id, connector_id, status);
+                self.client.send_status_notification(request).await?;
+                Ok(())
+            }
+        }
+
+        /// The `std` convenience: `OCPP2_0_1Client` itself implements `StatusNotifier` directly
+        /// (sourcing its timestamp from [`crate::clock::SystemClock`]) so existing callers that
+        /// pass a bare client need no source change.
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl StatusNotifier for OCPP2_0_1Client {
             type Error = ClientError<OCPP2_0_1Error>;
@@ -955,15 +1130,53 @@ mod ocpp_2_0_1 {
                 status: ConnectorStatus,
                 _connector_state: ConnectorState,
             ) -> Result<(), Self::Error> {
-                self.send_status_notification(StatusNotificationRequest {
-                    custom_data: None,
-                    timestamp: SystemClock.now().to_rfc3339(),
-                    connector_status: map_status(status),
-                    evse_id: evse_id as i64,
-                    connector_id: connector_id as i64,
-                })
-                .await?;
+                let request = build_status_notification_request(
+                    &crate::clock::SystemClock,
+                    evse_id,
+                    connector_id,
+                    status,
+                );
+                self.send_status_notification(request).await?;
                 Ok(())
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            use chrono::{DateTime, Utc};
+
+            /// A [`Clock`] that always reads a fixed, caller-chosen instant.
+            struct FixedClock(DateTime<Utc>);
+
+            impl Clock for FixedClock {
+                fn now(&self) -> DateTime<Utc> {
+                    self.0
+                }
+            }
+
+            #[test]
+            fn a_fixed_clocks_reading_reaches_the_wire_request_timestamp() {
+                let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let clock = FixedClock(fixed);
+
+                let request =
+                    build_status_notification_request(&clock, 0, 0, ConnectorStatus::Available);
+
+                assert_eq!(request.timestamp, fixed.to_rfc3339());
+            }
+
+            #[test]
+            fn an_unsynchronized_clocks_reading_is_still_sent_not_substituted_or_dropped() {
+                let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+                assert!(!is_synchronized(&unset_rtc.now()));
+
+                let request =
+                    build_status_notification_request(&unset_rtc, 0, 0, ConnectorStatus::Available);
+
+                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
             }
         }
     }

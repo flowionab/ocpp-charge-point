@@ -98,7 +98,7 @@ close — mostly missing one version each.
 |------|--------|------|
 | Actor model, version-independent state | ✅ | `ChargePointState` owns transactions, reservations, local auth list, cost, reset, device model — all mutated only via `ChargePointEvent`. |
 | Hardware abstraction | 🚧 | `ChargePoint` / `Evse` / `Connector`: lock, unlock, contactor, reboot. **No capability model, no current-limit hook, no file transfer, no display, no RTC.** |
-| `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. |
+| `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. Until the [G3.1](#93-g3--time) follow-up, this held only for a build with *no version feature* — every OCPP adapter was `std`-gated dead code, so a bare-metal build could not actually speak OCPP. All three version adapters are now reachable without `std`. |
 | Offline queueing | 🚧 | `OfflineQueue` exists and is used by Availability / Transactions / Security. Bounded (G2.1) and in-RAM; the rest of the crate's collections aren't audited yet — see [G2](#92-g2--bounded-memory). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | ⬜ | **Nothing survives a restart.** `VariableAttribute::persistent` is recorded and ignored. |
@@ -1070,18 +1070,45 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
       real `started_at`; a transaction already recorded with `None` is not
       retroactively corrected (`PersistedTransaction::started_at`'s docs
       spell out the reconciliation options, e.g. against the CSMS's own
-      `TransactionEvent(Started)` receipt time). Deliberately **not** touched:
-      the CSMS-facing `StatusNotification`/`TransactionEvent`/
-      `SecurityEventNotification` `timestamp` adapters
-      (`with_system_clock` modules in `src/transactions.rs`,
-      `src/availability.rs`, `src/security.rs`). Those are hard-locked to
-      `SystemClock` (`std`-only, always OS-backed and real) rather than
-      taking a caller-supplied `Clock` — there is no no-RTC path to reach
-      them today, and OCPP's wire `timestamp` field on those messages is
-      mandatory, so there is no honest "unknown" to fall back to on that
-      boundary even if there were. Each site now carries a one-line comment
-      recording this scope decision explicitly rather than leaving it
-      implicit.
+      `TransactionEvent(Started)` receipt time).
+
+      **Since closed — the CSMS-facing timestamp adapters take a
+      caller-supplied `Clock` too.** This entry originally recorded a scope
+      decision to leave the `StatusNotification`/`TransactionEvent`/
+      `SecurityEventNotification`/report `timestamp` adapters hard-locked to
+      `SystemClock`, on the reasoning that "there is no no-RTC path to reach
+      them today". That reasoning was circular, and the cost was much larger
+      than the entry implied: those eight `#[cfg(feature = "std")] mod
+      with_system_clock` modules were each their adapter's *only* consumer, so
+      without `std` the adapters were dead code — which meant **no OCPP version
+      adapter was reachable in a `no_std` build at all**. A bare-metal build
+      compiled the core state machine but could not speak 1.6J, 2.0.1 or 2.1.
+      CI caught this the whole time (`-D warnings` dead-code errors under
+      `--no-default-features --features ocpp_1_6` / `ocpp_2_0_1` / `ocpp_2_1`)
+      and the `feature-matrix` job had simply been red and unread for several
+      commits — see [H1.2](#101-h1--ci-hardening).
+
+      Each adapter is now generic over `C: Clock` with a `with_clock(…, clock)`
+      constructor available on all targets, and the modules are renamed
+      `with_clock` and no longer `std`-gated. Existing `std` callers are
+      unaffected: `new(…)` survives as a `#[cfg(feature = "std")]` convenience
+      forwarding `SystemClock`, and the direct `impl StatusNotifier for
+      OCPP2_1Client`-style impls stay exactly as they were, so
+      `setup()`/`connect_and_setup()` needed no signature change and no call
+      site moved. Because `ocpp-client`'s client types are foreign and can't
+      carry a `clock` field, the 2.x paths are a pair of thin shells — the
+      `std` direct impl and the generic wrapper — over one shared
+      `build_*_request` function, so the two cannot drift.
+
+      The timestamp policy, which G3.1 previously used as justification: OCPP's
+      wire `timestamp` on these messages is mandatory and has no "unknown"
+      encoding, so an unsynchronized clock's reading is **sent as-is** — never
+      substituted, clamped or omitted — and a `tracing::warn!` records that it
+      happened. That differs from `PersistedTransaction::started_at`, which is
+      an internal `Option` and so *can* honestly stay blank. The policy is
+      documented once on `crate::clock::is_synchronized` and guarded by an
+      `an_unsynchronized_clocks_reading_is_still_sent_not_substituted_or_dropped`
+      test in each of the four adapter files.
 - [x] **G3.2** Clock sync from `BootNotification`/`Heartbeat` responses,
       raising `SettingSystemTime`. Fully wired into the live path.
       `BootNotificationOutcome` grew `current_time: Option<DateTime<Utc>>`,
@@ -1233,6 +1260,12 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
       arbitrary; the first green `main` run supplies the number, and this
       stays open until `--fail-under-lines` is in.
 - [x] **H1.7** Run on PRs, not just `push`.
+- [ ] **H1.8** **Make a red gate visible.** `feature-matrix` was failing on
+      `main` for at least three consecutive commits before anyone looked; the
+      other six jobs were green, so nothing surfaced it. The failure was real
+      (see [G3.1](#93-g3--time)) and is now fixed, but the process gap isn't:
+      a gating job can go red and stay red unnoticed. Branch protection on
+      `main`, or a notification on a failing `main` run, whichever fits.
 
 ### 10.2 H2 — Integration testing
 

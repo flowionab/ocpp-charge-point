@@ -27,6 +27,11 @@ use crate::state::{
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+#[cfg(feature = "ocpp_2_0_1")]
+pub use self::ocpp_2_0_1::Ocpp2_0_1ReportHandler;
+#[cfg(feature = "ocpp_2_1")]
+pub use self::ocpp_2_1::Ocpp2_1ReportHandler;
+
 /// Which of OCPP's three report bases to generate for `GetBaseReport`, matching OCPP's
 /// `ReportBaseEnum`. See [`handle_get_base_report`] for exactly what each includes in terms of
 /// this crate's [`DeviceModel`].
@@ -753,6 +758,8 @@ mod tests {
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
+    pub use with_clock::Ocpp2_1ReportHandler;
+
     use super::{
         ReportBase, ReportComponentCriterion, ReportComponentVariable, ReportEntry, ReportOutcome,
     };
@@ -1096,17 +1103,16 @@ mod ocpp_2_1 {
         }
     }
 
-    #[cfg(feature = "std")]
-    mod with_system_clock {
-        // `NotifyReportRequest` needs a timestamp; producing one without a caller-supplied
-        // `Clock` requires the `std`-only `SystemClock` (see `crate::clock`), so this impl needs
-        // both `ocpp_2_1` and `std` - mirrors `crate::security::ocpp_2_1::with_system_clock`.
+    // `NotifyReportRequest.generatedAt` needs a timestamp, produced from a caller-supplied
+    // `Clock` - see `crate::clock::is_synchronized`'s docs for the policy on an unsynchronized
+    // reading (send it as-is, warn, never fabricate or drop it).
+    mod with_clock {
         use super::{
             build_report_data, map_component_criterion, map_component_variable, map_report_base,
             map_status,
         };
         use crate::actor::ChargePointActor;
-        use crate::clock::{Clock, SystemClock};
+        use crate::clock::{Clock, is_synchronized};
         use crate::reporting::{
             GetBaseReportHandler, GetReportHandler, ReportEntry, ReportOutcome, chunk_report,
             handle_get_base_report, handle_get_report,
@@ -1118,17 +1124,32 @@ mod ocpp_2_1 {
             GetBaseReportResponse, GetReportResponse, NotifyReportRequest,
         };
 
+        /// The `NotifyReport.generatedAt` timestamp, sourced from `clock.now()` - pure (no
+        /// network I/O), so a fixed [`Clock`] fake can assert the exact value used, without
+        /// needing a live `OCPP2_1Client` - see this module's tests.
+        fn generated_at<C: Clock>(clock: &C) -> alloc::string::String {
+            let now = clock.now();
+            if !is_synchronized(&now) {
+                tracing::warn!(
+                    timestamp = %now,
+                    "NotifyReport generatedAt sourced from an unsynchronized clock"
+                );
+            }
+            now.to_rfc3339()
+        }
+
         /// Sends `entries` (already decided `Accepted` by the caller) to the CSMS as one or more
-        /// `NotifyReport`s, chunked via `chunk_report`. A chunk that fails to send is logged and
-        /// skipped rather than aborting the rest - the same "log and continue" treatment this
-        /// crate gives every other fire-and-forget report send (e.g. `run_with_offline_queue`'s
-        /// callers).
-        async fn send_report_chunks(
+        /// `NotifyReport`s, chunked via `chunk_report`, all sharing one `generatedAt` timestamp
+        /// from `clock.now()`. A chunk that fails to send is logged and skipped rather than
+        /// aborting the rest - the same "log and continue" treatment this crate gives every other
+        /// fire-and-forget report send (e.g. `run_with_offline_queue`'s callers).
+        async fn send_report_chunks<C: Clock>(
             client: &OCPP2_1Client,
+            clock: &C,
             request_id: i64,
             entries: Vec<ReportEntry>,
         ) {
-            let generated_at = SystemClock.now().to_rfc3339();
+            let generated_at = generated_at(clock);
             for chunk in chunk_report(&entries) {
                 let report_data: Vec<_> = chunk.entries.iter().map(build_report_data).collect();
                 let request = NotifyReportRequest {
@@ -1145,6 +1166,99 @@ mod ocpp_2_1 {
             }
         }
 
+        /// Wraps an `OCPP2_1Client` with a caller-supplied [`Clock`] for `NotifyReport`'s
+        /// `generatedAt` timestamp - the no_std-reachable counterpart to this module's `std`-only
+        /// `OCPP2_1Client` impls below, which exist alongside this (not instead of it) so no
+        /// existing `std` caller needs a source change.
+        pub struct Ocpp2_1ReportHandler<C> {
+            client: OCPP2_1Client,
+            clock: C,
+        }
+
+        impl<C: Clock> Ocpp2_1ReportHandler<C> {
+            /// Wraps `client`, sourcing every `NotifyReport`'s `generatedAt` from `clock`.
+            pub fn with_clock(client: OCPP2_1Client, clock: C) -> Self {
+                Self { client, clock }
+            }
+        }
+
+        #[cfg(feature = "std")]
+        impl Ocpp2_1ReportHandler<crate::clock::SystemClock> {
+            /// Wraps `client`, sourcing every `NotifyReport`'s `generatedAt` from
+            /// [`crate::clock::SystemClock`].
+            pub fn new(client: OCPP2_1Client) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Clone + Send + Sync + 'static> GetBaseReportHandler for Ocpp2_1ReportHandler<C> {
+            async fn register_get_base_report_handler(&self, actor: ChargePointActor) {
+                let clock = self.clock.clone();
+                self.client
+                    .on_get_base_report(move |request, client| {
+                        let actor = actor.clone();
+                        let clock = clock.clone();
+                        async move {
+                            let base = map_report_base(&request.report_base);
+                            let outcome = handle_get_base_report(&actor, base);
+                            let response = GetBaseReportResponse {
+                                custom_data: None,
+                                status: map_status(&outcome),
+                                status_info: None,
+                            };
+                            if let ReportOutcome::Accepted(entries) = outcome {
+                                send_report_chunks(&client, &clock, request.request_id, entries)
+                                    .await;
+                            }
+                            Ok(response)
+                        }
+                    })
+                    .await;
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Clone + Send + Sync + 'static> GetReportHandler for Ocpp2_1ReportHandler<C> {
+            async fn register_get_report_handler(&self, actor: ChargePointActor) {
+                let clock = self.clock.clone();
+                self.client
+                    .on_get_report(move |request, client| {
+                        let actor = actor.clone();
+                        let clock = clock.clone();
+                        async move {
+                            let criteria: Vec<_> = request
+                                .component_criteria
+                                .as_ref()
+                                .map(|list| list.iter().map(map_component_criterion).collect())
+                                .unwrap_or_default();
+                            let component_variable: Vec<_> = request
+                                .component_variable
+                                .as_ref()
+                                .map(|list| list.iter().map(map_component_variable).collect())
+                                .unwrap_or_default();
+                            let outcome = handle_get_report(&actor, &criteria, &component_variable);
+                            let response = GetReportResponse {
+                                custom_data: None,
+                                status: map_status(&outcome),
+                                status_info: None,
+                            };
+                            if let ReportOutcome::Accepted(entries) = outcome {
+                                send_report_chunks(&client, &clock, request.request_id, entries)
+                                    .await;
+                            }
+                            Ok(response)
+                        }
+                    })
+                    .await;
+            }
+        }
+
+        /// The `std` convenience: `OCPP2_1Client` itself implements `GetBaseReportHandler`/
+        /// `GetReportHandler` directly (sourcing `generatedAt` from
+        /// [`crate::clock::SystemClock`]) so existing callers that pass a bare client - e.g.
+        /// [`crate::connect::connect_and_setup`] - need no source change.
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl GetBaseReportHandler for OCPP2_1Client {
             async fn register_get_base_report_handler(&self, actor: ChargePointActor) {
@@ -1159,7 +1273,13 @@ mod ocpp_2_1 {
                             status_info: None,
                         };
                         if let ReportOutcome::Accepted(entries) = outcome {
-                            send_report_chunks(&client, request.request_id, entries).await;
+                            send_report_chunks(
+                                &client,
+                                &crate::clock::SystemClock,
+                                request.request_id,
+                                entries,
+                            )
+                            .await;
                         }
                         Ok(response)
                     }
@@ -1168,6 +1288,7 @@ mod ocpp_2_1 {
             }
         }
 
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl GetReportHandler for OCPP2_1Client {
             async fn register_get_report_handler(&self, actor: ChargePointActor) {
@@ -1191,7 +1312,13 @@ mod ocpp_2_1 {
                             status_info: None,
                         };
                         if let ReportOutcome::Accepted(entries) = outcome {
-                            send_report_chunks(&client, request.request_id, entries).await;
+                            send_report_chunks(
+                                &client,
+                                &crate::clock::SystemClock,
+                                request.request_id,
+                                entries,
+                            )
+                            .await;
                         }
                         Ok(response)
                     }
@@ -1203,11 +1330,55 @@ mod ocpp_2_1 {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use chrono::{DateTime, Utc};
 
             #[test]
             fn ocpp2_1_client_implements_the_report_handler_traits() {
                 fn assert_impl<T: GetBaseReportHandler + GetReportHandler>() {}
                 assert_impl::<OCPP2_1Client>();
+            }
+
+            /// A [`Clock`] that always reads a fixed, caller-chosen instant.
+            #[derive(Clone)]
+            struct FixedClock(DateTime<Utc>);
+
+            impl Clock for FixedClock {
+                fn now(&self) -> DateTime<Utc> {
+                    self.0
+                }
+            }
+
+            #[test]
+            fn ocpp2_1_report_handler_can_be_constructed_with_a_caller_supplied_clock() {
+                // Compile-level check that `with_clock` accepts a non-`SystemClock` fake,
+                // unlocking the no_std path `crate::clock::SystemClock` (a `std`-only type)
+                // can't reach - the actual timestamp behavior is exercised by `generated_at`'s
+                // own tests below, which don't need a live `OCPP2_1Client`.
+                fn assert_ctor<
+                    F: Fn(OCPP2_1Client, FixedClock) -> Ocpp2_1ReportHandler<FixedClock>,
+                >(
+                    _: F,
+                ) {
+                }
+                assert_ctor(Ocpp2_1ReportHandler::with_clock);
+            }
+
+            #[test]
+            fn a_fixed_clocks_reading_is_used_as_generated_at() {
+                let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let clock = FixedClock(fixed);
+
+                assert_eq!(generated_at(&clock), fixed.to_rfc3339());
+            }
+
+            #[test]
+            fn an_unsynchronized_clocks_reading_is_still_used_not_substituted_or_dropped() {
+                let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+                assert!(!is_synchronized(&unset_rtc.now()));
+
+                assert_eq!(generated_at(&unset_rtc), unset_rtc.0.to_rfc3339());
             }
         }
     }
@@ -1222,6 +1393,8 @@ mod ocpp_2_1 {
 /// module, just targeting `OCPP2_0_1Client`/`ocpp_types::v201`.
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
+    pub use with_clock::Ocpp2_0_1ReportHandler;
+
     use super::{
         ReportBase, ReportComponentCriterion, ReportComponentVariable, ReportEntry, ReportOutcome,
     };
@@ -1446,15 +1619,17 @@ mod ocpp_2_0_1 {
         }
     }
 
-    #[cfg(feature = "std")]
-    mod with_system_clock {
-        // Mirrors `super::ocpp_2_1::with_system_clock` - see its docs for why `std` is needed.
+    // `NotifyReportRequest.generatedAt` needs a timestamp, produced from a caller-supplied
+    // `Clock` - see `crate::clock::is_synchronized`'s docs for the policy on an unsynchronized
+    // reading (send it as-is, warn, never fabricate or drop it). Mirrors
+    // `super::ocpp_2_1::with_clock`.
+    mod with_clock {
         use super::{
             build_report_data, map_component_criterion, map_component_variable, map_report_base,
             map_status,
         };
         use crate::actor::ChargePointActor;
-        use crate::clock::{Clock, SystemClock};
+        use crate::clock::{Clock, is_synchronized};
         use crate::reporting::{
             GetBaseReportHandler, GetReportHandler, ReportEntry, ReportOutcome, chunk_report,
             handle_get_base_report, handle_get_report,
@@ -1466,12 +1641,24 @@ mod ocpp_2_0_1 {
             GetBaseReportResponse, GetReportResponse, NotifyReportRequest,
         };
 
-        async fn send_report_chunks(
+        fn generated_at<C: Clock>(clock: &C) -> alloc::string::String {
+            let now = clock.now();
+            if !is_synchronized(&now) {
+                tracing::warn!(
+                    timestamp = %now,
+                    "NotifyReport generatedAt sourced from an unsynchronized clock"
+                );
+            }
+            now.to_rfc3339()
+        }
+
+        async fn send_report_chunks<C: Clock>(
             client: &OCPP2_0_1Client,
+            clock: &C,
             request_id: i64,
             entries: Vec<ReportEntry>,
         ) {
-            let generated_at = SystemClock.now().to_rfc3339();
+            let generated_at = generated_at(clock);
             for chunk in chunk_report(&entries) {
                 let report_data: Vec<_> = chunk.entries.iter().map(build_report_data).collect();
                 let request = NotifyReportRequest {
@@ -1488,6 +1675,97 @@ mod ocpp_2_0_1 {
             }
         }
 
+        /// Wraps an `OCPP2_0_1Client` with a caller-supplied [`Clock`] for `NotifyReport`'s
+        /// `generatedAt` timestamp - mirrors `super::ocpp_2_1::with_clock::Ocpp2_1ReportHandler`.
+        pub struct Ocpp2_0_1ReportHandler<C> {
+            client: OCPP2_0_1Client,
+            clock: C,
+        }
+
+        impl<C: Clock> Ocpp2_0_1ReportHandler<C> {
+            /// Wraps `client`, sourcing every `NotifyReport`'s `generatedAt` from `clock`.
+            pub fn with_clock(client: OCPP2_0_1Client, clock: C) -> Self {
+                Self { client, clock }
+            }
+        }
+
+        #[cfg(feature = "std")]
+        impl Ocpp2_0_1ReportHandler<crate::clock::SystemClock> {
+            /// Wraps `client`, sourcing every `NotifyReport`'s `generatedAt` from
+            /// [`crate::clock::SystemClock`].
+            pub fn new(client: OCPP2_0_1Client) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Clone + Send + Sync + 'static> GetBaseReportHandler for Ocpp2_0_1ReportHandler<C> {
+            async fn register_get_base_report_handler(&self, actor: ChargePointActor) {
+                let clock = self.clock.clone();
+                self.client
+                    .on_get_base_report(move |request, client| {
+                        let actor = actor.clone();
+                        let clock = clock.clone();
+                        async move {
+                            let base = map_report_base(&request.report_base);
+                            let outcome = handle_get_base_report(&actor, base);
+                            let response = GetBaseReportResponse {
+                                custom_data: None,
+                                status: map_status(&outcome),
+                                status_info: None,
+                            };
+                            if let ReportOutcome::Accepted(entries) = outcome {
+                                send_report_chunks(&client, &clock, request.request_id, entries)
+                                    .await;
+                            }
+                            Ok(response)
+                        }
+                    })
+                    .await;
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<C: Clock + Clone + Send + Sync + 'static> GetReportHandler for Ocpp2_0_1ReportHandler<C> {
+            async fn register_get_report_handler(&self, actor: ChargePointActor) {
+                let clock = self.clock.clone();
+                self.client
+                    .on_get_report(move |request, client| {
+                        let actor = actor.clone();
+                        let clock = clock.clone();
+                        async move {
+                            let criteria: Vec<_> = request
+                                .component_criteria
+                                .as_ref()
+                                .map(|list| list.iter().map(map_component_criterion).collect())
+                                .unwrap_or_default();
+                            let component_variable: Vec<_> = request
+                                .component_variable
+                                .as_ref()
+                                .map(|list| list.iter().map(map_component_variable).collect())
+                                .unwrap_or_default();
+                            let outcome = handle_get_report(&actor, &criteria, &component_variable);
+                            let response = GetReportResponse {
+                                custom_data: None,
+                                status: map_status(&outcome),
+                                status_info: None,
+                            };
+                            if let ReportOutcome::Accepted(entries) = outcome {
+                                send_report_chunks(&client, &clock, request.request_id, entries)
+                                    .await;
+                            }
+                            Ok(response)
+                        }
+                    })
+                    .await;
+            }
+        }
+
+        /// The `std` convenience: `OCPP2_0_1Client` itself implements `GetBaseReportHandler`/
+        /// `GetReportHandler` directly (sourcing `generatedAt` from
+        /// [`crate::clock::SystemClock`]) so existing callers that pass a bare client need no
+        /// source change.
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl GetBaseReportHandler for OCPP2_0_1Client {
             async fn register_get_base_report_handler(&self, actor: ChargePointActor) {
@@ -1502,7 +1780,13 @@ mod ocpp_2_0_1 {
                             status_info: None,
                         };
                         if let ReportOutcome::Accepted(entries) = outcome {
-                            send_report_chunks(&client, request.request_id, entries).await;
+                            send_report_chunks(
+                                &client,
+                                &crate::clock::SystemClock,
+                                request.request_id,
+                                entries,
+                            )
+                            .await;
                         }
                         Ok(response)
                     }
@@ -1511,6 +1795,7 @@ mod ocpp_2_0_1 {
             }
         }
 
+        #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl GetReportHandler for OCPP2_0_1Client {
             async fn register_get_report_handler(&self, actor: ChargePointActor) {
@@ -1534,7 +1819,13 @@ mod ocpp_2_0_1 {
                             status_info: None,
                         };
                         if let ReportOutcome::Accepted(entries) = outcome {
-                            send_report_chunks(&client, request.request_id, entries).await;
+                            send_report_chunks(
+                                &client,
+                                &crate::clock::SystemClock,
+                                request.request_id,
+                                entries,
+                            )
+                            .await;
                         }
                         Ok(response)
                     }
@@ -1546,11 +1837,51 @@ mod ocpp_2_0_1 {
         #[cfg(test)]
         mod tests {
             use super::*;
+            use chrono::{DateTime, Utc};
 
             #[test]
             fn ocpp2_0_1_client_implements_the_report_handler_traits() {
                 fn assert_impl<T: GetBaseReportHandler + GetReportHandler>() {}
                 assert_impl::<OCPP2_0_1Client>();
+            }
+
+            /// A [`Clock`] that always reads a fixed, caller-chosen instant.
+            #[derive(Clone)]
+            struct FixedClock(DateTime<Utc>);
+
+            impl Clock for FixedClock {
+                fn now(&self) -> DateTime<Utc> {
+                    self.0
+                }
+            }
+
+            #[test]
+            fn ocpp2_0_1_report_handler_can_be_constructed_with_a_caller_supplied_clock() {
+                fn assert_ctor<
+                    F: Fn(OCPP2_0_1Client, FixedClock) -> Ocpp2_0_1ReportHandler<FixedClock>,
+                >(
+                    _: F,
+                ) {
+                }
+                assert_ctor(Ocpp2_0_1ReportHandler::with_clock);
+            }
+
+            #[test]
+            fn a_fixed_clocks_reading_is_used_as_generated_at() {
+                let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let clock = FixedClock(fixed);
+
+                assert_eq!(generated_at(&clock), fixed.to_rfc3339());
+            }
+
+            #[test]
+            fn an_unsynchronized_clocks_reading_is_still_used_not_substituted_or_dropped() {
+                let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+                assert!(!is_synchronized(&unset_rtc.now()));
+
+                assert_eq!(generated_at(&unset_rtc), unset_rtc.0.to_rfc3339());
             }
         }
     }

@@ -56,6 +56,20 @@ pub fn unsynchronized_before() -> DateTime<Utc> {
 /// rather than sending a plausible-looking but fabricated timestamp - see `crate::provisioning`'s
 /// time-sync helpers for how a real time value later arrives (from `BootNotification`/
 /// `Heartbeat`'s `currentTime`) and corrects it.
+///
+/// ## The version adapters' timestamp policy
+///
+/// Every version adapter that stamps a mandatory OCPP wire `timestamp` (StatusNotification,
+/// TransactionEvent, SecurityEventNotification, NotifyReport's `generatedAt`, ...) from a
+/// caller-supplied [`Clock`] follows the same rule: **send the reading as-is even when this
+/// function returns `false`.** OCPP's `timestamp` fields are mandatory and have no "unknown"
+/// encoding, so there is no honest alternative value - substituting, clamping, or omitting it
+/// would misrepresent the charge point to the CSMS more than an honestly-unsynchronized reading
+/// does. `crate::provisioning`'s clock-sync machinery is the path by which *later* timestamps
+/// become correct; no individual message send papers over an unset RTC on its own. Each adapter
+/// instead emits a `tracing::warn!` (naming the message and the reading sent) whenever this
+/// function returns `false` for that reading, so an unset RTC shipping a bogus but CSMS-visible
+/// timestamp is at least locally observable.
 pub fn is_synchronized(now: &DateTime<Utc>) -> bool {
     *now >= unsynchronized_before()
 }

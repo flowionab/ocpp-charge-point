@@ -396,10 +396,12 @@ pub async fn run_transaction_persistence<S: Storage, C: Clock>(
 /// [`PersistedTransaction::started_at`]'s docs. This never blocks recording the transaction
 /// itself (G3.1's explicit requirement): every other field is still written, the transaction is
 /// still recoverable after a power cut, and only the start time is left blank pending a real
-/// sync - the CSMS-facing `TransactionEvent(Started)` timestamp is a separate, `std`-only
-/// concern (see `crate::transactions`'s `with_system_clock` adapters, which are not reachable
-/// from unsynchronized embedded hardware since they're locked to `SystemClock`, always
-/// OS-backed and real).
+/// sync - the CSMS-facing `TransactionEvent(Started)` timestamp is a separate concern handled by
+/// `crate::transactions`'s own version adapters, which (like this function) now take a
+/// caller-injectable [`Clock`] rather than being locked to `SystemClock`, and follow the same
+/// [`crate::clock::is_synchronized`] policy: send the reading as-is (with a warning) rather than
+/// leaving it blank the way this record's `started_at` does - see that policy's docs for why the
+/// two cases differ (a wire-mandatory field has no `None` to fall back to).
 fn next_record<C: Clock>(
     previous: Option<&PersistedTransaction>,
     occurred: &TransactionEventOccurred,
