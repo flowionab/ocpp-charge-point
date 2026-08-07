@@ -48,11 +48,14 @@ use crate::hardware::{AtomicStorage, Storage};
 use crate::offline_queue::{OfflineQueue, flush_offline_queue};
 use crate::security::{SecurityEventLog, SecurityLogEntry};
 use crate::state::{
-    BootReasonCause, ChargePointEvent, ChargePointState, Component, ConnectorState,
-    ConnectorStatus, ConnectorStatusChanged, LocalListEntry, MeterSample,
-    RecoveredDeviceModelAttribute, RecoveredReservation, RecoveredTransaction, Reservation,
-    SecurityEvent, SecurityEventType, Transaction, TransactionEventKind, TransactionEventOccurred,
-    TransactionUpdateReason, Variable, VariableAttributeType,
+    BootReasonCause, ChargePointEvent, ChargePointState, ChargingProfile, ChargingProfileId,
+    ChargingProfileKind, ChargingProfilePurpose, ChargingProfileScope, ChargingRateUnit,
+    ChargingSchedule, ChargingSchedulePeriod, Component, ConnectorState, ConnectorStatus,
+    ConnectorStatusChanged, InstalledChargingProfile, LocalListEntry, MeterSample,
+    RecoveredDeviceModelAttribute, RecoveredReservation, RecoveredTransaction, RecurrencyKind,
+    Reservation, SecurityEvent, SecurityEventType, Transaction, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason, Variable,
+    VariableAttributeType,
 };
 use crate::sync::{BroadcastReceiver, WatchReceiver};
 
@@ -1376,6 +1379,469 @@ pub async fn flush_and_persist_security_event_queue<S, F, Fut, E>(
         queue, store, send,
     )
     .await
+}
+
+// --- charging profile persistence (E2.7, docs/PRODUCTION-ROADMAP.md §7.2) ---
+
+/// The version stamped into every [`PersistedChargingProfiles`] record. Independent of the other
+/// schema constants here - see [`SCHEMA_VERSION`]'s docs.
+pub const CHARGING_PROFILE_SCHEMA_VERSION: u32 = 1;
+
+/// The key the whole charging profile store is written under. One whole-store snapshot rather than
+/// a record per profile, for the same reason [`LOCAL_AUTH_LIST_KEY`] is: the store's contents only
+/// ever change as a unit that has already been resolved by
+/// [`crate::state::ChargingProfileStore::install`]/`clear`, so there is no per-profile addressing
+/// to gain.
+const CHARGING_PROFILE_KEY: &str = "ocpp-cp/charging-profiles";
+
+/// A `serde`-able mirror of [`crate::state::ChargingProfilePurpose`]. Exhaustively matched both
+/// ways, so adding a purpose is a compile error here rather than a silent data-loss bug - the same
+/// discipline [`PersistedSecurityEventType`] follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedChargingProfilePurpose {
+    ChargePointMax,
+    TxDefault,
+    Tx,
+    ExternalConstraints,
+    PriorityCharging,
+}
+
+impl From<ChargingProfilePurpose> for PersistedChargingProfilePurpose {
+    fn from(purpose: ChargingProfilePurpose) -> Self {
+        match purpose {
+            ChargingProfilePurpose::ChargePointMax => Self::ChargePointMax,
+            ChargingProfilePurpose::TxDefault => Self::TxDefault,
+            ChargingProfilePurpose::Tx => Self::Tx,
+            ChargingProfilePurpose::ExternalConstraints => Self::ExternalConstraints,
+            ChargingProfilePurpose::PriorityCharging => Self::PriorityCharging,
+        }
+    }
+}
+
+impl From<PersistedChargingProfilePurpose> for ChargingProfilePurpose {
+    fn from(purpose: PersistedChargingProfilePurpose) -> Self {
+        match purpose {
+            PersistedChargingProfilePurpose::ChargePointMax => Self::ChargePointMax,
+            PersistedChargingProfilePurpose::TxDefault => Self::TxDefault,
+            PersistedChargingProfilePurpose::Tx => Self::Tx,
+            PersistedChargingProfilePurpose::ExternalConstraints => Self::ExternalConstraints,
+            PersistedChargingProfilePurpose::PriorityCharging => Self::PriorityCharging,
+        }
+    }
+}
+
+/// A `serde`-able mirror of [`crate::state::ChargingProfileKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedChargingProfileKind {
+    Absolute,
+    Recurring,
+    Relative,
+}
+
+impl From<ChargingProfileKind> for PersistedChargingProfileKind {
+    fn from(kind: ChargingProfileKind) -> Self {
+        match kind {
+            ChargingProfileKind::Absolute => Self::Absolute,
+            ChargingProfileKind::Recurring => Self::Recurring,
+            ChargingProfileKind::Relative => Self::Relative,
+        }
+    }
+}
+
+impl From<PersistedChargingProfileKind> for ChargingProfileKind {
+    fn from(kind: PersistedChargingProfileKind) -> Self {
+        match kind {
+            PersistedChargingProfileKind::Absolute => Self::Absolute,
+            PersistedChargingProfileKind::Recurring => Self::Recurring,
+            PersistedChargingProfileKind::Relative => Self::Relative,
+        }
+    }
+}
+
+/// A `serde`-able mirror of [`crate::state::RecurrencyKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedRecurrencyKind {
+    Daily,
+    Weekly,
+}
+
+impl From<RecurrencyKind> for PersistedRecurrencyKind {
+    fn from(kind: RecurrencyKind) -> Self {
+        match kind {
+            RecurrencyKind::Daily => Self::Daily,
+            RecurrencyKind::Weekly => Self::Weekly,
+        }
+    }
+}
+
+impl From<PersistedRecurrencyKind> for RecurrencyKind {
+    fn from(kind: PersistedRecurrencyKind) -> Self {
+        match kind {
+            PersistedRecurrencyKind::Daily => Self::Daily,
+            PersistedRecurrencyKind::Weekly => Self::Weekly,
+        }
+    }
+}
+
+/// A `serde`-able mirror of [`crate::state::ChargingRateUnit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedChargingRateUnit {
+    Amps,
+    Watts,
+}
+
+impl From<ChargingRateUnit> for PersistedChargingRateUnit {
+    fn from(unit: ChargingRateUnit) -> Self {
+        match unit {
+            ChargingRateUnit::Amps => Self::Amps,
+            ChargingRateUnit::Watts => Self::Watts,
+        }
+    }
+}
+
+impl From<PersistedChargingRateUnit> for ChargingRateUnit {
+    fn from(unit: PersistedChargingRateUnit) -> Self {
+        match unit {
+            PersistedChargingRateUnit::Amps => Self::Amps,
+            PersistedChargingRateUnit::Watts => Self::Watts,
+        }
+    }
+}
+
+/// A `serde`-able mirror of [`crate::state::ChargingProfileScope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedChargingProfileScope {
+    ChargePoint,
+    Evse(usize),
+}
+
+impl From<ChargingProfileScope> for PersistedChargingProfileScope {
+    fn from(scope: ChargingProfileScope) -> Self {
+        match scope {
+            ChargingProfileScope::ChargePoint => Self::ChargePoint,
+            ChargingProfileScope::Evse(evse_id) => Self::Evse(evse_id),
+        }
+    }
+}
+
+impl From<PersistedChargingProfileScope> for ChargingProfileScope {
+    fn from(scope: PersistedChargingProfileScope) -> Self {
+        match scope {
+            PersistedChargingProfileScope::ChargePoint => Self::ChargePoint,
+            PersistedChargingProfileScope::Evse(evse_id) => Self::Evse(evse_id),
+        }
+    }
+}
+
+/// One schedule period as written to durable storage.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PersistedChargingSchedulePeriod {
+    start_period_secs: u32,
+    limit: f64,
+    number_phases: Option<u8>,
+}
+
+/// One schedule as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PersistedChargingSchedule {
+    id: i32,
+    start_schedule: Option<DateTime<Utc>>,
+    duration_secs: Option<u32>,
+    rate_unit: PersistedChargingRateUnit,
+    min_charging_rate: Option<f64>,
+    periods: Vec<PersistedChargingSchedulePeriod>,
+}
+
+/// One installed charging profile as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedChargingProfile {
+    /// Where it was installed - see [`crate::state::ChargingProfileScope`]. Private, like every
+    /// field here, because the mirror enums are private to this module: the way to read one back
+    /// is to convert it into an [`InstalledChargingProfile`].
+    scope: PersistedChargingProfileScope,
+    id: i32,
+    stack_level: u32,
+    purpose: PersistedChargingProfilePurpose,
+    kind: PersistedChargingProfileKind,
+    recurrency: Option<PersistedRecurrencyKind>,
+    valid_from: Option<DateTime<Utc>>,
+    valid_to: Option<DateTime<Utc>>,
+    transaction_id: Option<u64>,
+    schedules: Vec<PersistedChargingSchedule>,
+}
+
+impl From<&InstalledChargingProfile> for PersistedChargingProfile {
+    fn from(installed: &InstalledChargingProfile) -> Self {
+        let profile = &installed.profile;
+        Self {
+            scope: installed.scope.into(),
+            id: profile.id.0,
+            stack_level: profile.stack_level,
+            purpose: profile.purpose.into(),
+            kind: profile.kind.into(),
+            recurrency: profile.recurrency.map(Into::into),
+            valid_from: profile.valid_from,
+            valid_to: profile.valid_to,
+            transaction_id: profile.transaction_id.map(|id| id.0),
+            schedules: profile
+                .schedules
+                .iter()
+                .map(|schedule| PersistedChargingSchedule {
+                    id: schedule.id,
+                    start_schedule: schedule.start_schedule,
+                    duration_secs: schedule.duration_secs,
+                    rate_unit: schedule.rate_unit.into(),
+                    min_charging_rate: schedule.min_charging_rate,
+                    periods: schedule
+                        .periods
+                        .iter()
+                        .map(|period| PersistedChargingSchedulePeriod {
+                            start_period_secs: period.start_period_secs,
+                            limit: period.limit,
+                            number_phases: period.number_phases,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<PersistedChargingProfile> for InstalledChargingProfile {
+    fn from(persisted: PersistedChargingProfile) -> Self {
+        Self {
+            scope: persisted.scope.into(),
+            profile: ChargingProfile {
+                id: ChargingProfileId(persisted.id),
+                stack_level: persisted.stack_level,
+                purpose: persisted.purpose.into(),
+                kind: persisted.kind.into(),
+                recurrency: persisted.recurrency.map(Into::into),
+                valid_from: persisted.valid_from,
+                valid_to: persisted.valid_to,
+                transaction_id: persisted.transaction_id.map(TransactionId),
+                schedules: persisted
+                    .schedules
+                    .into_iter()
+                    .map(|schedule| ChargingSchedule {
+                        id: schedule.id,
+                        start_schedule: schedule.start_schedule,
+                        duration_secs: schedule.duration_secs,
+                        rate_unit: schedule.rate_unit.into(),
+                        min_charging_rate: schedule.min_charging_rate,
+                        periods: schedule
+                            .periods
+                            .into_iter()
+                            .map(|period| ChargingSchedulePeriod {
+                                start_period_secs: period.start_period_secs,
+                                limit: period.limit,
+                                number_phases: period.number_phases,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// The whole charging profile store as written to durable storage.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedChargingProfiles {
+    /// The [`CHARGING_PROFILE_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// Every installed profile, in installation order.
+    pub profiles: Vec<PersistedChargingProfile>,
+}
+
+/// A borrowing twin of [`PersistedChargingProfiles`], mirroring [`SerializablePersistedQueue`]'s
+/// role.
+#[derive(serde::Serialize)]
+struct SerializablePersistedChargingProfiles<'a> {
+    schema_version: u32,
+    profiles: &'a [PersistedChargingProfile],
+}
+
+/// Reads and writes the charging profile store, as one whole-store snapshot, through a
+/// [`Storage`].
+///
+/// Named for what it persists rather than following the `<State type>Store` convention the other
+/// stores here use: the state type is *itself* called
+/// [`ChargingProfileStore`](crate::state::ChargingProfileStore), and two types one letter apart
+/// would be a footgun at every call site.
+///
+/// Every method degrades rather than failing, exactly like [`TransactionStore`].
+#[derive(Debug, Clone)]
+pub struct ChargingProfileSnapshotStore<S> {
+    storage: S,
+}
+
+impl<S: Storage> ChargingProfileSnapshotStore<S> {
+    /// Creates a store over `storage`.
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Writes `profiles` as the whole store, replacing whatever snapshot was there. Returns
+    /// whether the write reached storage.
+    pub async fn save(&self, profiles: &[InstalledChargingProfile]) -> bool {
+        let profiles: Vec<PersistedChargingProfile> = profiles
+            .iter()
+            .map(PersistedChargingProfile::from)
+            .collect();
+        let Ok(encoded) = serde_json::to_vec(&SerializablePersistedChargingProfiles {
+            schema_version: CHARGING_PROFILE_SCHEMA_VERSION,
+            profiles: &profiles,
+        }) else {
+            tracing::error!("failed to encode the charging profiles for storage");
+            return false;
+        };
+        match self.storage.set(CHARGING_PROFILE_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist the charging profiles; load limits will not survive a \
+                     restart"
+                );
+                false
+            }
+        }
+    }
+
+    /// Reads back the persisted profiles, in installation order, or an empty `Vec` if there are
+    /// none, they can't be read, or they were written by an incompatible
+    /// [`CHARGING_PROFILE_SCHEMA_VERSION`] - discarded rather than guessed at, exactly like
+    /// [`TransactionStore::load`].
+    pub async fn load(&self) -> Vec<InstalledChargingProfile> {
+        let encoded = match self.storage.get(CHARGING_PROFILE_KEY).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read the persisted charging profiles; treating them as absent"
+                );
+                return Vec::new();
+            }
+        };
+        let record: PersistedChargingProfiles = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "the persisted charging profiles could not be decoded; discarding them"
+                );
+                return Vec::new();
+            }
+        };
+        if record.schema_version != CHARGING_PROFILE_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = CHARGING_PROFILE_SCHEMA_VERSION,
+                "discarding persisted charging profiles written by an incompatible schema version"
+            );
+            return Vec::new();
+        }
+        record
+            .profiles
+            .into_iter()
+            .map(InstalledChargingProfile::from)
+            .collect()
+    }
+}
+
+impl<S: Storage + Send + Sync> ChargingProfileSnapshotStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does - and with the same amplification
+    /// [`SecurityLogStore::new_atomic`] notes: this is one whole-store record, so a torn write
+    /// costs every installed limit rather than one.
+    pub fn new_atomic(storage: S) -> Self {
+        ChargingProfileSnapshotStore::new(AtomicStorage::new(storage))
+    }
+}
+
+/// Recovers the charging profiles that were installed when the charge point last lost power, and
+/// hands them to the state machine as a single
+/// [`ChargePointEvent::PersistedChargingProfilesRestored`].
+///
+/// Call this once at boot, **before** the charging-limit projection first evaluates and before a
+/// CSMS `SetChargingProfile` could race it - [`crate::builder::ChargePointBuilder`] does both by
+/// registering this ahead of `smart_charging`.
+///
+/// A profile whose `valid_to` has already passed is dropped rather than restored: it could never
+/// apply again, and carrying it would keep the store's bound occupied. That check is skipped
+/// entirely when `clock` doesn't look synchronized ([`crate::clock::is_synchronized`]) - on
+/// hardware with no RTC, "the past" is not a question this charge point can answer yet, and
+/// discarding a live load limit because an unset clock reads 1970 would be much worse than
+/// keeping a stale one. Same stance [`restore_reservations`] takes for expiry.
+///
+/// Returns the number of profiles handed to the state machine (which may still refuse some - see
+/// the event's docs).
+pub async fn restore_charging_profiles<S: Storage, C: Clock>(
+    actor: &ChargePointActor,
+    store: &ChargingProfileSnapshotStore<S>,
+    clock: &C,
+) -> usize {
+    let profiles = store.load().await;
+    let now = clock.now();
+    let clock_trustworthy = crate::clock::is_synchronized(&now);
+    let kept: Vec<InstalledChargingProfile> = profiles
+        .into_iter()
+        .filter(|installed| {
+            let expired = clock_trustworthy
+                && installed
+                    .profile
+                    .valid_to
+                    .is_some_and(|valid_to| now >= valid_to);
+            if expired {
+                tracing::info!(
+                    profile_id = installed.profile.id.0,
+                    "discarding a charging profile whose validity expired while the charge point \
+                     was powered off"
+                );
+            }
+            !expired
+        })
+        .collect();
+    let recovered = kept.len();
+    if recovered > 0 {
+        tracing::info!(
+            count = recovered,
+            "recovering charging profiles from durable storage"
+        );
+    }
+    let _ = actor
+        .send(ChargePointEvent::PersistedChargingProfilesRestored { profiles: kept })
+        .await;
+    recovered
+}
+
+/// Persists the charging profile store whenever it changes, forever.
+///
+/// Writes are driven by the store's contents rather than by a counter: profiles change only when a
+/// CSMS installs or clears one, which is rare enough that every change is worth a flash write -
+/// there is no high-rate traffic here for a threshold to protect against, and the write that
+/// matters is the one immediately before a power cut. Mirrors
+/// [`run_local_authorization_list_persistence`], which persists its own CSMS-driven state the same
+/// way.
+pub async fn run_charging_profile_persistence<S: Storage>(
+    mut state_changes: WatchReceiver<ChargePointState>,
+    store: &ChargingProfileSnapshotStore<S>,
+) {
+    let mut last: Vec<InstalledChargingProfile> = Vec::new();
+    loop {
+        state_changes.changed().await;
+        let profiles = state_changes
+            .borrow()
+            .charging_profiles
+            .installed()
+            .to_vec();
+        if profiles != last {
+            store.save(&profiles).await;
+            last = profiles;
+        }
+    }
 }
 
 // --- security log persistence (E2.10, docs/PRODUCTION-ROADMAP.md §7.2) ---
@@ -3302,6 +3768,252 @@ mod tests {
         .await;
 
         assert_eq!(*delivered.lock().unwrap(), alloc::vec![first, second]);
+    }
+
+    // --- charging profile persistence (E2.7) ---
+
+    fn test_charging_profile(id: i32) -> InstalledChargingProfile {
+        InstalledChargingProfile {
+            scope: ChargingProfileScope::Evse(0),
+            profile: ChargingProfile {
+                id: ChargingProfileId(id),
+                stack_level: 2,
+                purpose: ChargingProfilePurpose::TxDefault,
+                kind: ChargingProfileKind::Recurring,
+                recurrency: Some(RecurrencyKind::Daily),
+                valid_from: DateTime::from_timestamp(1_800_000_000, 0),
+                valid_to: DateTime::from_timestamp(1_900_000_000, 0),
+                transaction_id: Some(TransactionId(9)),
+                schedules: alloc::vec![ChargingSchedule {
+                    id: 3,
+                    start_schedule: DateTime::from_timestamp(1_800_000_000, 0),
+                    duration_secs: Some(3_600),
+                    rate_unit: ChargingRateUnit::Amps,
+                    min_charging_rate: Some(6.0),
+                    periods: alloc::vec![
+                        ChargingSchedulePeriod {
+                            start_period_secs: 0,
+                            limit: 16.0,
+                            number_phases: Some(3),
+                        },
+                        ChargingSchedulePeriod {
+                            start_period_secs: 1_800,
+                            limit: 32.0,
+                            number_phases: None,
+                        },
+                    ],
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn a_charging_profile_round_trips_through_its_persisted_mirror_field_for_field() {
+        let installed = test_charging_profile(1);
+        let persisted = PersistedChargingProfile::from(&installed);
+        assert_eq!(InstalledChargingProfile::from(persisted), installed);
+    }
+
+    #[test]
+    fn every_purpose_kind_recurrency_rate_unit_and_scope_variant_round_trips() {
+        for purpose in [
+            ChargingProfilePurpose::ChargePointMax,
+            ChargingProfilePurpose::TxDefault,
+            ChargingProfilePurpose::Tx,
+            ChargingProfilePurpose::ExternalConstraints,
+            ChargingProfilePurpose::PriorityCharging,
+        ] {
+            let persisted: PersistedChargingProfilePurpose = purpose.into();
+            assert_eq!(ChargingProfilePurpose::from(persisted), purpose);
+        }
+        for kind in [
+            ChargingProfileKind::Absolute,
+            ChargingProfileKind::Recurring,
+            ChargingProfileKind::Relative,
+        ] {
+            let persisted: PersistedChargingProfileKind = kind.into();
+            assert_eq!(ChargingProfileKind::from(persisted), kind);
+        }
+        for recurrency in [RecurrencyKind::Daily, RecurrencyKind::Weekly] {
+            let persisted: PersistedRecurrencyKind = recurrency.into();
+            assert_eq!(RecurrencyKind::from(persisted), recurrency);
+        }
+        for unit in [ChargingRateUnit::Amps, ChargingRateUnit::Watts] {
+            let persisted: PersistedChargingRateUnit = unit.into();
+            assert_eq!(ChargingRateUnit::from(persisted), unit);
+        }
+        for scope in [
+            ChargingProfileScope::ChargePoint,
+            ChargingProfileScope::Evse(0),
+            ChargingProfileScope::Evse(3),
+        ] {
+            let persisted: PersistedChargingProfileScope = scope.into();
+            assert_eq!(ChargingProfileScope::from(persisted), scope);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_charging_profile_snapshot_round_trips_through_storage() {
+        let store = ChargingProfileSnapshotStore::new(InMemoryStorage::new());
+        let profiles = alloc::vec![test_charging_profile(1), test_charging_profile(2)];
+
+        assert!(store.save(&profiles).await);
+        assert_eq!(store.load().await, profiles);
+    }
+
+    #[tokio::test]
+    async fn a_charging_profile_snapshot_from_an_incompatible_schema_version_is_discarded() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = ChargingProfileSnapshotStore::new(storage.clone());
+        let encoded = serde_json::to_vec(&PersistedChargingProfiles {
+            schema_version: CHARGING_PROFILE_SCHEMA_VERSION + 1,
+            profiles: alloc::vec![PersistedChargingProfile::from(&test_charging_profile(1))],
+        })
+        .unwrap();
+        storage.set(CHARGING_PROFILE_KEY, &encoded).await.unwrap();
+
+        assert_eq!(store.load().await, alloc::vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_charging_profile_snapshot_is_discarded_rather_than_panicking() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = ChargingProfileSnapshotStore::new(storage.clone());
+        storage
+            .set(CHARGING_PROFILE_KEY, b"not json")
+            .await
+            .unwrap();
+
+        assert_eq!(store.load().await, alloc::vec![]);
+    }
+
+    /// The end-to-end guarantee E2.7 exists for: a power cut must not silently un-limit a charge
+    /// point that a CSMS has load-managed.
+    #[tokio::test]
+    async fn charging_profiles_interrupted_by_a_power_cut_are_recovered_after_reboot() {
+        use crate::executor::TokioExecutor;
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+
+        // --- before the cut: the CSMS installs a profile, which the persistence loop writes.
+        let before = ChargePointActor::spawn([1], &TokioExecutor);
+        let store = ChargingProfileSnapshotStore::new(storage.clone());
+        let state_changes = before.subscribe();
+        tokio::spawn(async move {
+            run_charging_profile_persistence(state_changes, &store).await;
+        });
+        let _ = before
+            .send(ChargePointEvent::ChargingProfileSet {
+                scope: ChargingProfileScope::Evse(0),
+                profile: alloc::boxed::Box::new(test_charging_profile(1).profile),
+            })
+            .await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        drop(before);
+
+        // --- after the reboot: a fresh charge point recovers it from storage alone.
+        let after = ChargePointActor::spawn([1], &TokioExecutor);
+        let store = ChargingProfileSnapshotStore::new(storage.clone());
+        let clock = FixedClock(DateTime::from_timestamp(1_800_000_100, 0).unwrap());
+        assert_eq!(restore_charging_profiles(&after, &store, &clock).await, 1);
+
+        let recovered = after.state().charging_profiles.installed().to_vec();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].profile.id, ChargingProfileId(1));
+        assert_eq!(recovered[0].scope, ChargingProfileScope::Evse(0));
+        assert_eq!(recovered[0].profile.schedules[0].periods[1].limit, 32.0);
+    }
+
+    #[tokio::test]
+    async fn a_profile_whose_validity_expired_while_powered_off_is_not_restored() {
+        use crate::executor::TokioExecutor;
+
+        let store = ChargingProfileSnapshotStore::new(InMemoryStorage::new());
+        store.save(&alloc::vec![test_charging_profile(1)]).await;
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        // `valid_to` is 1_900_000_000; boot well after it.
+        let clock = FixedClock(DateTime::from_timestamp(1_950_000_000, 0).unwrap());
+
+        assert_eq!(restore_charging_profiles(&actor, &store, &clock).await, 0);
+        assert!(actor.state().charging_profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unsynchronized_clock_never_discards_a_profile_as_expired() {
+        use crate::executor::TokioExecutor;
+
+        let store = ChargingProfileSnapshotStore::new(InMemoryStorage::new());
+        store.save(&alloc::vec![test_charging_profile(1)]).await;
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        assert!(!crate::clock::is_synchronized(&unset_rtc.now()));
+
+        // Every `valid_to` looks "in the future" to an unset clock reading 1970, but the point is
+        // the reverse case: this must not become a rule that silently drops live load limits on
+        // hardware with no RTC, so expiry is not evaluated at all.
+        assert_eq!(
+            restore_charging_profiles(&actor, &store, &unset_rtc).await,
+            1
+        );
+        assert_eq!(actor.state().charging_profiles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_recovered_profile_for_an_evse_this_firmware_no_longer_has_is_discarded() {
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let mut orphan = test_charging_profile(1);
+        orphan.scope = ChargingProfileScope::Evse(7);
+
+        let _ = actor
+            .send(ChargePointEvent::PersistedChargingProfilesRestored {
+                profiles: alloc::vec![orphan],
+            })
+            .await;
+
+        assert!(actor.state().charging_profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovered_profiles_beyond_the_bound_raise_memory_exhaustion_rather_than_vanishing() {
+        use crate::executor::TokioExecutor;
+        use crate::state::StateLimits;
+
+        let actor = ChargePointActor::spawn_with_limits(
+            [1],
+            &TokioExecutor,
+            StateLimits::default().with_max_charging_profiles(1),
+        );
+        let mut reported = actor.subscribe_security_events();
+        let mut second = test_charging_profile(2);
+        second.profile.stack_level = 9;
+
+        let _ = actor
+            .send(ChargePointEvent::PersistedChargingProfilesRestored {
+                profiles: alloc::vec![test_charging_profile(1), second],
+            })
+            .await;
+
+        assert_eq!(actor.state().charging_profiles.len(), 1);
+        let event = reported.recv().await.unwrap();
+        assert_eq!(event.event_type, SecurityEventType::MemoryExhaustion);
+    }
+
+    #[tokio::test]
+    async fn a_charge_point_without_storage_persists_and_recovers_no_charging_profiles() {
+        use crate::executor::TokioExecutor;
+
+        let store = ChargingProfileSnapshotStore::new(NoStorage);
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        store.save(&alloc::vec![test_charging_profile(1)]).await;
+
+        assert_eq!(
+            restore_charging_profiles(&actor, &store, &SystemClock).await,
+            0
+        );
     }
 
     // --- security log persistence (E2.10) ---

@@ -33,12 +33,13 @@ use crate::hardware::{Capabilities, warn_on_feature_mismatches};
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
 use crate::offline_queue::{OfflineQueue, OverflowPolicy, run_with_offline_queue};
 use crate::persistence::{
-    BootReasonStore, DeviceModelStore, LocalAuthorizationListStore, QueueStore, ReservationStore,
-    TransactionStore, flush_and_persist_security_event_queue,
+    BootReasonStore, ChargingProfileSnapshotStore, DeviceModelStore, LocalAuthorizationListStore,
+    QueueStore, ReservationStore, TransactionStore, flush_and_persist_security_event_queue,
     flush_and_persist_status_notification_queue, flush_and_persist_transaction_event_queue,
-    restore_device_model, restore_local_authorization_list, restore_reservations,
-    restore_security_event_queue, restore_security_log, restore_status_notification_queue,
-    restore_transaction_event_queue, restore_transactions, run_device_model_persistence,
+    restore_charging_profiles, restore_device_model, restore_local_authorization_list,
+    restore_reservations, restore_security_event_queue, restore_security_log,
+    restore_status_notification_queue, restore_transaction_event_queue, restore_transactions,
+    run_charging_profile_persistence, run_device_model_persistence,
     run_local_authorization_list_persistence, run_persisted_security_event_queue,
     run_persisted_status_notification_queue, run_persisted_transaction_event_queue,
     run_reservation_persistence, run_security_log_persistence, run_transaction_persistence,
@@ -251,6 +252,39 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
     pub fn capabilities(&self) -> Capabilities {
         self.capabilities
+    }
+
+    /// Registers durable charging-profile state (`docs/PRODUCTION-ROADMAP.md` §7.2, E2.7):
+    /// recovers whatever load limits the CSMS had installed before the charge point last lost
+    /// power, then persists every subsequent change through `storage` for the life of the process.
+    ///
+    /// **Call this before [`Self::smart_charging`]** - the restore must land before the
+    /// charging-limit projection first evaluates, or the charge point spends its first moments
+    /// back believing nothing limits it. Registering the two in this order is all that takes; the
+    /// restore completes before this method returns.
+    ///
+    /// Without it a power cut silently un-limits a load-managed charge point: the profiles are
+    /// gone, the projection computes no limit, and hardware goes back to its own maximum until the
+    /// CSMS notices and re-sends. `storage` may be [`crate::hardware::NoStorage`], in which case
+    /// this behaves exactly as if it were never called.
+    ///
+    /// `clock` decides whether a persisted profile's `valid_to` is trustworthy to compare
+    /// against; see [`crate::persistence::restore_charging_profiles`] for what an unsynchronized
+    /// clock does (nothing, deliberately).
+    pub async fn charging_profile_persistence<S, K>(self, storage: S, clock: K) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+    {
+        let store = Arc::new(ChargingProfileSnapshotStore::new(storage));
+        restore_charging_profiles(&self.runtime.actor(), &store, &clock).await;
+
+        let state_changes = self.runtime.actor().subscribe();
+        self.executor.spawn(Box::pin(async move {
+            run_charging_profile_persistence(state_changes, &store).await;
+        }));
+
+        self
     }
 
     /// Registers the Smart Charging functional block (`docs/ROADMAP.md` §11,
@@ -2395,6 +2429,148 @@ mod tests {
         assert_eq!(
             restore_security_log(&restored_again, &SecurityLogStore::new(storage)).await,
             2
+        );
+    }
+
+    /// E2.7's end-to-end guarantee at the builder level: the load limits a CSMS installed are
+    /// still in force after a power cut, and are back in force *before* the projection first
+    /// decides what the connector may draw.
+    #[tokio::test]
+    async fn charging_profile_persistence_survives_a_reboot_and_restores_before_the_projection() {
+        use crate::smart_charging::{
+            ChargingLimitProjection, ClearChargingProfileHandler, GetCompositeScheduleHandler,
+            SetChargingProfileHandler,
+        };
+        use crate::state::ChargePointEvent;
+        use crate::state::{
+            ChargingProfile, ChargingProfileId, ChargingProfileKind, ChargingProfilePurpose,
+            ChargingProfileScope, ChargingRateUnit, ChargingSchedule, ChargingSchedulePeriod,
+        };
+
+        fn installation_limit() -> ChargingProfile {
+            ChargingProfile {
+                id: ChargingProfileId(1),
+                stack_level: 0,
+                // A charge-point-wide cap, so it limits the connector whether or not anything is
+                // charging - which is what makes "did the limit survive?" observable without
+                // driving a whole session first.
+                purpose: ChargingProfilePurpose::ChargePointMax,
+                kind: ChargingProfileKind::Absolute,
+                recurrency: None,
+                valid_from: None,
+                valid_to: None,
+                transaction_id: None,
+                schedules: alloc::vec![ChargingSchedule {
+                    id: 1,
+                    start_schedule: None,
+                    duration_secs: None,
+                    rate_unit: ChargingRateUnit::Amps,
+                    min_charging_rate: None,
+                    periods: alloc::vec![ChargingSchedulePeriod {
+                        start_period_secs: 0,
+                        limit: 20.0,
+                        number_phases: None,
+                    }],
+                }],
+            }
+        }
+
+        let storage = Arc::new(InMemoryStorage::new());
+
+        // --- before the cut: install a limit and let it reach storage.
+        let charge_point1 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
+            .await
+            .unwrap()
+            .charging_profile_persistence(storage.clone(), crate::clock::SystemClock)
+            .await;
+        let _ = builder1
+            .runtime
+            .actor()
+            .send(ChargePointEvent::ChargingProfileSet {
+                scope: ChargingProfileScope::ChargePoint,
+                profile: Box::new(installation_limit()),
+            })
+            .await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        drop(builder1);
+
+        // --- after the reboot: registering persistence first, then smart charging, is all it
+        // takes for the projection's very first evaluation to see the recovered profile.
+        let charge_point2 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        // A CSMS that registers the three smart-charging handlers and does nothing else: this
+        // test is about what the *projection* sees at boot, not about the wire.
+        #[derive(Clone, Default)]
+        struct SmartChargingCsms;
+
+        #[async_trait::async_trait]
+        impl SetChargingProfileHandler for SmartChargingCsms {
+            async fn register_set_charging_profile_handler(
+                &self,
+                _actor: crate::actor::ChargePointActor,
+            ) {
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ClearChargingProfileHandler for SmartChargingCsms {
+            async fn register_clear_charging_profile_handler(
+                &self,
+                _actor: crate::actor::ChargePointActor,
+            ) {
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl GetCompositeScheduleHandler for SmartChargingCsms {
+            async fn register_get_composite_schedule_handler(
+                &self,
+                _actor: crate::actor::ChargePointActor,
+                _projection: Arc<ChargingLimitProjection>,
+            ) {
+            }
+        }
+
+        let csms = SmartChargingCsms;
+        let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
+            .await
+            .unwrap()
+            .charging_profile_persistence(storage.clone(), crate::clock::SystemClock)
+            .await
+            .smart_charging(
+                &csms,
+                Arc::new(ChargingLimitProjection::new()),
+                crate::clock::SystemClock,
+                crate::provisioning::TokioBackoff,
+            )
+            .await
+            .build();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        let state = runtime2.actor().state();
+        assert_eq!(state.charging_profiles.len(), 1);
+        assert_eq!(
+            state.evses[0].charging_limits[0],
+            Some(20_000),
+            "the recovered limit must reach hardware, not just the store"
         );
     }
 

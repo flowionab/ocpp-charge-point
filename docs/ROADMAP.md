@@ -1204,9 +1204,12 @@ Charging profiles and schedule negotiation.
   Still missing: `GetChargingProfiles`/`ReportChargingProfiles` (the store-side
   query exists; the multi-part report sender doesn't), `NotifyChargingLimit`/
   `ClearedChargingLimit`, `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`,
-  2.1's dynamic schedule updates and priority-charging messages, and
-  persistence of the profile store across a reboot (E2.7 - the store is
-  RAM-only today, so load limits do not survive a power cut).
+  2.1's dynamic schedule updates and priority-charging messages. The profile
+  store itself is durable (`persistence::ChargingProfileSnapshotStore`, wired
+  via `ChargePointBuilder::charging_profile_persistence`): installed load
+  limits survive a power cut and are restored before the projection's first
+  evaluation, so a restart cannot silently un-limit a load-managed charge
+  point.
 - Version notes: 2.1 adds richer profile purposes and DER-linked limits
   **(verify vs 2.1 spec)**; 1.6J smart charging is optional-profile and a
   strict subset.

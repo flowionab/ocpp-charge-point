@@ -6,9 +6,9 @@ use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::{
     ChargingProfile, ChargingProfileCriteria, ChargingProfileScope, Component, ConnectorState,
-    ConnectorStatus, DeviceModelEvent, IdToken, LocalListEntry, MeterSample, RegistrationStatus,
-    Reservation, ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, Variable,
-    VariableAttributeType,
+    ConnectorStatus, DeviceModelEvent, IdToken, InstalledChargingProfile, LocalListEntry,
+    MeterSample, RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent,
+    StopReason, Transaction, Variable, VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -169,6 +169,21 @@ pub enum ChargePointEvent {
     PersistedDeviceModelAttributesRestored {
         /// The attribute values to restore, in no particular order.
         attributes: Vec<RecoveredDeviceModelAttribute>,
+    },
+    /// Charging profiles recovered from durable storage at boot (`docs/PRODUCTION-ROADMAP.md`
+    /// §7.2, E2.7).
+    ///
+    /// Each is installed through the same [`crate::state::ChargingProfileStore::install`] path a
+    /// live `SetChargingProfile` takes, so the replacement rules and the
+    /// [`StateLimits::max_charging_profiles`](crate::state::StateLimits::max_charging_profiles)
+    /// bound hold identically however a profile arrived. A profile addressing an EVSE this
+    /// firmware no longer has is discarded and logged (a topology change across the update that
+    /// caused the restart), and any refused by the bound raise a `MemoryExhaustion` security
+    /// event rather than disappearing quietly - a *limit* the CSMS believes is installed but
+    /// isn't is exactly the kind of divergence worth reporting.
+    PersistedChargingProfilesRestored {
+        /// The recovered profiles, in the order they were installed before the restart.
+        profiles: Vec<InstalledChargingProfile>,
     },
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {

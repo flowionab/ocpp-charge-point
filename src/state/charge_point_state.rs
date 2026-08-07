@@ -5,12 +5,13 @@ use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
-    AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargingProfileStore,
-    ConnectorEvent, ConnectorState, ConnectorStatusChanged, DeviceModel, DeviceModelEvent,
-    EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
-    MeterSample, PendingReset, RegistrationStatus, ResetKind, ResetTarget, SecurityEvent,
-    SecurityEventType, StateLimits, StopReason, Transaction, TransactionChargingState,
-    TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
+    AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargingProfileScope,
+    ChargingProfileStore, ConnectorEvent, ConnectorState, ConnectorStatusChanged, DeviceModel,
+    DeviceModelEvent, EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList,
+    LocalListEntry, MeterSample, PendingReset, RegistrationStatus, ResetKind, ResetTarget,
+    SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
+    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
+    TransactionUpdateReason,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -197,6 +198,45 @@ impl ChargePointState {
                         false
                     }
                 }
+            }
+            ChargePointEvent::PersistedChargingProfilesRestored { profiles } => {
+                let mut restored_any = false;
+                let mut refused = 0usize;
+                for installed in profiles {
+                    if let ChargingProfileScope::Evse(evse_id) = installed.scope
+                        && evse_id >= self.evses.len()
+                    {
+                        tracing::warn!(
+                            evse_id,
+                            profile_id = installed.profile.id.0,
+                            "discarding a recovered charging profile for an EVSE this charge point no longer has"
+                        );
+                        continue;
+                    }
+                    match self
+                        .charging_profiles
+                        .install(installed.scope, installed.profile)
+                    {
+                        Ok(()) => restored_any = true,
+                        Err(rejection) => {
+                            tracing::warn!(?rejection, "a recovered charging profile was refused");
+                            refused += 1;
+                        }
+                    }
+                }
+                if refused > 0 {
+                    // A limit the CSMS believes is installed but that this charge point does not
+                    // hold is worth reporting, not just logging - same stance the local
+                    // authorization list's truncation takes.
+                    effects.push(ChargePointEffect::SecurityEventOccurred(SecurityEvent {
+                        event_type: SecurityEventType::MemoryExhaustion,
+                        tech_info: Some(alloc::format!(
+                            "dropped {refused} recovered charging profiles beyond the configured maximum of {}",
+                            self.charging_profiles.max_profiles()
+                        )),
+                    }));
+                }
+                restored_any
             }
             ChargePointEvent::ChargingProfilesCleared { criteria } => {
                 self.charging_profiles.clear(&criteria) > 0

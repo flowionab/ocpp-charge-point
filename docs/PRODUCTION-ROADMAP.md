@@ -101,8 +101,8 @@ close — mostly missing one version each.
 | `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. Until the [G3.1](#93-g3--time) follow-up, this held only for a build with *no version feature* — every OCPP adapter was `std`-gated dead code, so a bare-metal build could not actually speak OCPP. All three version adapters are now reachable without `std`. |
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
-| Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: authorization cache, charging profiles, certificates, network profiles. |
-| Test suite | 🚧 | 564 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: authorization cache, certificates, network profiles. |
+| Test suite | 🚧 | 658 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -725,7 +725,7 @@ mid-transaction currently loses the transaction.
 | Local authorization list + version number | Re-download after every boot is unacceptable offline | R§4 |
 | Authorization cache | Offline authorization | [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment) |
 | Reservations | Survive a reboot inside the reservation window | R§8 |
-| Charging profiles | Load limits must not vanish on reboot — **now unblocked**: [B2.1](#b2--smart-charging-r11)'s store exists, so E2.7 is ordinary work rather than blocked work | [B2.1](#b2--smart-charging-r11) |
+| Charging profiles | Load limits survive a reboot (`persistence::ChargingProfileSnapshotStore`; `ChargePointBuilder::charging_profile_persistence`) | [B2.1](#b2--smart-charging-r11) |
 | Offline message queue | All three queues now durable (`src/persistence.rs`; `ChargePointBuilder::transaction_events_persisted` / `status_notifications_persisted` / `security_events_persisted`) | [G2](#92-g2--bounded-memory) |
 | Certificates and keys | Security profile 2/3 | [B4.1](#b4--certificates-and-iso-15118-r1-r13) |
 | Security event log | Durable and size-bounded (`src/security.rs`, `src/persistence.rs`; `ChargePointBuilder::security_log_persisted`) | [F4](#84-f4--security-events) |
@@ -980,17 +980,52 @@ mid-transaction currently loses the transaction.
       the blocks that would (`GetLog`, customer-information erasure) are [B5.1](#b5--diagnostics-and-monitoring-r14)/[B5.5](#b5--diagnostics-and-monitoring-r14) - which is
       the honest remaining half of [F4.3](#84-f4--security-events): the durable log exists, the `GetLog` reader
       does not.
-- [ ] **E2.5, E2.9, E2.11** One task per remaining row above. All three are blocked on functional
-      blocks that don't exist yet: authorization cache on
+- [ ] **E2.5, E2.9, E2.11** One task per remaining row above. All three remain blocked on
+      functional blocks that don't exist yet: authorization cache on
       [B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment), certificates on
       [B4.1](#b4--certificates-and-iso-15118-r1-r13), network profiles on
       [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle).
-- [ ] **E2.7** Charging profiles. **No longer blocked** — [B2.1](#b2--smart-charging-r11)'s
-      `ChargingProfileStore` now exists, so this is ordinary work in the shape every other row
-      already has (a `ChargingProfileStore` snapshot through `hardware::Storage`, restored at
-      boot before the projection first evaluates). Until it lands, a power cut loses every
-      installed load limit, and the charge point comes back unlimited until the CSMS notices and
-      re-sends — worth doing before a site relies on load management.
+- [x] **E2.7** Charging profiles — `persistence::ChargingProfileSnapshotStore`/
+      `restore_charging_profiles`/`run_charging_profile_persistence`, wired via
+      `ChargePointBuilder::charging_profile_persistence`. Unblocked by
+      [B2.1](#b2--smart-charging-r11) and closed immediately after it, because the gap it left was
+      the sharpest one durability had: a power cut silently *un-limited* a load-managed charge
+      point — profiles gone, projection computing nothing, hardware back at its own maximum until
+      the CSMS noticed and re-sent.
+
+      One whole-store JSON snapshot per write, versioned with its own
+      `CHARGING_PROFILE_SCHEMA_VERSION` and discarded on a decode failure or version mismatch like
+      every other record here. The mirror types match exhaustively in both directions (purpose,
+      kind, recurrency, rate unit, scope, plus the schedule/period bodies), so adding a variant to
+      any of those state enums is a compile error at the mirror rather than a silent data-loss
+      bug; a round-trip test drives every variant of each.
+
+      **Recovery goes through the same door a live `SetChargingProfile` does.**
+      `ChargePointEvent::PersistedChargingProfilesRestored` installs each profile through
+      `ChargingProfileStore::install`, so the replacement rules and the
+      `max_charging_profiles` bound hold identically however a profile arrived. A profile
+      addressing an EVSE this firmware no longer has (a topology change across the update that
+      caused the restart) is discarded and logged; profiles the bound refuses raise
+      `MemoryExhaustion` rather than vanishing quietly — a *limit* the CSMS believes is installed
+      but that the charge point does not hold is exactly the divergence worth reporting.
+
+      **Expiry follows E2.6's stance, not a new one**: a profile whose `valid_to` has already
+      passed is dropped at boot (it could never apply again, and it would hold a slot against the
+      bound), but only when `crate::clock::is_synchronized` accepts the reading. On hardware with
+      no RTC, "has this expired?" is not a question the charge point can answer yet, and
+      discarding a live load limit because an unset clock reads 1970 would be far worse than
+      keeping a stale one.
+
+      **Ordering**: register this *before* `smart_charging`, so the restore lands before the
+      projection's first evaluation — otherwise the charge point spends its first moments back
+      believing nothing limits it. The builder test asserts the recovered limit reaches
+      `charging_limits` (i.e. hardware), not merely the store, and was verified to fail when the
+      restore call is removed.
+
+      Write policy is deliberately undebounced, like the local authorization list's: profiles
+      change only when a CSMS installs or clears one, so there is no high-rate traffic for a
+      threshold to protect flash against, and the write that matters is the one immediately before
+      the cut.
 
 ### 7.3 E3 — Crash consistency
 
@@ -1784,13 +1819,13 @@ mid-transaction clock jumps.
 
 Three honest caveats, none of them a hole in the exit criteria:
 
-- **Four E2 rows remain RAM-only.** Three are blocked on functional blocks that do not exist yet:
-  authorization cache ([B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)),
+- **Three E2 rows remain RAM-only**, every one blocked on a functional block that does not exist
+  yet: authorization cache ([B1.2](#b1--core-spine-must-be-complete-for-any-production-deployment)),
   certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)), network profiles
   ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle)).
-  The fourth, charging profiles ([E2.7](#72-e2--what-must-survive)), stopped being blocked the
-  moment [B2.1](#b2--smart-charging-r11) landed and is now the one durability gap that is simply
-  outstanding rather than waiting on anything.
+  Charging profiles ([E2.7](#72-e2--what-must-survive)) was the fourth until
+  [B2.1](#b2--smart-charging-r11) unblocked it; it landed with B2 rather than being left as a
+  durability gap behind a shipped block.
 - **Durability is opt-in per concern.** Every `*_persistence` / `*_persisted` registration on
   `ChargePointBuilder` is a separate call an integrator has to make; `setup()`'s
   "everything on" wrapper does not wire any of them, because it has no `Storage` to wire them
@@ -1926,5 +1961,5 @@ UpdateDynamicSchedule — see [D1](#61-d1--missing-action-wrappers).
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 24 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 646 | `#[test]` + `#[tokio::test]`, re-counted at the B2 commit (564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 658 | `#[test]` + `#[tokio::test]`, re-counted at the E2.7 commit (646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |
