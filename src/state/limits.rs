@@ -43,6 +43,10 @@ pub const DEFAULT_MAX_CHARGING_PROFILES: usize = 16;
 /// re-export exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
 pub use crate::state::authorization_cache::DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES;
 
+/// Default maximum number of occupied network profile slots - see
+/// [`crate::state::DEFAULT_MAX_NETWORK_PROFILE_SLOTS`].
+pub use crate::state::network_profile::DEFAULT_MAX_NETWORK_PROFILE_SLOTS;
+
 /// The configured maxima for every growable collection in [`crate::state::ChargePointState`], so a
 /// charge point's peak memory is a function of its configuration rather than of how much a CSMS or
 /// a hardware binding decides to push at it - see `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2). Passed
@@ -93,6 +97,10 @@ pub struct StateLimits {
     /// entry just means the next `Authorize` for that token goes to the CSMS, which is the normal
     /// path anyway. Clamped to at least 1.
     pub max_authorization_cache_entries: usize,
+    /// The most network profile configuration slots that may be occupied. A `SetNetworkProfile`
+    /// for a *new* slot beyond it is refused with OCPP's `Rejected`; replacing an already-occupied
+    /// slot always succeeds. Clamped to at least 1.
+    pub max_network_profile_slots: usize,
 }
 
 impl StateLimits {
@@ -104,7 +112,14 @@ impl StateLimits {
             max_device_model_variables: DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
             max_charging_profiles: DEFAULT_MAX_CHARGING_PROFILES,
             max_authorization_cache_entries: DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
+            max_network_profile_slots: DEFAULT_MAX_NETWORK_PROFILE_SLOTS,
         }
+    }
+
+    /// Overrides [`Self::max_network_profile_slots`].
+    pub const fn with_max_network_profile_slots(mut self, max: usize) -> Self {
+        self.max_network_profile_slots = max;
+        self
     }
 
     /// Overrides [`Self::max_authorization_cache_entries`].

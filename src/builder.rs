@@ -928,6 +928,25 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers inbound `SetNetworkProfile` handling (`docs/ROADMAP.md` §2,
+    /// `docs/PRODUCTION-ROADMAP.md` B1.8): the CSMS writing a network connection profile into a
+    /// configuration slot.
+    ///
+    /// **Storing a profile does not switch the connection.** This charge point keeps talking to
+    /// whatever address it was started with; dialling a stored profile, and rolling back if the
+    /// new one fails, is A9 and is not implemented. See [`crate::network_profile`], which says the
+    /// same thing where an integrator will actually read it.
+    ///
+    /// 2.x only - 1.6J has no such message.
+    pub async fn network_profiles<N>(self, csms: &N) -> Self
+    where
+        N: crate::network_profile::SetNetworkProfileHandler + Send + Sync + 'static,
+    {
+        csms.register_set_network_profile_handler(self.runtime.actor())
+            .await;
+        self
+    }
+
     /// Registers inbound `ClearCache` handling (`docs/ROADMAP.md` §3,
     /// `docs/PRODUCTION-ROADMAP.md` B1.2): a CSMS emptying the authorization cache.
     ///

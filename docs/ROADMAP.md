@@ -734,7 +734,13 @@ Boot, configuration, and the Component/Variable device model.
   2.1's `ImmediateAndResume` projects down to `Immediate`, since nothing here
   models resuming a transaction across a reboot.
 
-  Still missing: `SetNetworkProfile` and variable monitoring
+  `SetNetworkProfile` is wired for 2.0.1 and 2.1 (`crate::network_profile`,
+  B1.8): profiles are stored in bounded configuration slots, reported, and
+  refused when this charge point could never use them (SOAP transport, a
+  negative slot, a new slot past the bound). Storing one does **not** switch the
+  live connection - that is A9, still open - and `basicAuthPassword` is dropped
+  rather than kept, being a credential this crate cannot use. 1.6J has no such
+  message. Still missing: variable monitoring
   (`SetVariableMonitoring`/`GetMonitoringReport`/`NotifyMonitoringReport`).
   Two items previously listed here are done: device-model persistence across
   restarts (E2.3 - `VariableAttribute::persistent` is acted on now), and the

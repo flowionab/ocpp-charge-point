@@ -8,10 +8,10 @@ use crate::state::{
     AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
     ChargingProfileScope, ChargingProfileStore, ConnectorEvent, ConnectorState,
     ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
-    IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, PendingReset, RegistrationStatus,
-    ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
-    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
-    TransactionUpdateReason,
+    IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, NetworkProfileStore,
+    PendingReset, RegistrationStatus, ResetKind, ResetTarget, SecurityEvent, SecurityEventType,
+    StateLimits, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -62,6 +62,10 @@ pub struct ChargePointState {
     /// Conservatively empty ([`Capabilities::default`]) until `ChargePointBuilder::start` captures
     /// the real value - see `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
     pub capabilities: Capabilities,
+    /// Network connection profiles the CSMS has written into configuration slots
+    /// (`SetNetworkProfile`). Stored and reported; **not** used to dial - see
+    /// [`NetworkProfileStore`] and `docs/ROADMAP.md` §2.
+    pub network_profiles: NetworkProfileStore,
     /// Authorization decisions the CSMS has already made, kept so a charge point that can't
     /// reach it can still answer - see [`AuthorizationCache`] and `docs/ROADMAP.md` §3.
     pub authorization_cache: AuthorizationCache,
@@ -119,6 +123,7 @@ impl ChargePointState {
             pending_reset: None,
             device_model: DeviceModel::with_max_variables(limits.max_device_model_variables),
             capabilities: Capabilities::default(),
+            network_profiles: NetworkProfileStore::with_max_slots(limits.max_network_profile_slots),
             authorization_cache: AuthorizationCache::with_max_entries(
                 limits.max_authorization_cache_entries,
             ),
@@ -186,6 +191,20 @@ impl ChargePointState {
                     }
                 }
                 true
+            }
+            ChargePointEvent::NetworkProfileSet { slot, profile } => {
+                self.network_profiles.set(slot, *profile)
+            }
+            ChargePointEvent::PersistedNetworkProfilesRestored { slots } => {
+                let dropped = self.network_profiles.replace(slots);
+                if dropped > 0 {
+                    tracing::warn!(
+                        dropped,
+                        max_slots = self.network_profiles.max_slots(),
+                        "truncated the recovered network profiles to the configured maximum"
+                    );
+                }
+                !self.network_profiles.is_empty()
             }
             ChargePointEvent::AuthorizationCached {
                 id_token,

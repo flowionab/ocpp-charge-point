@@ -61,6 +61,7 @@ where
     C: Connector,
     N: BootNotifier
         + crate::authorization::ClearCacheHandler
+        + crate::network_profile::SetNetworkProfileHandler
         + HeartbeatSender
         + StatusNotifier
         + TransactionNotifier
@@ -106,6 +107,8 @@ where
         .authorization(&csms, clock.clone())
         .await
         .clear_cache(&csms)
+        .await
+        .network_profiles(&csms)
         .await
         .security_events(&csms)
         .await
@@ -425,6 +428,15 @@ mod tests {
     impl crate::cost::CostUpdatedHandler for RecordingCsms {
         async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {
             self.cost_registered.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::network_profile::SetNetworkProfileHandler for RecordingCsms {
+        async fn register_set_network_profile_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
         }
     }
 

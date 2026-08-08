@@ -12,6 +12,7 @@ mod id_token;
 mod limits;
 mod local_authorization_list;
 mod meter_sample;
+mod network_profile;
 mod registration_status;
 mod reservation;
 mod reset;
@@ -50,6 +51,10 @@ pub use self::limits::{
 };
 pub use self::local_authorization_list::{LocalAuthorizationList, LocalListEntry};
 pub use self::meter_sample::MeterSample;
+pub use self::network_profile::{
+    DEFAULT_MAX_NETWORK_PROFILE_SLOTS, NetworkConnectionProfile, NetworkInterface,
+    NetworkProfileSlot, NetworkProfileStore, NetworkTransport,
+};
 pub use self::registration_status::RegistrationStatus;
 pub use self::reservation::{Reservation, ReservationId};
 pub use self::reset::{PendingReset, ResetKind, ResetTarget};

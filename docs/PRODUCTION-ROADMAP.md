@@ -102,7 +102,7 @@ close — mostly missing one version each.
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the authorization cache, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: certificates, network profiles. |
-| Test suite | 🚧 | 732 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Test suite | 🚧 | 746 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -139,7 +139,7 @@ that can't reliably reconnect is worse than one missing a functional block.
 | **A6** | Per-message timeouts and retry: `MessageTimeout`, `TransactionMessageAttempts`, `TransactionMessageRetryInterval` (aliases exist, values inert). | ⬜ |
 | **A7** | `MessageAttemptInterval` / queue-depth limits for offline messages; drop policy when the queue is full, and the `MemoryExhaustion` security event when it happens. | ⬜ |
 | **A8** | Test the `NotImplemented` CALLERROR path end-to-end from this crate's side, so property 1 is *asserted*, not just inherited. | ⬜ |
-| **A9** | Network interface selection / `SetNetworkProfile` application (R§2) — the message handler is B-work; actually switching the active connection to a new profile, with rollback if the new profile fails to connect, is A-work. | ⬜ |
+| **A9** | Network interface selection / `SetNetworkProfile` application (R§2) — the message handler is done ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment): profiles are stored, reported and bounded); actually switching the active connection to a stored profile, with rollback if it fails to connect, is A-work and remains open. | ⬜ |
 
 ---
 
@@ -423,7 +423,44 @@ version.
       `max_device_model_variables` either way, so defaults displace filler rather than adding to
       it; what changed is that more of that budget now goes to variables OCPP requires.
       `docs/MEMORY.md` explains that, and the ceilings still hold.
-- [ ] **B1.8** `SetNetworkProfile` handler (R§2), paired with [A9](#3-workstream-a--transport-negotiation-connection-lifecycle).
+- [x] **B1.8** `SetNetworkProfile` handler — `src/network_profile.rs` and
+      `src/state/network_profile.rs`, on 2.0.1 and 2.1 (1.6J has no such message; its network
+      configuration lives in the security whitepaper extensions
+      [D2.2](#62-d2--type-completeness-audit) covers).
+
+      **This stores profiles; it does not switch connections**, and the boundary is stated in the
+      module docs, on the builder method and in the roadmap rather than left to be inferred from a
+      working-looking slot store. OCPP says a profile applies to a *future* connection attempt and
+      the CSMS orders slots separately, so storing is genuinely the message's job — but a charge
+      point built on this crate keeps talking to whatever address its integrator passed
+      `connect_and_setup`. Dialling a stored profile, with rollback when the new one fails to
+      connect, is [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) and remains
+      open.
+
+      Three requests are refused rather than stored, each for a reason the charge point can defend:
+      a **negative slot** (addresses nothing), **SOAP transport** (OCPP 2.x is JSON over WebSocket;
+      this crate cannot speak it), and a **new slot beyond
+      `StateLimits::max_network_profile_slots`** (default 4). Replacing an *occupied* slot always
+      succeeds even at the bound — the CSMS is not asking for more storage, and refusing would
+      leave the charge point holding a profile the CSMS believes it replaced. A profile naming a
+      security profile this crate cannot run *is* stored: staging one for a future firmware is
+      legitimate, and what this crate must not do is claim to have applied it.
+
+      **`basicAuthPassword` is dropped on the way in, deliberately.** It is a credential this crate
+      cannot use (security profiles are workstream F), and keeping it in state that `GetVariables`
+      reports and durable storage writes would be a liability with no upside. `apn`/`vpn` are
+      dropped too: they configure an integrator's connectivity stack, not the OCPP application
+      layer.
+
+      One version difference worth recording: 2.0.1's `OCPPInterfaceEnum` has eight values where
+      2.1 has nine (`Any` is 2.1's addition), and 2.0.1's `NetworkConnectionProfile` has no
+      `identity` field at all. The 2.0.1 adapter matches its enum exhaustively with no catch-all,
+      so a value added upstream becomes a compile error rather than a silent `Any`.
+
+      **E2.11 (persisting the slots) is unblocked by this** and left outstanding —
+      `ChargePointEvent::PersistedNetworkProfilesRestored` is already in place for a restore to
+      use. It matters less than the other durability rows until A9 lands: profiles this crate does
+      not dial with are worth less after a reboot than a load limit or a cached authorization.
 
 ### B2 — Smart charging (R§11)
 
@@ -960,7 +997,7 @@ mid-transaction currently loses the transaction.
 | Offline message queue | All three queues now durable (`src/persistence.rs`; `ChargePointBuilder::transaction_events_persisted` / `status_notifications_persisted` / `security_events_persisted`) | [G2](#92-g2--bounded-memory) |
 | Certificates and keys | Security profile 2/3 | [B4.1](#b4--certificates-and-iso-15118-r1-r13) |
 | Security event log | Durable and size-bounded (`src/security.rs`, `src/persistence.rs`; `ChargePointBuilder::security_log_persisted`) | [F4](#84-f4--security-events) |
-| Network profiles | Recover connectivity after a bad profile switch | [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) |
+| Network profiles | Recover connectivity after a bad profile switch — **now unblocked**: [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)'s slot store exists | [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) |
 | Boot reason | `BootNotification.reason` must distinguish power-up from a commanded reset | R§2 |
 
 - [x] **E2.1** In-flight transaction — `src/persistence.rs`. Each connector's
@@ -1211,9 +1248,14 @@ mid-transaction currently loses the transaction.
       the blocks that would (`GetLog`, customer-information erasure) are [B5.1](#b5--diagnostics-and-monitoring-r14)/[B5.5](#b5--diagnostics-and-monitoring-r14) - which is
       the honest remaining half of [F4.3](#84-f4--security-events): the durable log exists, the `GetLog` reader
       does not.
-- [ ] **E2.9, E2.11** Certificates ([B4.1](#b4--certificates-and-iso-15118-r1-r13)) and network
-      profiles ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)/[A9](#3-workstream-a--transport-negotiation-connection-lifecycle))
-      remain blocked on functional blocks that don't exist yet.
+- [ ] **E2.9** Certificates — still blocked on [B4.1](#b4--certificates-and-iso-15118-r1-r13),
+      which does not exist.
+- [ ] **E2.11** Network profiles. **No longer blocked** —
+      [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)'s slot store landed
+      and `ChargePointEvent::PersistedNetworkProfilesRestored` is in place for a restore to use.
+      Lower value than the other rows until [A9](#3-workstream-a--transport-negotiation-connection-lifecycle):
+      profiles this crate does not dial with are worth less after a reboot than a load limit or a
+      cached authorization decision.
 - [x] **E2.5** Authorization cache — `persistence::AuthorizationCacheStore`/
       `restore_authorization_cache`/`run_authorization_cache_persistence`, wired via
       `ChargePointBuilder::authorization_cache_persistence`. Unblocked by
@@ -2146,15 +2188,15 @@ StopTransaction, TriggerMessage, UnlockConnector
 **Missing:** DiagnosticsStatusNotification,
 FirmwareStatusNotification, GetDiagnostics, UpdateFirmware
 
-### A.2 OCPP 2.0.1 — 28 of 63 wired
+### A.2 OCPP 2.0.1 — 29 of 63 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
 GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
 MeterValues, RequestStopTransaction, ReserveNow, Reset, SendLocalList,
-SetChargingProfile, SetVariables, StatusNotification, TransactionEvent,
-TriggerMessage, UnlockConnector
+SetChargingProfile, SetNetworkProfile, SetVariables, StatusNotification,
+TransactionEvent, TriggerMessage, UnlockConnector
 
 **Missing:** CertificateSigned,
 ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
@@ -2167,21 +2209,21 @@ NotifyCustomerInformation, NotifyDisplayMessages, NotifyEVChargingNeeds,
 NotifyEVChargingSchedule, NotifyEvent, NotifyMonitoringReport,
 PublishFirmware, PublishFirmwareStatusNotification, ReportChargingProfiles,
 ReservationStatusUpdate, SetDisplayMessage,
-SetMonitoringBase, SetMonitoringLevel, SetNetworkProfile,
+SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 
 **Also:** `SecurityEventNotification` is in the 2.0.1 spec and in
 `ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
 [D1](#61-d1--missing-action-wrappers).
 
-### A.3 OCPP 2.1 — 29 of 86 wired
+### A.3 OCPP 2.1 — 30 of 86 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
 GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
-MeterValues, SendLocalList, SetChargingProfile, SetVariables,
+MeterValues, SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
 StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
 
 **Missing:** AFRRSignal, AdjustPeriodicEventStream, BatterySwap,
@@ -2201,7 +2243,7 @@ NotifySettlement, NotifyWebPaymentStarted, OpenPeriodicEventStream,
 PublishFirmware, PublishFirmwareStatusNotification,
 PullDynamicScheduleUpdate, ReportChargingProfiles, ReportDERControl,
 RequestBatterySwap, ReservationStatusUpdate,
-SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel, SetNetworkProfile,
+SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware,
 UsePriorityCharging, VatNumberValidation
 
@@ -2221,6 +2263,6 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 | 1.6J standard config keys aliased | 23, plus 10 answered from live state | `src/device_model.rs` |
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
-| Protocol trait bounds on `setup()`'s CSMS parameter | 27 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 732 | `#[test]` + `#[tokio::test]`, re-counted at the B1.7 commit (730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
+| Test functions in `src/` | 746 | `#[test]` + `#[tokio::test]`, re-counted at the B1.8 commit (732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

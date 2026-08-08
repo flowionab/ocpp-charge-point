@@ -7,9 +7,9 @@ use crate::hardware::Capabilities;
 use crate::state::{
     AuthorizationCacheEntry, AuthorizationStatus, ChargingProfile, ChargingProfileCriteria,
     ChargingProfileScope, Component, ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken,
-    InstalledChargingProfile, LocalListEntry, MeterSample, RegistrationStatus, Reservation,
-    ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, Variable,
-    VariableAttributeType,
+    InstalledChargingProfile, LocalListEntry, MeterSample, NetworkConnectionProfile,
+    NetworkProfileSlot, RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent,
+    StopReason, Transaction, Variable, VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -60,6 +60,23 @@ pub enum ChargePointEvent {
         /// Whether to interrupt anything in progress right away, or wait for `target` to go
         /// idle first.
         kind: ResetKind,
+    },
+    /// The CSMS wrote a network connection profile into a configuration slot (OCPP
+    /// `SetNetworkProfile`). Stored for reporting and for a future connection attempt; it does
+    /// **not** switch the live connection - see [`crate::state::NetworkProfileStore`].
+    NetworkProfileSet {
+        /// The configuration slot addressed.
+        slot: i32,
+        /// The profile to store. Boxed for the same reason
+        /// [`Self::ChargingProfileSet`]'s profile is: it is one of the larger things any variant
+        /// carries, and every event on the mailbox would otherwise pay for it.
+        profile: alloc::boxed::Box<NetworkConnectionProfile>,
+    },
+    /// Network profile slots recovered from durable storage at boot.
+    PersistedNetworkProfilesRestored {
+        /// The recovered slots. Slots beyond the configured bound are dropped from the highest
+        /// slot number down.
+        slots: Vec<NetworkProfileSlot>,
     },
     /// The CSMS answered an `Authorize` request, and the decision is worth remembering - see
     /// [`crate::state::AuthorizationCache`]. Raised by

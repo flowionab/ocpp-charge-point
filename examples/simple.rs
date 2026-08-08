@@ -238,6 +238,18 @@ impl CostUpdatedHandler for AlwaysAcceptBootNotifier {
     }
 }
 
+// SetNetworkProfile (docs/ROADMAP.md §2): storing a connection profile in a slot. This sample
+// never receives one, and storing one would not change where it connects anyway - see
+// `ocpp_charge_point::network_profile`.
+#[async_trait::async_trait]
+impl ocpp_charge_point::network_profile::SetNetworkProfileHandler for AlwaysAcceptBootNotifier {
+    async fn register_set_network_profile_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
 // ClearCache (docs/ROADMAP.md §3): emptying the authorization cache.
 #[async_trait::async_trait]
 impl ClearCacheHandler for AlwaysAcceptBootNotifier {

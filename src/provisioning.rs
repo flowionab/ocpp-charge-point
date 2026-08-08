@@ -1110,6 +1110,15 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::network_profile::SetNetworkProfileHandler for FixedBootNotifier {
+        async fn register_set_network_profile_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::authorization::ClearCacheHandler for FixedBootNotifier {
         async fn register_clear_cache_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
