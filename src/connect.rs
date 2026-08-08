@@ -29,6 +29,7 @@ use crate::clock::{SystemClock, SystemMonotonicClock};
 use crate::executor::Executor;
 use crate::hardware::{ChargePoint, Connector, Evse};
 use crate::network_switch::ConnectionTarget;
+use crate::payload_limit::PayloadLimits;
 use crate::provisioning::Backoff;
 use crate::setup::setup;
 use crate::state::{Component, DeviceModel, Variable, VariableAttributeType};
@@ -75,11 +76,19 @@ impl<S: fmt::Debug + fmt::Display> std::error::Error for ConnectAndSetupError<S>
 /// [`setup`](crate::setup) against the resulting client if it negotiated OCPP 2.1 - the only
 /// version `setup()` can currently drive end-to-end (see this module's docs). The "batteries
 /// included" entry point for std/tokio users who don't need a custom transport.
+///
+/// `payload_limits` (`None` for [`PayloadLimits::default`]) sets the inbound-frame ceiling every
+/// *redial* is guarded with (F5.2) - see [`crate::payload_limit`] for exactly what that covers.
+/// It does **not** cover the initial dial this function performs itself: `ocpp_client::connect`
+/// builds that connection's transport internally and exposes no hook to guard it, which is a real
+/// upstream gap this crate cannot close without duplicating transport/handshake logic
+/// `CLAUDE.md` reserves to `ocpp-client`.
 pub async fn connect_and_setup<T, E, C, X, B>(
     charge_point: T,
     address: &str,
     versions: Option<&[OcppVersion]>,
     options: Option<ConnectOptions<'_>>,
+    payload_limits: Option<PayloadLimits>,
     executor: X,
     backoff: B,
 ) -> Result<ChargePointRuntime<T>, ConnectAndSetupError<T::StartError>>
@@ -102,6 +111,9 @@ where
     // connection's reconnector. Which version it redials is filled in below, once the CSMS has
     // picked one.
     let target = ConnectionTarget::new(address, &options);
+    // F5.2: configures the ceiling every redial through `target` is guarded with - see this
+    // function's own docs for why the *initial* dial just below is not covered.
+    target.set_max_inbound_frame_bytes(payload_limits.unwrap_or_default().max_inbound_frame_bytes);
     let negotiated = ocpp_client::connect(address, versions, Some(target.install(options)))
         .await
         .map_err(ConnectAndSetupError::Connect)?;
@@ -123,7 +135,7 @@ where
         #[cfg(feature = "ocpp_1_6")]
         NegotiatedClient::V1_6(client) => {
             target.set_version(OcppVersion::V1_6);
-            setup_ocpp_1_6(charge_point, client, executor, backoff).await
+            setup_ocpp_1_6(charge_point, client, executor, backoff, target).await
         }
     }
 }
@@ -156,6 +168,10 @@ where
     )
     .await
     .map_err(ConnectAndSetupError::Start)?;
+
+    // F5.2: from here on, a redial's `SizeLimitedStream` can raise `MemoryExhaustion` on this
+    // charge point's own actor when it refuses an oversized frame.
+    target.attach_security_reporting(runtime.actor());
 
     // B2.6's priority charging is registered here rather than in `setup()` for the same reason
     // network switching is: it is 2.1-only, and `setup()` is generic over a CSMS client that may
@@ -412,6 +428,7 @@ async fn setup_ocpp_1_6<T, E, C, X, B>(
     client: ocpp_client::ocpp_1_6::OCPP1_6Client,
     executor: X,
     backoff: B,
+    target: alloc::sync::Arc<ConnectionTarget>,
 ) -> Result<ChargePointRuntime<T>, ConnectAndSetupError<T::StartError>>
 where
     T: ChargePoint<E, C>,
@@ -488,7 +505,13 @@ where
 
     // A7: sweep the queues registered above on OCPP's own MessageAttemptInterval - see
     // `ChargePointBuilder::offline_queue_retries`.
-    Ok(builder.offline_queue_retries(backoff, 60).build())
+    let runtime = builder.offline_queue_retries(backoff, 60).build();
+    // F5.2: 1.6J gets no `network_profile_switching` registration (no such OCPP message exists
+    // for it), but `target` is still installed as the transport's reconnector (see
+    // `connect_and_setup`), so its redials still need a security-event destination for an
+    // oversized frame `SizeLimitedStream` refuses.
+    target.attach_security_reporting(runtime.actor());
+    Ok(runtime)
 }
 
 #[cfg(test)]

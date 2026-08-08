@@ -1220,6 +1220,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     {
         let actor = self.runtime.actor();
         let target = target.clone();
+        // F5.2: from here on, a redial's `SizeLimitedStream` can raise `MemoryExhaustion` on this
+        // charge point's own actor when it refuses an oversized frame.
+        target.attach_security_reporting(actor.clone());
         self.executor.spawn(Box::pin(async move {
             crate::network_switch::run_network_profile_switching(
                 &actor, &target, &closer, &backoff,

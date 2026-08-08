@@ -248,6 +248,7 @@ async fn a_set_network_profile_moves_the_connection_to_the_new_address() {
         &format!("ws://{first_addr}"),
         None,
         None,
+        None,
         TokioExecutor,
         TokioBackoff,
     )

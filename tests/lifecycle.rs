@@ -141,6 +141,7 @@ async fn run_session(subprotocol: &'static str, version: OcppVersion) -> MockCsm
         csms.address(),
         Some(&[version]),
         None,
+        None,
         TokioExecutor,
         ocpp_charge_point::provisioning::TokioBackoff,
     )
@@ -250,6 +251,7 @@ async fn a_csms_that_disappears_mid_transaction_loses_nothing() {
         charge_point(),
         csms.address(),
         Some(&[OcppVersion::V2_1]),
+        None,
         None,
         TokioExecutor,
         ocpp_charge_point::provisioning::TokioBackoff,

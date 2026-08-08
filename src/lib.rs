@@ -63,6 +63,9 @@ pub mod network_profile;
 #[cfg(feature = "websocket")]
 pub mod network_switch;
 pub mod offline_queue;
+/// A configurable ceiling on inbound OCPP-J WebSocket frame size, and the transport-level guard
+/// that enforces it (F5.2). See [`payload_limit`]'s own docs for exactly what "enforces" covers.
+pub mod payload_limit;
 pub mod persistence;
 pub mod provisioning;
 pub mod refusal;
