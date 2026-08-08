@@ -44,6 +44,10 @@
 //! | `SendLocalList`              | CALLRESULT `SendLocalListResponseStatus::NotSupported` | CALLRESULT `SendLocalListStatusEnum::Failed` (no `NotSupported` in 2.x) | CALLRESULT `SendLocalListStatusEnum::Failed` (no `NotSupported` in 2.x) |
 //! | `GetLocalListVersion`        | CALLERROR (`GetLocalListVersionResponse` is `{ listVersion }`, no status field in any version) | CALLERROR (no status field) | CALLERROR (no status field) |
 //! | `CostUpdated`                | n/a (no `CostUpdated` in 1.6 - `tariff_and_cost` has no 1.6 feature profile) | CALLERROR (`CostUpdatedResponse` is `{}`, no status field) | CALLERROR (no status field) |
+//! | `SetDefaultTariff`           | n/a (2.1-only - no tariff messages before 2.1) | n/a | CALLRESULT `TariffSetStatusEnum::Rejected` |
+//! | `ChangeTransactionTariff`    | n/a | n/a | CALLRESULT `TariffChangeStatusEnum::Rejected` |
+//! | `ClearTariffs`               | n/a | n/a | CALLERROR (`ClearTariffsResponse` has only a per-item `clearTariffsResult`, no top-level status) |
+//! | `GetTariffs`                 | n/a | n/a | CALLRESULT `TariffGetStatusEnum::Rejected` |
 //! | `GetVariables`/`SetVariables`| n/a (device model is 2.x-only) | CALLRESULT `GetVariableStatusEnum::Rejected` / `SetVariableStatusEnum::Rejected` (N/A today - not gated by any single `Capabilities` field) | same as 2.0.1 |
 //! | `GetBaseReport`/`GetReport`  | n/a (2.x-only) | CALLRESULT `GenericDeviceModelStatusEnum::NotSupported` (N/A today) | CALLRESULT `GenericDeviceModelStatusEnum::NotSupported` (N/A today) |
 //! | `Reset`                      | CALLRESULT `ResetResponseStatus::Rejected` (N/A today - `Reset` is core, always registered) | CALLRESULT `ResetStatusEnum::Rejected` (N/A today) | CALLRESULT `ResetStatusEnum::Rejected` (N/A today) |
@@ -167,6 +171,26 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
     RefusalGate {
         message: "UsePriorityCharging",
         capability: |c| c.smart_charging,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "SetDefaultTariff",
+        capability: |c| c.tariff_and_cost,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "ChangeTransactionTariff",
+        capability: |c| c.tariff_and_cost,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "ClearTariffs",
+        capability: |c| c.tariff_and_cost,
+        shape: RefusalShape::CallError,
+    },
+    RefusalGate {
+        message: "GetTariffs",
+        capability: |c| c.tariff_and_cost,
         shape: RefusalShape::CallResultStatus,
     },
 ];

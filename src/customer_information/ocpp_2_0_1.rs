@@ -11,7 +11,7 @@ use ocpp_client::ocpp_types::v201::{
 use crate::actor::ChargePointActor;
 use crate::customer_information::{
     CustomerInformationHandler, CustomerInformationNotifier, CustomerInformationOutcome,
-    CustomerInformationQueue, CustomerInformationQuery, handle_customer_information,
+    CustomerInformationQuery, CustomerInformationQueue, handle_customer_information,
 };
 use crate::state::{IdToken, IdTokenKind};
 
@@ -186,11 +186,23 @@ mod tests {
 
     #[test]
     fn every_wire_kind_maps_onto_this_crates_kinds() {
-        assert_eq!(map_id_token_kind(IdTokenEnum::Central), IdTokenKind::Central);
+        assert_eq!(
+            map_id_token_kind(IdTokenEnum::Central),
+            IdTokenKind::Central
+        );
         assert_eq!(map_id_token_kind(IdTokenEnum::EMAID), IdTokenKind::EMAID);
-        assert_eq!(map_id_token_kind(IdTokenEnum::ISO14443), IdTokenKind::ISO14443);
-        assert_eq!(map_id_token_kind(IdTokenEnum::ISO15693), IdTokenKind::ISO15693);
-        assert_eq!(map_id_token_kind(IdTokenEnum::KeyCode), IdTokenKind::KeyCode);
+        assert_eq!(
+            map_id_token_kind(IdTokenEnum::ISO14443),
+            IdTokenKind::ISO14443
+        );
+        assert_eq!(
+            map_id_token_kind(IdTokenEnum::ISO15693),
+            IdTokenKind::ISO15693
+        );
+        assert_eq!(
+            map_id_token_kind(IdTokenEnum::KeyCode),
+            IdTokenKind::KeyCode
+        );
         assert_eq!(map_id_token_kind(IdTokenEnum::Local), IdTokenKind::Local);
         assert_eq!(
             map_id_token_kind(IdTokenEnum::MacAddress),
@@ -233,13 +245,16 @@ mod tests {
         let request = CustomerInformationRequest {
             clear: false,
             custom_data: None,
-            customer_certificate: Some(ocpp_client::ocpp_types::v201::common::CertificateHashData {
-                custom_data: None,
-                hash_algorithm: ocpp_client::ocpp_types::v201::common::HashAlgorithmEnum::SHA256,
-                issuer_key_hash: heapless::String::try_from("issuer-key-hash").unwrap(),
-                issuer_name_hash: heapless::String::try_from("issuer-name-hash").unwrap(),
-                serial_number: heapless::String::try_from("1").unwrap(),
-            }),
+            customer_certificate: Some(
+                ocpp_client::ocpp_types::v201::common::CertificateHashData {
+                    custom_data: None,
+                    hash_algorithm:
+                        ocpp_client::ocpp_types::v201::common::HashAlgorithmEnum::SHA256,
+                    issuer_key_hash: heapless::String::try_from("issuer-key-hash").unwrap(),
+                    issuer_name_hash: heapless::String::try_from("issuer-name-hash").unwrap(),
+                    serial_number: heapless::String::try_from("1").unwrap(),
+                },
+            ),
             customer_identifier: None,
             id_token: None,
             report: true,

@@ -14,8 +14,8 @@ use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::provisioning::Backoff;
 use crate::state::{
-    ChargePointEvent, Component, EventTrigger, MonitorType, SetMonitorRejection,
-    TriggeredMonitor, Variable, VariableAttributeType, VariableMonitorId, VariableMonitoringEvent,
+    ChargePointEvent, Component, EventTrigger, MonitorType, SetMonitorRejection, TriggeredMonitor,
+    Variable, VariableAttributeType, VariableMonitorId, VariableMonitoringEvent,
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -103,7 +103,10 @@ async fn resolve_and_apply_set(
     request: SetMonitorRequest,
 ) -> SetMonitorOutcome {
     let state = actor.state();
-    let Some(definition) = state.device_model.get(&request.component, &request.variable) else {
+    let Some(definition) = state
+        .device_model
+        .get(&request.component, &request.variable)
+    else {
         return if state.device_model.has_component(&request.component) {
             SetMonitorOutcome::UnknownVariable
         } else {
@@ -129,7 +132,9 @@ async fn resolve_and_apply_set(
     // The id is resolved here, from the same snapshot the accept/reject decision itself is made
     // against - see `VariableMonitorStore::next_id`'s docs for the (narrow, shared-with-every-
     // other-batch-decision-in-this-crate) race that leaves open.
-    let id = request.id.unwrap_or_else(|| state.variable_monitors.next_id());
+    let id = request
+        .id
+        .unwrap_or_else(|| state.variable_monitors.next_id());
     if let Err(rejection) =
         state
             .variable_monitors
@@ -269,7 +274,11 @@ pub async fn run_variable_monitor_events<N: VariableMonitorEventNotifier>(
 ///
 /// A failed report is logged and the monitor is left due, so it's retried on the very next sweep
 /// rather than silently waiting out its full interval again.
-pub async fn run_periodic_variable_monitors<N: VariableMonitorEventNotifier, C: Clock, B: Backoff>(
+pub async fn run_periodic_variable_monitors<
+    N: VariableMonitorEventNotifier,
+    C: Clock,
+    B: Backoff,
+>(
     notifier: &N,
     clock: &C,
     backoff: &B,
@@ -325,7 +334,9 @@ fn due_periodic_events(
         if !is_due {
             continue;
         }
-        let Some(definition) = state.device_model.get(&monitor.component, &monitor.variable)
+        let Some(definition) = state
+            .device_model
+            .get(&monitor.component, &monitor.variable)
         else {
             continue;
         };
@@ -348,7 +359,10 @@ fn due_periodic_events(
 mod tests {
     use super::*;
     use crate::executor::TokioExecutor;
-    use crate::state::{DeviceModelEvent, VariableAttribute, VariableCharacteristics, VariableDataType, VariableMutability};
+    use crate::state::{
+        DeviceModelEvent, VariableAttribute, VariableCharacteristics, VariableDataType,
+        VariableMutability,
+    };
 
     fn component(name: &str) -> Component {
         Component {
@@ -365,7 +379,11 @@ mod tests {
         }
     }
 
-    async fn register_monitorable_variable(actor: &ChargePointActor, component_name: &str, variable_name: &str) {
+    async fn register_monitorable_variable(
+        actor: &ChargePointActor,
+        component_name: &str,
+        variable_name: &str,
+    ) {
         actor
             .send(ChargePointEvent::DeviceModel(
                 DeviceModelEvent::VariableRegistered {
@@ -1286,9 +1304,7 @@ mod ocpp_2_0_1 {
         }
     }
 
-    fn build_component(
-        component: &Component,
-    ) -> ocpp_client::ocpp_types::v201::common::Component {
+    fn build_component(component: &Component) -> ocpp_client::ocpp_types::v201::common::Component {
         ocpp_client::ocpp_types::v201::common::Component {
             custom_data: None,
             evse: component.evse.map(|(evse_id, connector_id)| EVSE {

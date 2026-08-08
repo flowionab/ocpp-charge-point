@@ -23,6 +23,9 @@ use crate::smart_charging::{
     ClearChargingProfileHandler, GetChargingProfilesHandler, GetCompositeScheduleHandler,
     SetChargingProfileHandler,
 };
+use crate::tariff::{
+    ChangeTransactionTariffHandler, ClearTariffsHandler, GetTariffsHandler, SetDefaultTariffHandler,
+};
 use crate::transactions::TransactionNotifier;
 use crate::variable_monitoring::{
     ClearVariableMonitoringHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
@@ -87,6 +90,10 @@ where
         + GetReportHandler
         + SecurityEventNotifier
         + CostUpdatedHandler
+        + SetDefaultTariffHandler
+        + ChangeTransactionTariffHandler
+        + ClearTariffsHandler
+        + GetTariffsHandler
         + crate::meter_values::MeterValuesNotifier
         + SetChargingProfileHandler
         + ClearChargingProfileHandler
@@ -158,7 +165,7 @@ where
         builder = builder.local_authorization_list(&csms).await;
     }
     if capabilities.tariff_and_cost {
-        builder = builder.cost(&csms).await;
+        builder = builder.cost(&csms).await.tariffs(&csms).await;
     }
     if capabilities.smart_charging {
         builder = builder
@@ -495,6 +502,34 @@ mod tests {
         async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {
             self.cost_registered.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tariff::SetDefaultTariffHandler for RecordingCsms {
+        async fn register_set_default_tariff_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tariff::ChangeTransactionTariffHandler for RecordingCsms {
+        async fn register_change_transaction_tariff_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tariff::ClearTariffsHandler for RecordingCsms {
+        async fn register_clear_tariffs_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tariff::GetTariffsHandler for RecordingCsms {
+        async fn register_get_tariffs_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
 
     #[async_trait::async_trait]

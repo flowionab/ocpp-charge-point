@@ -1232,10 +1232,51 @@ full re-sweep), so this block is unblocked, just unwritten.
 | Message | 2.0.1 | 2.1 |
 |---------|:-----:|:---:|
 | CostUpdated | ✅ | ✅ |
-| SetDefaultTariff / ChangeTransactionTariff / ClearTariffs / GetTariffs | — | ⬜ |
+| SetDefaultTariff / ChangeTransactionTariff / ClearTariffs / GetTariffs | — | ✅ |
 | NotifySettlement / NotifyWebPaymentStarted / VatNumberValidation | — | ⬜ |
 
-- [ ] **B7.1** Tariff store and per-transaction tariff assignment (2.1).
+- [x] **B7.1** Tariff store and per-transaction tariff assignment (2.1).
+
+      A new `src/tariff.rs` plus `state::tariff` wires all four 2.1-only messages -
+      `SetDefaultTariff`, `ChangeTransactionTariff`, `ClearTariffs`, `GetTariffs` - following the
+      house pattern (`handle_*` functions deciding against real state, an `ocpp_2_1` wire adapter,
+      registered through `ChargePointBuilder::tariffs` and gated on the existing `tariff_and_cost`
+      capability that already covered `CostUpdated`). A default tariff (`SetDefaultTariff`) is
+      scoped to one EVSE or the whole charge point and lives in the new `state::TariffStore`,
+      mirroring `ChargingProfileStore`'s one-slot-per-scope replacement rule and
+      `StateLimits::max_tariffs` bound. A driver tariff (`ChangeTransactionTariff`) is scoped to
+      one running transaction - but rather than following `Transaction::priority_charging`'s exact
+      shape (a field on `Transaction` itself), it landed on a new
+      `EvseState::transaction_tariffs` side-table, indexed like `running_costs` and cleared on
+      the same `TransactionEventKind::Started`/`Ended` transition: `ChangeTransactionTariff`
+      addresses a transaction the same way `CostUpdated` already does (by id, resolved to a
+      connector via the same `find_transaction` lookup), so reusing that side-table's shape meant
+      the "must end with the session, never leak to the next driver" guarantee **and** the actual
+      wiring came for free from `crate::cost`, instead of touching `Transaction`'s struct literal
+      at its nine other call sites for a field every one of them would have to thread through.
+      `ChangeTransactionTariff` against a transaction that isn't running is refused
+      (`TxNotFound`) before anything is dispatched, never silently stored. `ClearTariffs` and
+      `GetTariffs` both report per-tariff status/assignment rather than failing or answering as a
+      batch, mirroring `device_model`'s per-item `GetVariables`/`SetVariables` resolution; `GetTariffs`
+      additionally folds in any transaction's driver tariff for the queried EVSE, since that is a
+      real currently-applicable tariff `ClearTariffs` deliberately leaves alone (a driver tariff
+      already ends with its own transaction, so there is nothing for `ClearTariffs` to do there -
+      a CSMS that wants to change one mid-session sends another `ChangeTransactionTariff`).
+
+      **Deliberately shallow, and deliberately not persisted.** `state::Tariff` keeps only what
+      `SetDefaultTariff`/`ClearTariffs`/`GetTariffs` need to identify, scope and report a tariff -
+      id, currency, `validFrom` - and drops OCPP's priced structure (energy/time/fixed-fee
+      components and their conditions) entirely: this crate has no consumer for a computed price
+      (§9 already tracks that as open), `GetTariffs`' own response only ever echoes a
+      `tariffId`/`tariffKind`/`validFrom` rather than the full priced tariff, and modeling price
+      components nothing reads would just be spec-fidelity for its own sake. **Computing a
+      running cost from an assigned tariff is still open** - `CostUpdated` (the CSMS *telling*
+      this charge point a running cost) is unrelated and unchanged. Tariff persistence across a
+      restart is also skipped, unlike the charging-profile snapshot store: a lost default tariff
+      is cheap for a CSMS to notice and resend, where a lost charging profile is a safety limit
+      the CSMS believes is still enforced - and a driver tariff never needed persisting in the
+      first place, since the transaction it's scoped to already doesn't resume across a restart
+      (E4.1 closes every recovered transaction out as `PowerLoss` instead).
 - [ ] **B7.2** Payment terminal integration surface (2.1) — feature-flagged;
       `PaymentCtrlr` alone accounts for 22 of the 122 required device-model
       variables, so this is not a small block.

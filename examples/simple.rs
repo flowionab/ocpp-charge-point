@@ -31,6 +31,9 @@ use ocpp_charge_point::state::{
     AuthorizationStatus, BootReasonCause, ChargePointEvent, ConnectorEvent, ConnectorStatus,
     EvseEvent, IdToken, RegistrationStatus, Transaction, TransactionEventKind,
 };
+use ocpp_charge_point::tariff::{
+    ChangeTransactionTariffHandler, ClearTariffsHandler, GetTariffsHandler, SetDefaultTariffHandler,
+};
 use ocpp_charge_point::transactions::TransactionNotifier;
 
 /// A stand-in for a real CSMS connection. Real deployments pass an `ocpp-client` version
@@ -270,6 +273,45 @@ impl SecurityEventNotifier for AlwaysAcceptBootNotifier {
 #[async_trait::async_trait]
 impl CostUpdatedHandler for AlwaysAcceptBootNotifier {
     async fn register_cost_updated_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+// The tariff store and per-transaction tariff assignment (docs/PRODUCTION-ROADMAP.md B7.1):
+// SetDefaultTariff/ChangeTransactionTariff/ClearTariffs/GetTariffs. This sample never receives
+// any of them - see `ocpp_charge_point::tariff`.
+#[async_trait::async_trait]
+impl SetDefaultTariffHandler for AlwaysAcceptBootNotifier {
+    async fn register_set_default_tariff_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ChangeTransactionTariffHandler for AlwaysAcceptBootNotifier {
+    async fn register_change_transaction_tariff_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClearTariffsHandler for AlwaysAcceptBootNotifier {
+    async fn register_clear_tariffs_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetTariffsHandler for AlwaysAcceptBootNotifier {
+    async fn register_get_tariffs_handler(
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {

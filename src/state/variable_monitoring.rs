@@ -444,8 +444,12 @@ mod tests {
         );
 
         let second = store.next_id();
-        let result =
-            store.precheck(second, &component(), &variable(), MonitorType::UpperThreshold);
+        let result = store.precheck(
+            second,
+            &component(),
+            &variable(),
+            MonitorType::UpperThreshold,
+        );
 
         assert_eq!(result, Err(SetMonitorRejection::Duplicate));
     }
@@ -464,8 +468,12 @@ mod tests {
         );
 
         let second = store.next_id();
-        let result =
-            store.precheck(second, &component(), &variable(), MonitorType::LowerThreshold);
+        let result = store.precheck(
+            second,
+            &component(),
+            &variable(),
+            MonitorType::LowerThreshold,
+        );
 
         assert_eq!(result, Ok(()));
     }

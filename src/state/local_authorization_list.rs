@@ -93,7 +93,8 @@ impl LocalAuthorizationList {
     /// Returns whether an entry was actually held (and so removed).
     pub fn forget(&mut self, id_token: &IdToken) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|entry| entry.id_token.value != id_token.value);
+        self.entries
+            .retain(|entry| entry.id_token.value != id_token.value);
         let changed = self.entries.len() != before;
         if changed {
             self.version += 1;

@@ -11,7 +11,7 @@ use ocpp_client::ocpp_types::v21::{
 use crate::actor::ChargePointActor;
 use crate::customer_information::{
     CustomerInformationHandler, CustomerInformationNotifier, CustomerInformationOutcome,
-    CustomerInformationQueue, CustomerInformationQuery, handle_customer_information,
+    CustomerInformationQuery, CustomerInformationQueue, handle_customer_information,
 };
 use crate::state::{IdToken, IdTokenKind};
 
@@ -187,7 +187,10 @@ mod tests {
     #[test]
     fn every_wire_kind_maps_onto_this_crates_kinds() {
         assert_eq!(map_id_token_kind("Central"), IdTokenKind::Central);
-        assert_eq!(map_id_token_kind("DirectPayment"), IdTokenKind::DirectPayment);
+        assert_eq!(
+            map_id_token_kind("DirectPayment"),
+            IdTokenKind::DirectPayment
+        );
         assert_eq!(map_id_token_kind("eMAID"), IdTokenKind::EMAID);
         assert_eq!(map_id_token_kind("EVCCID"), IdTokenKind::EVCCID);
         assert_eq!(map_id_token_kind("ISO14443"), IdTokenKind::ISO14443);

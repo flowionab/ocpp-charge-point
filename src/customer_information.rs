@@ -281,10 +281,7 @@ fn split_at_char_boundaries(data: &str, max_bytes: usize) -> Vec<&str> {
         if end == 0 {
             // `max_bytes` landed inside the first `char`'s own encoding - take that whole `char`
             // rather than produce an empty chunk that would never make progress.
-            end = rest
-                .chars()
-                .next()
-                .map_or(rest.len(), char::len_utf8);
+            end = rest.chars().next().map_or(rest.len(), char::len_utf8);
         }
         let (part, remainder) = rest.split_at(end);
         parts.push(part);
@@ -316,7 +313,13 @@ async fn send_chunk<N: CustomerInformationNotifier>(
     chunk: CustomerInformationChunk,
 ) {
     if let Err(err) = notifier
-        .notify_customer_information(request_id, chunk.seq_no, chunk.tbc, generated_at, chunk.data)
+        .notify_customer_information(
+            request_id,
+            chunk.seq_no,
+            chunk.tbc,
+            generated_at,
+            chunk.data,
+        )
         .await
     {
         tracing::warn!(

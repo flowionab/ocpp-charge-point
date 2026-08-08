@@ -15,7 +15,12 @@ fn token(value: &str) -> IdToken {
     }
 }
 
-fn query(request_id: i64, report: bool, clear: bool, id_token: Option<IdToken>) -> CustomerInformationQuery {
+fn query(
+    request_id: i64,
+    report: bool,
+    clear: bool,
+    id_token: Option<IdToken>,
+) -> CustomerInformationQuery {
     CustomerInformationQuery {
         request_id,
         report,
@@ -54,13 +59,10 @@ impl CustomerInformationNotifier for RecordingNotifier {
         generated_at: &str,
         data: String,
     ) -> Result<(), Self::Error> {
-        self.seen.lock().unwrap().push((
-            request_id,
-            seq_no,
-            tbc,
-            generated_at.to_string(),
-            data,
-        ));
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request_id, seq_no, tbc, generated_at.to_string(), data));
         Ok(())
     }
 }

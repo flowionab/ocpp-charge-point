@@ -1138,6 +1138,38 @@ pub(crate) mod test_support {
         async fn register_cost_updated_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
 
+    #[cfg(feature = "tariff-cost")]
+    #[async_trait::async_trait]
+    impl crate::tariff::SetDefaultTariffHandler for FixedBootNotifier {
+        async fn register_set_default_tariff_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[cfg(feature = "tariff-cost")]
+    #[async_trait::async_trait]
+    impl crate::tariff::ChangeTransactionTariffHandler for FixedBootNotifier {
+        async fn register_change_transaction_tariff_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[cfg(feature = "tariff-cost")]
+    #[async_trait::async_trait]
+    impl crate::tariff::ClearTariffsHandler for FixedBootNotifier {
+        async fn register_clear_tariffs_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[cfg(feature = "tariff-cost")]
+    #[async_trait::async_trait]
+    impl crate::tariff::GetTariffsHandler for FixedBootNotifier {
+        async fn register_get_tariffs_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
     #[async_trait::async_trait]
     impl crate::network_profile::SetNetworkProfileHandler for FixedBootNotifier {
         async fn register_set_network_profile_handler(

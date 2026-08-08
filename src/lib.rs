@@ -89,6 +89,11 @@ mod setup;
 /// per-EVSE/per-connector state machines, and the events/effects that drive and observe them.
 pub mod state;
 pub mod sync;
+/// Tariff and cost functional block: the tariff store and per-transaction tariff assignment
+/// (OCPP 2.1's `SetDefaultTariff`/`ChangeTransactionTariff`/`ClearTariffs`/`GetTariffs`). See
+/// [`tariff`]'s own docs for why this is 2.1-only and stores/reports rather than computes a cost.
+#[cfg(feature = "tariff-cost")]
+pub mod tariff;
 #[cfg(feature = "ocpp_1_6")]
 mod topology;
 pub mod transaction_status;
