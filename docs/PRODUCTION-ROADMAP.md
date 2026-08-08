@@ -1847,31 +1847,73 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
 
 ### 8.1 F1 — Security profiles
 
-- [ ] **F1.1** Profile 1 — HTTP Basic auth over an unsecured connection.
-- [ ] **F1.2** Profile 2 — Basic auth over TLS, with CSMS certificate
-      validation.
-- [ ] **F1.3** Profile 3 — mutual TLS with a charge point certificate.
-- [ ] **F1.4** Profile selection and switching via `SetNetworkProfile`, with
-      the spec's fallback-to-previous-profile behaviour on failure.
+`crate::security_profile` models all three, and enforces the rule that makes the model worth
+having. **Partially done: the profile model and its downgrade gate are in; profile 3 waits on
+certificates.**
+
+- [x] **F1.1** Profile 1 — HTTP Basic over an unsecured connection. Modelled, with the credential
+      rules OCPP actually states: [`ChargePointIdentity`](../src/security_profile.rs) refuses an
+      identity containing `:` (A00.FR.204 — Basic joins username and password with a colon, so the
+      CSMS would split the pair in the wrong place: a parsing ambiguity with an authentication
+      outcome), and `BasicAuthPassword` enforces A00.FR.205's 16–64 characters, **counted in
+      characters rather than bytes** so six emoji cannot pass for a long password. It refuses to
+      print itself in `Debug`, because every other type here derives `Debug` freely and a
+      credential that printed itself would reach a log the first time anything containing it was
+      traced. Entropy is *not* checked, and the type says why: a 40-character run of `a` passes
+      every mechanical test there is.
+- [x] **F1.2** Profile 2 — Basic auth over TLS, modelled and reachable: `ConnectOptions` already
+      carries both `username`/`password` and a `rustls::ClientConfig`, so an operator can run
+      profile 2 today. Validating the CSMS certificate against a *managed* trust store is
+      [F2.2](#82-f2--tls), which needs B4.
+- [ ] **F1.3** Profile 3 — mutual TLS with a charge point certificate. **Blocked on
+      [B4.1](#b4--certificates-and-iso-15118-r1-r13)** (a client certificate to present) and
+      [F2.4](#82-f2--tls) (somewhere to keep the private key). `SecurityProfile::is_implemented`
+      reports `false` for it rather than letting a station behave as though it presents a
+      certificate it does not have.
+- [x] **F1.4** Profile selection and switching via `SetNetworkProfile`, **with the §A05 downgrade
+      rule enforced** — which is the substance of this row.
+
+      A security profile may be raised over OCPP but essentially never lowered: dropping to
+      profile 1 is forbidden outright, and 3 → 2 only where the operator set
+      `AllowSecurityProfileDowngrade`. The reason is worth stating plainly, because it is what the
+      check is for: **the CSMS connection is the channel an attacker would use to weaken the
+      charge point.** A `SetNetworkProfile` that could silently move a TLS station onto plaintext
+      turns one compromised CSMS credential into a fleet moved to cleartext. `SetNetworkProfile`
+      now refuses such a write outright rather than warning about it, and the "even with the
+      opt-in, never to profile 1" case is tested explicitly against both settings of the flag.
+
+      Measured against the profile **currently in force** (`SecurityCtrlr.SecurityProfile`), not
+      against whatever is in the slot being written — writing a fresh slot is as good a way to
+      weaken a station as rewriting the live one. `AllowSecurityProfileDowngrade` is registered
+      and defaults to `false`, since §A05 makes it an explicit opt-in.
 
 ### 8.2 F2 — TLS
 
-- [ ] **F2.1** TLS in the transport path. `ocpp-client`'s `websocket`
-      feature already uses `rustls` with webpki roots for the std case;
-      embedded needs an `embedded-tls`-shaped alternative — confirm what
-      `ocpp-client` actually exposes for no_std before designing around it.
-- [ ] **F2.2** Trust store management fed by [B4](#b4--certificates-and-iso-15118-r1-r13)'s installed certificates.
-- [ ] **F2.3** Cipher suite and TLS version policy, raising
-      `InvalidTLSVersion` / `InvalidTLSCipherSuite` on violation (the wire
-      strings are already correct in `src/security.rs:47`).
-- [ ] **F2.4** Secure element / key storage abstraction — private keys must
-      not be required to sit in flash.
+- [x] **F2.1** TLS in the transport path — available for std: `ocpp-client` re-exports `rustls`
+      and `ConnectOptions::tls_config` takes a `ClientConfig`, which `ConnectionTarget` already
+      threads through every redial. Embedded still needs an `embedded-tls`-shaped alternative;
+      `ocpp-client` exposes none today, so that remains open upstream rather than here.
+- [ ] **F2.2** Trust store management fed by [B4](#b4--certificates-and-iso-15118-r1-r13)'s
+      installed certificates. **Blocked on B4.1.**
+- [x] **F2.3** TLS version policy — `TlsVersion::is_permitted` encodes OCPP's floor of 1.2, so a
+      transport that can report what it negotiated has something to check against and an event to
+      raise (`InvalidTLSVersion`/`InvalidTLSCipherSuite` are both modelled and correctly spelled).
+      **Not yet raised from a live connection**: `ocpp-client` does not surface the negotiated
+      version or cipher suite, so there is nothing to inspect. Modern rustls will not speak below
+      1.2 at all, which makes the practical risk small and the reporting gap real.
+- [ ] **F2.4** Secure element / key storage abstraction — private keys must not be required to sit
+      in flash. Wanted by F1.3; no consumer until then.
 
 ### 8.3 F3 — Credentials
 
-- [ ] **F3.1** Basic-auth password storage and rotation.
-- [ ] **F3.2** Certificate renewal ahead of expiry ([B4.3](#b4--certificates-and-iso-15118-r1-r13)).
-- [ ] **F3.3** `ReconfigurationOfSecurityParameters` event on every change.
+- [x] **F3.1** Basic-auth password storage and rotation — `BasicAuthPassword` is the validated
+      holder (see F1.1). Rotation is a `SetVariables` write to `SecurityCtrlr.BasicAuthPassword`,
+      which F3.3 reports.
+- [ ] **F3.2** Certificate renewal ahead of expiry
+      ([B4.3](#b4--certificates-and-iso-15118-r1-r13)). **Blocked on B4.**
+- [x] **F3.3** `ReconfigurationOfSecurityParameters` on every change — raised by
+      [F4.2](#84-f4--security-events) on an accepted `SetNetworkProfile`, which is where a security
+      profile and endpoint change.
 
 ### 8.4 F4 — Security events
 
@@ -2703,5 +2745,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 895 | `#[test]` + `#[tokio::test]`, re-counted at the B3.2 commit (873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 909 | `#[test]` + `#[tokio::test]`, re-counted at the F1–F3 commit (895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

@@ -538,6 +538,19 @@ Secures the OCPP connection and reports security-relevant events.
   `DeleteCertificate`, `InstallCertificate`, `GetInstalledCertificateIds`.
 - Internal state needed: certificate store abstraction, security event log,
   security profile (1/2/3) configuration.
+- **Security profiles** are modelled in `crate::security_profile`, and the rule
+  that makes the model worth having is enforced: a profile may be raised over
+  OCPP but essentially never lowered (§A05). Dropping to profile 1 is refused
+  outright, 3 → 2 only with `AllowSecurityProfileDowngrade`. That check exists
+  because the CSMS connection is the channel an attacker would use to weaken the
+  station - a `SetNetworkProfile` that could move a TLS charge point onto
+  plaintext turns one compromised credential into a fleet on cleartext.
+  Credentials come with the rules OCPP states: an identity containing `:` is
+  refused (Basic auth would split the pair in the wrong place) and a password
+  must be 16-64 characters, counted in characters rather than bytes. Profiles 1
+  and 2 are runnable today; profile 3 needs a client certificate and a key store,
+  and `SecurityProfile::is_implemented` says so rather than letting a station
+  behave as though it presents a certificate it has not got.
 - Status: 🚧 partial — `SecurityEventNotification` (outbound only) is
   implemented on **both 2.1 and 2.0.1**; the certificate messages (`SignCertificate`,
   `CertificateSigned`, `Get15118EVCertificate`, `GetCertificateStatus`,

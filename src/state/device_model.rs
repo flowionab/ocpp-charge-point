@@ -894,6 +894,19 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
     },
     DefaultVariable {
         component: "SecurityCtrlr",
+        variable: "AllowSecurityProfileDowngrade",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        // `false`: §A05 makes lowering the security profile an explicit operator opt-in, and it
+        // only ever unlocks 3 -> 2 - dropping to profile 1 stays refused with this set. See
+        // `crate::security_profile::SecurityProfileChange`.
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+        persistent: true,
+    },
+    DefaultVariable {
+        component: "SecurityCtrlr",
         variable: "OrganizationName",
         instance: None,
         data_type: VariableDataType::String,

@@ -63,6 +63,27 @@ pub async fn handle_set_network_profile(
     }
 
     let state = actor.state();
+
+    // §A05: a security profile may be raised over OCPP but essentially never lowered. Checked
+    // against the profile *currently in force* rather than against whatever happens to be in this
+    // slot, because the attack this stops is a `SetNetworkProfile` moving a secured station onto
+    // a weaker channel - and writing a fresh slot is as good a way to do that as rewriting the
+    // live one. See `crate::security_profile::SecurityProfileChange`.
+    let change = crate::security_profile::SecurityProfileChange::evaluate(
+        active_security_profile(&state),
+        crate::security_profile::SecurityProfile::from_number(profile.security_profile),
+        allows_security_profile_downgrade(&state),
+    );
+    if !change.is_allowed() {
+        tracing::warn!(
+            slot,
+            proposed = profile.security_profile,
+            ?change,
+            "refusing a network profile that would weaken this charge point's security profile"
+        );
+        return SetNetworkProfileOutcome::Rejected;
+    }
+
     let would_be_new = state.network_profiles.get(slot).is_none();
     if would_be_new && state.network_profiles.len() >= state.network_profiles.max_slots() {
         tracing::warn!(
@@ -97,6 +118,47 @@ pub async fn handle_set_network_profile(
     )
     .await;
     SetNetworkProfileOutcome::Accepted
+}
+
+/// The security profile this charge point is running now, from
+/// `SecurityCtrlr`/`SecurityProfile` - the value a CSMS reads, so the value a downgrade is
+/// measured against. An unreadable or undefined value is treated as profile 1, the weakest, which
+/// makes the comparison permissive rather than letting a malformed variable block every write.
+fn active_security_profile(
+    state: &crate::state::ChargePointState,
+) -> crate::security_profile::SecurityProfile {
+    security_ctrlr(state, "SecurityProfile")
+        .and_then(|value| value.parse().ok())
+        .and_then(crate::security_profile::SecurityProfile::from_number)
+        .unwrap_or(crate::security_profile::SecurityProfile::UnsecuredBasicAuth)
+}
+
+/// `SecurityCtrlr`/`AllowSecurityProfileDowngrade`, defaulting to **false**: §A05 makes the
+/// downgrade path an explicit opt-in, so an absent variable withholds it.
+fn allows_security_profile_downgrade(state: &crate::state::ChargePointState) -> bool {
+    security_ctrlr(state, "AllowSecurityProfileDowngrade")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+/// Reads a `SecurityCtrlr` variable's actual value out of the live device model.
+fn security_ctrlr(
+    state: &crate::state::ChargePointState,
+    variable: &str,
+) -> Option<alloc::string::String> {
+    let component = crate::state::Component {
+        name: "SecurityCtrlr".into(),
+        instance: None,
+        evse: None,
+    };
+    let variable = crate::state::Variable {
+        name: variable.into(),
+        instance: None,
+    };
+    state
+        .device_model
+        .get(&component, &variable)
+        .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
+        .map(|attribute| attribute.value.clone())
 }
 
 /// The profile this charge point should be connected through, per
@@ -326,6 +388,104 @@ mod tests {
                 .map(|profile| profile.security_profile),
             Some(3)
         );
+    }
+
+    #[tokio::test]
+    async fn a_profile_that_would_drop_the_charge_point_to_plaintext_is_refused() {
+        use crate::state::{DeviceModelEvent, VariableAttributeType};
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        // The charge point is running TLS.
+        let _ = actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: crate::state::Component {
+                        name: "SecurityCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: crate::state::Variable {
+                        name: "SecurityProfile".into(),
+                        instance: None,
+                    },
+                    attribute_type: VariableAttributeType::Actual,
+                    value: "2".into(),
+                },
+            ))
+            .await;
+
+        let outcome = handle_set_network_profile(
+            &actor,
+            1,
+            NetworkConnectionProfile {
+                security_profile: 1,
+                ..profile("wss://elsewhere")
+            },
+        )
+        .await;
+
+        // §A05: this is the write that would turn one compromised CSMS credential into a station
+        // moved onto cleartext, so it is refused outright - not merely warned about.
+        assert_eq!(outcome, SetNetworkProfileOutcome::Rejected);
+        assert!(actor.state().network_profiles.get(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn raising_the_security_profile_is_accepted() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        // Default is profile 1, so anything stronger goes in.
+        let outcome = handle_set_network_profile(
+            &actor,
+            1,
+            NetworkConnectionProfile {
+                security_profile: 3,
+                ..profile("wss://stronger")
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, SetNetworkProfileOutcome::Accepted);
+    }
+
+    #[tokio::test]
+    async fn a_downgrade_the_operator_opted_into_is_accepted() {
+        use crate::state::{DeviceModelEvent, VariableAttributeType};
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        for (variable, value) in [
+            ("SecurityProfile", "3"),
+            ("AllowSecurityProfileDowngrade", "true"),
+        ] {
+            let _ = actor
+                .send(ChargePointEvent::DeviceModel(
+                    DeviceModelEvent::AttributeValueSet {
+                        component: crate::state::Component {
+                            name: "SecurityCtrlr".into(),
+                            instance: None,
+                            evse: None,
+                        },
+                        variable: crate::state::Variable {
+                            name: variable.into(),
+                            instance: None,
+                        },
+                        attribute_type: VariableAttributeType::Actual,
+                        value: value.into(),
+                    },
+                ))
+                .await;
+        }
+
+        // 3 -> 2 is the one downgrade §A05 permits, and only on this explicit opt-in.
+        let outcome = handle_set_network_profile(
+            &actor,
+            1,
+            NetworkConnectionProfile {
+                security_profile: 2,
+                ..profile("wss://elsewhere")
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, SetNetworkProfileOutcome::Accepted);
     }
 }
 
