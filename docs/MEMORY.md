@@ -61,7 +61,7 @@ the charging profile store full.
 | Offline queue capacity (each of 3) | 25 | 100 | 200 |
 | Security log capacity | 25 | 50 | 200 |
 | `max_charging_profiles` | 16 | 16 | 16 |
-| Empty state (incl. built-in device model) | 5.0 KB | 5.2 KB | 6.6 KB |
+| Empty state (incl. built-in device model) | 17.3 KB | 17.6 KB | 19.7 KB |
 | Local authorization list, full | 3.1 KB | 10.9 KB | 52.5 KB |
 | Device model, full | 22.4 KB | 95.8 KB | 190.7 KB |
 | Busy connectors (transaction + reservation each) | 0.1 KB | 0.3 KB | 1.0 KB |
@@ -70,11 +70,19 @@ the charging profile store full.
 | Transaction queue, full | 6.0 KB | 23.8 KB | 47.6 KB |
 | Security queue, full | 5.1 KB | 20.5 KB | 41.1 KB |
 | Security log, full | 5.6 KB | 11.3 KB | 45.2 KB |
-| **Total retained** | **53.1 KB** | **175.8 KB** | **396.0 KB** |
+| **Total retained** | **59.0 KB** | **178.5 KB** | **401.3 KB** |
 
-Read that as: the crate's own defaults need roughly **176 KB of heap** in the
+Read that as: the crate's own defaults need roughly **179 KB of heap** in the
 worst case, and a deliberately tightened single-connector wallbox fits in
-roughly **53 KB**. Neither figure includes the exclusions above.
+roughly **59 KB**. Neither figure includes the exclusions above.
+
+The empty-state floor jumped from ~5 KB to ~17 KB when the crate started
+registering OCPP's standard configuration variables by default (B1.6: 26 of
+them, so that a 1.6J CSMS can read every *required* key without the hardware
+binding registering anything). That is the device model's per-variable cost
+below in action, and it is the price of protocol compliance rather than of
+topology — note how little it moves between a 1-connector and an 8-connector
+charge point.
 
 The charging profile store is the one row that does not scale with the
 configuration: `max_charging_profiles` defaults to 16 whatever the topology, so a
@@ -139,11 +147,11 @@ Two consequences worth stating plainly:
 
 - Register related variables on a **shared** component. This is the single
   highest-leverage memory decision a hardware binding makes.
-- The ~5 KB "empty state" floor is almost entirely the built-in device model's
-  two default variables sitting on two separate components (two inner nodes plus
-  an outer one). It is the price of having a device model at all, not of the
-  charge point's topology — note how little the floor moves between a
-  1-connector and an 8-connector configuration.
+- The ~17 KB "empty state" floor is almost entirely the built-in device model's
+  26 default variables (B1.6's standard OCPP configuration keys), spread across
+  eight `*Ctrlr` components. It is the price of answering OCPP's required
+  configuration keys, not of the charge point's topology — note how little the
+  floor moves between a 1-connector and an 8-connector configuration.
 
 ### 32-bit targets
 

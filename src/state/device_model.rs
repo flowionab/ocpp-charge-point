@@ -326,178 +326,35 @@ impl DeviceModel {
     ///   `RequestStartTransaction` still needs an `Authorize` round trip. Not yet consulted by
     ///   `crate::remote_control` either, for the same reason.
     fn register_defaults(&mut self) {
-        // Authorization caching (docs/PRODUCTION-ROADMAP.md B1.2). All three are registered
-        // explicitly rather than left absent with a guessed fallback: a charge point's answer to
-        // "may this card charge while you're offline?" should be readable by the CSMS, not
-        // inferred from what this crate assumes when a variable is missing.
-        self.register(
-            Component {
-                name: "AuthCacheCtrlr".into(),
-                instance: None,
-                evse: None,
-            },
-            Variable {
-                name: "Enabled".into(),
-                instance: None,
-            },
-            VariableCharacteristics {
-                data_type: VariableDataType::Boolean,
-                unit: None,
-                min_limit: None,
-                max_limit: None,
-                values_list: None,
-                supports_monitoring: false,
-            },
-            alloc::vec![VariableAttribute {
-                attribute_type: VariableAttributeType::Actual,
-                value: "true".into(),
-                mutability: VariableMutability::ReadWrite,
-                persistent: false,
-                constant: false,
-                requires_reboot: false,
-            }],
-        );
-        self.register(
-            Component {
-                name: "AuthCacheCtrlr".into(),
-                instance: None,
-                evse: None,
-            },
-            Variable {
-                name: "LifeTime".into(),
-                instance: None,
-            },
-            VariableCharacteristics {
-                data_type: VariableDataType::Integer,
-                unit: Some("s".into()),
-                min_limit: None,
-                max_limit: None,
-                values_list: None,
-                supports_monitoring: false,
-            },
-            // `0` is OCPP's "no lifetime configured", which this crate reads as "entries don't
-            // expire on age". They are still bounded in number and still clearable.
-            alloc::vec![VariableAttribute {
-                attribute_type: VariableAttributeType::Actual,
-                value: "0".into(),
-                mutability: VariableMutability::ReadWrite,
-                persistent: false,
-                constant: false,
-                requires_reboot: false,
-            }],
-        );
-        self.register(
-            Component {
-                name: "AuthCtrlr".into(),
-                instance: None,
-                evse: None,
-            },
-            Variable {
-                name: "LocalAuthorizeOffline".into(),
-                instance: None,
-            },
-            VariableCharacteristics {
-                data_type: VariableDataType::Boolean,
-                unit: None,
-                min_limit: None,
-                max_limit: None,
-                values_list: None,
-                supports_monitoring: false,
-            },
-            alloc::vec![VariableAttribute {
-                attribute_type: VariableAttributeType::Actual,
-                value: "true".into(),
-                mutability: VariableMutability::ReadWrite,
-                persistent: false,
-                constant: false,
-                requires_reboot: false,
-            }],
-        );
-        // Clock-aligned data (docs/PRODUCTION-ROADMAP.md B1.1). `0` is OCPP's own "disabled",
-        // which is the right default for a charge point nobody has configured yet: a charge point
-        // that started reporting on a 15-minute drumbeat because this crate picked a number would
-        // be spending a CSMS's bandwidth on a decision it never made.
-        self.register(
-            Component {
-                name: "AlignedDataCtrlr".into(),
-                instance: None,
-                evse: None,
-            },
-            Variable {
-                name: "Interval".into(),
-                instance: None,
-            },
-            VariableCharacteristics {
-                data_type: VariableDataType::Integer,
-                unit: Some("s".into()),
-                min_limit: None,
-                max_limit: None,
-                values_list: None,
-                supports_monitoring: false,
-            },
-            alloc::vec![VariableAttribute {
-                attribute_type: VariableAttributeType::Actual,
-                value: "0".into(),
-                mutability: VariableMutability::ReadWrite,
-                persistent: false,
-                constant: false,
-                requires_reboot: false,
-            }],
-        );
-        self.register(
-            Component {
-                name: "OCPPCommCtrlr".into(),
-                instance: None,
-                evse: None,
-            },
-            Variable {
-                name: "HeartbeatInterval".into(),
-                instance: None,
-            },
-            VariableCharacteristics {
-                data_type: VariableDataType::Integer,
-                unit: Some("s".into()),
-                min_limit: None,
-                max_limit: None,
-                values_list: None,
-                supports_monitoring: false,
-            },
-            vec![VariableAttribute {
-                attribute_type: VariableAttributeType::Actual,
-                value: "60".into(),
-                mutability: VariableMutability::ReadWrite,
-                persistent: true,
-                constant: false,
-                requires_reboot: false,
-            }],
-        );
-        self.register(
-            Component {
-                name: "AuthCtrlr".into(),
-                instance: None,
-                evse: None,
-            },
-            Variable {
-                name: "AuthorizeRemoteStart".into(),
-                instance: None,
-            },
-            VariableCharacteristics {
-                data_type: VariableDataType::Boolean,
-                unit: None,
-                min_limit: None,
-                max_limit: None,
-                values_list: None,
-                supports_monitoring: false,
-            },
-            vec![VariableAttribute {
-                attribute_type: VariableAttributeType::Actual,
-                value: "false".into(),
-                mutability: VariableMutability::ReadWrite,
-                persistent: true,
-                constant: false,
-                requires_reboot: false,
-            }],
-        );
+        for default in DEFAULT_VARIABLES {
+            self.register(
+                Component {
+                    name: default.component.into(),
+                    instance: None,
+                    evse: None,
+                },
+                Variable {
+                    name: default.variable.into(),
+                    instance: default.instance.map(Into::into),
+                },
+                VariableCharacteristics {
+                    data_type: default.data_type,
+                    unit: default.unit.map(Into::into),
+                    min_limit: None,
+                    max_limit: None,
+                    values_list: None,
+                    supports_monitoring: false,
+                },
+                vec![VariableAttribute {
+                    attribute_type: VariableAttributeType::Actual,
+                    value: default.value.into(),
+                    mutability: default.mutability,
+                    persistent: default.persistent,
+                    constant: false,
+                    requires_reboot: false,
+                }],
+            );
+        }
     }
 }
 
@@ -543,6 +400,333 @@ pub enum DeviceModelEvent {
         value: String,
     },
 }
+
+/// One variable [`DeviceModel::register_defaults`] registers on every charge point.
+///
+/// The table exists because these are not this crate's inventions: each is a variable OCPP itself
+/// standardizes, and most are 1.6J *required* configuration keys that a CSMS may read at any time
+/// (`docs/PRODUCTION-ROADMAP.md` B1.6). Registering them here is what makes them readable at all -
+/// `crate::device_model`'s 1.6J adapter aliases a key onto a `(Component, Variable)` and then
+/// looks it up, so an alias with nothing registered behind it answers `unknownKey`.
+pub(crate) struct DefaultVariable {
+    /// The 2.x component name (1.6J's flat key aliases onto it - see `crate::device_model`).
+    pub component: &'static str,
+    /// The 2.x variable name.
+    pub variable: &'static str,
+    /// The variable's instance, where OCPP disambiguates several uses of one name (e.g.
+    /// `OCPPCommCtrlr.MessageAttempts[TransactionEvent]`).
+    pub instance: Option<&'static str>,
+    /// The variable's data type, as reported by `GetVariables`/`GetReport`.
+    pub data_type: VariableDataType,
+    /// The unit, where OCPP defines one.
+    pub unit: Option<&'static str>,
+    /// The value a charge point starts with.
+    pub value: &'static str,
+    /// Whether a CSMS may write it. **`ReadWrite` here means the value is writable, not that this
+    /// crate acts on it** - see [`DEFAULT_VARIABLES`]' own docs for which are live.
+    pub mutability: VariableMutability,
+    /// Whether the value should survive a reboot (see
+    /// [`VariableAttribute::persistent`](crate::state::VariableAttribute::persistent) and E2.3).
+    ///
+    /// True only where re-learning the value costs something a CSMS would notice: a heartbeat
+    /// interval it negotiated once at BootNotification, say. Most of these are re-sent by the CSMS
+    /// on connecting anyway, and a stale configuration value that outlived the CSMS's own view of
+    /// it would be worse than a default.
+    pub persistent: bool,
+}
+
+/// Every variable registered on a fresh [`DeviceModel`].
+///
+/// # Which of these actually *do* something
+///
+/// Being registered makes a variable readable and (where `ReadWrite`) writable. It does not by
+/// itself make the charge point behave differently, and this table deliberately mixes both kinds
+/// rather than pretending otherwise:
+///
+/// - **Live** - read by this crate on the path they govern, so a CSMS write changes behaviour on
+///   the next cycle: `OCPPCommCtrlr.HeartbeatInterval` (`crate::provisioning::run_heartbeat`),
+///   `AlignedDataCtrlr.Interval` (`crate::meter_values`), `AuthCacheCtrlr.Enabled`,
+///   `AuthCacheCtrlr.LifeTime` and `AuthCtrlr.LocalAuthorizeOffline` (`crate::authorization`'s
+///   offline path).
+/// - **Recorded** - stored and reported faithfully, but nothing in this crate consults them yet.
+///   They are registered because a 1.6J CSMS may *require* them to be readable, and answering
+///   `unknownKey` for a required key is a compliance failure in a way that answering with an
+///   honest, unacted-on value is not. Each is listed in `docs/ROADMAP.md` §2 as outstanding.
+///
+/// The distinction is deliberately visible rather than hidden: `crate::device_model`'s
+/// `standard_key_is_honoured` reports it, and a test asserts the two lists stay in step.
+pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
+    // --- live: read by this crate on the path they govern ---
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "HeartbeatInterval",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "60",
+        mutability: VariableMutability::ReadWrite,
+        // The accepted BootNotification interval is written here after registration, and
+        // re-learning it costs a CSMS round trip - one of the two values worth keeping.
+        persistent: true,
+    },
+    DefaultVariable {
+        component: "AlignedDataCtrlr",
+        variable: "Interval",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        // OCPP's own "clock-aligned data is disabled" - a charge point nobody configured should
+        // not start reporting on a drumbeat this crate chose for it.
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "AuthCacheCtrlr",
+        variable: "Enabled",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        value: "true",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "AuthCacheCtrlr",
+        variable: "LifeTime",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        // 0 = entries don't age out. They are still bounded in number and still clearable.
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "AuthCtrlr",
+        variable: "LocalAuthorizeOffline",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        value: "true",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "AuthCtrlr",
+        variable: "AuthorizeRemoteStart",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+        persistent: true,
+    },
+    // --- recorded: readable and writable, but not yet consulted by this crate ---
+    DefaultVariable {
+        component: "AuthCtrlr",
+        variable: "LocalPreAuthorize",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        // False is the honest default for a switch this crate does not implement: claiming to
+        // pre-authorize from the local list while online, and then not doing it, would be worse
+        // than saying no.
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "AuthCtrlr",
+        variable: "OfflineTxForUnknownIdEnabled",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "TxCtrlr",
+        variable: "EVConnectionTimeOut",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "120",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "TxCtrlr",
+        variable: "StopTxOnEVSideDisconnect",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        value: "true",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "TxCtrlr",
+        variable: "StopTxOnInvalidId",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        value: "true",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "TxCtrlr",
+        variable: "MaxEnergyOnInvalidId",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("Wh"),
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "SampledDataCtrlr",
+        variable: "TxUpdatedInterval",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "SampledDataCtrlr",
+        variable: "TxUpdatedMeasurands",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        value: "Energy.Active.Import.Register",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "SampledDataCtrlr",
+        variable: "TxEndedMeasurands",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        value: "Energy.Active.Import.Register",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "SampledDataCtrlr",
+        variable: "TxEndedInterval",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "AlignedDataCtrlr",
+        variable: "Measurands",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        value: "Energy.Active.Import.Register",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "AlignedDataCtrlr",
+        variable: "TxEndedMeasurands",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        value: "Energy.Active.Import.Register",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "AlignedDataCtrlr",
+        variable: "TxEndedInterval",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "MessageAttempts",
+        instance: Some("TransactionEvent"),
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "3",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "MessageAttemptInterval",
+        instance: Some("TransactionEvent"),
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "60",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "WebSocketPingInterval",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "ResetRetries",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "1",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "ChargingStation",
+        variable: "MinimumStatusDuration",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "UnlockOnEVSideDisconnect",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        value: "true",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "LocalAuthListCtrlr",
+        variable: "Enabled",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        value: "true",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+];
 
 #[cfg(test)]
 mod tests {
@@ -695,17 +879,15 @@ mod tests {
         );
         assert_eq!(
             model.len(),
-            6,
-            "the built-in defaults: HeartbeatInterval, AuthorizeRemoteStart, \
-             AlignedDataCtrlr.Interval, AuthCacheCtrlr.Enabled, AuthCacheCtrlr.LifeTime, \
-             AuthCtrlr.LocalAuthorizeOffline"
+            DEFAULT_VARIABLES.len(),
+            "every entry in DEFAULT_VARIABLES should be registered, and nothing else"
         );
     }
 
     #[test]
     fn registering_past_the_maximum_is_refused_and_leaves_the_model_alone() {
         // One slot above the built-in defaults, so exactly one custom registration fits.
-        let mut model = DeviceModel::with_max_variables(7);
+        let mut model = DeviceModel::with_max_variables(DEFAULT_VARIABLES.len() + 1);
         assert!(model.register(
             component("Custom"),
             variable("First"),
@@ -721,7 +903,7 @@ mod tests {
         );
 
         assert!(!registered);
-        assert_eq!(model.len(), 7);
+        assert_eq!(model.len(), DEFAULT_VARIABLES.len() + 1);
         assert_eq!(model.get(&component("Custom"), &variable("Second")), None);
     }
 
@@ -729,7 +911,7 @@ mod tests {
     /// block it - otherwise a full model could never have a value's characteristics corrected.
     #[test]
     fn redefining_an_existing_variable_is_allowed_at_the_maximum() {
-        let mut model = DeviceModel::with_max_variables(6);
+        let mut model = DeviceModel::with_max_variables(DEFAULT_VARIABLES.len());
 
         let registered = model.register(
             component("OCPPCommCtrlr"),
@@ -739,7 +921,7 @@ mod tests {
         );
 
         assert!(registered);
-        assert_eq!(model.len(), 6);
+        assert_eq!(model.len(), DEFAULT_VARIABLES.len());
         assert_eq!(
             model
                 .get(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval"))
@@ -757,8 +939,8 @@ mod tests {
     fn a_maximum_below_the_built_in_defaults_is_raised_to_fit_them() {
         let model = DeviceModel::with_max_variables(0);
 
-        assert_eq!(model.max_variables(), 6);
-        assert_eq!(model.len(), 6);
+        assert_eq!(model.max_variables(), DEFAULT_VARIABLES.len());
+        assert_eq!(model.len(), DEFAULT_VARIABLES.len());
     }
 
     #[test]
@@ -782,19 +964,14 @@ mod tests {
             .map(|(component, _, _)| component.name.as_str())
             .collect();
 
-        // Alphabetical, with all three built-in defaults' components included.
-        assert_eq!(
-            names,
-            vec![
-                "AlignedDataCtrlr",
-                "Alpha",
-                "AuthCacheCtrlr",
-                "AuthCacheCtrlr",
-                "AuthCtrlr",
-                "AuthCtrlr",
-                "OCPPCommCtrlr",
-                "Zeta"
-            ]
-        );
+        // Alphabetical, defaults included - asserted as "sorted, with the two registered here in
+        // the right places" rather than as a literal list, which would just be a transcription of
+        // DEFAULT_VARIABLES that has to be re-transcribed whenever a block lands.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        assert_eq!(names.first(), Some(&"AlignedDataCtrlr"));
+        assert_eq!(names.last(), Some(&"Zeta"));
+        assert!(names.contains(&"Alpha"));
     }
 }

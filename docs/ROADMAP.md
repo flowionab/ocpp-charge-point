@@ -652,8 +652,14 @@ Boot, configuration, and the Component/Variable device model.
   `AuthCtrlr`/`AuthorizeRemoteStart`. `encode_key` emits the real 1.6J name
   when an alias exists, so an unfiltered `GetConfiguration` returns names a
   1.6J CSMS recognises; anything unmapped still degrades to the dotted form
-  rather than breaking. The table is deliberately partial (12 of ~40 Core
-  keys) and documents how to extend it. `ConnectorPhaseRotation` is
+  rather than breaking. The table now covers every **required** 1.6J key
+  (Core, plus the optional profiles this crate implements) - 23 aliased onto
+  real device model variables that `DeviceModel::register_defaults` registers,
+  plus 10 answered from live state (topology, `StateLimits`, `Capabilities`, or
+  a documented advisory figure where this crate imposes no limit at all). Which
+  of the writable ones actually *take effect* is recorded in
+  `DEFAULT_VARIABLES`' docs rather than left to be discovered: five are live,
+  the rest are stored and reported faithfully but not yet consulted. `ConnectorPhaseRotation` is
   explicitly excluded, not silently mismapped: 1.6 packs a per-connector list
   into a single key while 2.0.1 models `PhaseRotation` per connector, and
   that fan-out doesn't fit a static `key -> (Component, Variable)` entry.
@@ -718,11 +724,12 @@ Boot, configuration, and the Component/Variable device model.
   2.1's `ImmediateAndResume` projects down to `Immediate`, since nothing here
   models resuming a transaction across a reboot.
 
-  Still missing: `SetNetworkProfile`, device-model persistence across
-  restarts (`VariableAttribute::persistent` is recorded but not acted on),
-  variable monitoring (`SetVariableMonitoring`/`GetMonitoringReport`/
-  `NotifyMonitoringReport`), and the remaining ~28 standard 1.6J
-  configuration keys.
+  Still missing: `SetNetworkProfile` and variable monitoring
+  (`SetVariableMonitoring`/`GetMonitoringReport`/`NotifyMonitoringReport`).
+  Two items previously listed here are done: device-model persistence across
+  restarts (E2.3 - `VariableAttribute::persistent` is acted on now), and the
+  standard 1.6J configuration keys (B1.6 - every *required* key is readable
+  except `ConnectorPhaseRotation`, which is excluded for the reason above).
 - Version notes: 1.6J's `Configuration` key/value model and 2.0.1's
   Component/Variable model both need to be projections of one internal
   config representation; 1.6J has no `GetBaseReport`/structured device

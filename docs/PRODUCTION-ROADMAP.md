@@ -102,7 +102,7 @@ close — mostly missing one version each.
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the authorization cache, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: certificates, network profiles. |
-| Test suite | 🚧 | 725 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Test suite | 🚧 | 730 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -170,7 +170,7 @@ version.
 | RemoteStart/Stop · RequestStart/StopTransaction | ✅ | ✅ | ✅ | |
 | **ClearCache** | ✅ | ✅ | ✅ | |
 | **TriggerMessage** | ✅ | ✅ | ✅ | Heartbeat and StatusNotification are fulfilled; every other `requestedMessage` is refused with `NotImplemented`. |
-| GetConfiguration / ChangeConfiguration | ✅ | — | — | 12 of ~46 standard keys aliased. |
+| GetConfiguration / ChangeConfiguration | ✅ | — | — | Every *required* standard key readable except `ConnectorPhaseRotation`; 23 aliased plus 10 answered from live state. |
 | GetVariables / SetVariables | — | ✅ | ✅ | |
 | GetBaseReport / GetReport / NotifyReport | — | ✅ | ✅ | |
 
@@ -333,9 +333,49 @@ version.
 
       A meter reading taken while suspended is still recorded — a suspended session is still a
       session, and the register can move.
-- [ ] **B1.6** Complete the 1.6J standard configuration key table —
-      12 of ~46 aliased today; all *required* keys must be readable and the
-      writable ones must take effect.
+- [x] **B1.6** 1.6J standard configuration keys — every **required** key of the Core profile and
+      of the optional profiles this crate implements is now readable on a fresh charge point, with
+      one documented exception.
+
+      **Readable was the hard part, and it wasn't only the alias table.** An alias maps a 1.6J key
+      onto a `(Component, Variable)`; if nothing is *registered* behind it, `GetConfiguration`
+      still answers `unknownKey`. So the aliases grew from 14 to 23, and
+      `DeviceModel::register_defaults` became a table (`DEFAULT_VARIABLES`, 26 entries) that
+      registers the variables behind them. Two tests turn B1.6's requirement into a guarantee
+      rather than a claim: every required 1.6J key resolves *and has a value* on a charge point
+      straight out of `ChargePointState::new`, and an unfiltered `GetConfiguration` lists them all
+      — because that is how a CSMS discovers a charge point. A third asserts every alias has a
+      registered variable behind it, since an alias with nothing behind it is worse than no alias.
+
+      **Ten keys are answered from live state instead of being stored**, and for two distinct
+      reasons kept distinct in `DerivedKey`'s docs. *Derived*: the answer already exists somewhere
+      authoritative and a second copy could disagree — `NumberOfConnectors` (topology),
+      `LocalAuthListMaxLength`/`SendLocalListMaxLength`/`MaxChargingProfilesInstalled`
+      (`StateLimits`), `SupportedFeatureProfiles` (`Capabilities`). *Advisory*: this crate imposes
+      no limit at all, but 1.6J requires the key, so `GetConfigurationMaxKeys`,
+      `ChargeProfileMaxStackLevel` and `ChargingScheduleMaxPeriods` report a documented figure a
+      CSMS can size requests against, and exceeding it is accepted anyway. Reporting a bound this
+      crate does not enforce would have been the dishonest option. A `ChangeConfiguration` on any
+      of them is `Rejected` ("it exists, you can't write it"), not `NotSupported`, which would
+      claim the charge point had never heard of a key it just reported a value for.
+
+      **Which writable keys take effect is stated, not implied.** Five are *live* — read on the
+      path they govern, so a CSMS write changes behaviour on the next cycle: `HeartbeatInterval`,
+      `AlignedDataCtrlr.Interval`, `AuthCacheCtrlr.Enabled`, `AuthCacheCtrlr.LifeTime`,
+      `AuthCtrlr.LocalAuthorizeOffline`. The rest are *recorded* — stored and reported faithfully,
+      not yet consulted. `DEFAULT_VARIABLES`' own docs carry that split, because a required key
+      answered honestly-but-inertly is a compliance pass and a behaviour gap at the same time, and
+      only one of those is visible from the wire.
+
+      `ConnectorPhaseRotation` remains the one required Core key this crate does not answer, for
+      the reason already recorded in R§2: 1.6 packs a per-connector list into one key while 2.x
+      models `PhaseRotation` per connector, and that fan-out doesn't fit a static alias. It is
+      excluded explicitly in the test's own list rather than quietly missing.
+
+      **Memory moved and the figures were re-measured, not estimated**: registering 26 variables
+      by default lifts the empty-state floor from ~5 KB to ~17 KB, so retained-heap totals are now
+      ~59 KB / ~179 KB / ~401 KB. `docs/MEMORY.md` and the README carry the new numbers; the
+      existing ceilings still hold.
 - [ ] **B1.7** Register the 2.x required device-model variables. The
       vendored appendix lists **122 required component/variable rows across
       23 components**; the crate registers **2**. Scope per enabled feature
@@ -2135,10 +2175,10 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 |--------|-------|--------|
 | Device-model rows in the 2.1 appendix | 438 | `docs/OCPP-2.1/Appendices_CSV_v2.1/dm_components_vars.csv` |
 | …marked Required | 122, across 23 components | same |
-| …registered by this crate | 6 (`AlignedDataCtrlr.Interval`, `AuthCacheCtrlr.Enabled`, `AuthCacheCtrlr.LifeTime`, `AuthCtrlr.AuthorizeRemoteStart`, `AuthCtrlr.LocalAuthorizeOffline`, `OCPPCommCtrlr.HeartbeatInterval`) | `src/state/device_model.rs` |
-| 1.6J standard config keys aliased | 14 | `src/device_model.rs` |
+| …registered by this crate | 26 (`DEFAULT_VARIABLES`) | `src/state/device_model.rs` |
+| 1.6J standard config keys aliased | 23, plus 10 answered from live state | `src/device_model.rs` |
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 27 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 725 | `#[test]` + `#[tokio::test]`, re-counted at the E2.5 commit (717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 730 | `#[test]` + `#[tokio::test]`, re-counted at the B1.6 commit (725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

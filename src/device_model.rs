@@ -1378,6 +1378,72 @@ mod ocpp_1_6 {
             variable: "WebSocketPingInterval",
             instance: None,
         },
+        // dm_components_vars.csv:316 - 1.6's "ConnectionTimeOut" became
+        // "TxCtrlr.EVConnectionTimeOut".
+        StandardKeyAlias {
+            key: "ConnectionTimeOut",
+            component: "TxCtrlr",
+            variable: "EVConnectionTimeOut",
+            instance: None,
+        },
+        // dm_components_vars.csv:318
+        StandardKeyAlias {
+            key: "StopTransactionOnEVSideDisconnect",
+            component: "TxCtrlr",
+            variable: "StopTxOnEVSideDisconnect",
+            instance: None,
+        },
+        // dm_components_vars.csv:317
+        StandardKeyAlias {
+            key: "MaxEnergyOnInvalidId",
+            component: "TxCtrlr",
+            variable: "MaxEnergyOnInvalidId",
+            instance: None,
+        },
+        // dm_components_vars.csv:261 - 1.6's per-transaction sampled measurand list.
+        StandardKeyAlias {
+            key: "MeterValuesSampledData",
+            component: "SampledDataCtrlr",
+            variable: "TxUpdatedMeasurands",
+            instance: None,
+        },
+        // dm_components_vars.csv:258 - 1.6's end-of-transaction sampled measurand list.
+        StandardKeyAlias {
+            key: "StopTxnSampledData",
+            component: "SampledDataCtrlr",
+            variable: "TxEndedMeasurands",
+            instance: None,
+        },
+        // dm_components_vars.csv:79 - 1.6's clock-aligned measurand list.
+        StandardKeyAlias {
+            key: "MeterValuesAlignedData",
+            component: "AlignedDataCtrlr",
+            variable: "Measurands",
+            instance: None,
+        },
+        // dm_components_vars.csv:84 - 1.6's end-of-transaction clock-aligned measurand list.
+        StandardKeyAlias {
+            key: "StopTxnAlignedData",
+            component: "AlignedDataCtrlr",
+            variable: "TxEndedMeasurands",
+            instance: None,
+        },
+        // dm_components_vars.csv:41 - listed against `<generic>` (it applies to any
+        // component); this crate registers it charge-point-wide, which is the only scope 1.6J's
+        // flat key can address anyway.
+        StandardKeyAlias {
+            key: "MinimumStatusDuration",
+            component: "ChargingStation",
+            variable: "MinimumStatusDuration",
+            instance: None,
+        },
+        // dm_components_vars.csv:211
+        StandardKeyAlias {
+            key: "LocalAuthListEnabled",
+            component: "LocalAuthListCtrlr",
+            variable: "Enabled",
+            instance: None,
+        },
     ];
 
     /// Resolves a bare 1.6J standard configuration key name (e.g. `"HeartbeatInterval"`) to its
@@ -1485,6 +1551,114 @@ mod ocpp_1_6 {
         })
     }
 
+    /// A 1.6J standard configuration key this crate answers from *live state* rather than from a
+    /// stored device-model variable.
+    ///
+    /// Two different reasons land a key here, and the distinction is worth keeping straight:
+    ///
+    /// - **Derived** - the answer already exists somewhere authoritative, and storing a second
+    ///   copy would let the two disagree. `NumberOfConnectors` is the hardware topology;
+    ///   `LocalAuthListMaxLength`, `SendLocalListMaxLength` and `MaxChargingProfilesInstalled` are
+    ///   [`crate::state::StateLimits`]; `SupportedFeatureProfiles` is
+    ///   [`crate::hardware::Capabilities`]. A CSMS reading these gets what the charge point will
+    ///   actually do, always.
+    /// - **Advisory** - this crate imposes no limit at all, but 1.6J *requires* the key, so
+    ///   refusing to answer would be a compliance failure. `GetConfigurationMaxKeys`,
+    ///   `ChargeProfileMaxStackLevel` and `ChargingScheduleMaxPeriods` report a documented figure
+    ///   a CSMS can size its requests against; exceeding it is accepted anyway. Reporting a real
+    ///   bound this crate does not enforce would be the dishonest option, so each says so here.
+    ///
+    /// All are read-only: a `ChangeConfiguration` on one is `Rejected` (it exists, it just can't
+    /// be written) rather than `NotSupported`, which would claim the charge point had never heard
+    /// of it.
+    struct DerivedKey {
+        /// The 1.6J key name.
+        key: &'static str,
+        /// Computes the value from live state.
+        value: fn(&crate::state::ChargePointState) -> String,
+    }
+
+    /// How many keys a `GetConfiguration` may request before this crate stops promising to answer
+    /// them all. Purely advisory: nothing here rejects a larger request - see [`DerivedKey`].
+    const GET_CONFIGURATION_MAX_KEYS: usize = 100;
+
+    /// Advisory `ChargeProfileMaxStackLevel`/`ChargingScheduleMaxPeriods` figures - see
+    /// [`DerivedKey`]. The charging profile store accepts any stack level and any number of
+    /// schedule periods that fits its own bound, so these describe what a sane CSMS should send
+    /// rather than what this charge point enforces.
+    const ADVISORY_MAX_STACK_LEVEL: u32 = 8;
+    const ADVISORY_MAX_SCHEDULE_PERIODS: u32 = 24;
+
+    /// Every [`DerivedKey`] this module answers.
+    const DERIVED_KEYS: &[DerivedKey] = &[
+        DerivedKey {
+            key: "NumberOfConnectors",
+            value: |state| {
+                let connectors: usize = state.evses.iter().map(|evse| evse.connectors.len()).sum();
+                connectors.to_string()
+            },
+        },
+        DerivedKey {
+            key: "GetConfigurationMaxKeys",
+            value: |_state| GET_CONFIGURATION_MAX_KEYS.to_string(),
+        },
+        DerivedKey {
+            key: "LocalAuthListMaxLength",
+            value: |state| state.local_authorization_list.max_entries.to_string(),
+        },
+        DerivedKey {
+            key: "SendLocalListMaxLength",
+            // The same bound: a `SendLocalList` that would exceed the list's capacity is refused
+            // whole (see `crate::local_authorization_list`), so the two figures cannot differ.
+            value: |state| state.local_authorization_list.max_entries.to_string(),
+        },
+        DerivedKey {
+            key: "MaxChargingProfilesInstalled",
+            value: |state| state.charging_profiles.max_profiles().to_string(),
+        },
+        DerivedKey {
+            key: "ChargeProfileMaxStackLevel",
+            value: |_state| ADVISORY_MAX_STACK_LEVEL.to_string(),
+        },
+        DerivedKey {
+            key: "ChargingScheduleMaxPeriods",
+            value: |_state| ADVISORY_MAX_SCHEDULE_PERIODS.to_string(),
+        },
+        DerivedKey {
+            key: "ChargingScheduleAllowedChargingRateUnit",
+            // Both, and genuinely: `crate::smart_charging::compose` reads whichever unit a
+            // schedule is expressed in (converting only when the integrator supplied the supply
+            // characteristics that make conversion honest).
+            value: |_state| "Current,Power".into(),
+        },
+        DerivedKey {
+            key: "ReserveConnectorZeroSupported",
+            // 1.6J's connector 0 means "any connector on the charge point";
+            // `crate::reservation::handle_reserve_now` picks a specific connector instead, so a
+            // reservation is always against one connector. Answering `true` would promise a
+            // behaviour this crate does not have.
+            value: |_state| "false".into(),
+        },
+        DerivedKey {
+            key: "ConnectorSwitch3to1PhaseSupported",
+            // Phase switching is hardware this crate has no binding for at all.
+            value: |_state| "false".into(),
+        },
+    ];
+
+    /// Builds the read-only [`ConfigurationKeyItem`] for a derived key.
+    fn derived_key_item(
+        derived: &DerivedKey,
+        state: &crate::state::ChargePointState,
+    ) -> ConfigurationKeyItem {
+        let value = (derived.value)(state);
+        ConfigurationKeyItem {
+            key: heapless::String::try_from(derived.key).unwrap_or_default(),
+            readonly: true,
+            value: heapless::String::try_from(truncate_to_byte_boundary(&value, 500)).ok(),
+        }
+    }
+
     /// The 1.6J standard `GetConfiguration` key name for `SupportedFeatureProfiles` - a
     /// comma-separated list of every functional-block profile this charge point genuinely
     /// supports (Core, FirmwareManagement, LocalAuthListManagement, Reservation, SmartCharging,
@@ -1515,10 +1689,11 @@ mod ocpp_1_6 {
     /// into the second element) otherwise. See the module docs for why this reads the device
     /// model directly rather than through [`crate::device_model::handle_get_variables`].
     fn resolve_get_configuration(
-        device_model: &DeviceModel,
-        capabilities: &Capabilities,
+        state: &crate::state::ChargePointState,
         keys: Option<&[heapless::String<50>]>,
     ) -> (Vec<ConfigurationKeyItem>, Vec<heapless::String<50>>) {
+        let device_model: &DeviceModel = &state.device_model;
+        let capabilities: &Capabilities = &state.capabilities;
         match keys {
             None => {
                 let mut configuration_key: Vec<ConfigurationKeyItem> = device_model
@@ -1528,6 +1703,11 @@ mod ocpp_1_6 {
                     })
                     .collect();
                 configuration_key.push(supported_feature_profiles_item(capabilities));
+                configuration_key.extend(
+                    DERIVED_KEYS
+                        .iter()
+                        .map(|derived| derived_key_item(derived, state)),
+                );
                 (configuration_key, Vec::new())
             }
             Some(keys) => {
@@ -1536,6 +1716,13 @@ mod ocpp_1_6 {
                 for key in keys {
                     if key.as_str() == SUPPORTED_FEATURE_PROFILES_KEY {
                         configuration_key.push(supported_feature_profiles_item(capabilities));
+                        continue;
+                    }
+                    if let Some(derived) = DERIVED_KEYS
+                        .iter()
+                        .find(|derived| derived.key == key.as_str())
+                    {
+                        configuration_key.push(derived_key_item(derived, state));
                         continue;
                     }
                     let resolved = decode_key(key.as_str()).and_then(|(component, variable)| {
@@ -1550,6 +1737,14 @@ mod ocpp_1_6 {
                 (configuration_key, unknown_key)
             }
         }
+    }
+
+    /// Whether `key` is one this module answers from live state rather than the device model -
+    /// i.e. a read-only key a `ChangeConfiguration` must be told it cannot write, rather than told
+    /// it has never heard of. See [`DerivedKey`].
+    fn is_read_only_synthetic_key(key: &str) -> bool {
+        key == SUPPORTED_FEATURE_PROFILES_KEY
+            || DERIVED_KEYS.iter().any(|derived| derived.key == key)
     }
 
     /// Collapses a [`SetVariableOutcome`] onto 1.6J's `ChangeConfigurationResponseStatus`: every
@@ -1577,11 +1772,8 @@ mod ocpp_1_6 {
                 let actor = actor.clone();
                 async move {
                     let state = actor.state();
-                    let (configuration_key, unknown_key) = resolve_get_configuration(
-                        &state.device_model,
-                        &state.capabilities,
-                        request.key.as_deref(),
-                    );
+                    let (configuration_key, unknown_key) =
+                        resolve_get_configuration(&state, request.key.as_deref());
                     Ok(GetConfigurationResponse {
                         configuration_key: (!configuration_key.is_empty())
                             .then_some(configuration_key),
@@ -1599,6 +1791,14 @@ mod ocpp_1_6 {
             self.on_change_configuration(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // A key this charge point answers from live state exists but cannot be
+                    // written - `Rejected` says exactly that, where `NotSupported` would claim it
+                    // had never heard of a key it just reported a value for.
+                    if is_read_only_synthetic_key(request.key.as_str()) {
+                        return Ok(ChangeConfigurationResponse {
+                            status: ChangeConfigurationResponseStatus::Rejected,
+                        });
+                    }
                     let outcome = match decode_key(request.key.as_str()) {
                         Some((component, variable)) => handle_set_variables(
                             &actor,
@@ -1760,12 +1960,150 @@ mod ocpp_1_6 {
             );
         }
 
+        /// A charge point with one EVSE of one connector - `resolve_get_configuration` now reads
+        /// the whole state, since several 1.6J keys are derived from topology and limits rather
+        /// than stored (see [`DerivedKey`]).
+        fn test_state() -> crate::state::ChargePointState {
+            crate::state::ChargePointState::new([1])
+        }
+
+        /// OCPP 1.6J Appendix 1's **required** Core-profile configuration keys, plus the required
+        /// keys of the profiles this crate implements (LocalAuthListManagement, Reservation,
+        /// SmartCharging). A CSMS may read any of these at any time, and answering `unknownKey`
+        /// for one is a compliance failure - so this list is the contract B1.6 exists to meet.
+        ///
+        /// `ConnectorPhaseRotation` is deliberately absent: 1.6 packs a per-connector list into a
+        /// single key while 2.x models `PhaseRotation` per connector, and that fan-out doesn't fit
+        /// a static key -> `(Component, Variable)` alias. It is the one required Core key this
+        /// crate does not answer, and it is excluded explicitly here rather than quietly missing.
+        const REQUIRED_1_6_KEYS: &[&str] = &[
+            // Core
+            "AuthorizeRemoteTxRequests",
+            "ClockAlignedDataInterval",
+            "ConnectionTimeOut",
+            "GetConfigurationMaxKeys",
+            "HeartbeatInterval",
+            "LocalAuthorizeOffline",
+            "LocalPreAuthorize",
+            "MeterValuesAlignedData",
+            "MeterValuesSampledData",
+            "MeterValueSampleInterval",
+            "NumberOfConnectors",
+            "ResetRetries",
+            "StopTransactionOnEVSideDisconnect",
+            "StopTransactionOnInvalidId",
+            "StopTxnAlignedData",
+            "StopTxnSampledData",
+            "SupportedFeatureProfiles",
+            "TransactionMessageAttempts",
+            "TransactionMessageRetryInterval",
+            "UnlockConnectorOnEVSideDisconnect",
+            // LocalAuthListManagement
+            "LocalAuthListEnabled",
+            "LocalAuthListMaxLength",
+            "SendLocalListMaxLength",
+            // SmartCharging
+            "ChargeProfileMaxStackLevel",
+            "ChargingScheduleAllowedChargingRateUnit",
+            "ChargingScheduleMaxPeriods",
+            "MaxChargingProfilesInstalled",
+        ];
+
+        /// B1.6's actual requirement, as a test rather than a claim: every required 1.6J key is
+        /// readable on a charge point straight out of `ChargePointState::new` - no hardware
+        /// binding, no CSMS configuration, nothing registered by anything but this crate's own
+        /// defaults.
+        #[test]
+        fn every_required_1_6j_configuration_key_is_readable_on_a_fresh_charge_point() {
+            let state = test_state();
+
+            for key in REQUIRED_1_6_KEYS {
+                let requested = alloc::vec![heapless::String::try_from(*key).unwrap()];
+                let (configuration_key, unknown_key) =
+                    resolve_get_configuration(&state, Some(&requested));
+
+                assert!(
+                    unknown_key.is_empty(),
+                    "required 1.6J key `{key}` answered unknownKey"
+                );
+                assert_eq!(configuration_key.len(), 1, "`{key}` resolved oddly");
+                assert!(
+                    configuration_key[0].value.is_some(),
+                    "required 1.6J key `{key}` has no value"
+                );
+            }
+        }
+
+        /// The other half of readability: an unfiltered `GetConfiguration` must *list* them, not
+        /// merely answer when asked by name. A CSMS discovering a charge point reads it this way.
+        #[test]
+        fn an_unfiltered_get_configuration_lists_every_required_1_6j_key() {
+            let (configuration_key, _) = resolve_get_configuration(&test_state(), None);
+
+            for key in REQUIRED_1_6_KEYS {
+                assert!(
+                    configuration_key
+                        .iter()
+                        .any(|item| item.key.as_str() == *key),
+                    "required 1.6J key `{key}` missing from an unfiltered GetConfiguration"
+                );
+            }
+        }
+
+        #[test]
+        fn every_alias_resolves_to_a_variable_this_crate_actually_registers() {
+            // An alias with nothing registered behind it is worse than no alias at all: the key
+            // looks supported in this table and answers `unknownKey` on the wire.
+            let state = test_state();
+            for alias in STANDARD_KEY_ALIASES {
+                let requested = alloc::vec![heapless::String::try_from(alias.key).unwrap()];
+                let (configuration_key, unknown_key) =
+                    resolve_get_configuration(&state, Some(&requested));
+                assert!(
+                    unknown_key.is_empty() && configuration_key.len() == 1,
+                    "alias `{}` has no registered variable behind it",
+                    alias.key
+                );
+            }
+        }
+
+        #[test]
+        fn a_derived_key_cannot_be_written_and_says_so_specifically() {
+            // `Rejected` ("it exists, you can't write it"), not `NotSupported` ("never heard of
+            // it") - the charge point just reported a value for it.
+            for key in ["NumberOfConnectors", "SupportedFeatureProfiles"] {
+                assert!(is_read_only_synthetic_key(key), "`{key}` should be derived");
+            }
+            assert!(!is_read_only_synthetic_key("HeartbeatInterval"));
+        }
+
+        #[test]
+        fn derived_keys_report_this_charge_points_real_topology_and_limits() {
+            let state = crate::state::ChargePointState::with_limits(
+                [2, 2],
+                crate::state::StateLimits::default()
+                    .with_max_local_authorization_list_entries(25)
+                    .with_max_charging_profiles(4),
+            );
+
+            let value = |key: &str| {
+                let requested = alloc::vec![heapless::String::try_from(key).unwrap()];
+                let (items, _) = resolve_get_configuration(&state, Some(&requested));
+                items[0]
+                    .value
+                    .as_deref()
+                    .map(alloc::string::ToString::to_string)
+            };
+
+            assert_eq!(value("NumberOfConnectors").as_deref(), Some("4"));
+            assert_eq!(value("LocalAuthListMaxLength").as_deref(), Some("25"));
+            assert_eq!(value("SendLocalListMaxLength").as_deref(), Some("25"));
+            assert_eq!(value("MaxChargingProfilesInstalled").as_deref(), Some("4"));
+        }
+
         #[test]
         fn getting_every_key_lists_the_built_in_defaults_under_their_standard_names() {
-            let model = DeviceModel::new();
-
-            let (configuration_key, unknown_key) =
-                resolve_get_configuration(&model, &Capabilities::default(), None);
+            let (configuration_key, unknown_key) = resolve_get_configuration(&test_state(), None);
 
             assert!(unknown_key.is_empty());
             assert!(
@@ -1789,11 +2127,8 @@ mod ocpp_1_6 {
 
         #[test]
         fn requesting_a_known_key_by_its_dotted_form_still_works() {
-            let model = DeviceModel::new();
-
             let (configuration_key, unknown_key) = resolve_get_configuration(
-                &model,
-                &Capabilities::default(),
+                &test_state(),
                 Some(&[heapless::String::try_from("OCPPCommCtrlr.HeartbeatInterval").unwrap()]),
             );
 
@@ -1805,11 +2140,8 @@ mod ocpp_1_6 {
 
         #[test]
         fn requesting_a_known_key_by_its_standard_alias_resolves_the_same_variable() {
-            let model = DeviceModel::new();
-
             let (configuration_key, unknown_key) = resolve_get_configuration(
-                &model,
-                &Capabilities::default(),
+                &test_state(),
                 Some(&[heapless::String::try_from("HeartbeatInterval").unwrap()]),
             );
 
@@ -1821,11 +2153,8 @@ mod ocpp_1_6 {
 
         #[test]
         fn requesting_an_unrecognized_key_reports_it_as_unknown() {
-            let model = DeviceModel::new();
-
             let (configuration_key, unknown_key) = resolve_get_configuration(
-                &model,
-                &Capabilities::default(),
+                &test_state(),
                 Some(&[heapless::String::try_from("TotallyUnknownVendorKey").unwrap()]),
             );
 
@@ -1858,8 +2187,7 @@ mod ocpp_1_6 {
             assert_eq!(outcome, SetVariableOutcome::Accepted);
 
             let (configuration_key, _) = resolve_get_configuration(
-                &actor.state().device_model,
-                &Capabilities::default(),
+                &actor.state(),
                 Some(&[heapless::String::try_from("HeartbeatInterval").unwrap()]),
             );
             assert_eq!(configuration_key[0].value.as_deref(), Some("120"));

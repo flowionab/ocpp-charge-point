@@ -413,7 +413,10 @@ mod tests {
 
         let entries = report_base_entries(&model, ReportBase::FullInventory);
 
-        assert_eq!(entries.len(), 6); // the six built-in defaults
+        // Asserted against the model's own count rather than a literal: the built-in default set
+        // grows as functional blocks land (B1.6 alone added most of 1.6J's required keys), and a
+        // hard-coded number here would only ever be a reminder to update this line.
+        assert_eq!(entries.len(), model.len());
     }
 
     #[test]
@@ -434,7 +437,7 @@ mod tests {
 
         // Every built-in default is ReadWrite, so they're all included; the freshly registered
         // ReadOnly-only variable is not.
-        assert_eq!(entries.len(), 6);
+        assert_eq!(entries.len(), model.len() - 1);
         assert!(
             entries
                 .iter()
@@ -458,20 +461,28 @@ mod tests {
 
         let entries = report_base_entries(&model, ReportBase::SummaryInventory);
 
-        // The freshly registered `Problem`, plus the one well-known control variable the built-in
-        // defaults contribute (`AuthCacheCtrlr.Enabled`) - and nothing else, which is the point:
-        // `HeartbeatInterval` and friends are configuration, not status.
+        // The freshly registered `Problem`, plus the well-known control variables the built-in
+        // defaults contribute - and nothing else, which is the point: `HeartbeatInterval` and
+        // friends are configuration, not status.
         let names: alloc::vec::Vec<_> = entries
             .iter()
-            .map(|entry| entry.variable.name.as_str())
+            .map(|entry| (entry.component.name.as_str(), entry.variable.name.as_str()))
             .collect();
-        assert_eq!(names, alloc::vec!["Enabled", "Problem"]);
+        assert_eq!(
+            names,
+            alloc::vec![
+                ("AuthCacheCtrlr", "Enabled"),
+                ("Connector", "Problem"),
+                ("LocalAuthListCtrlr", "Enabled")
+            ]
+        );
     }
 
-    /// A fresh model now has exactly one well-known status/control variable among its built-in
-    /// defaults - `AuthCacheCtrlr.Enabled`, registered by B1.2 - so the summary report is no
-    /// longer empty out of the box. That is the summary working, not leaking: whether the
-    /// authorization cache is enabled is precisely the kind of control state this report is for.
+    /// A fresh model has two well-known status/control variables among its built-in defaults -
+    /// `AuthCacheCtrlr.Enabled` (B1.2) and `LocalAuthListCtrlr.Enabled` (B1.6) - so the summary
+    /// report is not empty out of the box. That is the summary working, not leaking: whether the
+    /// authorization cache and the local list are enabled is precisely the control state this
+    /// report is for, while `HeartbeatInterval` and friends are configuration and stay out.
     #[test]
     fn a_fresh_device_model_summarises_the_control_variables_it_has() {
         let model = DeviceModel::new();
@@ -482,7 +493,13 @@ mod tests {
             .iter()
             .map(|entry| (entry.component.name.as_str(), entry.variable.name.as_str()))
             .collect();
-        assert_eq!(names, alloc::vec![("AuthCacheCtrlr", "Enabled")]);
+        assert_eq!(
+            names,
+            alloc::vec![
+                ("AuthCacheCtrlr", "Enabled"),
+                ("LocalAuthListCtrlr", "Enabled")
+            ]
+        );
     }
 
     #[test]
@@ -683,10 +700,8 @@ mod tests {
             panic!("a base report is always accepted");
         };
         assert!(
-            entries
-                .iter()
-                .all(|entry| entry.component.name == "AuthCacheCtrlr"),
-            "nothing but the built-in control variable should be summarised on a fresh model"
+            entries.iter().all(|entry| entry.variable.name == "Enabled"),
+            "nothing but the built-in control variables should be summarised on a fresh model"
         );
     }
 
@@ -713,7 +728,14 @@ mod tests {
         );
 
         match outcome {
-            ReportOutcome::Accepted(entries) => assert_eq!(entries.len(), 1),
+            // Every variable registered on `OCPPCommCtrlr`, whatever the built-in default set
+            // currently holds there.
+            ReportOutcome::Accepted(entries) => assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.component.name == "OCPPCommCtrlr")
+                    && !entries.is_empty()
+            ),
             other => panic!("expected Accepted, got {other:?}"),
         }
     }

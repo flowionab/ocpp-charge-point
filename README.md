@@ -216,9 +216,9 @@ Measured worst-case retained heap, filled to those bounds:
 
 | Configuration | Retained heap |
 | --- | --- |
-| Tight AC wallbox (1 connector, 25 list entries, 64 device model variables) | **~53 KB** |
-| Crate defaults (2 connectors, 100 entries, 256 variables) | **~176 KB** |
-| DC site (4 EVSEs × 2 connectors, 500 entries, 512 variables) | **~396 KB** |
+| Tight AC wallbox (1 connector, 25 list entries, 64 device model variables) | **~59 KB** |
+| Crate defaults (2 connectors, 100 entries, 256 variables) | **~179 KB** |
+| DC site (4 EVSEs × 2 connectors, 500 entries, 512 variables) | **~401 KB** |
 
 These are 64-bit host figures and a conservative upper bound for a 32-bit MCU, which holds less. They exclude task stacks, transport/TLS buffers, and allocator overhead.
 
