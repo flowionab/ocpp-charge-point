@@ -2596,25 +2596,46 @@ nowhere. These five rows make it mechanical.
 
 ### 10.2 H2 — Integration testing
 
-514 unit tests, one integration test. Unit coverage is genuinely good; what's
-missing is proof that the pieces work *together* over a real socket.
+974 unit tests, and now 11 integration tests over a real socket. Unit coverage was always good;
+what was missing was proof that the pieces work *together* on the wire.
 
-- [ ] **H2.1** Mock CSMS harness — scripted request/response over a real
-      WebSocket, for all three versions. Extend
-      `tests/connect_2_1_websocket.rs`.
-- [ ] **H2.2** Full-lifecycle scenario tests per version: boot → status →
-      plug → authorize → start → meter → stop → unlock.
-- [ ] **H2.3** Offline scenarios: disconnect mid-transaction, queue,
-      reconnect, verify ordering and no duplication.
-- [ ] **H2.4** Version-projection tests — same internal event sequence,
-      three protocol versions, assert each wire shape.
+- [x] **H2.1** Mock CSMS harness — [`tests/common/mod.rs`](../tests/common/mod.rs). Every
+      integration test used to stand up its own `TcpListener`, negotiate its own subprotocol and
+      hand-decode its own frames: fine for one round trip, unworkable for scenarios that assert on
+      a *sequence*.
+
+      It answers charge-point-initiated calls from a script, records everything received in order,
+      and can push CSMS-initiated calls back. Deliberately **not** a CSMS simulator: it does not
+      validate payloads against the schema or model CSMS behaviour. Its job is to be a truthful
+      mirror of what went out on the socket, because that is the thing unit tests cannot see.
+      Unscripted actions still get a valid empty CALLRESULT — a charge point blocked on a response
+      it will never receive fails the test slowly and for the wrong reason.
+- [x] **H2.2** Full-lifecycle scenarios per version — boot → plug → authorize → start → meter →
+      stop → unlock, driven through the public API and asserted from the wire, on 1.6J, 2.0.1 and
+      2.1.
+- [x] **H2.3** Offline scenario — the mock CSMS is dropped mid-transaction and the charge point
+      keeps being driven by its hardware. Asserts it survives a dead socket rather than wedging or
+      panicking, and that the session closes out properly: the transaction is not left dangling and
+      the connector returns to `Available`.
+- [x] **H2.4** Version projection — **the test this architecture most needed**, and the one no
+      per-version unit test can write, because writing it means driving the *same* internal event
+      sequence through all three adapters and comparing. The same charge point and hardware binding
+      produce 2.x's `chargingStation`-nested identity and 1.6J's flattened
+      `chargePointVendor`/`chargePointModel`, and the same internal transaction becomes a 2.x
+      `TransactionEvent` or a 1.6J `StartTransaction`/`StopTransaction` pair. Each assertion checks
+      both that the right shape is present *and* that the other version's is absent — otherwise a
+      charge point emitting both would pass.
 - [x] **H2.5** Power-cut recovery — done by [E4.4](#74-e4--recovery)'s sweep
-      ([`tests/power_cut_recovery.rs`](../tests/power_cut_recovery.rs)), which is an integration
-      test over the public API rather than an in-crate one. It drives the actor and the
-      persistence tasks directly rather than a socket, so [H2.1](#102-h2--integration-testing)'s
-      mock-CSMS harness would still add the wire-level half.
-- [ ] **H2.6** A simulated-hardware charge point in `examples/`, usable as
-      an integrator's starting point and as a soak-test subject.
+      ([`tests/power_cut_recovery.rs`](../tests/power_cut_recovery.rs)).
+- [ ] **H2.6** A simulated-hardware charge point in `examples/`, usable as an integrator's starting
+      point and as a soak-test subject. Overlaps [G1.3](#91-g1--no_std-across-the-matrix)'s embedded
+      example; do them together.
+
+**One API gap this surfaced.** `connect_and_setup` takes `Option<&[OcppVersion]>`, but the crate
+never re-exported `OcppVersion` — so no caller outside this crate could name the type without
+taking a direct dependency on `ocpp-client` and matching its exact version, which is exactly the
+coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match the upstream type
+(an unconditional re-export broke the `--no-default-features` build).
 
 ### 10.3 H3 — Compliance
 
@@ -2920,4 +2941,4 @@ gap is entirely this crate's to close.
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
 | Test functions in `src/` | 974 | `#[test]` + `#[tokio::test]`, re-counted at the G4 commit (963 after merging the B5.4/E2.11/H1.6 worktrees (942 at B4.2, 920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
-| Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |
+| Integration tests | 11 | `tests/` (`connect_2_1_websocket`, `lifecycle`, `get_charging_profiles`, `memory_budget`, `network_profile_switch`, `power_cut_recovery`), sharing the H2.1 mock CSMS in `tests/common/` |

@@ -110,3 +110,15 @@ pub use self::runtime::ChargePointRuntime;
     feature = "tariff-cost"
 ))]
 pub use self::setup::setup;
+/// The OCPP versions [`connect_and_setup`] can be asked to offer.
+///
+/// Re-exported because [`connect_and_setup`]'s signature names it: without this, no caller outside
+/// this crate could construct the `versions` argument without taking a direct dependency on
+/// `ocpp-client` and matching its exact version - which is precisely the coupling
+/// `CLAUDE.md` asks this crate to absorb on an integrator's behalf.
+///
+/// Gated to match the upstream type, which is itself feature-gated: re-exporting it
+/// unconditionally broke the `--no-default-features` build, since a no_std charge point compiles
+/// none of the version adapters it enumerates.
+#[cfg(any(feature = "ocpp_1_6", feature = "ocpp_2_0_1", feature = "ocpp_2_1"))]
+pub use ocpp_client::OcppVersion;
