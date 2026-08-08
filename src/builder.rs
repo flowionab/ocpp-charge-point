@@ -114,6 +114,15 @@ pub struct ChargePointBuilder<T, X> {
     // and must not starve - or be starved by - the CSMS forwarder. Taken in `start()` so an event
     // raised during hardware start-up is logged rather than missed.
     security_log_events: Option<BroadcastReceiver<SecurityEvent>>,
+    // One entry per offline queue registered so far, each a closure that flushes that queue
+    // exactly as its reconnect handler does. `Self::offline_queue_retries` drives them all on a
+    // timer; collecting closures rather than the queues themselves keeps the builder free of the
+    // per-queue message types, which differ.
+    queue_flushes: Vec<QueueFlush>,
+    // Set by `offline_queue_capacity`, read by every queue-creating registration below. Fixed
+    // for the life of the builder, like `StateLimits` is for the state - a bound a later call
+    // could raise is not a bound.
+    offline_queue_capacity: usize,
     // Set by `boot_reason_persistence`, read by `provisioning`: the cause loaded from durable
     // storage at build time (`None` - no `boot_reason_persistence` call, or nothing was
     // persisted - reports an uncommanded restart, same as before this feature existed). Fixed for
@@ -125,6 +134,12 @@ pub struct ChargePointBuilder<T, X> {
     // generic `BootReasonStore<S>` field (which would force `S` onto `ChargePointBuilder` itself).
     boot_reason_clearer: Option<Arc<dyn BootReasonClearer>>,
 }
+
+/// One registered offline queue's flush, type-erased so [`ChargePointBuilder`] can hold flushes
+/// for queues whose message types differ - see that struct's `queue_flushes` field.
+type QueueFlush = Arc<
+    dyn Fn() -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
 
 /// Type-erases a [`BootReasonStore<S>`]'s `clear` so [`ChargePointBuilder`] can hold one without
 /// becoming generic over `S` itself - the same reason `alloc::sync::Arc<dyn Trait>` gets reached
@@ -242,9 +257,72 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             security_events: Some(security_events),
             transaction_persistence_events: Some(transaction_persistence_events),
             security_log_events: Some(security_log_events),
+            queue_flushes: Vec::new(),
+            offline_queue_capacity: crate::offline_queue::DEFAULT_CAPACITY,
             boot_reason: None,
             boot_reason_clearer: None,
         })
+    }
+
+    /// Bounds every offline report queue this builder creates (status, transaction, security) at
+    /// `capacity` messages instead of [`crate::offline_queue::DEFAULT_CAPACITY`].
+    ///
+    /// **Call this before registering any of those blocks** - a queue is created when its block
+    /// registers, so a later call cannot resize one that already exists. That is deliberate: a
+    /// queue whose bound can move underneath it is not bounded in the sense G2.1 means.
+    ///
+    /// The trade-off is memory against how long an outage the charge point can absorb without
+    /// losing reports - `docs/MEMORY.md` prices a queued message per kind, and
+    /// [`crate::offline_queue::OverflowPolicy`] decides what goes when the bound is hit.
+    pub fn offline_queue_capacity(mut self, capacity: usize) -> Self {
+        self.offline_queue_capacity = capacity;
+        self
+    }
+
+    /// Spawns a timer that retries every offline queue registered so far, every
+    /// `OCPPCommCtrlr`/`MessageAttemptInterval[TransactionEvent]` seconds (A7).
+    ///
+    /// **Call this after the blocks whose queues you want retried** - it drives the queues that
+    /// exist when it runs, and registration order is otherwise irrelevant.
+    ///
+    /// Without it a queued report is only retried when *new* traffic arrives or the connection
+    /// reconnects. That is enough for a busy charge point and wrong for a quiet one: the last
+    /// report before an outage would sit indefinitely on a charge point that has gone quiet -
+    /// which is exactly the charge point most likely to have gone quiet *because* it is offline.
+    ///
+    /// The interval is re-read every cycle, so a CSMS changing it takes effect on the next sweep
+    /// without a reboot; `fallback_interval_secs` covers it being absent, unparseable or `0`
+    /// (which would be a busy-spin). Sweeps run concurrently with the forwarder's own flush and
+    /// the reconnect flush, and [`crate::offline_queue::flush_offline_queue`]'s claim makes that
+    /// overlap a no-op rather than a double-send.
+    pub fn offline_queue_retries<B>(self, backoff: B, fallback_interval_secs: u32) -> Self
+    where
+        B: Backoff + Send + Sync + 'static,
+    {
+        let flushes = self.queue_flushes.clone();
+        if flushes.is_empty() {
+            tracing::warn!(
+                "offline_queue_retries registered before any queue - nothing will be retried on a \
+                 timer; call it after the blocks whose queues you want swept"
+            );
+            return self;
+        }
+        let actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            loop {
+                backoff
+                    .wait(crate::offline_queue::message_attempt_interval_secs(
+                        &actor,
+                        fallback_interval_secs,
+                    ))
+                    .await;
+                for flush in &flushes {
+                    flush().await;
+                }
+            }
+        }));
+
+        self
     }
 
     /// This charge point's connector topology - `connector_counts[evse_id]` is that EVSE's
@@ -623,7 +701,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         // `DropOldest` (the default): a queued status is superseded by whatever the connector's
         // status actually is by the time the connection recovers, so keeping the newest is more
         // useful than keeping the oldest - see `OverflowPolicy`'s docs.
-        let status_queue = Arc::new(OfflineQueue::new());
+        let status_queue = Arc::new(OfflineQueue::with_capacity(self.offline_queue_capacity));
         let status_notifier = Arc::new(DedupedStatusNotifier::new(csms.clone()));
         let forwarder_queue = status_queue.clone();
         let forwarder_notifier = status_notifier.clone();
@@ -652,10 +730,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             )
             .await;
         }));
-        csms.register_reconnect_handler(move || {
-            let queue = status_queue.clone();
-            let notifier = status_notifier.clone();
-            async move {
+        let flush_queue = status_queue.clone();
+        let flush_notifier = status_notifier.clone();
+        let flush: QueueFlush = Arc::new(move || {
+            let queue = flush_queue.clone();
+            let notifier = flush_notifier.clone();
+            Box::pin(async move {
                 crate::offline_queue::flush_offline_queue(&queue, move |changed| {
                     let notifier = notifier.clone();
                     async move {
@@ -670,7 +750,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                     }
                 })
                 .await;
-            }
+            })
+        });
+        self.queue_flushes.push(flush.clone());
+        csms.register_reconnect_handler(move || {
+            let flush = flush.clone();
+            async move { flush().await }
         })
         .await;
 
@@ -704,7 +789,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         };
 
         // `DropOldest` (the default), same reasoning as `Self::status_notifications`.
-        let status_queue = Arc::new(OfflineQueue::new());
+        let status_queue = Arc::new(OfflineQueue::with_capacity(self.offline_queue_capacity));
         // Restore before any live traffic is wired up - so an event that arrives during start-up
         // can never be delivered ahead of an older one the backlog restores.
         restore_status_notification_queue(&status_queue, &store).await;
@@ -739,11 +824,11 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             )
             .await;
         }));
-        csms.register_reconnect_handler(move || {
+        let flush: QueueFlush = Arc::new(move || {
             let queue = status_queue.clone();
             let store = store.clone();
             let notifier = status_notifier.clone();
-            async move {
+            Box::pin(async move {
                 flush_and_persist_status_notification_queue(&queue, &store, move |changed| {
                     let notifier = notifier.clone();
                     async move {
@@ -758,7 +843,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                     }
                 })
                 .await;
-            }
+            })
+        });
+        self.queue_flushes.push(flush.clone());
+        csms.register_reconnect_handler(move || {
+            let flush = flush.clone();
+            async move { flush().await }
         })
         .await;
 
@@ -781,8 +871,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         // would permanently lose that billing data. Rejecting the newest instead only delays
         // fresh transaction activity - it never disturbs what's already queued - see
         // `OverflowPolicy`'s docs.
-        let transaction_queue =
-            Arc::new(OfflineQueue::new().with_overflow_policy(OverflowPolicy::DropNewest));
+        let transaction_queue = Arc::new(
+            OfflineQueue::with_capacity(self.offline_queue_capacity)
+                .with_overflow_policy(OverflowPolicy::DropNewest),
+        );
         let forwarder_queue = transaction_queue.clone();
         let forwarder_csms = csms.clone();
         let overflow_actor = self.runtime.actor();
@@ -811,10 +903,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             .await;
         }));
         let reconnect_csms = csms.clone();
-        csms.register_reconnect_handler(move || {
+        let flush: QueueFlush = Arc::new(move || {
             let queue = transaction_queue.clone();
             let csms = reconnect_csms.clone();
-            async move {
+            Box::pin(async move {
                 crate::offline_queue::flush_offline_queue(&queue, move |occurred| {
                     let notifier = csms.clone();
                     async move {
@@ -829,7 +921,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                     }
                 })
                 .await;
-            }
+            })
+        });
+        self.queue_flushes.push(flush.clone());
+        csms.register_reconnect_handler(move || {
+            let flush = flush.clone();
+            async move { flush().await }
         })
         .await;
 
@@ -856,8 +953,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         };
 
         // `DropNewest`, same reasoning as `Self::transaction_events`.
-        let transaction_queue =
-            Arc::new(OfflineQueue::new().with_overflow_policy(OverflowPolicy::DropNewest));
+        let transaction_queue = Arc::new(
+            OfflineQueue::with_capacity(self.offline_queue_capacity)
+                .with_overflow_policy(OverflowPolicy::DropNewest),
+        );
         // Restore before any live traffic is wired up - so an event that arrives during start-up
         // can never be delivered ahead of an older one the backlog restores.
         restore_transaction_event_queue(&transaction_queue, &store).await;
@@ -892,11 +991,11 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             .await;
         }));
         let reconnect_csms = csms.clone();
-        csms.register_reconnect_handler(move || {
+        let flush: QueueFlush = Arc::new(move || {
             let queue = transaction_queue.clone();
             let store = store.clone();
             let csms = reconnect_csms.clone();
-            async move {
+            Box::pin(async move {
                 flush_and_persist_transaction_event_queue(&queue, &store, move |occurred| {
                     let notifier = csms.clone();
                     async move {
@@ -911,7 +1010,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                     }
                 })
                 .await;
-            }
+            })
+        });
+        self.queue_flushes.push(flush.clone());
+        csms.register_reconnect_handler(move || {
+            let flush = flush.clone();
+            async move { flush().await }
         })
         .await;
 
@@ -989,7 +1093,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             return self;
         };
 
-        let security_queue = Arc::new(OfflineQueue::new());
+        let security_queue = Arc::new(OfflineQueue::with_capacity(self.offline_queue_capacity));
         let forwarder_queue = security_queue.clone();
         let forwarder_csms = csms.clone();
         self.executor.spawn(Box::pin(async move {
@@ -1022,10 +1126,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             .await;
         }));
         let reconnect_csms = csms.clone();
-        csms.register_reconnect_handler(move || {
+        let flush: QueueFlush = Arc::new(move || {
             let queue = security_queue.clone();
             let csms = reconnect_csms.clone();
-            async move {
+            Box::pin(async move {
                 crate::offline_queue::flush_offline_queue(&queue, move |event| {
                     let notifier = csms.clone();
                     async move {
@@ -1035,7 +1139,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                     }
                 })
                 .await;
-            }
+            })
+        });
+        self.queue_flushes.push(flush.clone());
+        csms.register_reconnect_handler(move || {
+            let flush = flush.clone();
+            async move { flush().await }
         })
         .await;
 
@@ -1057,7 +1166,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         };
 
         // `DropOldest` (the default), same reasoning as `Self::security_events`.
-        let security_queue = Arc::new(OfflineQueue::new());
+        let security_queue = Arc::new(OfflineQueue::with_capacity(self.offline_queue_capacity));
         // Restore before any live traffic is wired up - so an event that arrives during start-up
         // can never be delivered ahead of an older one the backlog restores.
         restore_security_event_queue(&security_queue, &store).await;
@@ -1092,11 +1201,11 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             .await;
         }));
         let reconnect_csms = csms.clone();
-        csms.register_reconnect_handler(move || {
+        let flush: QueueFlush = Arc::new(move || {
             let queue = security_queue.clone();
             let store = store.clone();
             let csms = reconnect_csms.clone();
-            async move {
+            Box::pin(async move {
                 flush_and_persist_security_event_queue(&queue, &store, move |event| {
                     let notifier = csms.clone();
                     async move {
@@ -1106,7 +1215,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                     }
                 })
                 .await;
-            }
+            })
+        });
+        self.queue_flushes.push(flush.clone());
+        csms.register_reconnect_handler(move || {
+            let flush = flush.clone();
+            async move { flush().await }
         })
         .await;
 

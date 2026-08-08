@@ -12,6 +12,7 @@ use alloc::collections::VecDeque;
 use core::cell::RefCell;
 use core::fmt;
 use core::future::Future;
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
@@ -71,6 +72,14 @@ pub struct OfflineQueue<M> {
     pending: BlockingMutex<CriticalSectionRawMutex, RefCell<VecDeque<M>>>,
     capacity: usize,
     policy: OverflowPolicy,
+    /// Whether a flush is in progress. [`flush_offline_queue`] peeks the front message, sends it,
+    /// and pops only on success - so two flushes running at once would both peek the *same*
+    /// message and send it twice. There are now three things that can start one (a new message
+    /// arriving, a reconnect, and the retry timer), so this makes a concurrent flush skip rather
+    /// than duplicate. An `AtomicBool` rather than a mutex because the guard has to survive an
+    /// `.await`, which the `embassy-sync` blocking mutex this crate's no_std-safe state uses
+    /// cannot.
+    flushing: AtomicBool,
 }
 
 impl<M> OfflineQueue<M> {
@@ -87,6 +96,7 @@ impl<M> OfflineQueue<M> {
             pending: BlockingMutex::new(RefCell::new(VecDeque::new())),
             capacity: capacity.max(1),
             policy: OverflowPolicy::default(),
+            flushing: AtomicBool::new(false),
         }
     }
 
@@ -125,6 +135,23 @@ impl<M> OfflineQueue<M> {
 impl<M> Default for OfflineQueue<M> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<M> OfflineQueue<M> {
+    /// The queue's configured capacity - see [`Self::with_capacity`].
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Claims the right to flush, or reports that someone else already holds it. Released by
+    /// [`Self::end_flush`]; see [`Self::flushing`]'s docs for why this exists.
+    fn try_begin_flush(&self) -> bool {
+        !self.flushing.swap(true, Ordering::SeqCst)
+    }
+
+    fn end_flush(&self) {
+        self.flushing.store(false, Ordering::SeqCst);
     }
 }
 
@@ -188,6 +215,12 @@ where
     Fut: Future<Output = Result<(), E>>,
     E: fmt::Display,
 {
+    // A flush already in progress is doing this work; joining in would peek the same front
+    // message and send it twice. Returning is safe rather than lossy - the flush that holds the
+    // claim drains everything queued, including whatever this caller had just pushed.
+    if !queue.try_begin_flush() {
+        return;
+    }
     while let Some(message) = queue.peek_front() {
         match send(message).await {
             Ok(()) => queue.pop_front(),
@@ -196,6 +229,79 @@ where
                 break;
             }
         }
+    }
+    queue.end_flush();
+}
+
+/// The `(Component, Variable)` OCPP defines for how long to wait between attempts at a queued
+/// message - `OCPPCommCtrlr`/`MessageAttemptInterval[TransactionEvent]`.
+fn message_attempt_interval_variable() -> (crate::state::Component, crate::state::Variable) {
+    (
+        crate::state::Component {
+            name: "OCPPCommCtrlr".into(),
+            instance: None,
+            evse: None,
+        },
+        crate::state::Variable {
+            name: "MessageAttemptInterval".into(),
+            instance: Some("TransactionEvent".into()),
+        },
+    )
+}
+
+/// How long to wait between retry sweeps of an offline queue, from
+/// `OCPPCommCtrlr`/`MessageAttemptInterval[TransactionEvent]`, or `fallback` when it is absent,
+/// unparseable or `0` - a `0` would turn [`run_offline_queue_retries`] into a busy-spin, so it is
+/// treated as "not set" exactly as [`crate::provisioning::run_heartbeat`] treats a `0` interval.
+///
+/// OCPP scopes this variable to `TransactionEvent`, and this crate applies it to every offline
+/// queue rather than only that one. The alternative - inventing separate intervals for status and
+/// security events, which OCPP does not define - would be a configuration surface no CSMS knows
+/// how to drive.
+pub fn message_attempt_interval_secs(actor: &crate::actor::ChargePointActor, fallback: u32) -> u32 {
+    let (component, variable) = message_attempt_interval_variable();
+    actor
+        .state()
+        .device_model
+        .get(&component, &variable)
+        .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
+        .and_then(|attribute| attribute.value.parse::<u32>().ok())
+        .filter(|interval| *interval != 0)
+        .unwrap_or(fallback)
+}
+
+/// Retries whatever is sitting in `queue` every
+/// `OCPPCommCtrlr`/`MessageAttemptInterval[TransactionEvent]` seconds, forever.
+///
+/// Without this, a queued report is only retried when *new* traffic arrives or the connection
+/// reconnects - so the last report before an outage could sit indefinitely on a charge point that
+/// went quiet, which is exactly the charge point most likely to have gone quiet *because* it is
+/// offline. The interval is re-read every cycle, so a CSMS changing it takes effect on the next
+/// sweep without a reboot.
+///
+/// Concurrent with the forwarder's own flush and the reconnect flush; [`flush_offline_queue`]'s
+/// claim makes the overlap a no-op rather than a double-send.
+pub async fn run_offline_queue_retries<M, B, F, Fut, E>(
+    queue: &OfflineQueue<M>,
+    backoff: &B,
+    actor: &crate::actor::ChargePointActor,
+    fallback_interval_secs: u32,
+    mut send: F,
+) where
+    M: Clone,
+    B: crate::provisioning::Backoff,
+    F: FnMut(M) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+{
+    loop {
+        backoff
+            .wait(message_attempt_interval_secs(actor, fallback_interval_secs))
+            .await;
+        if queue.is_empty() {
+            continue;
+        }
+        flush_offline_queue(queue, &mut send).await;
     }
 }
 
@@ -230,7 +336,10 @@ pub async fn run_with_offline_queue<M, F, Fut, E, H, HFut>(
 
 #[cfg(test)]
 mod tests {
-    use super::{OfflineQueue, flush_offline_queue, run_with_offline_queue};
+    use super::{
+        OfflineQueue, flush_offline_queue, message_attempt_interval_secs,
+        run_offline_queue_retries, run_with_offline_queue,
+    };
     use crate::sync::broadcast_channel;
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -400,6 +509,169 @@ mod tests {
         // Capacity 2, DropOldest: restoring [1, 2, 3] evicts 1 to make room for 3.
         assert_eq!(dropped, alloc::vec![1]);
         assert_eq!(queue.snapshot(), alloc::vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_second_flush_running_concurrently_does_not_send_the_same_message_twice() {
+        // Three things can start a flush - a new message, a reconnect, and the retry timer - so
+        // the front message would otherwise be peeked by two of them and sent twice.
+        let queue = alloc::sync::Arc::new(OfflineQueue::new());
+        queue.push(1);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+
+        let slow_queue = queue.clone();
+        let slow_sent = sent.clone();
+        let slow = tokio::spawn(async move {
+            flush_offline_queue(&slow_queue, move |_message: i32| {
+                let sent = slow_sent.clone();
+                let release_rx = release_rx.clone();
+                async move {
+                    sent.fetch_add(1, Ordering::SeqCst);
+                    // Hold the flush open until the second one has had its chance to interfere.
+                    if let Some(rx) = release_rx.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    Ok::<(), SendError>(())
+                }
+            })
+            .await;
+        });
+
+        // Let the first flush reach its in-flight send.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let second_sent = sent.clone();
+        flush_offline_queue(&queue, move |_message: i32| {
+            let sent = second_sent.clone();
+            async move {
+                sent.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), SendError>(())
+            }
+        })
+        .await;
+
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            1,
+            "the concurrent flush should have skipped, not re-sent the in-flight message"
+        );
+
+        let _ = release_tx.send(());
+        slow.await.unwrap();
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_flush_that_finished_leaves_the_queue_flushable_again() {
+        // The claim must be released on the failure path too, or one failed send would wedge the
+        // queue shut for the life of the process.
+        let queue = OfflineQueue::new();
+        queue.push(1);
+
+        flush_offline_queue(&queue, |_message: i32| async { Err::<(), _>(SendError) }).await;
+        assert_eq!(queue.len(), 1);
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let counted = delivered.clone();
+        flush_offline_queue(&queue, move |_message: i32| {
+            let delivered = counted.clone();
+            async move {
+                delivered.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), SendError>(())
+            }
+        })
+        .await;
+
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_retry_timer_drains_a_queue_nothing_else_is_touching() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let queue = alloc::sync::Arc::new(OfflineQueue::new());
+        queue.push(7);
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct ImmediateBackoff;
+
+        #[async_trait::async_trait]
+        impl crate::provisioning::Backoff for ImmediateBackoff {
+            async fn wait(&self, _seconds: u32) {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let task_queue = queue.clone();
+        let task_delivered = delivered.clone();
+        let task_actor = actor.clone();
+        let task = tokio::spawn(async move {
+            run_offline_queue_retries(
+                &task_queue,
+                &ImmediateBackoff,
+                &task_actor,
+                60,
+                move |message: i32| {
+                    let delivered = task_delivered.clone();
+                    async move {
+                        delivered.lock().unwrap().push(message);
+                        Ok::<(), SendError>(())
+                    }
+                },
+            )
+            .await;
+        });
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+
+        // No new message arrived and no reconnect happened - the timer alone got it out.
+        assert_eq!(*delivered.lock().unwrap(), alloc::vec![7]);
+    }
+
+    #[tokio::test]
+    async fn the_retry_interval_comes_from_the_device_model_and_falls_back_sanely() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+        use crate::state::{ChargePointEvent, DeviceModelEvent, VariableAttributeType};
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        // B1.7 registers this with a value of 60.
+        assert_eq!(message_attempt_interval_secs(&actor, 30), 60);
+
+        let set = |value: &str| {
+            ChargePointEvent::DeviceModel(DeviceModelEvent::AttributeValueSet {
+                component: crate::state::Component {
+                    name: "OCPPCommCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: "MessageAttemptInterval".into(),
+                    instance: Some("TransactionEvent".into()),
+                },
+                attribute_type: VariableAttributeType::Actual,
+                value: value.into(),
+            })
+        };
+
+        let _ = actor.send(set("15")).await;
+        assert_eq!(message_attempt_interval_secs(&actor, 30), 15);
+
+        // A `0` would be a busy-spin, and an unparseable value is not a number - both fall back.
+        let _ = actor.send(set("0")).await;
+        assert_eq!(message_attempt_interval_secs(&actor, 30), 30);
+        let _ = actor.send(set("soon")).await;
+        assert_eq!(message_attempt_interval_secs(&actor, 30), 30);
     }
 
     #[tokio::test]

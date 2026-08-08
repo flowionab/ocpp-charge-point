@@ -317,3 +317,127 @@ async fn restricting_the_offered_versions_forces_the_one_named() {
 
     server.await.unwrap();
 }
+
+/// A8: property 1 of the definition of done - *no message is silently dropped* - asserted from
+/// this crate's side rather than inherited from `ocpp-client`.
+///
+/// The CSMS calls an action this charge point registered no handler for (`GetLog`: the Diagnostics
+/// block does not exist here). The charge point must answer a CALLERROR with `NotImplemented`,
+/// not a CALLRESULT, not silence. Silence is the failure this test really guards: a CSMS waiting
+/// on a response that never comes is far worse than one told no.
+#[tokio::test]
+async fn an_unhandled_action_is_answered_with_a_not_implemented_call_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_hdr_async(
+            tcp,
+            #[allow(clippy::result_large_err)]
+            |_req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+             mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                response
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", "ocpp2.1".parse().unwrap());
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+
+        // Answer the boot sequence first, so the charge point is a live session rather than one
+        // still retrying registration.
+        let frame = match ws.next().await.unwrap().unwrap() {
+            Message::Text(text) => text.to_string(),
+            other => panic!("expected a text frame, got {other:?}"),
+        };
+        let call: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(call[2], "BootNotification");
+        let message_id = call[1].as_str().unwrap().to_string();
+        ws.send(Message::text(
+            serde_json::to_string(&json!([
+                3,
+                message_id,
+                {
+                    "currentTime": "2024-01-01T00:00:00Z",
+                    "interval": 300,
+                    "status": "Accepted"
+                }
+            ]))
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Now call something this build has no handler for.
+        ws.send(Message::text(
+            serde_json::to_string(&json!([
+                2,
+                "unhandled-1",
+                "GetLog",
+                {
+                    "log": { "remoteLocation": "ftp://example.invalid/logs" },
+                    "logType": "DiagnosticsLog",
+                    "requestId": 1
+                }
+            ]))
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Skip anything the charge point volunteers in the meantime (a StatusNotification, say) -
+        // what matters is that the answer to *this* call arrives. Bounded, because the failure
+        // this test guards against is *silence*: without the timeout, a charge point that never
+        // answered would hang the suite instead of failing it.
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame = match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => text.to_string(),
+                    other => panic!("expected a text frame, got {other:?}"),
+                };
+                let answer: Value = serde_json::from_str(&frame).unwrap();
+                if answer[1] != "unhandled-1" {
+                    // A call *from* the charge point: answer it so nothing blocks, and keep waiting.
+                    if answer[0] == 2 {
+                        let id = answer[1].as_str().unwrap().to_string();
+                        ws.send(Message::text(
+                            serde_json::to_string(&json!([3, id, {}])).unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    continue;
+                }
+                assert_eq!(answer[0], 4, "expected a CALLERROR, got {answer}");
+                assert_eq!(answer[2], "NotImplemented");
+                break;
+            }
+        })
+        .await;
+        answered.expect("the charge point never answered the unhandled call");
+    });
+
+    let runtime = connect_and_setup(
+        TestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector],
+            }],
+        },
+        &format!("ws://{addr}"),
+        Some(&[ocpp_client::OcppVersion::V2_1]),
+        None,
+        TokioExecutor,
+        TokioBackoff,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        runtime.state().registration,
+        Some(RegistrationStatus::Accepted)
+    );
+
+    server.await.unwrap();
+}

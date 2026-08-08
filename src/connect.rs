@@ -185,12 +185,14 @@ where
                 &client,
                 alloc::sync::Arc::new(crate::smart_charging::ChargingLimitProjection::new()),
                 SystemClock,
-                backoff,
+                backoff.clone(),
             )
             .await;
     }
 
-    Ok(builder.build())
+    // A7: sweep the queues registered above on OCPP's own MessageAttemptInterval - see
+    // `ChargePointBuilder::offline_queue_retries`.
+    Ok(builder.offline_queue_retries(backoff, 60).build())
 }
 
 /// Runs a full OCPP 1.6J session against `client` (A1).
@@ -279,10 +281,12 @@ where
                 &crate::smart_charging::Ocpp1_6SmartChargingHandler::new(client.clone(), counts),
                 alloc::sync::Arc::new(crate::smart_charging::ChargingLimitProjection::new()),
                 SystemClock,
-                backoff,
+                backoff.clone(),
             )
             .await;
     }
 
-    Ok(builder.build())
+    // A7: sweep the queues registered above on OCPP's own MessageAttemptInterval - see
+    // `ChargePointBuilder::offline_queue_retries`.
+    Ok(builder.offline_queue_retries(backoff, 60).build())
 }

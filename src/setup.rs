@@ -146,12 +146,15 @@ where
                 &csms,
                 alloc::sync::Arc::new(crate::smart_charging::ChargingLimitProjection::new()),
                 clock,
-                backoff,
+                backoff.clone(),
             )
             .await;
     }
 
-    Ok(builder.build())
+    // A7: sweep every queue registered above on OCPP's own MessageAttemptInterval, so a charge
+    // point that goes quiet mid-outage still retries what it queued. 60 s is the fallback when
+    // the device model has no usable value.
+    Ok(builder.offline_queue_retries(backoff, 60).build())
 }
 
 #[cfg(test)]
