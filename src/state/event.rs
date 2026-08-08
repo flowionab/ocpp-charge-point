@@ -8,8 +8,8 @@ use crate::state::{
     AuthorizationCacheEntry, AuthorizationStatus, ChargingProfile, ChargingProfileCriteria,
     ChargingProfileScope, Component, ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken,
     InstalledChargingProfile, LocalListEntry, MeterSample, NetworkConnectionProfile,
-    NetworkProfileSlot, RegistrationStatus, Reservation, ResetKind, ResetTarget, SecurityEvent,
-    StopReason, Transaction, Variable, VariableAttributeType,
+    NetworkProfileSlot, RegistrationStatus, Reservation, ReservationId, ResetKind, ResetTarget,
+    SecurityEvent, StopReason, Transaction, Variable, VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -325,6 +325,12 @@ pub enum ConnectorEvent {
     /// The CSMS cancelled this connector's reservation (OCPP `CancelReservation`) while it's
     /// `Reserved`. See `docs/ROADMAP.md` §8.
     ReservationCancelled,
+    /// This connector's reservation ran past its `expiryDateTime` and was released by the charge
+    /// point, freeing the connector. Dispatched by
+    /// [`crate::reservation::run_reservation_expiry`], not by the CSMS - which is why, unlike
+    /// [`Self::ReservationCancelled`], it produces a
+    /// [`ChargePointEffect::ReservationEnded`] for the CSMS to be told about.
+    ReservationExpired,
     /// The CSMS reported a new running total cost for this connector's active transaction (OCPP
     /// `CostUpdated`). Ignored if there's no active transaction. See `docs/ROADMAP.md` §9.
     CostUpdated(f64),
@@ -386,6 +392,34 @@ pub enum ChargePointEffect {
     /// A security-relevant event occurred; the Security functional block reports this to the
     /// CSMS via SecurityEventNotification.
     SecurityEventOccurred(SecurityEvent),
+    /// A reservation ended for a reason the CSMS did not ask for; the Reservation functional
+    /// block reports this via ReservationStatusUpdate (2.x only).
+    ReservationEnded(ReservationUpdate),
+}
+
+/// Why a reservation ended, as OCPP's `ReservationUpdateStatusEnum` expresses it.
+///
+/// Only the reasons the CSMS needs telling about. A `CancelReservation` it sent itself produces
+/// no update - reporting a change back to the peer that requested it is noise, and OCPP does not
+/// ask for it. 2.1's third value, `NoTransaction` (the reservation was honoured but no
+/// transaction followed), needs a timer this crate does not have yet; see
+/// `docs/PRODUCTION-ROADMAP.md` B8.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationEndReason {
+    /// The reservation ran past its `expiryDateTime`.
+    Expired,
+    /// The charge point released the reservation because it could no longer honour it - the
+    /// reserved connector faulted or was made unavailable.
+    Removed,
+}
+
+/// A reservation ended without the CSMS asking, reported via ReservationStatusUpdate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservationUpdate {
+    /// The reservation that ended.
+    pub id: ReservationId,
+    /// Why it ended.
+    pub reason: ReservationEndReason,
 }
 
 /// An [`IdToken`] was presented on a connector and needs an authorization decision, reported to

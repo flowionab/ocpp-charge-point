@@ -1081,12 +1081,13 @@ Operational availability of charge point / EVSE / connector.
 
 Reserving a connector/EVSE ahead of use.
 
-- Messages: `ReserveNow`, `CancelReservation`.
+- Messages: `ReserveNow`, `CancelReservation`, `ReservationStatusUpdate` (2.x).
 - Internal state needed: reservation entity (id, expiry, id token,
   target EVSE/connector), a `Reserved` connector state, expiry timer.
 - Status: 🚧 partial — `ConnectorState` gained a `Reserved` state, reachable
   only from `Available` (`ConnectorEvent::Reserved(Reservation)`) and left via
-  `ConnectorEvent::ReservationCancelled` (back to `Available`) or
+  `ConnectorEvent::ReservationCancelled`/`ReservationExpired` (back to
+  `Available`) or
   `ConnectorEvent::CableConnected` (straight into the normal `Connected` flow,
   same as plugging into an `Available` connector - the reservation is cleared
   either way). `availability_status()` now actually reaches
@@ -1108,10 +1109,21 @@ Reserving a connector/EVSE ahead of use.
   `Available`, the outcome reports the most informative wire status
   (`Faulted`/`Unavailable`/`Occupied`, in that priority order) rather than
   collapsing everything to a bare rejection. `CancelReservation` finds the
-  connector by `ReservationId` and frees it. Still missing: expiry (no timer
-  infrastructure exists to drive a reservation back to `Available` on its
-  own - see `docs/ROADMAP.md` §0's note on `ChargePointRuntime`'s lack of a
-  scheduling hook, same gap blocking clock-aligned meter sampling in §10),
+  connector by `ReservationId` and frees it.
+
+  Expiry works: `reservation::run_reservation_expiry` sweeps on an
+  `Executor`/`Backoff`-driven interval and releases a reservation past its
+  `expiryDateTime`, skipping the sweep entirely while the clock is
+  unsynchronized - a charge point that does not know the time cannot know a
+  reservation lapsed, and holding a connector too long is recoverable where
+  releasing a valid reservation is not. The CSMS is told over
+  `ReservationStatusUpdate` (2.x; 1.6J has no such message), as it is when the
+  charge point *removes* a reservation because the connector faulted or was
+  made unavailable. A cancellation the CSMS sent, and a cable arriving to
+  honour the reservation, are deliberately not reported.
+
+  Still missing: 2.1's `NoTransaction` status (needs a timer from the moment
+  the cable arrives, for a duration OCPP does not name),
   `groupIdToken` (not modeled, same gap as §3), `connectorType` filtering
   (hardware doesn't expose connector type yet), and matching the presented
   `id_token` against the reservation's on cable connection - the CSMS's own

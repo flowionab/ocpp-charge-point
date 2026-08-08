@@ -40,8 +40,8 @@ pub use self::device_model::{
 pub use self::event::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent,
     ConnectorStatusChanged, EvseEvent, HardwareCommand, RecoveredDeviceModelAttribute,
-    RecoveredReservation, RecoveredTransaction, TransactionEventKind, TransactionEventOccurred,
-    TransactionUpdateReason,
+    RecoveredReservation, RecoveredTransaction, ReservationEndReason, ReservationUpdate,
+    TransactionEventKind, TransactionEventOccurred, TransactionUpdateReason,
 };
 pub use self::evse_state::{EvseState, EvseStatus};
 pub use self::id_token::{IdToken, IdTokenKind};

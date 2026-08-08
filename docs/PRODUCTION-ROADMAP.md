@@ -742,8 +742,35 @@ is 🔒 on [D1](#61-d1--missing-action-wrappers).
 
 ### B8 — Reservation, DER/V2X, battery swap
 
-- [ ] **B8.1** `ReservationStatusUpdate` (2.x) — the only gap in an
-      otherwise complete reservation block.
+- [x] **B8.1** `ReservationStatusUpdate` (2.x) — the reservation block is now complete.
+
+      Reservations end three ways and only two are reported: the CSMS cancelling one needs no
+      report (it asked), and a cable arriving is the reservation being *honoured* rather than
+      failing. What is left is `Expired` and `Removed` — the latter being the charge point giving
+      up on a connector it can no longer hold, which faulting or being made unavailable is. Both
+      come out of `apply_connector_event`, where the reason a reservation slot was cleared is
+      still known, as a `ChargePointEffect::ReservationEnded` on its own broadcast channel.
+
+      **The expiry sweep came with it**, and had to: `Reservation`'s own docs recorded that a
+      reservation only ended on cancellation or a cable, so an expiry the CSMS was counting on
+      never happened and the connector stayed held indefinitely. `run_reservation_expiry` closes
+      that. It **skips entirely while the clock is unsynchronized**
+      (`clock::is_synchronized`) — a charge point that does not know the time cannot know a
+      reservation lapsed, and holding a connector too long is recoverable where releasing a valid
+      reservation is not. Relying on an unset RTC reading near the epoch to make nothing expire
+      would be relying on which way a broken clock happens to be broken.
+
+      A failed report is logged and dropped rather than queued, deliberately: delivered after an
+      outage it would tell the CSMS about a reservation that lapsed an unknown time ago, on a
+      connector whose real state the CSMS has since re-learned from the queued, ordered
+      `StatusNotification` behind it.
+
+      **Not done:** 2.1's third status, `NoTransaction` (the reservation was honoured but no
+      transaction followed). Knowing it needs a timer running from the moment the cable arrives,
+      and OCPP names no duration for it — so nothing maps to it rather than something being
+      stretched to fit. 1.6J has no `ReservationStatusUpdate` at all, so a 1.6J CSMS learns a
+      reservation ended only from the connector's `StatusNotification`; that is a version
+      difference, not a gap here.
 - [ ] **B8.2** DER control (2.1): `ClearDERControl`, `ReportDERControl`,
       `NotifyDERAlarm`, `NotifyDERStartStop`, `AFRRSignal`, plus
       `GetDERControl`/`SetDERControl` (🔒 [D1](#61-d1--missing-action-wrappers)). Feature-flagged; needs bidirectional
@@ -1218,15 +1245,12 @@ mid-transaction currently loses the transaction.
       The expired-reservation decision: a reservation whose `expires_at` had already passed while
       the charge point was off is **not** resurrected as active. `restore_reservations` drops it,
       logs a warning, and never raises
-      `ChargePointEvent::PersistedReservationsRestored` for it at all. This crate still has no
-      *live* expiry sweep (a reservation still only ends via `CancelReservation` or being
-      superseded by a cable connection while the process runs) — a reservation created and
-      expiring within a single boot does not expire on its own yet. A periodic sweep task shaped
-      like `provisioning::run_heartbeat` (driving a new `ChargePointEvent` through the actor on an
-      `Executor`/`Backoff`-driven interval) is the natural next step, but needs a new event variant
-      on `ChargePointEvent`/`ChargePointState` — tracked as follow-up, not done in this slice. Note
-      also that reporting an expiry to the CSMS would go over OCPP's `ReservationStatusUpdate`
-      message, which is separately not wired at all (see B8.1). Restoring an expired reservation
+      `ChargePointEvent::PersistedReservationsRestored` for it at all. The *live* expiry sweep that
+      was recorded here as missing landed with
+      [B8.1](#b8--reservation-derv2x-battery-swap): `reservation::run_reservation_expiry` releases
+      a lapsed reservation on an `Executor`/`Backoff`-driven interval and the CSMS is told over
+      `ReservationStatusUpdate`, so a reservation created and expiring within a single boot now
+      ends on its own. Restoring an expired reservation
       anyway would leave the connector wrongly `Reserved` with nothing left to ever clear it. The
       check
       itself only fires when the supplied `Clock` looks synchronized
@@ -2264,13 +2288,13 @@ StopTransaction, TriggerMessage, UnlockConnector
 **Missing:** DiagnosticsStatusNotification,
 FirmwareStatusNotification, GetDiagnostics, UpdateFirmware
 
-### A.2 OCPP 2.0.1 — 30 of 63 wired
+### A.2 OCPP 2.0.1 — 31 of 63 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
 GetReport, GetVariables, Heartbeat, NotifyReport, ReportChargingProfiles,
-RequestStartTransaction,
+ReservationStatusUpdate, RequestStartTransaction,
 MeterValues, RequestStopTransaction, ReserveNow, Reset, SendLocalList,
 SetChargingProfile, SetNetworkProfile, SetVariables, StatusNotification,
 TransactionEvent, TriggerMessage, UnlockConnector
@@ -2284,8 +2308,7 @@ GetLog, GetMonitoringReport, GetTransactionStatus, InstallCertificate,
 LogStatusNotification, NotifyChargingLimit,
 NotifyCustomerInformation, NotifyDisplayMessages, NotifyEVChargingNeeds,
 NotifyEVChargingSchedule, NotifyEvent, NotifyMonitoringReport,
-PublishFirmware, PublishFirmwareStatusNotification,
-ReservationStatusUpdate, SetDisplayMessage,
+PublishFirmware, PublishFirmwareStatusNotification, SetDisplayMessage,
 SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 
@@ -2293,13 +2316,13 @@ SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 `ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
 [D1](#61-d1--missing-action-wrappers).
 
-### A.3 OCPP 2.1 — 31 of 86 wired
+### A.3 OCPP 2.1 — 32 of 86 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
 GetReport, GetVariables, Heartbeat, NotifyReport, ReportChargingProfiles,
-RequestStartTransaction,
+ReservationStatusUpdate, RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
 MeterValues, SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
 StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
@@ -2320,7 +2343,7 @@ NotifyMonitoringReport, NotifyPeriodicEventStream, NotifyPriorityCharging,
 NotifySettlement, NotifyWebPaymentStarted, OpenPeriodicEventStream,
 PublishFirmware, PublishFirmwareStatusNotification,
 PullDynamicScheduleUpdate, ReportDERControl,
-RequestBatterySwap, ReservationStatusUpdate,
+RequestBatterySwap,
 SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware,
 UsePriorityCharging, VatNumberValidation
@@ -2342,5 +2365,5 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 784 | `#[test]` + `#[tokio::test]`, re-counted at the B2.7 commit (769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 792 | `#[test]` + `#[tokio::test]`, re-counted at the B8.1 commit (784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

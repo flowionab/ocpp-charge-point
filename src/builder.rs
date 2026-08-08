@@ -1326,6 +1326,43 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers `ReservationStatusUpdate` reporting and the expiry sweep that produces most of
+    /// it (`docs/PRODUCTION-ROADMAP.md` B8.1).
+    ///
+    /// Two things, because neither is useful alone: a reservation that expires with nobody
+    /// telling the CSMS is a silent divergence, and a report loop with no expiry to report has
+    /// almost nothing to say. `interval_secs` is how often expiry is checked - a minute is ample,
+    /// since reservation windows are quarter-hours.
+    ///
+    /// **2.x only** - 1.6J has no `ReservationStatusUpdate`, so it is registered separately from
+    /// [`Self::reservation`] rather than folded into its bounds.
+    #[cfg(feature = "reservation")]
+    pub fn reservation_status_updates<N, K, B>(
+        self,
+        csms: &N,
+        clock: K,
+        backoff: B,
+        interval_secs: u32,
+    ) -> Self
+    where
+        N: crate::reservation::ReservationStatusNotifier + Clone + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+    {
+        let updates = self.runtime.actor().subscribe_reservation_updates();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::reservation::run_reservation_status_updates(updates, &notifier).await;
+        }));
+
+        let actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            crate::reservation::run_reservation_expiry(&actor, &clock, &backoff, interval_secs)
+                .await;
+        }));
+        self
+    }
+
     /// Registers the Reset functional block: the Reset handler feeds into the runtime's actor.
     pub async fn reset<N>(self, csms: &N) -> Self
     where

@@ -1,7 +1,8 @@
 use crate::executor::Executor;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
-    ConnectorStatusChanged, HardwareCommand, ResetKind, SecurityEvent, TransactionEventOccurred,
+    ConnectorStatusChanged, HardwareCommand, ReservationUpdate, ResetKind, SecurityEvent,
+    TransactionEventOccurred,
 };
 use crate::sync::{
     BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
@@ -36,6 +37,7 @@ struct EffectSenders {
     transaction_events: BroadcastSender<TransactionEventOccurred>,
     authorization_requests: BroadcastSender<AuthorizationRequested>,
     security_events: BroadcastSender<SecurityEvent>,
+    reservation_updates: BroadcastSender<ReservationUpdate>,
 }
 
 /// An error sending an event to a [`ChargePointActor`].
@@ -62,6 +64,7 @@ pub struct ChargePointActor {
     transaction_events: BroadcastSender<TransactionEventOccurred>,
     authorization_requests: BroadcastSender<AuthorizationRequested>,
     security_events: BroadcastSender<SecurityEvent>,
+    reservation_updates: BroadcastSender<ReservationUpdate>,
     // A plain shared cell rather than a `Watch` - this is a settable-once, read-many hook, not a
     // stream of values anything needs to await a *change* in. See `set_boot_reason_recorder`'s
     // docs for what it's for and why `crate::reset::handle_reset` needs a synchronous way to
@@ -104,12 +107,14 @@ impl ChargePointActor {
         let transaction_events = broadcast_channel();
         let authorization_requests = broadcast_channel();
         let security_events = broadcast_channel();
+        let reservation_updates = broadcast_channel();
         let effects = EffectSenders {
             commands: commands.clone(),
             status_notifications: status_notifications.clone(),
             transaction_events: transaction_events.clone(),
             authorization_requests: authorization_requests.clone(),
             security_events: security_events.clone(),
+            reservation_updates: reservation_updates.clone(),
         };
         executor.spawn(Box::pin(run(state, mailbox.clone(), updates, effects)));
 
@@ -121,6 +126,7 @@ impl ChargePointActor {
             transaction_events,
             authorization_requests,
             security_events,
+            reservation_updates,
             boot_reason_recorder: Arc::new(BlockingMutex::new(RefCell::new(None))),
         }
     }
@@ -190,6 +196,13 @@ impl ChargePointActor {
         self.security_events.subscribe()
     }
 
+    /// Subscribes to reservations that ended without the CSMS asking - reported to it as
+    /// ReservationStatusUpdate by the Reservation functional block (see
+    /// [`crate::reservation::run_reservation_status_updates`]).
+    pub fn subscribe_reservation_updates(&self) -> BroadcastReceiver<ReservationUpdate> {
+        self.reservation_updates.subscribe()
+    }
+
     /// Installs `recorder`, called by [`crate::reset::handle_reset`] with the accepted `Reset`'s
     /// `ResetKind` synchronously *before* the `ResetRequested` event that may immediately produce
     /// a `HardwareCommand::Reboot` is sent to this actor - so a durable-storage-backed `recorder`
@@ -251,6 +264,9 @@ async fn run(
                 }
                 ChargePointEffect::AuthorizationRequested(requested) => {
                     effects.authorization_requests.send(requested);
+                }
+                ChargePointEffect::ReservationEnded(update) => {
+                    effects.reservation_updates.send(update);
                 }
                 ChargePointEffect::SecurityEventOccurred(event) => {
                     effects.security_events.send(event);

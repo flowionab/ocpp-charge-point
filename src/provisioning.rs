@@ -1161,6 +1161,18 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::reservation::ReservationStatusNotifier for FixedBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_reservation_status(
+            &self,
+            _update: crate::state::ReservationUpdate,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::smart_charging::GetChargingProfilesHandler for FixedBootNotifier {
         async fn register_get_charging_profiles_handler(
             &self,

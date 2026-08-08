@@ -93,6 +93,9 @@ impl ConnectorState {
             }
             (Self::Available, ConnectorEvent::Reserved(_)) => (Self::Reserved, None),
             (Self::Reserved, ConnectorEvent::ReservationCancelled) => (Self::Available, None),
+            // Expiry frees the connector exactly like a cancellation does; the two differ only in
+            // what the CSMS is told afterwards - see `ReservationEndReason`.
+            (Self::Reserved, ConnectorEvent::ReservationExpired) => (Self::Available, None),
             (Self::Connected, ConnectorEvent::LockConfirmed) => (Self::Locked, None),
             (Self::Locked, ConnectorEvent::IdTokenPresented(_)) => (Self::Authorizing, None),
             (Self::Locked, ConnectorEvent::RemoteUnlockRequested) => {

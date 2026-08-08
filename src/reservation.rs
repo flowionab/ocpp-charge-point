@@ -1,10 +1,20 @@
-//! Reservation functional block: CSMS-initiated `ReserveNow`/`CancelReservation`. See
-//! `docs/ROADMAP.md` §8.
+//! Reservation functional block: CSMS-initiated `ReserveNow`/`CancelReservation`, plus the
+//! charge point's own `ReservationStatusUpdate` when a reservation ends without being asked to.
+//! See `docs/ROADMAP.md` §8 and `docs/PRODUCTION-ROADMAP.md` B8.1.
+//!
+//! # Reservations end three ways
+//!
+//! The CSMS cancels one, a cable arrives and honours it, or it ends on its own - expired, or
+//! removed because the connector faulted or was made unavailable. Only the last pair is reported:
+//! the CSMS already knows about a cancellation it sent, and a cable arriving is the reservation
+//! doing its job. [`run_reservation_expiry`] is what makes expiry happen at all; without it a
+//! reservation the CSMS expects to lapse would hold its connector forever.
 
 use crate::actor::ChargePointActor;
+use crate::clock::Clock;
 use crate::state::{
     ChargePointEvent, ChargePointState, ConnectorEvent, ConnectorState, EvseEvent, IdToken,
-    Reservation, ReservationId,
+    Reservation, ReservationId, ReservationUpdate,
 };
 use alloc::boxed::Box;
 use chrono::{DateTime, Utc};
@@ -235,11 +245,124 @@ pub trait CancelReservationHandler {
     async fn register_cancel_reservation_handler(&self, actor: ChargePointActor);
 }
 
+/// Reports a reservation that ended without the CSMS asking, via OCPP `ReservationStatusUpdate`.
+///
+/// 2.x only - 1.6J has no such message, so a 1.6J CSMS learns a reservation ended only from the
+/// connector's `StatusNotification` going back to `Available`. That is a real difference between
+/// the versions rather than a gap in this crate.
+#[async_trait::async_trait]
+pub trait ReservationStatusNotifier {
+    /// What went wrong reporting the update.
+    type Error: core::fmt::Display;
+
+    /// Reports that `update.id` ended for `update.reason`.
+    async fn notify_reservation_status(&self, update: ReservationUpdate)
+    -> Result<(), Self::Error>;
+}
+
+#[async_trait::async_trait]
+impl<T: ReservationStatusNotifier + Send + Sync + ?Sized> ReservationStatusNotifier
+    for alloc::sync::Arc<T>
+{
+    type Error = T::Error;
+
+    async fn notify_reservation_status(
+        &self,
+        update: ReservationUpdate,
+    ) -> Result<(), Self::Error> {
+        (**self).notify_reservation_status(update).await
+    }
+}
+
+/// Forwards every reservation that ended on its own to the CSMS, until the actor stops.
+///
+/// A failed send is logged and dropped rather than queued. That is deliberate and worth stating:
+/// a `ReservationStatusUpdate` delivered after an outage tells the CSMS about a reservation that
+/// expired an unknown time ago, on a connector whose real state the CSMS has since re-learned
+/// from `StatusNotification` - which is queued, ordered, and authoritative. Replaying stale
+/// reservation news behind it would be worse than silence.
+pub async fn run_reservation_status_updates<N: ReservationStatusNotifier>(
+    mut updates: crate::sync::BroadcastReceiver<ReservationUpdate>,
+    csms: &N,
+) {
+    while let Ok(update) = updates.recv().await {
+        if let Err(err) = csms.notify_reservation_status(update).await {
+            tracing::warn!(
+                error = %err,
+                reservation_id = update.id.0,
+                "failed to report a reservation status update"
+            );
+        }
+    }
+}
+
+/// Releases reservations whose `expiryDateTime` has passed, every `interval_secs`.
+///
+/// Without this a reservation only ends when the CSMS cancels it or a cable arrives, so an
+/// expiry the CSMS is counting on never happens and the connector stays held indefinitely - see
+/// [`crate::state::Reservation`], which described exactly this gap.
+///
+/// **Skipped entirely while the clock is unsynchronized** (see [`crate::clock::is_synchronized`]).
+/// An unsynchronized reading is typically near the epoch, which would make every future
+/// `expiryDateTime` look distant and expire nothing - but relying on that would be relying on
+/// which way a broken clock happens to be broken. A charge point that does not know the time
+/// cannot know a reservation has expired, and holding a connector too long is recoverable where
+/// releasing one that is still valid is not.
+pub async fn run_reservation_expiry<C: Clock, B: crate::provisioning::Backoff>(
+    actor: &ChargePointActor,
+    clock: &C,
+    backoff: &B,
+    interval_secs: u32,
+) {
+    loop {
+        backoff.wait(interval_secs.max(1)).await;
+        let now = clock.now();
+        if !crate::clock::is_synchronized(&now) {
+            tracing::debug!("skipping the reservation expiry sweep: the clock is not synchronized");
+            continue;
+        }
+        for (evse_id, connector_id) in expired_reservations(&actor.state(), now) {
+            tracing::info!(evse_id, connector_id, "releasing an expired reservation");
+            let _ = actor
+                .send(ChargePointEvent::Evse {
+                    evse_id,
+                    event: EvseEvent::Connector {
+                        connector_id,
+                        event: ConnectorEvent::ReservationExpired,
+                    },
+                })
+                .await;
+        }
+    }
+}
+
+/// Every reserved connector whose reservation has an `expires_at` at or before `now`.
+///
+/// A reservation with no `expires_at` never expires, per [`crate::state::Reservation`]'s docs -
+/// an unparseable `expiryDateTime` must not become "expires immediately".
+fn expired_reservations(
+    state: &crate::state::ChargePointState,
+    now: DateTime<Utc>,
+) -> alloc::vec::Vec<(usize, usize)> {
+    let mut expired = alloc::vec::Vec::new();
+    for (evse_id, evse) in state.evses.iter().enumerate() {
+        for (connector_id, reservation) in evse.reservations.iter().enumerate() {
+            if let Some(reservation) = reservation
+                && reservation.expires_at.is_some_and(|expiry| expiry <= now)
+            {
+                expired.push((evse_id, connector_id));
+            }
+        }
+    }
+    expired
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelReservationOutcome, ReserveNowOutcome, handle_cancel_reservation, handle_reserve_now,
-        parse_expiry_date_time,
+        CancelReservationOutcome, ReservationStatusNotifier, ReserveNowOutcome,
+        expired_reservations, handle_cancel_reservation, handle_reserve_now,
+        parse_expiry_date_time, run_reservation_expiry, run_reservation_status_updates,
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
@@ -283,6 +406,186 @@ mod tests {
             .await
             .unwrap();
         actor
+    }
+
+    /// A [`crate::clock::Clock`] fixed at a caller-chosen instant, so expiry can be tested
+    /// without waiting for one.
+    #[derive(Clone)]
+    struct FixedClock(chrono::DateTime<chrono::Utc>);
+
+    impl crate::clock::Clock for FixedClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.0
+        }
+    }
+
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        rfc3339.parse().unwrap()
+    }
+
+    async fn reserve_until(actor: &ChargePointActor, id: i64, expires_at: Option<&str>) {
+        handle_reserve_now(
+            actor,
+            Some(0),
+            ReservationId(id),
+            test_id_token(),
+            expires_at.map(at),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn only_a_reservation_past_its_expiry_is_swept() {
+        let actor = spawn_with_reservation([2]).await;
+        reserve_until(&actor, 1, Some("2030-01-01T00:00:00Z")).await;
+
+        let state = actor.state();
+        assert!(
+            expired_reservations(&state, at("2029-12-31T23:59:59Z")).is_empty(),
+            "a second before expiry is not expired"
+        );
+        assert_eq!(
+            expired_reservations(&state, at("2030-01-01T00:00:00Z")),
+            alloc::vec![(0, 0)],
+            "OCPP's expiryDateTime is the instant it lapses, not the last valid one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reservation_with_no_expiry_is_never_swept() {
+        let actor = spawn_with_reservation([1]).await;
+        reserve_until(&actor, 1, None).await;
+
+        // An unparseable expiryDateTime becomes `None`, and must not turn into "expires now" -
+        // that would let one malformed request cancel a reservation the driver is relying on.
+        assert!(expired_reservations(&actor.state(), at("2999-01-01T00:00:00Z")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_sweep_frees_an_expired_connector_and_reports_it() {
+        let actor = spawn_with_reservation([1]).await;
+        reserve_until(&actor, 7, Some("2020-01-01T00:00:00Z")).await;
+
+        let mut updates = actor.subscribe_reservation_updates();
+        let sweeping = {
+            let actor = actor.clone();
+            tokio::spawn(async move {
+                run_reservation_expiry(
+                    &actor,
+                    &FixedClock(at("2030-01-01T00:00:00Z")),
+                    &crate::provisioning::TokioBackoff,
+                    1,
+                )
+                .await;
+            })
+        };
+
+        let update = tokio::time::timeout(core::time::Duration::from_secs(5), updates.recv())
+            .await
+            .expect("the sweep never reported anything")
+            .unwrap();
+        assert_eq!(update.id, ReservationId(7));
+        assert_eq!(update.reason, crate::state::ReservationEndReason::Expired);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Available
+        );
+        sweeping.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unsynchronized_clock_expires_nothing() {
+        let actor = spawn_with_reservation([1]).await;
+        // Expiry *before* the unsynchronized reading below, so the sweep would release it if the
+        // guard were not there. Testing this with an epoch reading and a 2020 expiry would prove
+        // nothing: the comparison fails on its own, which is exactly the "relying on which way a
+        // broken clock is broken" the guard exists to avoid.
+        reserve_until(&actor, 7, Some("2005-01-01T00:00:00Z")).await;
+
+        let sweeping = {
+            let actor = actor.clone();
+            tokio::spawn(async move {
+                // Before `clock::unsynchronized_before`, so this reading is not to be trusted -
+                // a charge point that does not know the time cannot know a reservation lapsed.
+                run_reservation_expiry(
+                    &actor,
+                    &FixedClock(at("2010-01-01T00:00:00Z")),
+                    &crate::provisioning::TokioBackoff,
+                    1,
+                )
+                .await;
+            })
+        };
+        tokio::time::sleep(core::time::Duration::from_millis(1_500)).await;
+
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Reserved
+        );
+        sweeping.abort();
+    }
+
+    struct RecordingNotifier {
+        updates:
+            alloc::sync::Arc<std::sync::Mutex<alloc::vec::Vec<crate::state::ReservationUpdate>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReservationStatusNotifier for RecordingNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_reservation_status(
+            &self,
+            update: crate::state::ReservationUpdate,
+        ) -> Result<(), Self::Error> {
+            self.updates.lock().unwrap().push(update);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn every_reported_end_reaches_the_csms_but_a_cancellation_does_not() {
+        let actor = spawn_with_reservation([2]).await;
+        let recorded = alloc::sync::Arc::new(std::sync::Mutex::new(alloc::vec::Vec::new()));
+        let notifier = RecordingNotifier {
+            updates: recorded.clone(),
+        };
+        let updates = actor.subscribe_reservation_updates();
+        let forwarding = tokio::spawn(async move {
+            run_reservation_status_updates(updates, &notifier).await;
+        });
+
+        reserve_until(&actor, 1, None).await;
+        handle_cancel_reservation(&actor, ReservationId(1)).await;
+        reserve_until(&actor, 2, None).await;
+        let _ = actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::FaultDetected,
+                },
+            })
+            .await;
+
+        for _ in 0..50 {
+            if !recorded.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "only the fault should have been reported"
+        );
+        assert_eq!(recorded[0].id, ReservationId(2));
+        assert_eq!(
+            recorded[0].reason,
+            crate::state::ReservationEndReason::Removed
+        );
+        forwarding.abort();
     }
 
     #[tokio::test]
@@ -475,17 +778,22 @@ mod tests {
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
     use super::{
-        CancelReservationHandler, CancelReservationOutcome, ReserveNowHandler, ReserveNowOutcome,
-        handle_cancel_reservation, handle_reserve_now,
+        CancelReservationHandler, CancelReservationOutcome, ReservationStatusNotifier,
+        ReserveNowHandler, ReserveNowOutcome, handle_cancel_reservation, handle_reserve_now,
     };
     use crate::actor::ChargePointActor;
-    use crate::state::{IdToken, IdTokenKind, ReservationId};
+    use crate::state::{
+        IdToken, IdTokenKind, ReservationEndReason, ReservationId, ReservationUpdate,
+    };
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{CancelReservationStatusEnum, ReserveNowStatusEnum};
+    use ocpp_client::ocpp_types::v21::common::{
+        CancelReservationStatusEnum, ReservationUpdateStatusEnum, ReserveNowStatusEnum,
+    };
     use ocpp_client::ocpp_types::v21::{
-        CancelReservationResponse, ReserveNowRequest, ReserveNowResponse,
+        CancelReservationResponse, ReservationStatusUpdateRequest, ReserveNowRequest,
+        ReserveNowResponse,
     };
 
     fn map_id_token_kind(kind: &str) -> IdTokenKind {
@@ -589,6 +897,37 @@ mod ocpp_2_1 {
         }
     }
 
+    /// This crate's end reason onto 2.1's status enum.
+    ///
+    /// 2.1 adds a third value, `NoTransaction` - the reservation was honoured but no transaction
+    /// followed - which this crate never produces: knowing it needs a timer running from the
+    /// moment the cable arrives, and OCPP names no duration for it. Nothing here maps to it
+    /// rather than something being stretched to fit. See `docs/PRODUCTION-ROADMAP.md` B8.1.
+    fn map_end_reason(reason: ReservationEndReason) -> ReservationUpdateStatusEnum {
+        match reason {
+            ReservationEndReason::Expired => ReservationUpdateStatusEnum::Expired,
+            ReservationEndReason::Removed => ReservationUpdateStatusEnum::Removed,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReservationStatusNotifier for OCPP2_1Client {
+        type Error = ocpp_client::ClientError<ocpp_client::ocpp_2_1::OCPP2_1Error>;
+
+        async fn notify_reservation_status(
+            &self,
+            update: ReservationUpdate,
+        ) -> Result<(), Self::Error> {
+            self.send_reservation_status_update(ReservationStatusUpdateRequest {
+                custom_data: None,
+                reservation_id: update.id.0,
+                reservation_update_status: map_end_reason(update.reason),
+            })
+            .await
+            .map(|_| ())
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -684,20 +1023,21 @@ mod ocpp_2_1 {
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
     use super::{
-        CancelReservationHandler, CancelReservationOutcome, ReserveNowHandler, ReserveNowOutcome,
-        handle_cancel_reservation, handle_reserve_now,
+        CancelReservationHandler, CancelReservationOutcome, ReservationStatusNotifier,
+        ReserveNowHandler, ReserveNowOutcome, handle_cancel_reservation, handle_reserve_now,
     };
     use crate::actor::ChargePointActor;
     use crate::remote_control::ocpp_2_0_1::map_id_token_kind;
-    use crate::state::{IdToken, ReservationId};
+    use crate::state::{IdToken, ReservationEndReason, ReservationId, ReservationUpdate};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
     use ocpp_client::ocpp_types::v201::common::{
-        CancelReservationStatusEnum, ReserveNowStatusEnum,
+        CancelReservationStatusEnum, ReservationUpdateStatusEnum, ReserveNowStatusEnum,
     };
     use ocpp_client::ocpp_types::v201::{
-        CancelReservationResponse, ReserveNowRequest, ReserveNowResponse,
+        CancelReservationResponse, ReservationStatusUpdateRequest, ReserveNowRequest,
+        ReserveNowResponse,
     };
 
     fn map_id_token(id_token: &ocpp_client::ocpp_types::v201::common::IdToken) -> IdToken {
@@ -780,6 +1120,33 @@ mod ocpp_2_0_1 {
                 }
             })
             .await;
+        }
+    }
+
+    /// This crate's end reason onto 2.0.1's status enum. 2.0.1 has only these two - it is 2.1
+    /// that added `NoTransaction` - so nothing is lost here.
+    fn map_end_reason(reason: ReservationEndReason) -> ReservationUpdateStatusEnum {
+        match reason {
+            ReservationEndReason::Expired => ReservationUpdateStatusEnum::Expired,
+            ReservationEndReason::Removed => ReservationUpdateStatusEnum::Removed,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReservationStatusNotifier for OCPP2_0_1Client {
+        type Error = ocpp_client::ClientError<ocpp_client::ocpp_2_0_1::OCPP2_0_1Error>;
+
+        async fn notify_reservation_status(
+            &self,
+            update: ReservationUpdate,
+        ) -> Result<(), Self::Error> {
+            self.send_reservation_status_update(ReservationStatusUpdateRequest {
+                custom_data: None,
+                reservation_id: update.id.0,
+                reservation_update_status: map_end_reason(update.reason),
+            })
+            .await
+            .map(|_| ())
         }
     }
 

@@ -9,10 +9,10 @@ use crate::state::{
     ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent, ConnectorState,
     ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
     IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, NetworkProfileStore,
-    PendingReset, RegistrationStatus, ResetKind, ResetTarget, SecurityEvent, SecurityEventType,
-    StateLimits, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
-    TransactionEventOccurred, TransactionId, TransactionUpdateReason, Variable,
-    VariableAttributeType,
+    PendingReset, RegistrationStatus, ReservationEndReason, ReservationUpdate, ResetKind,
+    ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
+    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
+    TransactionUpdateReason, Variable, VariableAttributeType,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -510,14 +510,39 @@ impl ChargePointState {
             ConnectorEvent::CurrentLimitConfirmed(limit_ma) => Some(*limit_ma),
             _ => None,
         };
+        // Captured before `apply` consumes the event; only these two are distinguishable here,
+        // and only they change what the CSMS is told.
+        let was_cancelled = matches!(event, ConnectorEvent::ReservationCancelled);
+        let was_expired = matches!(event, ConnectorEvent::ReservationExpired);
         let transition = connector.apply(event);
         let new_state = *connector;
+        let mut reservation_ended = None;
         if let Some(slot) = evse.reservations.get_mut(connector_id) {
             if new_state == ConnectorState::Reserved {
                 *slot = reservation_made;
             } else if previous_state == ConnectorState::Reserved {
+                // Why it ended decides whether the CSMS hears about it. A cancellation it sent
+                // needs no report, and a cable arriving is the reservation being *honoured* -
+                // reporting either as an end would tell the CSMS its reservation failed when it
+                // did exactly what it was for. What is left is expiry, and the charge point
+                // giving up on a connector it can no longer hold.
+                reservation_ended =
+                    slot.as_ref()
+                        .map(|reservation| reservation.id)
+                        .and_then(|id| {
+                            let reason = match (was_cancelled, was_expired, new_state) {
+                                (true, _, _) => return None,
+                                (_, true, _) => ReservationEndReason::Expired,
+                                (_, _, ConnectorState::Connected) => return None,
+                                _ => ReservationEndReason::Removed,
+                            };
+                            Some(ReservationUpdate { id, reason })
+                        });
                 *slot = None;
             }
+        }
+        if let Some(update) = reservation_ended {
+            effects.push(ChargePointEffect::ReservationEnded(update));
         }
         if let Some(command) = transition.command {
             effects.push(ChargePointEffect::HardwareCommand(match command {
@@ -1750,6 +1775,63 @@ mod tests {
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Locked);
         assert_eq!(state.evses[0].reservations[0], None);
+    }
+
+    #[test]
+    fn an_expired_reservation_frees_the_connector_and_tells_the_csms() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::Reserved(reservation(1)));
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ReservationExpired);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+        assert_eq!(state.evses[0].reservations[0], None);
+        assert!(effects.contains(&ChargePointEffect::ReservationEnded(
+            crate::state::ReservationUpdate {
+                id: crate::state::ReservationId(1),
+                reason: crate::state::ReservationEndReason::Expired,
+            }
+        )));
+    }
+
+    #[test]
+    fn a_reserved_connector_that_faults_reports_the_reservation_removed() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::Reserved(reservation(1)));
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
+
+        // The charge point can no longer honour the reservation, and the CSMS is still holding
+        // this connector for a driver unless it is told otherwise.
+        assert!(effects.contains(&ChargePointEffect::ReservationEnded(
+            crate::state::ReservationUpdate {
+                id: crate::state::ReservationId(1),
+                reason: crate::state::ReservationEndReason::Removed,
+            }
+        )));
+    }
+
+    #[test]
+    fn a_reservation_that_is_honoured_or_cancelled_is_not_reported_as_ended() {
+        let mut honoured = ChargePointState::new([1]);
+        apply_connector_event(&mut honoured, ConnectorEvent::Reserved(reservation(1)));
+        let effects = apply_connector_event(&mut honoured, ConnectorEvent::CableConnected);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::ReservationEnded(_))),
+            "a cable arriving is the reservation doing its job, not failing"
+        );
+
+        let mut cancelled = ChargePointState::new([1]);
+        apply_connector_event(&mut cancelled, ConnectorEvent::Reserved(reservation(1)));
+        let effects = apply_connector_event(&mut cancelled, ConnectorEvent::ReservationCancelled);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::ReservationEnded(_))),
+            "the CSMS asked for this one; reporting it back is noise"
+        );
     }
 
     #[test]

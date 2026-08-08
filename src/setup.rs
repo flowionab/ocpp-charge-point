@@ -74,6 +74,7 @@ where
         + TriggerMessageHandler
         + ReserveNowHandler
         + CancelReservationHandler
+        + crate::reservation::ReservationStatusNotifier
         + ResetHandler
         + SendLocalListHandler
         + GetLocalListVersionHandler
@@ -134,7 +135,12 @@ where
     // other C3 surface (device model, `SupportedFeatureProfiles`, `*Ctrlr.Available`) also reads.
     let capabilities = builder.capabilities();
     if capabilities.reservation {
-        builder = builder.reservation(&csms).await;
+        builder = builder
+            .reservation(&csms)
+            .await
+            // 2.x only - see `ChargePointBuilder::reservation_status_updates`. 60 s between
+            // expiry sweeps against reservation windows measured in quarter-hours.
+            .reservation_status_updates(&csms, clock.clone(), backoff.clone(), 60);
     }
     if capabilities.local_auth_list {
         builder = builder.local_authorization_list(&csms).await;
@@ -365,6 +371,18 @@ mod tests {
     impl crate::reservation::ReserveNowHandler for RecordingCsms {
         async fn register_reserve_now_handler(&self, _actor: crate::actor::ChargePointActor) {
             self.reservation_registered.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reservation::ReservationStatusNotifier for RecordingCsms {
+        type Error = core::convert::Infallible;
+
+        async fn notify_reservation_status(
+            &self,
+            _update: crate::state::ReservationUpdate,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 

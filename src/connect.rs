@@ -285,7 +285,10 @@ where
     // so the CSMS gets `NotImplemented` rather than a handler backed by hardware that can't.
     let capabilities = builder.capabilities();
     if capabilities.reservation {
-        builder = builder.reservation(&client).await;
+        builder = builder
+            .reservation(&client)
+            .await
+            .reservation_status_updates(&client, SystemClock, backoff.clone(), 60);
     }
     if capabilities.local_auth_list {
         builder = builder.local_authorization_list(&client).await;
