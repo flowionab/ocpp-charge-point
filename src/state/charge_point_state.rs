@@ -220,6 +220,11 @@ impl ChargePointState {
                 .authorization_cache
                 .remember(id_token, status, cached_at),
             ChargePointEvent::AuthorizationCacheCleared => self.authorization_cache.clear() > 0,
+            ChargePointEvent::CustomerInformationErased { id_token } => {
+                let cache_changed = self.authorization_cache.forget(&id_token);
+                let list_changed = self.local_authorization_list.forget(&id_token);
+                cache_changed || list_changed
+            }
             ChargePointEvent::PersistedAuthorizationCacheRestored { entries } => {
                 let dropped = self.authorization_cache.replace(entries);
                 if dropped > 0 {
@@ -2701,5 +2706,45 @@ mod tests {
                 .map(|transaction| transaction.id),
             Some(TransactionId(1))
         );
+    }
+
+    /// B5.5 (docs/PRODUCTION-ROADMAP.md B5): `CustomerInformationErased` is the real state
+    /// mutation behind `CustomerInformation`'s `clear` job - it must reach both stores that key
+    /// on an `IdToken`, not just one.
+    #[test]
+    fn customer_information_erased_forgets_the_token_from_both_the_cache_and_the_local_list() {
+        let mut state = ChargePointState::new([1]);
+        let token = test_id_token();
+        state.authorization_cache.remember(
+            token.clone(),
+            crate::state::AuthorizationStatus::Accepted,
+            None,
+        );
+        state.apply(ChargePointEvent::LocalListUpdated {
+            version: 1,
+            entries: alloc::vec![crate::state::LocalListEntry {
+                id_token: token.clone(),
+                status: crate::state::AuthorizationStatus::Accepted,
+            }],
+        });
+
+        let effects = state.apply(ChargePointEvent::CustomerInformationErased {
+            id_token: token.clone(),
+        });
+
+        assert!(state.authorization_cache.entries().is_empty());
+        assert!(state.local_authorization_list.entries.is_empty());
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn customer_information_erased_for_an_unheld_token_reports_no_change() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::CustomerInformationErased {
+            id_token: test_id_token(),
+        });
+
+        assert!(effects.is_empty());
     }
 }

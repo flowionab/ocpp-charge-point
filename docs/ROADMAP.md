@@ -1440,8 +1440,22 @@ Log/diagnostics retrieval for troubleshooting.
   1.6J is genuinely poorer rather than differently named: no log type (so a 1.6J
   CSMS cannot ask for the security log at all), no `requestId` to correlate
   notifications with, and no `AcceptedCanceled`. Still missing here: variable
-  monitoring, monitoring reports, `GetTransactionStatus`, customer information,
-  and 2.1's periodic event streams.
+  monitoring, monitoring reports, `GetTransactionStatus`, and 2.1's periodic
+  event streams.
+
+  **`CustomerInformation`/`NotifyCustomerInformation` (2.x only, B5.5) is also
+  wired end to end**, following the same "answer first, then act" shape as
+  `GetLog`: the response is synchronous and immediate, and the report/erasure
+  it accepted runs as a queued job. Only an `idToken` can actually be resolved
+  against this crate's state - the authorization cache, the local
+  authorization list, and any transaction currently in progress under that
+  identity - so a `customerIdentifier` (this crate keeps no such key) or a
+  `customerCertificate` (no certificate-chain crypto here) is honestly
+  answered `Invalid` rather than pretended at. `clear` erases the cache entry
+  and the local-list entry through a real `ChargePointEvent`, but never a live
+  transaction's identity: the CSMS still needs to bill and reconcile a
+  session in progress, and this crate keeps no separate history to erase from
+  once one ends.
 - Version notes: 1.6J's diagnostics flow maps to 2.x's `GetLog` flow with
   a narrower log-type set.
 

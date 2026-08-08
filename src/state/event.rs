@@ -268,6 +268,18 @@ pub enum ChargePointEvent {
         /// The recovered profiles, in the order they were installed before the restart.
         profiles: Vec<InstalledChargingProfile>,
     },
+    /// The CSMS asked (OCPP `CustomerInformation`, `clear: true`) that everything this charge
+    /// point holds about one customer be erased - see [`crate::customer_information`] and
+    /// `docs/PRODUCTION-ROADMAP.md` B5.5.
+    ///
+    /// Removes any [`AuthorizationCacheEntry`] and any [`LocalListEntry`] keyed on `id_token`.
+    /// Deliberately does **not** touch a transaction still in progress under this token - see
+    /// [`crate::customer_information`]'s docs for why erasing a live transaction's identity is not
+    /// a mutation this crate can honestly perform.
+    CustomerInformationErased {
+        /// The identifier whose held data should be erased.
+        id_token: IdToken,
+    },
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {
         /// The addressed EVSE's index.
