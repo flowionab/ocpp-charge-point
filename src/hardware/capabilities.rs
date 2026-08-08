@@ -402,6 +402,164 @@ pub fn supported_feature_profiles_1_6(capabilities: &Capabilities) -> alloc::str
     profiles
 }
 
+/// Builders for [`Capabilities`], because the struct is `#[non_exhaustive]`.
+///
+/// That attribute is right - adding a capability must not break every integrator - but it also
+/// means external code cannot use struct-expression syntax at all, so before these existed the
+/// only `Capabilities` anyone outside this crate could build was [`Capabilities::default`], which
+/// is all-false. A charge point that genuinely supports reservations had no way to say so. The
+/// crate's own tests never noticed, because in-crate code is exempt from `#[non_exhaustive]`.
+///
+/// ```
+/// use ocpp_charge_point::hardware::Capabilities;
+///
+/// let capabilities = Capabilities::default()
+///     .with_smart_charging(true)
+///     .with_reservation(true);
+/// assert!(capabilities.smart_charging);
+/// ```
+impl Capabilities {
+    /// Sets `max_current_per_connector_amps` - see that field.
+    #[must_use]
+    pub fn with_max_current_per_connector_amps(mut self, amps: Option<u16>) -> Self {
+        self.max_current_per_connector_amps = amps;
+        self
+    }
+
+    /// Sets `iso15118_support` - see that field.
+    #[must_use]
+    pub fn with_iso15118_support(mut self, level: Iso15118SupportLevel) -> Self {
+        self.iso15118_support = level;
+        self
+    }
+
+    /// Sets `has_display` - see that field.
+    #[must_use]
+    pub fn with_has_display(mut self, enabled: bool) -> Self {
+        self.has_display = enabled;
+        self
+    }
+
+    /// Sets `supports_bidirectional_power` - see that field.
+    #[must_use]
+    pub fn with_supports_bidirectional_power(mut self, enabled: bool) -> Self {
+        self.supports_bidirectional_power = enabled;
+        self
+    }
+
+    /// Sets `can_unlock_under_load` - see that field.
+    #[must_use]
+    pub fn with_can_unlock_under_load(mut self, enabled: bool) -> Self {
+        self.can_unlock_under_load = enabled;
+        self
+    }
+
+    /// Sets `has_rtc` - see that field.
+    #[must_use]
+    pub fn with_has_rtc(mut self, enabled: bool) -> Self {
+        self.has_rtc = enabled;
+        self
+    }
+
+    /// Sets `has_persistent_storage` - see that field.
+    #[must_use]
+    pub fn with_has_persistent_storage(mut self, enabled: bool) -> Self {
+        self.has_persistent_storage = enabled;
+        self
+    }
+
+    /// Sets `reservation` - see that field.
+    #[must_use]
+    pub fn with_reservation(mut self, enabled: bool) -> Self {
+        self.reservation = enabled;
+        self
+    }
+
+    /// Sets `local_auth_list` - see that field.
+    #[must_use]
+    pub fn with_local_auth_list(mut self, enabled: bool) -> Self {
+        self.local_auth_list = enabled;
+        self
+    }
+
+    /// Sets `smart_charging` - see that field.
+    #[must_use]
+    pub fn with_smart_charging(mut self, enabled: bool) -> Self {
+        self.smart_charging = enabled;
+        self
+    }
+
+    /// Sets `firmware_management` - see that field.
+    #[must_use]
+    pub fn with_firmware_management(mut self, enabled: bool) -> Self {
+        self.firmware_management = enabled;
+        self
+    }
+
+    /// Sets `diagnostics` - see that field.
+    #[must_use]
+    pub fn with_diagnostics(mut self, enabled: bool) -> Self {
+        self.diagnostics = enabled;
+        self
+    }
+
+    /// Sets `certificate_management` - see that field.
+    #[must_use]
+    pub fn with_certificate_management(mut self, enabled: bool) -> Self {
+        self.certificate_management = enabled;
+        self
+    }
+
+    /// Sets `variable_monitoring` - see that field.
+    #[must_use]
+    pub fn with_variable_monitoring(mut self, enabled: bool) -> Self {
+        self.variable_monitoring = enabled;
+        self
+    }
+
+    /// Sets `tariff_and_cost` - see that field.
+    #[must_use]
+    pub fn with_tariff_and_cost(mut self, enabled: bool) -> Self {
+        self.tariff_and_cost = enabled;
+        self
+    }
+
+    /// Sets `payment` - see that field.
+    #[must_use]
+    pub fn with_payment(mut self, enabled: bool) -> Self {
+        self.payment = enabled;
+        self
+    }
+
+    /// Sets `der_control` - see that field.
+    #[must_use]
+    pub fn with_der_control(mut self, enabled: bool) -> Self {
+        self.der_control = enabled;
+        self
+    }
+
+    /// Sets `battery_swap` - see that field.
+    #[must_use]
+    pub fn with_battery_swap(mut self, enabled: bool) -> Self {
+        self.battery_swap = enabled;
+        self
+    }
+
+    /// Sets `periodic_event_stream` - see that field.
+    #[must_use]
+    pub fn with_periodic_event_stream(mut self, enabled: bool) -> Self {
+        self.periodic_event_stream = enabled;
+        self
+    }
+
+    /// Sets `certificates` - see that field.
+    #[must_use]
+    pub fn with_certificates(mut self, enabled: bool) -> Self {
+        self.certificates = enabled;
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

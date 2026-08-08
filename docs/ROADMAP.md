@@ -1554,6 +1554,25 @@ section asks for, now enforced rather than asserted (G4):
   ordering that makes a fail-safe transition safe - contactor open *before*
   unlock, since releasing a latch while current flows exposes a live pin.
 
+## Examples
+
+Two, deliberately the same charge point seen from opposite ends:
+
+- `examples/embedded_bindings.rs` builds with `--no-default-features` and
+  supplies everything that configuration needs and nothing else does - a
+  `critical-section` backend, an `Executor`, a `Clock` and a `Backoff`. It makes
+  the no_std claim demonstrable rather than asserted, and CI builds it so it
+  cannot rot. It is a host binary, not a bare-metal link; the file says so.
+- `examples/simulated_charge_point.rs` is the std/tokio path an integrator would
+  copy: dial a CSMS, register every block, loop sessions. With no address it runs
+  offline, which is the point worth showing - the state machine is the charge
+  point, and it charges cars whether or not a backend is listening.
+
+Both put the command loop in `ChargePoint::start`, which is where the trait's
+contract puts it, and both print the hardware calls in order - so the fail-safe
+ordering the state machine drives, contactor open before unlock, is visible
+rather than merely tested.
+
 ## Suggested sequencing
 
 The functional blocks above are independent for planning purposes, but in

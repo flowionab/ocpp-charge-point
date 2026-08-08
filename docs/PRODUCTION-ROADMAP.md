@@ -2116,8 +2116,19 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
 - [ ] **G1.1** CI job building `--no-default-features` for a real MCU
       target (`thumbv7em-none-eabihf`), not just `cargo check` on the host.
 - [ ] **G1.2** Every new feature combination stays no_std-clean.
-- [ ] **G1.3** A minimal embedded example, so the claim is demonstrated
-      rather than asserted.
+- [x] **G1.3** A minimal embedded example — [`examples/embedded_bindings.rs`](../examples/embedded_bindings.rs),
+      built by CI with `--no-default-features` so it cannot rot. It supplies all four things the
+      no_std configuration requires and nothing else does: a `critical-section` backend, an
+      `Executor`, a `Clock` and a `Backoff`.
+
+      **What it demonstrates and what it does not**, stated in the file itself: it proves the
+      library and every trait an integrator implements compile and *run* without `std`, and shows
+      exactly what glue that costs. It is not a bare-metal link — it is a host binary whose executor
+      uses host threads. Producing a real one needs a cross toolchain that may not be installed, and
+      an example that only builds on one machine demonstrates less than this one does.
+
+      Its output is the teaching moment: driving a session prints the hardware calls in order, and
+      the fail-safe ordering G4.4 asserts — **contactor open before unlock** — is visible on stdout.
 
 ### 9.2 G2 — Bounded memory
 
@@ -2627,9 +2638,13 @@ what was missing was proof that the pieces work *together* on the wire.
       charge point emitting both would pass.
 - [x] **H2.5** Power-cut recovery — done by [E4.4](#74-e4--recovery)'s sweep
       ([`tests/power_cut_recovery.rs`](../tests/power_cut_recovery.rs)).
-- [ ] **H2.6** A simulated-hardware charge point in `examples/`, usable as an integrator's starting
-      point and as a soak-test subject. Overlaps [G1.3](#91-g1--no_std-across-the-matrix)'s embedded
-      example; do them together.
+- [x] **H2.6** A simulated-hardware charge point —
+      [`examples/simulated_charge_point.rs`](../examples/simulated_charge_point.rs), done together
+      with [G1.3](#91-g1--no_std-across-the-matrix) as planned, since they are the same artifact
+      seen from two ends. It dials a CSMS, registers every block, and loops sessions at a
+      configurable rate so it can be left running for days ([H4.1](#104-h4--longevity)'s soak
+      subject). With no address it runs entirely offline, which is worth showing on its own: a
+      charge point whose backend is unreachable still charges cars.
 
 **One API gap this surfaced.** `connect_and_setup` takes `Option<&[OcppVersion]>`, but the crate
 never re-exported `OcppVersion` — so no caller outside this crate could name the type without
@@ -2940,5 +2955,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 974 | `#[test]` + `#[tokio::test]`, re-counted at the G4 commit (963 after merging the B5.4/E2.11/H1.6 worktrees (942 at B4.2, 920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
-| Integration tests | 11 | `tests/` (`connect_2_1_websocket`, `lifecycle`, `get_charging_profiles`, `memory_budget`, `network_profile_switch`, `power_cut_recovery`), sharing the H2.1 mock CSMS in `tests/common/` |
+| Test functions in `src/` | 974 | `#[test]` + `#[tokio::test]`, re-counted at the G1.3/H2.6 commit (974 at G4/H2, (963 after merging the B5.4/E2.11/H1.6 worktrees (942 at B4.2, 920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Integration tests | 11, plus 2 runnable examples | `tests/` (`connect_2_1_websocket`, `lifecycle`, `get_charging_profiles`, `memory_budget`, `network_profile_switch`, `power_cut_recovery`), sharing the H2.1 mock CSMS in `tests/common/` |

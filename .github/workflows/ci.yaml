@@ -69,6 +69,15 @@ jobs:
         run: cargo hack check --each-feature --no-dev-deps --lib
       - name: True no_std (no default features)
         run: cargo check --no-default-features --lib
+      # G1.3: the no_std claim is only useful if something demonstrates building against it. This
+      # example supplies the critical-section backend, Executor, Clock and Backoff that
+      # --no-default-features requires, so a change that quietly makes those unimplementable fails
+      # here rather than in an integrator's tree.
+      - name: Embedded bindings example builds without default features
+        run: cargo build --example embedded_bindings --no-default-features
+      # H2.6: the integrator-facing example, on the full std/tokio path.
+      - name: Simulated charge point example builds
+        run: cargo build --example simulated_charge_point
       - name: std, no tokio runtime
         run: cargo check --no-default-features --features std,ocpp_1_6,ocpp_2_0_1,ocpp_2_1 --lib
       - name: All features
