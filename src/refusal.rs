@@ -134,6 +134,11 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         capability: |c| c.smart_charging,
         shape: RefusalShape::CallResultStatus,
     },
+    RefusalGate {
+        message: "UsePriorityCharging",
+        capability: |c| c.smart_charging,
+        shape: RefusalShape::CallResultStatus,
+    },
 ];
 
 /// Looks up the [`RefusalGate`] for `message` (by `Action::NAME`), if this crate has one.

@@ -65,7 +65,7 @@ generates for that version:
 |---------|-------|---------------------------|-------------------------|
 | **1.6J** | **19** | 28 | 28 core + security-whitepaper extensions |
 | **2.0.1** | **21** | 63 | 64 (`ocpp-types` has 64 request types) |
-| **2.1** | **22** | 86 | 90+ (`ocpp-types` has 90 request types) |
+| **2.1** | **22** | 91 (0.2.2; the 86 here was 0.2.0) | 90+ (`ocpp-types` has 90 request types) |
 
 Two things this table hides, both good news:
 
@@ -513,9 +513,9 @@ first: without it there is no load management.
 | GetChargingProfiles / ReportChargingProfiles | — | ✅ | ✅ |
 | NotifyChargingLimit / ClearedChargingLimit | — | ⬜ | ⬜ |
 | NotifyEVChargingNeeds / NotifyEVChargingSchedule | — | ⬜ | ⬜ |
-| NotifyPriorityCharging / UsePriorityCharging | — | — | ⬜ |
+| NotifyPriorityCharging / UsePriorityCharging | — | — | ✅ |
 | PullDynamicScheduleUpdate | — | — | ⬜ |
-| UpdateDynamicSchedule | — | — | 🔒 |
+| UpdateDynamicSchedule | — | — | ⬜ |
 | NotifyAllowedEnergyTransfer | — | — | ⬜ |
 
 **B2 tasks:**
@@ -648,12 +648,50 @@ first: without it there is no load management.
       since it was written. And 2.1's generated `ChargingProfile` is **56 KB by value** (see
       [D2.3](#62-d2--type-completeness-audit)), so building one to send is expensive in a way that
       matters on an MCU.
-- [ ] **B2.6** 2.1 dynamic schedule updates and priority charging. Untouched. The model already
-      carries `ChargingProfilePurpose::PriorityCharging` and the 2.1 adapter maps it both ways, so
-      the store and composition are ready; what is missing is the messages
-      (`UsePriorityCharging`, `NotifyPriorityCharging`, `PullDynamicScheduleUpdate`,
-      `UpdateDynamicSchedule`) and the dynamic-schedule fields the 2.1 adapter currently reads
-      past.
+- [ ] **B2.6** 2.1 dynamic schedule updates and priority charging. **Priority charging is done;
+      the dynamic-schedule half is not.**
+
+      **The upstream blocker this row carried was stale.** `UpdateDynamicSchedule` was marked 🔒
+      on [D1](#61-d1--missing-action-wrappers), but the pinned `ocpp-client` is now **0.2.2**, not
+      0.2.0 — it generates **91** OCPP 2.1 actions, including all four that were listed as absent
+      (`UpdateDynamicSchedule`, `SetDisplayMessage`, `GetDERControl`, `SetDERControl`) and 2.0.1's
+      `SecurityEventNotification`. D1.1/D1.2 closed that and the per-row markers were never
+      re-swept. Nothing in B2.6 is blocked upstream; neither is [B6](#b6--display-message-r15) or
+      [B8.2](#b8--reservation-derv2x-battery-swap).
+
+      **Priority charging (done).** `UsePriorityCharging` inbound and `NotifyPriorityCharging`
+      outbound, both 2.1-only, plus the composition gate that makes them mean anything.
+
+      The gate is the part that was a real defect rather than a missing message:
+      `PriorityCharging` profiles applied to *any* running transaction the moment they were
+      installed, because `applies_to_transaction` treated the purpose exactly like `TxDefault`. A
+      priority profile is a **grant**, not another stack level - installing one now changes
+      nothing until the CSMS names a transaction, which `CompositionContext::priority_charging`
+      and `Transaction::priority_charging` carry. The grant lives on the transaction, so it ends
+      with the session rather than leaking into whatever plugs in next, and
+      `#[serde(default)]` makes a session persisted before the field existed recover as
+      *ungranted* - the safe reading, since the CSMS can no longer see a priority it never
+      re-granted.
+
+      Two decisions worth recording. `NoProfile` is kept distinct from `Rejected` because it is
+      the one refusal the CSMS can act on (install a priority profile, then ask again), and
+      **deactivation never answers `NoProfile`**: the profile may have been cleared while the
+      grant stood, and refusing the withdrawal would leave the CSMS believing a transaction still
+      holds a priority it does not. A grant the CSMS *asked* for produces no
+      `NotifyPriorityCharging` - reporting a change back to the peer that requested it is noise -
+      so the effect fires only for `locally_initiated` changes, exactly the split
+      [B8.1](#b8--reservation-derv2x-battery-swap)'s `ReservationEnded` makes.
+
+      Registered from `connect.rs`'s 2.1 path rather than `setup()`, because `setup()` is generic
+      over a CSMS client that may equally be a 2.0.1 one and a 2.1-only bound there would make the
+      whole "everything on" wrapper unusable on 2.0.1 -
+      [`ChargePointBuilder::priority_charging`](../src/builder.rs) is the general entry point.
+
+      **Still open:** `PullDynamicScheduleUpdate` / `UpdateDynamicSchedule`, 2.1's `Dynamic`
+      profile kind (`map_kind` currently folds it into `Relative`), `dynUpdateInterval` /
+      `dynUpdateTime`, and the dynamic period fields the 2.1 adapter reads past (`setpoint`,
+      `dischargeLimit`, `operationMode`, the per-phase `*_L2`/`*_L3` variants). All of them are
+      now ordinary work, not blocked work.
 
 ### B3 — Firmware management (R§12)
 
@@ -721,8 +759,10 @@ first: without it there is no load management.
 ### B6 — Display message (R§15)
 
 `SetDisplayMessage`, `GetDisplayMessages`, `ClearDisplayMessage`,
-`NotifyDisplayMessages` — 2.x only, all ⬜, and `SetDisplayMessage` for 2.1
-is 🔒 on [D1](#61-d1--missing-action-wrappers).
+`NotifyDisplayMessages` — 2.x only, all ⬜. `SetDisplayMessage` for 2.1 was
+marked 🔒 on [D1](#61-d1--missing-action-wrappers); it no longer is. The pinned
+`ocpp-client` 0.2.2 generates it (see [B2.6](#b2--smart-charging-r11) for the
+full re-sweep), so this block is unblocked, just unwritten.
 
 - [ ] **B6.1** Display hardware hook + message store with priority/state.
 - [ ] **B6.2** The four messages, gated on a display capability.
@@ -773,7 +813,8 @@ is 🔒 on [D1](#61-d1--missing-action-wrappers).
       difference, not a gap here.
 - [ ] **B8.2** DER control (2.1): `ClearDERControl`, `ReportDERControl`,
       `NotifyDERAlarm`, `NotifyDERStartStop`, `AFRRSignal`, plus
-      `GetDERControl`/`SetDERControl` (🔒 [D1](#61-d1--missing-action-wrappers)). Feature-flagged; needs bidirectional
+      `GetDERControl`/`SetDERControl` (no longer 🔒 — `ocpp-client` 0.2.2 generates both; see
+      [B2.6](#b2--smart-charging-r11)). Feature-flagged; needs bidirectional
       power hardware.
 - [ ] **B8.3** Battery swap (2.1): `BatterySwap`, `RequestBatterySwap`.
       Feature-flagged; niche hardware.
@@ -2316,16 +2357,17 @@ SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 `ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
 [D1](#61-d1--missing-action-wrappers).
 
-### A.3 OCPP 2.1 — 32 of 86 wired
+### A.3 OCPP 2.1 — 34 of 91 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
-GetReport, GetVariables, Heartbeat, NotifyReport, ReportChargingProfiles,
-ReservationStatusUpdate, RequestStartTransaction,
+GetReport, GetVariables, Heartbeat, NotifyPriorityCharging, NotifyReport,
+ReportChargingProfiles, ReservationStatusUpdate, RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
 MeterValues, SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
-StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
+StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector,
+UsePriorityCharging
 
 **Missing:** AFRRSignal, AdjustPeriodicEventStream, BatterySwap,
 CertificateSigned, ChangeTransactionTariff, ClearDERControl, ClearDisplayMessage, ClearTariffs,
@@ -2339,20 +2381,23 @@ InstallCertificate, LogStatusNotification,
 NotifyAllowedEnergyTransfer, NotifyChargingLimit, NotifyCustomerInformation,
 NotifyDERAlarm, NotifyDERStartStop, NotifyDisplayMessages,
 NotifyEVChargingNeeds, NotifyEVChargingSchedule, NotifyEvent,
-NotifyMonitoringReport, NotifyPeriodicEventStream, NotifyPriorityCharging,
+NotifyMonitoringReport, NotifyPeriodicEventStream,
 NotifySettlement, NotifyWebPaymentStarted, OpenPeriodicEventStream,
 PublishFirmware, PublishFirmwareStatusNotification,
 PullDynamicScheduleUpdate, ReportDERControl,
 RequestBatterySwap,
 SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware,
-UsePriorityCharging, VatNumberValidation
+VatNumberValidation
 
-**Plus** four messages `ocpp-types` defines but `ocpp-client` generates no
-action for: SetDisplayMessage, GetDERControl, SetDERControl,
-UpdateDynamicSchedule — see [D1](#61-d1--missing-action-wrappers).
-(TriggerMessage was on this list; the pinned `ocpp-client` 0.2.1 does generate
-it, for all three versions — re-verified at the B1.3/B1.4 commit.)
+**No message is missing an action wrapper any more.** This list used to name
+four (SetDisplayMessage, GetDERControl, SetDERControl, UpdateDynamicSchedule)
+plus TriggerMessage; the pinned `ocpp-client` is now **0.2.2**, which generates
+**91** OCPP 2.1 actions and includes every one of them. Re-verified by counting
+`ocpp_2_1_action!`/`ocpp_2_1_send_action!` invocations in the pinned registry
+source at the B2.6 commit. The "86 available" figure above and in §2.1 is
+therefore stale in this crate's favour — it should read 91, and the remaining
+gap is entirely this crate's to close.
 
 ### A.4 Other verified figures
 
@@ -2365,5 +2410,5 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 792 | `#[test]` + `#[tokio::test]`, re-counted at the B8.1 commit (784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 803 | `#[test]` + `#[tokio::test]`, re-counted at the B2.6 priority-charging commit (792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

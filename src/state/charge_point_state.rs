@@ -249,6 +249,44 @@ impl ChargePointState {
                     }
                 }
             }
+            ChargePointEvent::PriorityChargingSet {
+                transaction_id,
+                activated,
+                locally_initiated,
+            } => {
+                let granted = self
+                    .evses
+                    .iter_mut()
+                    .flat_map(|evse| evse.transactions.iter_mut())
+                    .flatten()
+                    .find(|transaction| transaction.id == transaction_id)
+                    .map(|transaction| {
+                        set_if_changed(&mut transaction.priority_charging, activated)
+                    });
+                match granted {
+                    Some(changed) => {
+                        if changed && locally_initiated {
+                            effects.push(ChargePointEffect::PriorityChargingChanged(
+                                crate::state::PriorityChargingChange {
+                                    transaction_id,
+                                    activated,
+                                },
+                            ));
+                        }
+                        changed
+                    }
+                    None => {
+                        // The named transaction ended between the request arriving and this being
+                        // applied. Dropped rather than redirected - see the event's own docs.
+                        tracing::warn!(
+                            transaction_id = transaction_id.0,
+                            "ignoring a priority-charging change for a transaction that is no \
+                             longer running"
+                        );
+                        false
+                    }
+                }
+            }
             ChargePointEvent::PersistedChargingProfilesRestored { profiles } => {
                 let mut restored_any = false;
                 let mut refused = 0usize;
@@ -935,6 +973,9 @@ fn advance_transaction(
                 stop_reason: None,
                 seq_no: 0,
                 last_meter_sample: None,
+                // A grant belongs to the transaction that was granted it: a new session starts
+                // without one, whatever the previous session on this connector held.
+                priority_charging: false,
             };
             *slot = Some(transaction.clone());
             Some((TransactionEventKind::Started, transaction))
@@ -1231,6 +1272,7 @@ mod tests {
             stop_reason: None,
             seq_no: 0,
             last_meter_sample: None,
+            priority_charging: false,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -1337,6 +1379,7 @@ mod tests {
             stop_reason: None,
             seq_no: 0,
             last_meter_sample: None,
+            priority_charging: false,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -1370,6 +1413,7 @@ mod tests {
             stop_reason: None,
             seq_no: 1,
             last_meter_sample: None,
+            priority_charging: false,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -1408,6 +1452,7 @@ mod tests {
             stop_reason: None,
             seq_no: 2,
             last_meter_sample: Some(sample),
+            priority_charging: false,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -1543,6 +1588,7 @@ mod tests {
             stop_reason: Some(StopReason::Local),
             seq_no: 2,
             last_meter_sample: None,
+            priority_charging: false,
         };
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
         assert_eq!(state.evses[0].transactions[0], None);
@@ -1575,6 +1621,7 @@ mod tests {
             stop_reason: Some(StopReason::EmergencyStop),
             seq_no: 2,
             last_meter_sample: None,
+            priority_charging: false,
         };
         assert_eq!(state.evses[0].transactions[0], None);
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
@@ -2194,6 +2241,87 @@ mod tests {
     }
 
     #[test]
+    fn priority_charging_is_granted_to_a_named_transaction_and_ends_with_it() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested(test_id_token()),
+        );
+        let running = state.evses[0].transactions[0].as_ref().unwrap().id;
+        assert!(
+            !state.evses[0].transactions[0]
+                .as_ref()
+                .unwrap()
+                .priority_charging
+        );
+
+        let effects = state.apply(ChargePointEvent::PriorityChargingSet {
+            transaction_id: running,
+            activated: true,
+            locally_initiated: false,
+        });
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+        assert!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .unwrap()
+                .priority_charging
+        );
+        // The CSMS asked for this one, so it is not told about it again.
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::PriorityChargingChanged(_)))
+        );
+
+        // Re-granting what is already granted changes nothing, so nothing is re-reported.
+        let effects = state.apply(ChargePointEvent::PriorityChargingSet {
+            transaction_id: running,
+            activated: true,
+            locally_initiated: false,
+        });
+        assert!(!effects.contains(&ChargePointEffect::StateChanged));
+
+        // A grant for a transaction that isn't running is dropped rather than applied to whatever
+        // happens to be on the connector.
+        let effects = state.apply(ChargePointEvent::PriorityChargingSet {
+            transaction_id: TransactionId(999),
+            activated: true,
+            locally_initiated: false,
+        });
+        assert!(!effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn priority_charging_the_charge_point_granted_itself_is_reported_to_the_csms() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested(test_id_token()),
+        );
+        let running = state.evses[0].transactions[0].as_ref().unwrap().id;
+
+        let effects = state.apply(ChargePointEvent::PriorityChargingSet {
+            transaction_id: running,
+            activated: true,
+            locally_initiated: true,
+        });
+
+        assert!(
+            effects.contains(&ChargePointEffect::PriorityChargingChanged(
+                crate::state::PriorityChargingChange {
+                    transaction_id: running,
+                    activated: true,
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn a_profile_the_store_refuses_is_logged_rather_than_applied() {
         use crate::state::ChargingProfileScope;
         let mut state = ChargePointState::new([1]);
@@ -2416,6 +2544,7 @@ mod tests {
                 energy_wh: 4_200,
                 ..Default::default()
             }),
+            priority_charging: false,
         }
     }
 

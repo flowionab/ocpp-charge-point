@@ -169,6 +169,7 @@ fn full_transaction(index: usize) -> Transaction {
             voltage_v: Some(230),
             soc_percent: Some(64),
         }),
+        priority_charging: true,
     }
 }
 

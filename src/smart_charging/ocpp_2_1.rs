@@ -16,12 +16,13 @@ use ocpp_client::ocpp_types::v21::common::{
     ChargingProfile as WireChargingProfile, ChargingProfileKindEnum, ChargingProfilePurposeEnum,
     ChargingProfileStatusEnum, ChargingRateUnitEnum, ChargingSchedule as WireChargingSchedule,
     ClearChargingProfileStatusEnum, CompositeSchedule as WireCompositeSchedule, GenericStatusEnum,
-    GetChargingProfileStatusEnum, RecurrencyKindEnum,
+    GetChargingProfileStatusEnum, PriorityChargingStatusEnum, RecurrencyKindEnum,
 };
 use ocpp_client::ocpp_types::v21::{
     ClearChargingProfileRequest, ClearChargingProfileResponse, GetChargingProfilesRequest,
     GetChargingProfilesResponse, GetCompositeScheduleRequest, GetCompositeScheduleResponse,
-    ReportChargingProfilesRequest, SetChargingProfileRequest, SetChargingProfileResponse,
+    NotifyPriorityChargingRequest, ReportChargingProfilesRequest, SetChargingProfileRequest,
+    SetChargingProfileResponse, UsePriorityChargingRequest, UsePriorityChargingResponse,
 };
 
 use crate::actor::ChargePointActor;
@@ -29,15 +30,16 @@ use crate::clock::Clock;
 use crate::smart_charging::{
     ChargingLimitProjection, ClearChargingProfileHandler, ClearChargingProfileOutcome,
     CompositeSchedule, GetChargingProfilesHandler, GetCompositeScheduleHandler,
-    GetCompositeScheduleOutcome, SetChargingProfileHandler, SetChargingProfileOutcome,
+    GetCompositeScheduleOutcome, PriorityChargingNotifier, SetChargingProfileHandler,
+    SetChargingProfileOutcome, UsePriorityChargingHandler, UsePriorityChargingOutcome,
     chunk_charging_profile_report, handle_clear_charging_profile, handle_get_charging_profiles,
-    handle_get_composite_schedule, handle_set_charging_profile,
+    handle_get_composite_schedule, handle_set_charging_profile, handle_use_priority_charging,
 };
 use crate::state::{
     ChargingLimitSource, ChargingProfile, ChargingProfileCriteria, ChargingProfileId,
     ChargingProfileKind, ChargingProfilePurpose, ChargingProfileQuery, ChargingProfileScope,
     ChargingRateUnit, ChargingSchedule, ChargingSchedulePeriod, InstalledChargingProfile,
-    RecurrencyKind, TransactionId,
+    PriorityChargingChange, RecurrencyKind, TransactionId,
 };
 
 /// 2.1's purpose enum onto this crate's. Every 2.1 value has an internal counterpart, so nothing is
@@ -466,6 +468,14 @@ fn clear_response(status: ClearChargingProfileStatusEnum) -> ClearChargingProfil
     }
 }
 
+fn priority_response(status: PriorityChargingStatusEnum) -> UsePriorityChargingResponse {
+    UsePriorityChargingResponse {
+        custom_data: None,
+        status,
+        status_info: None,
+    }
+}
+
 fn composite_response(
     status: GenericStatusEnum,
     schedule: Option<WireCompositeSchedule>,
@@ -489,6 +499,15 @@ fn wire_clear_status(outcome: ClearChargingProfileOutcome) -> ClearChargingProfi
     match outcome {
         ClearChargingProfileOutcome::Accepted => ClearChargingProfileStatusEnum::Accepted,
         ClearChargingProfileOutcome::Unknown => ClearChargingProfileStatusEnum::Unknown,
+    }
+}
+
+/// 2.1's `UsePriorityCharging` outcome enum onto the wire's.
+fn wire_priority_status(outcome: UsePriorityChargingOutcome) -> PriorityChargingStatusEnum {
+    match outcome {
+        UsePriorityChargingOutcome::Accepted => PriorityChargingStatusEnum::Accepted,
+        UsePriorityChargingOutcome::NoProfile => PriorityChargingStatusEnum::NoProfile,
+        UsePriorityChargingOutcome::Rejected => PriorityChargingStatusEnum::Rejected,
     }
 }
 
@@ -650,6 +669,56 @@ impl<C: Clock + Clone + Send + Sync + 'static> GetCompositeScheduleHandler
     }
 }
 
+#[async_trait::async_trait]
+impl<C: Clock + Clone + Send + Sync + 'static> UsePriorityChargingHandler
+    for Ocpp2_1SmartChargingHandler<C>
+{
+    async fn register_use_priority_charging_handler(&self, actor: ChargePointActor) {
+        self.client
+            .on_use_priority_charging(move |request: UsePriorityChargingRequest, _client| {
+                let actor = actor.clone();
+                async move {
+                    // 2.x transaction ids are free-form strings on the wire while this crate mints
+                    // `u64`s. One that doesn't parse cannot name a transaction running here, which
+                    // is exactly what `Rejected` says - the same reading `map_profile` takes.
+                    let Ok(transaction_id) = request.transaction_id.parse().map(TransactionId)
+                    else {
+                        return Ok(priority_response(PriorityChargingStatusEnum::Rejected));
+                    };
+                    let outcome =
+                        handle_use_priority_charging(&actor, transaction_id, request.activate)
+                            .await;
+                    Ok(priority_response(wire_priority_status(outcome)))
+                }
+            })
+            .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: Clock + Clone + Send + Sync + 'static> PriorityChargingNotifier
+    for Ocpp2_1SmartChargingHandler<C>
+{
+    type Error = ocpp_client::ClientError<ocpp_client::ocpp_2_1::OCPP2_1Error>;
+
+    async fn notify_priority_charging(
+        &self,
+        change: PriorityChargingChange,
+    ) -> Result<(), Self::Error> {
+        self.client
+            .send_notify_priority_charging(NotifyPriorityChargingRequest {
+                activated: change.activated,
+                custom_data: None,
+                // The internal `u64` formatted as decimal, always well within the 36-byte bound -
+                // the same conversion `crate::transactions` makes for `TransactionEvent`.
+                transaction_id: heapless::String::try_from(change.transaction_id.0)
+                    .expect("u64 transaction id always fits in a 36-byte wire field"),
+            })
+            .await
+            .map(|_| ())
+    }
+}
+
 /// The `std` convenience: a bare [`OCPP2_1Client`] handles these messages directly, sourcing its
 /// timestamps from [`crate::clock::SystemClock`], so existing callers that pass a client need no
 /// source change - the same shape `crate::availability`/`crate::transactions` use.
@@ -681,6 +750,29 @@ mod std_impls {
             Ocpp2_1SmartChargingHandler::new(self.clone())
                 .register_get_charging_profiles_handler(actor)
                 .await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UsePriorityChargingHandler for OCPP2_1Client {
+        async fn register_use_priority_charging_handler(&self, actor: ChargePointActor) {
+            Ocpp2_1SmartChargingHandler::new(self.clone())
+                .register_use_priority_charging_handler(actor)
+                .await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PriorityChargingNotifier for OCPP2_1Client {
+        type Error = ocpp_client::ClientError<ocpp_client::ocpp_2_1::OCPP2_1Error>;
+
+        async fn notify_priority_charging(
+            &self,
+            change: PriorityChargingChange,
+        ) -> Result<(), Self::Error> {
+            Ocpp2_1SmartChargingHandler::new(self.clone())
+                .notify_priority_charging(change)
+                .await
         }
     }
 
@@ -1045,5 +1137,23 @@ mod tests {
         // An unknown source is `Other` - so a CSMS filtering on it matches nothing here rather
         // than everything.
         assert_eq!(map_limit_source("Martian"), ChargingLimitSource::Other);
+    }
+
+    #[test]
+    fn every_priority_charging_outcome_has_its_own_wire_status() {
+        assert_eq!(
+            wire_priority_status(UsePriorityChargingOutcome::Accepted),
+            PriorityChargingStatusEnum::Accepted
+        );
+        assert_eq!(
+            wire_priority_status(UsePriorityChargingOutcome::Rejected),
+            PriorityChargingStatusEnum::Rejected
+        );
+        // Not folded into `Rejected`: this is the one refusal the CSMS can act on - install a
+        // priority-charging profile, then ask again.
+        assert_eq!(
+            wire_priority_status(UsePriorityChargingOutcome::NoProfile),
+            PriorityChargingStatusEnum::NoProfile
+        );
     }
 }

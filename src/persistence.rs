@@ -3179,6 +3179,7 @@ mod tests {
                 energy_wh,
                 ..Default::default()
             }),
+            priority_charging: false,
         }
     }
 

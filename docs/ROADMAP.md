@@ -1273,9 +1273,24 @@ Charging profiles and schedule negotiation.
   `GetChargingProfiles`/`ReportChargingProfiles` is wired on 2.0.1 and 2.1
   (1.6J has no such message): the CSMS asks what is installed and the answer
   comes from the store, chunked by scope and source across as many
-  `ReportChargingProfiles` as it takes. Still missing: `NotifyChargingLimit`/
-  `ClearedChargingLimit`, `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`,
-  2.1's dynamic schedule updates and priority-charging messages. The profile
+  `ReportChargingProfiles` as it takes.
+
+  2.1's **priority charging** is wired both ways: `UsePriorityCharging` inbound,
+  `NotifyPriorityCharging` outbound for a grant the charge point made itself.
+  The messages were the smaller half - the gate behind them was a real defect.
+  A `PriorityCharging` profile used to apply the moment it was installed, to
+  whatever transaction happened to be running, because composition treated the
+  purpose exactly like `TxDefaultProfile`. It is a *grant*, not another stack
+  level: `Transaction::priority_charging` now carries it, so a priority profile
+  sits inert until the CSMS names a transaction, and the grant ends with that
+  session rather than leaking into the next driver's.
+
+  Still missing: `NotifyChargingLimit`/`ClearedChargingLimit`,
+  `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`, and 2.1's dynamic
+  schedule updates (`PullDynamicScheduleUpdate`/`UpdateDynamicSchedule`, the
+  `Dynamic` profile kind, and the setpoint/discharge/per-phase period fields
+  the 2.1 adapter reads past). None of those is blocked upstream any more -
+  see `docs/PRODUCTION-ROADMAP.md` B2.6. The profile
   store itself is durable (`persistence::ChargingProfileSnapshotStore`, wired
   via `ChargePointBuilder::charging_profile_persistence`): installed load
   limits survive a power cut and are restored before the projection's first

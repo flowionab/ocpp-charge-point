@@ -153,6 +153,7 @@ pub fn connector_composition_context(
         rate_unit: ChargingRateUnit::Amps,
         duration_secs,
         supply: projection.supply,
+        priority_charging: transaction.is_some_and(|transaction| transaction.priority_charging),
     }
 }
 
@@ -344,6 +345,59 @@ mod tests {
             .await;
         settle().await;
 
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(16_000));
+    }
+
+    #[tokio::test]
+    async fn granting_priority_charging_moves_the_connectors_limit_onto_the_priority_profile() {
+        let actor = Arc::new(ChargePointActor::spawn([1], &TokioExecutor));
+        let projection = Arc::new(ChargingLimitProjection::new());
+
+        let task_actor = actor.clone();
+        let task_projection = projection.clone();
+        tokio::spawn(async move {
+            run_charging_limit_projection(&task_actor, &task_projection, &fixed_clock()).await;
+        });
+
+        start_charging(&actor).await;
+        let transaction = actor.state().evses[0].transactions[0].as_ref().unwrap().id;
+        let _ = actor
+            .send(ChargePointEvent::ChargingProfileSet {
+                scope: ChargingProfileScope::Evse(0),
+                profile: alloc::boxed::Box::new(amp_profile(1, 16.0)),
+            })
+            .await;
+        let mut priority = amp_profile(2, 32.0);
+        priority.purpose = crate::state::ChargingProfilePurpose::PriorityCharging;
+        let _ = actor
+            .send(ChargePointEvent::ChargingProfileSet {
+                scope: ChargingProfileScope::Evse(0),
+                profile: alloc::boxed::Box::new(priority),
+            })
+            .await;
+        settle().await;
+        // Installed, not granted: hardware is still on the transaction default.
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(16_000));
+
+        let _ = actor
+            .send(ChargePointEvent::PriorityChargingSet {
+                transaction_id: transaction,
+                activated: true,
+                locally_initiated: false,
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(32_000));
+
+        // Withdrawing it puts hardware back, without the CSMS having to reinstall anything.
+        let _ = actor
+            .send(ChargePointEvent::PriorityChargingSet {
+                transaction_id: transaction,
+                activated: false,
+                locally_initiated: false,
+            })
+            .await;
+        settle().await;
         assert_eq!(actor.state().evses[0].charging_limits[0], Some(16_000));
     }
 

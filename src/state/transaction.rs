@@ -66,4 +66,19 @@ pub struct Transaction {
     /// The most recent meter reading reported while this transaction was `Charging`, if any -
     /// see the Meter values functional block (`docs/ROADMAP.md` §10).
     pub last_meter_sample: Option<crate::state::MeterSample>,
+    /// Whether priority charging has been granted for this transaction - OCPP 2.1's
+    /// `UsePriorityCharging` (`docs/PRODUCTION-ROADMAP.md` B2.6).
+    ///
+    /// While `true`, any installed
+    /// [`ChargingProfilePurpose::PriorityCharging`](crate::state::ChargingProfilePurpose::PriorityCharging)
+    /// profile applies to this transaction; while `false` those profiles sit inert. The grant
+    /// belongs to the transaction, not the connector, so it ends when the transaction does rather
+    /// than leaking into whatever plugs in next.
+    ///
+    /// Always `false` under 1.6J and 2.0.1: neither version can express the purpose or the
+    /// request. `#[serde(default)]` so a transaction persisted before this field existed recovers
+    /// as ungranted, which is the safe reading - a recovered session should not silently keep a
+    /// priority the CSMS can no longer see it holding.
+    #[serde(default)]
+    pub priority_charging: bool,
 }

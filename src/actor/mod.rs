@@ -160,6 +160,7 @@ mod tests {
                         stop_reason: None,
                         seq_no: 0,
                         last_meter_sample: None,
+                        priority_charging: false,
                     },
                 }),
             ]

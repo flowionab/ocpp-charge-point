@@ -1115,6 +1115,33 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers priority charging (`docs/PRODUCTION-ROADMAP.md` B2.6): inbound
+    /// `UsePriorityCharging`, and the outbound `NotifyPriorityCharging` loop reporting any grant
+    /// the charge point makes on its own.
+    ///
+    /// Separate from [`Self::smart_charging`] because it is **2.1 only** - neither 1.6J nor 2.0.1
+    /// has the messages or the profile purpose behind them - and folding it into that method's
+    /// bounds would make the whole block unregisterable on the older versions.
+    pub async fn priority_charging<N>(self, csms: &N) -> Self
+    where
+        N: crate::smart_charging::UsePriorityChargingHandler
+            + crate::smart_charging::PriorityChargingNotifier
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        csms.register_use_priority_charging_handler(self.runtime.actor())
+            .await;
+
+        let changes = self.runtime.actor().subscribe_priority_charging_changes();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::smart_charging::run_priority_charging_notifications(changes, &notifier).await;
+        }));
+        self
+    }
+
     /// Registers inbound `ClearCache` handling (`docs/ROADMAP.md` §3,
     /// `docs/PRODUCTION-ROADMAP.md` B1.2): a CSMS emptying the authorization cache.
     ///
@@ -3209,6 +3236,7 @@ mod tests {
                         energy_wh: 4_200,
                         ..Default::default()
                     }),
+                    priority_charging: false,
                 },
                 started_at: None,
                 meter_start: None,

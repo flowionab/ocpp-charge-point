@@ -178,6 +178,127 @@ pub fn handle_get_charging_profiles(
         .collect()
 }
 
+/// The outcome of a CSMS-initiated `UsePriorityCharging` (2.1), matching OCPP's
+/// `PriorityChargingStatusEnum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsePriorityChargingOutcome {
+    /// Priority charging was granted (or withdrawn) for the named transaction.
+    Accepted,
+    /// The transaction exists, but no [`ChargingProfilePurpose::PriorityCharging`] profile is
+    /// installed for the EVSE running it, so granting priority would change nothing.
+    ///
+    /// OCPP gives this its own status rather than folding it into `Rejected` because it is the one
+    /// refusal the CSMS can fix: install the profile, then ask again.
+    NoProfile,
+    /// The request could not be honoured - smart charging isn't available, or no transaction with
+    /// that id is running.
+    Rejected,
+}
+
+/// Handles a CSMS-initiated `UsePriorityCharging` against `actor` (2.1 only;
+/// `docs/PRODUCTION-ROADMAP.md` B2.6).
+///
+/// Like every handler here, the outcome is decided against the real state before anything is
+/// dispatched, so the status the CSMS receives is what actually happened.
+///
+/// **Deactivation is never `NoProfile`.** Withdrawing a grant is meaningful whether or not a
+/// priority profile is still installed - the profile may have been cleared while the grant stood -
+/// and answering `NoProfile` would leave the CSMS believing a transaction still holds a priority
+/// it does not.
+pub async fn handle_use_priority_charging(
+    actor: &ChargePointActor,
+    transaction_id: crate::state::TransactionId,
+    activate: bool,
+) -> UsePriorityChargingOutcome {
+    let state = actor.state();
+    if !crate::refusal::capability_present(&state.capabilities, "UsePriorityCharging") {
+        return UsePriorityChargingOutcome::Rejected;
+    }
+    let running = state.evses.iter().enumerate().find_map(|(evse_id, evse)| {
+        evse.transactions
+            .iter()
+            .flatten()
+            .any(|transaction| transaction.id == transaction_id)
+            .then_some(evse_id)
+    });
+    let Some(evse_id) = running else {
+        return UsePriorityChargingOutcome::Rejected;
+    };
+    if activate
+        && !state
+            .charging_profiles
+            .applying_to(evse_id)
+            .iter()
+            .any(|installed| {
+                installed.profile.purpose == crate::state::ChargingProfilePurpose::PriorityCharging
+            })
+    {
+        return UsePriorityChargingOutcome::NoProfile;
+    }
+
+    let _ = actor
+        .send(ChargePointEvent::PriorityChargingSet {
+            transaction_id,
+            activated: activate,
+            locally_initiated: false,
+        })
+        .await;
+    UsePriorityChargingOutcome::Accepted
+}
+
+/// Reports a priority-charging change the charge point made itself, as OCPP 2.1's
+/// `NotifyPriorityCharging`.
+///
+/// 2.1 only. Neither 1.6J nor 2.0.1 has the message or the profile purpose behind it, so on those
+/// versions the change is simply not reportable - a version difference, not a gap here.
+#[async_trait::async_trait]
+pub trait PriorityChargingNotifier {
+    /// What went wrong reporting the change.
+    type Error: core::fmt::Display;
+
+    /// Reports that priority charging is now `change.activated` for `change.transaction_id`.
+    async fn notify_priority_charging(
+        &self,
+        change: crate::state::PriorityChargingChange,
+    ) -> Result<(), Self::Error>;
+}
+
+#[async_trait::async_trait]
+impl<T: PriorityChargingNotifier + Send + Sync + ?Sized> PriorityChargingNotifier
+    for alloc::sync::Arc<T>
+{
+    type Error = T::Error;
+
+    async fn notify_priority_charging(
+        &self,
+        change: crate::state::PriorityChargingChange,
+    ) -> Result<(), Self::Error> {
+        (**self).notify_priority_charging(change).await
+    }
+}
+
+/// Forwards every priority-charging change the charge point made on its own to the CSMS, until the
+/// actor stops.
+///
+/// A failed send is logged and dropped rather than queued, for the same reason
+/// [`crate::reservation::run_reservation_status_updates`] drops one: delivered after an outage it
+/// would announce a priority on a transaction that has very likely ended, and the CSMS has since
+/// re-learned the real state from the queued, ordered `TransactionEvent` behind it.
+pub async fn run_priority_charging_notifications<N: PriorityChargingNotifier>(
+    mut changes: crate::sync::BroadcastReceiver<crate::state::PriorityChargingChange>,
+    csms: &N,
+) {
+    while let Ok(change) = changes.recv().await {
+        if let Err(err) = csms.notify_priority_charging(change).await {
+            tracing::warn!(
+                error = %err,
+                transaction_id = change.transaction_id.0,
+                "failed to report a priority-charging change"
+            );
+        }
+    }
+}
+
 /// The most profiles carried in a single `ReportChargingProfiles` message (see
 /// [`chunk_charging_profile_report`]).
 ///
@@ -258,6 +379,16 @@ pub fn chunk_charging_profile_report(
 pub trait SetChargingProfileHandler {
     /// Registers a `SetChargingProfile` handler dispatching against `actor`.
     async fn register_set_charging_profile_handler(&self, actor: ChargePointActor);
+}
+
+/// Registers this charge point's inbound `UsePriorityCharging` handling with the CSMS connection.
+///
+/// 2.1 only - see [`PriorityChargingNotifier`] for why the other two versions have nothing to
+/// register.
+#[async_trait::async_trait]
+pub trait UsePriorityChargingHandler {
+    /// Registers a `UsePriorityCharging` handler dispatching against `actor`.
+    async fn register_use_priority_charging_handler(&self, actor: ChargePointActor);
 }
 
 /// Registers this charge point's inbound `ClearChargingProfile` handling with the CSMS connection.
@@ -634,5 +765,134 @@ mod tests {
             chunk_charging_profile_report(&[installed(ChargingProfileScope::ChargePoint, 1)]);
 
         assert_eq!(chunks[0].source, ChargingLimitSource::Cso);
+    }
+
+    async fn start_charging(actor: &ChargePointActor) -> crate::state::TransactionId {
+        use crate::state::{ConnectorEvent, EvseEvent, IdToken, IdTokenKind};
+        let id_token = IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        };
+        for event in [
+            ConnectorEvent::CableConnected,
+            ConnectorEvent::LockConfirmed,
+            ConnectorEvent::IdTokenPresented(id_token.clone()),
+            ConnectorEvent::ChargingAuthorized(id_token),
+            ConnectorEvent::ContactorClosed,
+        ] {
+            let _ = actor
+                .send(ChargePointEvent::Evse {
+                    evse_id: 0,
+                    event: EvseEvent::Connector {
+                        connector_id: 0,
+                        event,
+                    },
+                })
+                .await;
+        }
+        actor.state().evses[0].transactions[0]
+            .as_ref()
+            .expect("a transaction should be running")
+            .id
+    }
+
+    fn priority_profile(id: i32) -> ChargingProfile {
+        ChargingProfile {
+            purpose: ChargingProfilePurpose::PriorityCharging,
+            ..profile(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_charging_is_granted_when_a_profile_is_installed_to_grant() {
+        let actor = actor_with_smart_charging().await;
+        let transaction = start_charging(&actor).await;
+        handle_set_charging_profile(
+            &actor,
+            ChargingProfileScope::Evse(0),
+            priority_profile(1),
+            now(),
+        )
+        .await;
+
+        let outcome = handle_use_priority_charging(&actor, transaction, true).await;
+
+        assert_eq!(outcome, UsePriorityChargingOutcome::Accepted);
+        assert!(
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .unwrap()
+                .priority_charging
+        );
+    }
+
+    #[tokio::test]
+    async fn granting_priority_with_no_priority_profile_installed_says_so_rather_than_rejecting() {
+        let actor = actor_with_smart_charging().await;
+        let transaction = start_charging(&actor).await;
+        // A transaction-default profile is installed, but that is not a priority-charging one.
+        handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), profile(1), now()).await;
+
+        let outcome = handle_use_priority_charging(&actor, transaction, true).await;
+
+        assert_eq!(outcome, UsePriorityChargingOutcome::NoProfile);
+        assert!(
+            !actor.state().evses[0].transactions[0]
+                .as_ref()
+                .unwrap()
+                .priority_charging
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawing_priority_is_accepted_even_once_the_profile_is_gone() {
+        let actor = actor_with_smart_charging().await;
+        let transaction = start_charging(&actor).await;
+        handle_set_charging_profile(
+            &actor,
+            ChargingProfileScope::Evse(0),
+            priority_profile(1),
+            now(),
+        )
+        .await;
+        handle_use_priority_charging(&actor, transaction, true).await;
+        handle_clear_charging_profile(&actor, ChargingProfileCriteria::default()).await;
+
+        let outcome = handle_use_priority_charging(&actor, transaction, false).await;
+
+        assert_eq!(outcome, UsePriorityChargingOutcome::Accepted);
+        assert!(
+            !actor.state().evses[0].transactions[0]
+                .as_ref()
+                .unwrap()
+                .priority_charging
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_charging_for_a_transaction_that_is_not_running_is_rejected() {
+        let actor = actor_with_smart_charging().await;
+        start_charging(&actor).await;
+
+        let outcome =
+            handle_use_priority_charging(&actor, crate::state::TransactionId(999), true).await;
+
+        assert_eq!(outcome, UsePriorityChargingOutcome::Rejected);
+    }
+
+    #[tokio::test]
+    async fn priority_charging_is_rejected_when_smart_charging_is_not_available() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let _ = actor
+            .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
+                smart_charging: false,
+                ..Capabilities::default()
+            }))
+            .await;
+        let transaction = start_charging(&actor).await;
+
+        let outcome = handle_use_priority_charging(&actor, transaction, true).await;
+
+        assert_eq!(outcome, UsePriorityChargingOutcome::Rejected);
     }
 }

@@ -157,6 +157,22 @@ where
     .await
     .map_err(ConnectAndSetupError::Start)?;
 
+    // B2.6's priority charging is registered here rather than in `setup()` for the same reason
+    // network switching is: it is 2.1-only, and `setup()` is generic over a CSMS client that may
+    // equally be a 2.0.1 one. Adding a 2.1-only bound there would make the whole "everything on"
+    // wrapper unusable on 2.0.1, which is the exact coupling C4's builder exists to avoid.
+    if runtime.actor().state().capabilities.smart_charging {
+        use crate::smart_charging::UsePriorityChargingHandler;
+        client
+            .register_use_priority_charging_handler(runtime.actor())
+            .await;
+        let changes = runtime.actor().subscribe_priority_charging_changes();
+        let notifier = client.clone();
+        executor.spawn(alloc::boxed::Box::pin(async move {
+            crate::smart_charging::run_priority_charging_notifications(changes, &notifier).await;
+        }));
+    }
+
     let actor = runtime.actor();
     executor.spawn(alloc::boxed::Box::pin(async move {
         crate::network_switch::run_network_profile_switching(&actor, &target, &client, &backoff)

@@ -9,7 +9,7 @@ use crate::state::{
     ChargingProfileScope, Component, ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken,
     InstalledChargingProfile, LocalListEntry, MeterSample, NetworkConnectionProfile,
     NetworkProfileSlot, RegistrationStatus, Reservation, ReservationId, ResetKind, ResetTarget,
-    SecurityEvent, StopReason, Transaction, Variable, VariableAttributeType,
+    SecurityEvent, StopReason, Transaction, TransactionId, Variable, VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -121,6 +121,27 @@ pub enum ChargePointEvent {
     ChargingProfilesCleared {
         /// Which profiles to clear - see [`ChargingProfileCriteria`].
         criteria: ChargingProfileCriteria,
+    },
+    /// Priority charging was granted or withdrawn for one transaction - OCPP 2.1's
+    /// `UsePriorityCharging` when the CSMS asked, or the charge point's own decision when it
+    /// didn't (`docs/PRODUCTION-ROADMAP.md` B2.6).
+    ///
+    /// Addressed by transaction rather than by connector, which is how OCPP addresses it and also
+    /// the only safe reading: by the time this is applied the session the CSMS named may have
+    /// ended, and granting priority to whatever started since would be granting it to the wrong
+    /// driver. A transaction that is no longer running is logged and dropped.
+    PriorityChargingSet {
+        /// The transaction to grant or withdraw priority charging for.
+        transaction_id: TransactionId,
+        /// `true` grants it, `false` withdraws it.
+        activated: bool,
+        /// Whether the charge point decided this itself rather than being told. Only a local
+        /// decision produces [`ChargePointEffect::PriorityChargingChanged`]: reporting a change
+        /// back to the CSMS that requested it is noise, and OCPP's `NotifyPriorityCharging`
+        /// exists precisely for the changes it did *not* request - the same split
+        /// [`Self::ChargingProfilesCleared`]'s sibling
+        /// [`ChargePointEffect::ReservationEnded`] makes for reservations.
+        locally_initiated: bool,
     },
     /// An event mutating the Component/Variable device model (OCPP `GetVariables`/
     /// `SetVariables`, or 1.6J's `GetConfiguration`/`ChangeConfiguration` projection onto it) -
@@ -395,6 +416,21 @@ pub enum ChargePointEffect {
     /// A reservation ended for a reason the CSMS did not ask for; the Reservation functional
     /// block reports this via ReservationStatusUpdate (2.x only).
     ReservationEnded(ReservationUpdate),
+    /// Priority charging was granted or withdrawn by the charge point itself; the Smart Charging
+    /// block reports this via `NotifyPriorityCharging` (2.1 only). A change the CSMS asked for
+    /// produces no effect - see
+    /// [`ChargePointEvent::PriorityChargingSet::locally_initiated`](ChargePointEvent::PriorityChargingSet).
+    PriorityChargingChanged(PriorityChargingChange),
+}
+
+/// A priority-charging grant the charge point made on its own, reported to the CSMS as
+/// `NotifyPriorityCharging` (`docs/PRODUCTION-ROADMAP.md` B2.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorityChargingChange {
+    /// The transaction whose priority changed.
+    pub transaction_id: TransactionId,
+    /// Whether priority charging is now active for it.
+    pub activated: bool,
 }
 
 /// Why a reservation ended, as OCPP's `ReservationUpdateStatusEnum` expresses it.

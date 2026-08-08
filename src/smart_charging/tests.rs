@@ -66,6 +66,7 @@ fn context() -> CompositionContext {
         rate_unit: ChargingRateUnit::Amps,
         duration_secs: 3_600,
         supply: None,
+        priority_charging: false,
     }
 }
 
@@ -240,6 +241,58 @@ fn transaction_scoped_profiles_do_not_apply_without_a_transaction() {
     let context = CompositionContext {
         transaction_id: None,
         transaction_started_at: None,
+        ..context()
+    };
+
+    assert_eq!(
+        compose(&profiles.iter().collect::<Vec<_>>(), &context),
+        None
+    );
+}
+
+#[test]
+fn a_priority_charging_profile_does_nothing_until_priority_charging_is_activated() {
+    let profiles = [
+        profile(
+            1,
+            ChargingProfilePurpose::TxDefault,
+            0,
+            schedule(&[(0, 16.0)]),
+        ),
+        profile(
+            2,
+            ChargingProfilePurpose::PriorityCharging,
+            0,
+            schedule(&[(0, 32.0)]),
+        ),
+    ];
+
+    // Installed but not activated: the transaction default still decides. A priority-charging
+    // profile that applied on installation would silently raise every session's limit, which is
+    // the opposite of `UsePriorityCharging` being a decision the CSMS makes per transaction.
+    let composed = compose(&profiles.iter().collect::<Vec<_>>(), &context()).unwrap();
+    assert_eq!(limits(&composed), vec![(0, 16.0)]);
+
+    let activated = CompositionContext {
+        priority_charging: true,
+        ..context()
+    };
+    let composed = compose(&profiles.iter().collect::<Vec<_>>(), &activated).unwrap();
+    assert_eq!(limits(&composed), vec![(0, 32.0)]);
+}
+
+#[test]
+fn activating_priority_charging_without_a_transaction_still_applies_nothing() {
+    let profiles = [profile(
+        1,
+        ChargingProfilePurpose::PriorityCharging,
+        0,
+        schedule(&[(0, 32.0)]),
+    )];
+    let context = CompositionContext {
+        transaction_id: None,
+        transaction_started_at: None,
+        priority_charging: true,
         ..context()
     };
 

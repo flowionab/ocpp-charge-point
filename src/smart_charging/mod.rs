@@ -53,9 +53,11 @@ pub use self::ocpp_2_1::Ocpp2_1SmartChargingHandler;
 pub use self::handlers::{
     CHARGING_PROFILE_REPORT_CHUNK_SIZE, ChargingProfileReportChunk, ClearChargingProfileHandler,
     ClearChargingProfileOutcome, GetChargingProfilesHandler, GetCompositeScheduleHandler,
-    GetCompositeScheduleOutcome, SetChargingProfileHandler, SetChargingProfileOutcome,
+    GetCompositeScheduleOutcome, PriorityChargingNotifier, SetChargingProfileHandler,
+    SetChargingProfileOutcome, UsePriorityChargingHandler, UsePriorityChargingOutcome,
     chunk_charging_profile_report, handle_clear_charging_profile, handle_get_charging_profiles,
-    handle_get_composite_schedule, handle_set_charging_profile,
+    handle_get_composite_schedule, handle_set_charging_profile, handle_use_priority_charging,
+    run_priority_charging_notifications,
 };
 pub use self::projection::{
     ChargingLimitProjection, connector_composition_context, run_charging_limit_projection,
@@ -136,6 +138,15 @@ pub struct CompositionContext {
     /// The supply characteristics for unit conversion, if the caller knows them - see
     /// [`SupplyCharacteristics`].
     pub supply: Option<SupplyCharacteristics>,
+    /// Whether priority charging is currently active for the transaction on this connector (2.1's
+    /// `UsePriorityCharging`, B2.6).
+    ///
+    /// [`ChargingProfilePurpose::PriorityCharging`] profiles contribute only while this is `true`.
+    /// Installation is not activation: a priority-charging profile sits inert until the CSMS asks
+    /// for it on a named transaction, which is what makes it a *grant* rather than just another
+    /// stack level. Always `false` on 1.6J and 2.0.1, neither of which can express the purpose or
+    /// the request - see [`crate::state::Transaction::priority_charging`].
+    pub priority_charging: bool,
 }
 
 /// The single limit curve that results from composing every applicable profile - what
@@ -452,8 +463,11 @@ fn applies_to_transaction(
             (None, Some(_)) => true,
             (_, None) => false,
         },
-        ChargingProfilePurpose::TxDefault | ChargingProfilePurpose::PriorityCharging => {
-            context.transaction_id.is_some()
+        ChargingProfilePurpose::TxDefault => context.transaction_id.is_some(),
+        // Priority charging needs both: a transaction to apply to, and a CSMS grant for it. See
+        // [`CompositionContext::priority_charging`].
+        ChargingProfilePurpose::PriorityCharging => {
+            context.transaction_id.is_some() && context.priority_charging
         }
     }
 }

@@ -1,8 +1,8 @@
 use crate::executor::Executor;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
-    ConnectorStatusChanged, HardwareCommand, ReservationUpdate, ResetKind, SecurityEvent,
-    TransactionEventOccurred,
+    ConnectorStatusChanged, HardwareCommand, PriorityChargingChange, ReservationUpdate, ResetKind,
+    SecurityEvent, TransactionEventOccurred,
 };
 use crate::sync::{
     BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
@@ -38,6 +38,7 @@ struct EffectSenders {
     authorization_requests: BroadcastSender<AuthorizationRequested>,
     security_events: BroadcastSender<SecurityEvent>,
     reservation_updates: BroadcastSender<ReservationUpdate>,
+    priority_charging_changes: BroadcastSender<PriorityChargingChange>,
 }
 
 /// An error sending an event to a [`ChargePointActor`].
@@ -65,6 +66,7 @@ pub struct ChargePointActor {
     authorization_requests: BroadcastSender<AuthorizationRequested>,
     security_events: BroadcastSender<SecurityEvent>,
     reservation_updates: BroadcastSender<ReservationUpdate>,
+    priority_charging_changes: BroadcastSender<PriorityChargingChange>,
     // A plain shared cell rather than a `Watch` - this is a settable-once, read-many hook, not a
     // stream of values anything needs to await a *change* in. See `set_boot_reason_recorder`'s
     // docs for what it's for and why `crate::reset::handle_reset` needs a synchronous way to
@@ -108,6 +110,7 @@ impl ChargePointActor {
         let authorization_requests = broadcast_channel();
         let security_events = broadcast_channel();
         let reservation_updates = broadcast_channel();
+        let priority_charging_changes = broadcast_channel();
         let effects = EffectSenders {
             commands: commands.clone(),
             status_notifications: status_notifications.clone(),
@@ -115,6 +118,7 @@ impl ChargePointActor {
             authorization_requests: authorization_requests.clone(),
             security_events: security_events.clone(),
             reservation_updates: reservation_updates.clone(),
+            priority_charging_changes: priority_charging_changes.clone(),
         };
         executor.spawn(Box::pin(run(state, mailbox.clone(), updates, effects)));
 
@@ -127,6 +131,7 @@ impl ChargePointActor {
             authorization_requests,
             security_events,
             reservation_updates,
+            priority_charging_changes,
             boot_reason_recorder: Arc::new(BlockingMutex::new(RefCell::new(None))),
         }
     }
@@ -203,6 +208,15 @@ impl ChargePointActor {
         self.reservation_updates.subscribe()
     }
 
+    /// Subscribes to priority-charging grants the charge point made on its own - reported to the
+    /// CSMS as `NotifyPriorityCharging` by the Smart Charging functional block (see
+    /// [`crate::smart_charging::run_priority_charging_notifications`]). A grant the CSMS asked
+    /// for with `UsePriorityCharging` never appears here; see
+    /// [`ChargePointEvent::PriorityChargingSet`](crate::state::ChargePointEvent::PriorityChargingSet).
+    pub fn subscribe_priority_charging_changes(&self) -> BroadcastReceiver<PriorityChargingChange> {
+        self.priority_charging_changes.subscribe()
+    }
+
     /// Installs `recorder`, called by [`crate::reset::handle_reset`] with the accepted `Reset`'s
     /// `ResetKind` synchronously *before* the `ResetRequested` event that may immediately produce
     /// a `HardwareCommand::Reboot` is sent to this actor - so a durable-storage-backed `recorder`
@@ -270,6 +284,9 @@ async fn run(
                 }
                 ChargePointEffect::SecurityEventOccurred(event) => {
                     effects.security_events.send(event);
+                }
+                ChargePointEffect::PriorityChargingChanged(change) => {
+                    effects.priority_charging_changes.send(change);
                 }
             }
         }

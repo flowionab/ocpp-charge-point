@@ -127,6 +127,7 @@ mod tests {
             stop_reason: None,
             seq_no: 0,
             last_meter_sample: None,
+            priority_charging: false,
         };
         sender.send(TransactionEventOccurred {
             evse_id: 0,
@@ -479,6 +480,7 @@ pub(crate) mod ocpp_2_1 {
                     stop_reason: None,
                     seq_no: 0,
                     last_meter_sample: None,
+                    priority_charging: false,
                 }
             }
 
@@ -642,6 +644,7 @@ pub(crate) mod ocpp_2_1 {
                 stop_reason: None,
                 seq_no: 0,
                 last_meter_sample: None,
+                priority_charging: false,
             };
 
             assert_eq!(
@@ -673,6 +676,7 @@ pub(crate) mod ocpp_2_1 {
                 stop_reason: None,
                 seq_no: 2,
                 last_meter_sample: None,
+                priority_charging: false,
             };
 
             assert_eq!(
@@ -1036,6 +1040,7 @@ pub(crate) mod ocpp_2_0_1 {
                     stop_reason: None,
                     seq_no: 0,
                     last_meter_sample: None,
+                    priority_charging: false,
                 }
             }
 
@@ -1161,6 +1166,7 @@ pub(crate) mod ocpp_2_0_1 {
                 stop_reason: None,
                 seq_no: 0,
                 last_meter_sample: None,
+                priority_charging: false,
             };
 
             assert_eq!(
@@ -1192,6 +1198,7 @@ pub(crate) mod ocpp_2_0_1 {
                 stop_reason: None,
                 seq_no: 2,
                 last_meter_sample: None,
+                priority_charging: false,
             };
 
             assert_eq!(
