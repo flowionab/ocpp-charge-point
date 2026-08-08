@@ -327,6 +327,10 @@ fn fill_charging_profiles(
                         })
                         .collect(),
                 }],
+                // A scheduled profile, so neither dynamic field applies - and the store would
+                // refuse the profile outright if `dyn_update_interval_secs` were set here.
+                dyn_update_interval_secs: None,
+                dyn_update_time: None,
             }),
         });
     }

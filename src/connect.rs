@@ -162,7 +162,7 @@ where
     // equally be a 2.0.1 one. Adding a 2.1-only bound there would make the whole "everything on"
     // wrapper unusable on 2.0.1, which is the exact coupling C4's builder exists to avoid.
     if runtime.actor().state().capabilities.smart_charging {
-        use crate::smart_charging::UsePriorityChargingHandler;
+        use crate::smart_charging::{UpdateDynamicScheduleHandler, UsePriorityChargingHandler};
         client
             .register_use_priority_charging_handler(runtime.actor())
             .await;
@@ -170,6 +170,25 @@ where
         let notifier = client.clone();
         executor.spawn(alloc::boxed::Box::pin(async move {
             crate::smart_charging::run_priority_charging_notifications(changes, &notifier).await;
+        }));
+
+        client
+            .register_update_dynamic_schedule_handler(runtime.actor())
+            .await;
+        let pull_actor = runtime.actor();
+        let puller = client.clone();
+        let pull_backoff = backoff.clone();
+        executor.spawn(alloc::boxed::Box::pin(async move {
+            // 30 s between due-ness checks, not between pulls: each dynamic profile carries its
+            // own `dynUpdateInterval`, and a charge point with none installed asks for nothing.
+            crate::smart_charging::run_dynamic_schedule_pulls(
+                &pull_actor,
+                &puller,
+                &SystemClock,
+                &pull_backoff,
+                30,
+            )
+            .await;
         }));
     }
 

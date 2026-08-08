@@ -1115,6 +1115,53 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers dynamic charging profiles (`docs/PRODUCTION-ROADMAP.md` B2.6, OCPP K28): inbound
+    /// `UpdateDynamicSchedule` for limits the CSMS pushes, and a sweep that pulls one with
+    /// `PullDynamicScheduleUpdate` for every installed dynamic profile whose own
+    /// `dynUpdateInterval` has come round.
+    ///
+    /// `interval_secs` is how often *due-ness is checked*, not how often a pull happens - each
+    /// profile carries its own interval, and a charge point with no dynamic profiles installed
+    /// makes no requests at all.
+    ///
+    /// **2.1 only.** Dynamic charging profiles do not exist in 1.6J or 2.0.1, so this is separate
+    /// from [`Self::smart_charging`] for the same reason [`Self::priority_charging`] is.
+    pub async fn dynamic_charging_profiles<N, K, B>(
+        self,
+        csms: &N,
+        clock: K,
+        backoff: B,
+        interval_secs: u32,
+    ) -> Self
+    where
+        N: crate::smart_charging::UpdateDynamicScheduleHandler
+            + crate::smart_charging::DynamicSchedulePuller
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <N as crate::smart_charging::DynamicSchedulePuller>::Error: Send,
+        K: crate::clock::Clock + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+    {
+        csms.register_update_dynamic_schedule_handler(self.runtime.actor())
+            .await;
+
+        let actor = self.runtime.actor();
+        let puller = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::smart_charging::run_dynamic_schedule_pulls(
+                &actor,
+                &puller,
+                &clock,
+                &backoff,
+                interval_secs,
+            )
+            .await;
+        }));
+        self
+    }
+
     /// Registers priority charging (`docs/PRODUCTION-ROADMAP.md` B2.6): inbound
     /// `UsePriorityCharging`, and the outbound `NotifyPriorityCharging` loop reporting any grant
     /// the charge point makes on its own.
@@ -2917,6 +2964,8 @@ mod tests {
                         number_phases: None,
                     }],
                 }],
+                dyn_update_interval_secs: None,
+                dyn_update_time: None,
             }
         }
 

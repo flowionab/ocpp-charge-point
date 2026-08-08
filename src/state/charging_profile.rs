@@ -68,6 +68,16 @@ pub enum ChargingProfileKind {
     /// that start time to evaluate one - see [`crate::smart_charging::CompositionContext`], which
     /// takes it from the caller rather than from the (deliberately clock-free) state machine.
     Relative,
+    /// **2.1 only.** The profile carries no schedule in the usual sense: exactly one schedule with
+    /// exactly one period, whose limit the CSMS replaces as it goes rather than laying out in
+    /// advance (`UpdateDynamicSchedule` pushed by the CSMS, or `PullDynamicScheduleUpdate` pulled
+    /// by the charge point). OCPP's K28; see [`ChargingProfile::dyn_update_time`] for what a
+    /// dynamic profile is anchored to and when it stops applying.
+    ///
+    /// Not projectable onto 1.6J or 2.0.1, neither of which has the kind or the messages. Their
+    /// adapters never produce one, and [`crate::smart_charging`]'s reporting maps it to the
+    /// nearest kind those versions can express.
+    Dynamic,
 }
 
 /// How often a [`ChargingProfileKind::Recurring`] schedule repeats.
@@ -204,6 +214,28 @@ pub struct ChargingProfile {
     /// The schedules, one per [`ChargingRateUnit`] the CSMS chose to express. 2.x permits several;
     /// 1.6J sends exactly one, so its adapter produces a single-element vector.
     pub schedules: Vec<ChargingSchedule>,
+    /// **[`ChargingProfileKind::Dynamic`] only.** How often the charge point should *pull* a fresh
+    /// limit for this profile (`PullDynamicScheduleUpdate`), in seconds. `None` or `0` means the
+    /// CSMS pushes updates instead and the charge point never asks - OCPP's K28.FR.10 makes
+    /// pulling conditional on this being greater than zero.
+    ///
+    /// Only meaningful on a dynamic profile: [`ChargingProfileStore::install`] refuses a
+    /// non-dynamic profile that carries one, per K28.FR.04.
+    pub dyn_update_interval_secs: Option<u32>,
+    /// **[`ChargingProfileKind::Dynamic`] only.** When this profile's single period last took a
+    /// new value - the instant it was installed, or the instant the most recent
+    /// `UpdateDynamicSchedule` / `PullDynamicScheduleUpdate` response was applied (K28.FR.05,
+    /// K28.FR.09).
+    ///
+    /// It does two jobs, which is why it is stored rather than derived. It is the schedule's
+    /// **anchor**: a dynamic period is active from the moment it arrives, so there is no
+    /// `start_schedule` to measure from. And it is the clock the profile's **expiry** runs on: if
+    /// the schedule carries a `duration_secs` and `now` is past `dyn_update_time + duration`, the
+    /// profile stops applying entirely and composition falls through to the next valid one
+    /// (K28.FR.13/K28.FR.15). That is a deliberate dead-man's switch - a CSMS that stops sending
+    /// updates must not leave a stale limit applied forever - and a later update makes the profile
+    /// eligible again (K28.FR.14) without the CSMS having to reinstall it.
+    pub dyn_update_time: Option<DateTime<Utc>>,
 }
 
 impl ChargingProfile {
@@ -215,11 +247,41 @@ impl ChargingProfile {
             .find(|schedule| schedule.rate_unit == unit)
     }
 
-    /// Whether this profile applies at `now`, per its `valid_from`/`valid_to` window alone. Says
+    /// Whether this profile applies at `now`, per its `valid_from`/`valid_to` window and - for a
+    /// [`ChargingProfileKind::Dynamic`] profile - whether its updates have gone stale. Says
     /// nothing about whether any of its schedules covers `now` - that's
     /// [`ChargingSchedule::limit_at`].
     pub fn is_valid_at(&self, now: DateTime<Utc>) -> bool {
-        self.valid_from.is_none_or(|from| now >= from) && self.valid_to.is_none_or(|to| now < to)
+        self.valid_from.is_none_or(|from| now >= from)
+            && self.valid_to.is_none_or(|to| now < to)
+            && !self.dynamic_updates_are_stale(now)
+    }
+
+    /// Whether this is a dynamic profile whose CSMS has stopped answering - OCPP K28.FR.13 and
+    /// K28.FR.15: the schedule carries a `duration_secs`, and `now` is past
+    /// [`dyn_update_time`](Self::dyn_update_time) plus that duration.
+    ///
+    /// A dead-man's switch, and the reason a dynamic profile's `duration` means something quite
+    /// different from a scheduled one's. A scheduled profile's duration says when its curve runs
+    /// out; a dynamic one's says how long a single pushed limit may be trusted without being
+    /// refreshed. A CSMS that goes quiet must not leave its last limit applied indefinitely, so
+    /// the profile stops applying and composition falls through to the next valid one. A later
+    /// update makes it eligible again (K28.FR.14) without the CSMS reinstalling anything, because
+    /// this is computed rather than latched.
+    fn dynamic_updates_are_stale(&self, now: DateTime<Utc>) -> bool {
+        if self.kind != ChargingProfileKind::Dynamic {
+            return false;
+        }
+        let Some(duration) = self
+            .schedules
+            .first()
+            .and_then(|schedule| schedule.duration_secs)
+        else {
+            // No duration means the CSMS set no deadline, so there is nothing to miss.
+            return false;
+        };
+        self.dyn_update_time
+            .is_some_and(|updated| now > updated + chrono::Duration::seconds(i64::from(duration)))
     }
 }
 
@@ -353,6 +415,13 @@ pub enum ChargingProfileRejection {
     /// charge-point-wide has no transaction to apply to, which OCPP rejects rather than
     /// interprets.
     ScopeNotAllowedForPurpose(String),
+    /// A [`ChargingProfileKind::Dynamic`] profile whose schedule isn't the single period OCPP
+    /// requires - K28.FR.01/K28.FR.02. Reported to a 2.1 CSMS as `Rejected` with
+    /// `statusInfo.reasonCode = "InvalidSchedule"`, which names the field to fix.
+    InvalidDynamicSchedule(String),
+    /// A **non**-dynamic profile carrying `dynUpdateInterval`, which only applies to dynamic ones
+    /// - K28.FR.04. Reported as `Rejected` with `reasonCode = "InvalidProfile"`.
+    DynUpdateIntervalOnNonDynamicProfile,
 }
 
 /// Every charging profile installed on the charge point, across every scope.
@@ -407,6 +476,10 @@ impl ChargingProfileStore {
     /// 2. **Same scope, purpose and stack level** - the CSMS is addressing one slot, so a new
     ///    profile in that slot displaces the old one rather than stacking beside it (which would
     ///    make the tie-break between them arbitrary).
+    ///
+    /// A [`ChargingProfileKind::Dynamic`] profile is additionally checked against OCPP's K28
+    /// shape rules - see [`ChargingProfileRejection::InvalidDynamicSchedule`] and
+    /// [`ChargingProfileRejection::DynUpdateIntervalOnNonDynamicProfile`].
     pub fn install(
         &mut self,
         scope: ChargingProfileScope,
@@ -415,6 +488,7 @@ impl ChargingProfileStore {
         if profile.schedules.is_empty() {
             return Err(ChargingProfileRejection::NoSchedule);
         }
+        Self::check_dynamic_shape(&profile)?;
         if scope == ChargingProfileScope::ChargePoint
             && profile.purpose == ChargingProfilePurpose::Tx
         {
@@ -437,6 +511,109 @@ impl ChargingProfileStore {
         self.profiles
             .push(InstalledChargingProfile { scope, profile });
         Ok(())
+    }
+
+    /// OCPP's K28 shape rules for a dynamic profile, and the one rule about profiles that are
+    /// *not* dynamic.
+    ///
+    /// A dynamic profile has no schedule to lay out - one schedule, one period, starting
+    /// immediately - so anything more is the CSMS having sent a scheduled profile under a dynamic
+    /// kind. Refused rather than trimmed to fit: silently dropping periods a CSMS sent would apply
+    /// a limit it never asked for.
+    fn check_dynamic_shape(profile: &ChargingProfile) -> Result<(), ChargingProfileRejection> {
+        if profile.kind != ChargingProfileKind::Dynamic {
+            // K28.FR.04.
+            return match profile.dyn_update_interval_secs {
+                Some(_) => Err(ChargingProfileRejection::DynUpdateIntervalOnNonDynamicProfile),
+                None => Ok(()),
+            };
+        }
+        // K28.FR.01.
+        if profile.schedules.len() != 1 {
+            return Err(ChargingProfileRejection::InvalidDynamicSchedule(
+                "a Dynamic profile carries exactly one charging schedule".into(),
+            ));
+        }
+        let schedule = &profile.schedules[0];
+        if schedule.periods.len() != 1 {
+            return Err(ChargingProfileRejection::InvalidDynamicSchedule(
+                "a Dynamic profile's schedule carries exactly one period".into(),
+            ));
+        }
+        // K28.FR.02.
+        if schedule.periods[0].start_period_secs != 0 {
+            return Err(ChargingProfileRejection::InvalidDynamicSchedule(
+                "a Dynamic profile's period starts at 0 - it takes effect on receipt".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Applies a dynamic limit update to the profile with `id`, stamping `updated_at` as its new
+    /// [`dyn_update_time`](ChargingProfile::dyn_update_time) - K28.FR.06/K28.FR.08/K28.FR.09.
+    ///
+    /// Returns `false` when no such profile is installed, or when the one installed is not
+    /// [`ChargingProfileKind::Dynamic`]: OCPP answers both with `Rejected` /
+    /// `reasonCode = "InvalidProfile"` (K28.FR.11), and updating a scheduled profile in place
+    /// would rewrite a curve the CSMS laid out deliberately.
+    ///
+    /// `limit` is `None` when the update carried only values this crate cannot project onto
+    /// hardware (a setpoint, a discharge limit, a per-phase asymmetry - see
+    /// [`crate::smart_charging`]). The timestamp still moves, because an update *did* arrive: the
+    /// profile's K28.FR.13 expiry must not fire on a CSMS that is answering perfectly well.
+    pub fn apply_dynamic_update(
+        &mut self,
+        id: ChargingProfileId,
+        limit: Option<f64>,
+        updated_at: DateTime<Utc>,
+    ) -> bool {
+        let Some(installed) = self
+            .profiles
+            .iter_mut()
+            .find(|installed| installed.profile.id == id)
+        else {
+            return false;
+        };
+        if installed.profile.kind != ChargingProfileKind::Dynamic {
+            return false;
+        }
+        if let Some(limit) = limit
+            && let Some(period) = installed
+                .profile
+                .schedules
+                .first_mut()
+                .and_then(|schedule| schedule.periods.first_mut())
+        {
+            period.limit = limit;
+        }
+        installed.profile.dyn_update_time = Some(updated_at);
+        true
+    }
+
+    /// Every installed dynamic profile that is due to pull a fresh limit at `now` - K28.FR.10:
+    /// `chargingProfileKind = Dynamic`, `dynUpdateInterval > 0`, and `dynUpdateTime +
+    /// dynUpdateInterval` reached.
+    ///
+    /// A profile whose `dyn_update_time` is somehow unset is treated as due: it has never been
+    /// updated, so asking is exactly right.
+    pub fn dynamic_pulls_due(&self, now: DateTime<Utc>) -> Vec<ChargingProfileId> {
+        self.profiles
+            .iter()
+            .filter(|installed| installed.profile.kind == ChargingProfileKind::Dynamic)
+            .filter(|installed| {
+                let Some(interval) = installed
+                    .profile
+                    .dyn_update_interval_secs
+                    .filter(|interval| *interval > 0)
+                else {
+                    return false;
+                };
+                installed.profile.dyn_update_time.is_none_or(|updated| {
+                    now >= updated + chrono::Duration::seconds(i64::from(interval))
+                })
+            })
+            .map(|installed| installed.profile.id)
+            .collect()
     }
 
     /// Removes every profile matching `criteria`, returning how many were removed (`0` means the
@@ -513,6 +690,21 @@ mod tests {
             valid_to: None,
             transaction_id: None,
             schedules: alloc::vec![schedule(ChargingRateUnit::Amps, &[(0, 16.0)])],
+            dyn_update_interval_secs: None,
+            dyn_update_time: None,
+        }
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+    }
+
+    /// The shape OCPP's K28.FR.01/K28.FR.02 require: one schedule, one period, starting at 0.
+    fn dynamic_profile(id: i32) -> ChargingProfile {
+        ChargingProfile {
+            kind: ChargingProfileKind::Dynamic,
+            dyn_update_time: Some(at(0)),
+            ..profile(id, ChargingProfilePurpose::TxDefault, 0)
         }
     }
 
@@ -798,5 +990,174 @@ mod tests {
         assert!(!ChargingProfilePurpose::TxDefault.caps_the_result());
         assert!(!ChargingProfilePurpose::Tx.caps_the_result());
         assert!(!ChargingProfilePurpose::PriorityCharging.caps_the_result());
+    }
+
+    #[test]
+    fn a_dynamic_profile_must_be_one_schedule_of_one_period_starting_immediately() {
+        let mut store = ChargingProfileStore::with_limit(10);
+
+        // Two schedules - K28.FR.01.
+        let mut two_schedules = dynamic_profile(1);
+        two_schedules
+            .schedules
+            .push(schedule(ChargingRateUnit::Watts, &[(0, 7_400.0)]));
+        assert!(matches!(
+            store.install(ChargingProfileScope::Evse(0), two_schedules),
+            Err(ChargingProfileRejection::InvalidDynamicSchedule(_))
+        ));
+
+        // Two periods - K28.FR.01.
+        let mut two_periods = dynamic_profile(1);
+        two_periods.schedules =
+            alloc::vec![schedule(ChargingRateUnit::Amps, &[(0, 16.0), (60, 32.0)])];
+        assert!(matches!(
+            store.install(ChargingProfileScope::Evse(0), two_periods),
+            Err(ChargingProfileRejection::InvalidDynamicSchedule(_))
+        ));
+
+        // A period that does not start at 0 - K28.FR.02. A dynamic limit takes effect on receipt;
+        // one starting later is a scheduled profile wearing the wrong kind.
+        let mut late_start = dynamic_profile(1);
+        late_start.schedules = alloc::vec![schedule(ChargingRateUnit::Amps, &[(60, 16.0)])];
+        assert!(matches!(
+            store.install(ChargingProfileScope::Evse(0), late_start),
+            Err(ChargingProfileRejection::InvalidDynamicSchedule(_))
+        ));
+
+        assert_eq!(
+            store.install(ChargingProfileScope::Evse(0), dynamic_profile(1)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_dyn_update_interval_on_a_scheduled_profile_is_refused() {
+        let mut store = ChargingProfileStore::with_limit(10);
+        let mut scheduled = profile(1, ChargingProfilePurpose::TxDefault, 0);
+        scheduled.dyn_update_interval_secs = Some(60);
+
+        // K28.FR.04: the field only means anything on a dynamic profile, so accepting it here
+        // would leave the CSMS believing this profile would be refreshed when nothing will.
+        assert_eq!(
+            store.install(ChargingProfileScope::Evse(0), scheduled),
+            Err(ChargingProfileRejection::DynUpdateIntervalOnNonDynamicProfile)
+        );
+    }
+
+    #[test]
+    fn a_dynamic_update_replaces_the_single_periods_limit_and_moves_the_anchor() {
+        let mut store = ChargingProfileStore::with_limit(10);
+        store
+            .install(ChargingProfileScope::Evse(0), dynamic_profile(1))
+            .unwrap();
+
+        assert!(store.apply_dynamic_update(ChargingProfileId(1), Some(24.0), at(300)));
+
+        let installed = &store.installed()[0].profile;
+        assert_eq!(installed.schedules[0].periods[0].limit, 24.0);
+        assert_eq!(installed.dyn_update_time, Some(at(300)));
+    }
+
+    #[test]
+    fn an_update_carrying_nothing_this_crate_can_project_still_moves_the_anchor() {
+        let mut store = ChargingProfileStore::with_limit(10);
+        store
+            .install(ChargingProfileScope::Evse(0), dynamic_profile(1))
+            .unwrap();
+
+        // A setpoint-only update: the CSMS answered, so the K28.FR.13 deadline must reset even
+        // though the limit this crate projects is unchanged.
+        assert!(store.apply_dynamic_update(ChargingProfileId(1), None, at(300)));
+
+        let installed = &store.installed()[0].profile;
+        assert_eq!(installed.schedules[0].periods[0].limit, 16.0);
+        assert_eq!(installed.dyn_update_time, Some(at(300)));
+    }
+
+    #[test]
+    fn a_dynamic_update_for_a_scheduled_or_absent_profile_is_refused() {
+        let mut store = ChargingProfileStore::with_limit(10);
+        store
+            .install(
+                ChargingProfileScope::Evse(0),
+                profile(1, ChargingProfilePurpose::TxDefault, 0),
+            )
+            .unwrap();
+
+        // K28.FR.11: updating a scheduled profile in place would rewrite a curve the CSMS laid
+        // out deliberately.
+        assert!(!store.apply_dynamic_update(ChargingProfileId(1), Some(24.0), at(300)));
+        assert_eq!(
+            store.installed()[0].profile.schedules[0].periods[0].limit,
+            16.0
+        );
+
+        assert!(!store.apply_dynamic_update(ChargingProfileId(99), Some(24.0), at(300)));
+    }
+
+    #[test]
+    fn a_dynamic_profile_stops_applying_once_its_updates_go_stale() {
+        let mut dynamic = dynamic_profile(1);
+        dynamic.schedules[0].duration_secs = Some(600);
+        dynamic.dyn_update_time = Some(at(0));
+
+        assert!(dynamic.is_valid_at(at(599)));
+        assert!(dynamic.is_valid_at(at(600)));
+        // K28.FR.13: past the deadline the CSMS set itself, the last limit is no longer trusted.
+        assert!(!dynamic.is_valid_at(at(601)));
+
+        // K28.FR.14: a fresh update makes it eligible again, with no reinstall.
+        dynamic.dyn_update_time = Some(at(600));
+        assert!(dynamic.is_valid_at(at(601)));
+    }
+
+    #[test]
+    fn a_dynamic_profile_with_no_duration_never_goes_stale() {
+        let dynamic = dynamic_profile(1);
+        assert_eq!(dynamic.schedules[0].duration_secs, None);
+
+        // No duration is the CSMS setting no deadline - there is nothing to miss.
+        assert!(dynamic.is_valid_at(at(10_000_000)));
+    }
+
+    #[test]
+    fn only_dynamic_profiles_with_a_positive_interval_are_ever_pulled() {
+        let mut store = ChargingProfileStore::with_limit(10);
+        // Pushed, not pulled: no interval at all.
+        store
+            .install(ChargingProfileScope::Evse(0), dynamic_profile(1))
+            .unwrap();
+        // Explicitly zero, which OCPP's K28.FR.10 reads the same way.
+        let mut zero = dynamic_profile(2);
+        zero.stack_level = 1;
+        zero.dyn_update_interval_secs = Some(0);
+        store.install(ChargingProfileScope::Evse(0), zero).unwrap();
+        // A scheduled profile can never carry an interval (K28.FR.04), so none is pullable.
+        store
+            .install(
+                ChargingProfileScope::Evse(1),
+                profile(3, ChargingProfilePurpose::TxDefault, 0),
+            )
+            .unwrap();
+        let mut pulled = dynamic_profile(4);
+        pulled.stack_level = 2;
+        pulled.dyn_update_interval_secs = Some(60);
+        store
+            .install(ChargingProfileScope::Evse(0), pulled)
+            .unwrap();
+
+        assert!(store.dynamic_pulls_due(at(59)).is_empty());
+        assert_eq!(
+            store.dynamic_pulls_due(at(60)),
+            alloc::vec![ChargingProfileId(4)]
+        );
+
+        // Once answered, the next pull is an interval away rather than every sweep.
+        store.apply_dynamic_update(ChargingProfileId(4), Some(24.0), at(60));
+        assert!(store.dynamic_pulls_due(at(119)).is_empty());
+        assert_eq!(
+            store.dynamic_pulls_due(at(120)),
+            alloc::vec![ChargingProfileId(4)]
+        );
     }
 }

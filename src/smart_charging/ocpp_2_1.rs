@@ -15,25 +15,29 @@ use ocpp_client::ocpp_2_1::OCPP2_1Client;
 use ocpp_client::ocpp_types::v21::common::{
     ChargingProfile as WireChargingProfile, ChargingProfileKindEnum, ChargingProfilePurposeEnum,
     ChargingProfileStatusEnum, ChargingRateUnitEnum, ChargingSchedule as WireChargingSchedule,
-    ClearChargingProfileStatusEnum, CompositeSchedule as WireCompositeSchedule, GenericStatusEnum,
-    GetChargingProfileStatusEnum, PriorityChargingStatusEnum, RecurrencyKindEnum,
+    ChargingScheduleUpdate, ClearChargingProfileStatusEnum,
+    CompositeSchedule as WireCompositeSchedule, GenericStatusEnum, GetChargingProfileStatusEnum,
+    PriorityChargingStatusEnum, RecurrencyKindEnum, StatusInfo,
 };
 use ocpp_client::ocpp_types::v21::{
     ClearChargingProfileRequest, ClearChargingProfileResponse, GetChargingProfilesRequest,
     GetChargingProfilesResponse, GetCompositeScheduleRequest, GetCompositeScheduleResponse,
-    NotifyPriorityChargingRequest, ReportChargingProfilesRequest, SetChargingProfileRequest,
-    SetChargingProfileResponse, UsePriorityChargingRequest, UsePriorityChargingResponse,
+    NotifyPriorityChargingRequest, PullDynamicScheduleUpdateRequest, ReportChargingProfilesRequest,
+    SetChargingProfileRequest, SetChargingProfileResponse, UpdateDynamicScheduleRequest,
+    UpdateDynamicScheduleResponse, UsePriorityChargingRequest, UsePriorityChargingResponse,
 };
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::smart_charging::{
     ChargingLimitProjection, ClearChargingProfileHandler, ClearChargingProfileOutcome,
-    CompositeSchedule, GetChargingProfilesHandler, GetCompositeScheduleHandler,
-    GetCompositeScheduleOutcome, PriorityChargingNotifier, SetChargingProfileHandler,
-    SetChargingProfileOutcome, UsePriorityChargingHandler, UsePriorityChargingOutcome,
+    CompositeSchedule, DynamicSchedulePuller, DynamicScheduleUpdate, GetChargingProfilesHandler,
+    GetCompositeScheduleHandler, GetCompositeScheduleOutcome, PriorityChargingNotifier,
+    SetChargingProfileHandler, SetChargingProfileOutcome, UpdateDynamicScheduleHandler,
+    UpdateDynamicScheduleOutcome, UsePriorityChargingHandler, UsePriorityChargingOutcome,
     chunk_charging_profile_report, handle_clear_charging_profile, handle_get_charging_profiles,
-    handle_get_composite_schedule, handle_set_charging_profile, handle_use_priority_charging,
+    handle_get_composite_schedule, handle_set_charging_profile, handle_update_dynamic_schedule,
+    handle_use_priority_charging,
 };
 use crate::state::{
     ChargingLimitSource, ChargingProfile, ChargingProfileCriteria, ChargingProfileId,
@@ -81,6 +85,7 @@ fn map_kind(kind: &ChargingProfileKindEnum) -> ChargingProfileKind {
     match kind {
         ChargingProfileKindEnum::Absolute => ChargingProfileKind::Absolute,
         ChargingProfileKindEnum::Recurring => ChargingProfileKind::Recurring,
+        ChargingProfileKindEnum::Dynamic => ChargingProfileKind::Dynamic,
         _ => ChargingProfileKind::Relative,
     }
 }
@@ -169,6 +174,10 @@ fn map_profile(profile: &ocpp_client::ocpp_types::v21::common::ChargingProfile) 
             .and_then(|id| id.parse().ok())
             .map(TransactionId),
         schedules: profile.charging_schedule.iter().map(map_schedule).collect(),
+        dyn_update_interval_secs: profile
+            .dyn_update_interval
+            .and_then(|interval| u32::try_from(interval).ok()),
+        dyn_update_time: parse_time(&profile.dyn_update_time),
     }
 }
 
@@ -256,6 +265,7 @@ fn wire_kind(kind: ChargingProfileKind) -> ChargingProfileKindEnum {
         ChargingProfileKind::Absolute => ChargingProfileKindEnum::Absolute,
         ChargingProfileKind::Recurring => ChargingProfileKindEnum::Recurring,
         ChargingProfileKind::Relative => ChargingProfileKindEnum::Relative,
+        ChargingProfileKind::Dynamic => ChargingProfileKindEnum::Dynamic,
     }
 }
 
@@ -344,13 +354,13 @@ fn wire_profile(profile: &ChargingProfile) -> WireChargingProfile {
         charging_profile_purpose: wire_purpose(profile.purpose),
         charging_schedule: schedules,
         custom_data: None,
-        dyn_update_interval: None,
-        dyn_update_time: None,
         id: i64::from(profile.id.0),
         invalid_after_offline_duration: None,
         max_offline_duration: None,
         price_schedule_signature: None,
         recurrency_kind: profile.recurrency.map(wire_recurrency),
+        dyn_update_interval: profile.dyn_update_interval_secs.map(i64::from),
+        dyn_update_time: profile.dyn_update_time.map(|at| at.to_rfc3339()),
         stack_level: i64::from(profile.stack_level),
         transaction_id: profile
             .transaction_id
@@ -452,11 +462,14 @@ async fn send_charging_profile_report(
 /// The generated response types carry no `Default`, and every one of these responses is "a status
 /// and nothing else" - so each gets one constructor here rather than the same three `None`s
 /// repeated at every return site.
-fn set_response(status: ChargingProfileStatusEnum) -> SetChargingProfileResponse {
+fn set_response(
+    status: ChargingProfileStatusEnum,
+    reason_code: Option<&str>,
+) -> SetChargingProfileResponse {
     SetChargingProfileResponse {
         custom_data: None,
         status,
-        status_info: None,
+        status_info: reason_code.and_then(status_info),
     }
 }
 
@@ -465,6 +478,17 @@ fn clear_response(status: ClearChargingProfileStatusEnum) -> ClearChargingProfil
         custom_data: None,
         status,
         status_info: None,
+    }
+}
+
+fn dynamic_response(
+    status: ChargingProfileStatusEnum,
+    reason_code: Option<&str>,
+) -> UpdateDynamicScheduleResponse {
+    UpdateDynamicScheduleResponse {
+        custom_data: None,
+        status,
+        status_info: reason_code.and_then(status_info),
     }
 }
 
@@ -500,6 +524,51 @@ fn wire_clear_status(outcome: ClearChargingProfileOutcome) -> ClearChargingProfi
         ClearChargingProfileOutcome::Accepted => ClearChargingProfileStatusEnum::Accepted,
         ClearChargingProfileOutcome::Unknown => ClearChargingProfileStatusEnum::Unknown,
     }
+}
+
+/// 2.1's `ChargingScheduleUpdate` onto this crate's [`DynamicScheduleUpdate`].
+///
+/// Only `limit` is carried; see [`DynamicScheduleUpdate`] for why the setpoints, discharge limits
+/// and per-phase variants are counted rather than kept.
+fn map_schedule_update(update: &ChargingScheduleUpdate) -> DynamicScheduleUpdate {
+    let unprojectable = [
+        update.discharge_limit,
+        update.discharge_limit_l2,
+        update.discharge_limit_l3,
+        update.limit_l2,
+        update.limit_l3,
+        update.setpoint,
+        update.setpoint_l2,
+        update.setpoint_l3,
+        update.setpoint_reactive,
+        update.setpoint_reactive_l2,
+        update.setpoint_reactive_l3,
+    ];
+    DynamicScheduleUpdate {
+        limit: update.limit,
+        carried_unprojectable_values: unprojectable.iter().any(Option::is_some),
+    }
+}
+
+/// This crate's dynamic-update outcome onto the `ChargingProfileStatusEnum` both dynamic messages
+/// answer with.
+fn wire_dynamic_status(outcome: UpdateDynamicScheduleOutcome) -> ChargingProfileStatusEnum {
+    match outcome {
+        UpdateDynamicScheduleOutcome::Accepted => ChargingProfileStatusEnum::Accepted,
+        UpdateDynamicScheduleOutcome::Rejected => ChargingProfileStatusEnum::Rejected,
+    }
+}
+
+/// A `Rejected` response carrying OCPP's own reason code, so a CSMS learns *which* rule it broke
+/// rather than only that something was wrong. K28.FR.03 names `InvalidSchedule` and K28.FR.11
+/// `InvalidProfile`; both fit the 20-byte wire field, and a code that somehow didn't would be
+/// dropped rather than truncated into a different code.
+fn status_info(reason_code: &str) -> Option<StatusInfo> {
+    Some(StatusInfo {
+        additional_info: None,
+        custom_data: None,
+        reason_code: heapless::String::try_from(reason_code).ok()?,
+    })
 }
 
 /// 2.1's `UsePriorityCharging` outcome enum onto the wire's.
@@ -548,7 +617,7 @@ impl<C: Clock + Clone + Send + Sync + 'static> SetChargingProfileHandler
                 let clock = clock.clone();
                 async move {
                     let Some(scope) = map_scope(request.evse_id) else {
-                        return Ok(set_response(ChargingProfileStatusEnum::Rejected));
+                        return Ok(set_response(ChargingProfileStatusEnum::Rejected, None));
                     };
                     let outcome = handle_set_charging_profile(
                         &actor,
@@ -557,7 +626,13 @@ impl<C: Clock + Clone + Send + Sync + 'static> SetChargingProfileHandler
                         clock.now(),
                     )
                     .await;
-                    Ok(set_response(wire_set_status(&outcome)))
+                    // K28.FR.03/K28.FR.04 name a reason code for the dynamic-profile shape rules,
+                    // which is what tells a CSMS *which* rule it broke.
+                    let reason = match &outcome {
+                        SetChargingProfileOutcome::Accepted => None,
+                        SetChargingProfileOutcome::Rejected(rejection) => rejection.reason_code,
+                    };
+                    Ok(set_response(wire_set_status(&outcome), reason))
                 }
             })
             .await;
@@ -696,6 +771,65 @@ impl<C: Clock + Clone + Send + Sync + 'static> UsePriorityChargingHandler
 }
 
 #[async_trait::async_trait]
+impl<C: Clock + Clone + Send + Sync + 'static> UpdateDynamicScheduleHandler
+    for Ocpp2_1SmartChargingHandler<C>
+{
+    async fn register_update_dynamic_schedule_handler(&self, actor: ChargePointActor) {
+        let clock = self.clock.clone();
+        self.client
+            .on_update_dynamic_schedule(move |request: UpdateDynamicScheduleRequest, _client| {
+                let actor = actor.clone();
+                let clock = clock.clone();
+                async move {
+                    let profile_id = ChargingProfileId(request.charging_profile_id as i32);
+                    let outcome = handle_update_dynamic_schedule(
+                        &actor,
+                        profile_id,
+                        map_schedule_update(&request.schedule_update),
+                        clock.now(),
+                    )
+                    .await;
+                    // K28.FR.11 names the reason code for the refusal, and there is only one
+                    // reason this can be refused: the profile is absent or not Dynamic.
+                    let reason = match outcome {
+                        UpdateDynamicScheduleOutcome::Accepted => None,
+                        UpdateDynamicScheduleOutcome::Rejected => Some("InvalidProfile"),
+                    };
+                    Ok(dynamic_response(wire_dynamic_status(outcome), reason))
+                }
+            })
+            .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: Clock + Clone + Send + Sync + 'static> DynamicSchedulePuller
+    for Ocpp2_1SmartChargingHandler<C>
+{
+    type Error = ocpp_client::ClientError<ocpp_client::ocpp_2_1::OCPP2_1Error>;
+
+    async fn pull_dynamic_schedule_update(
+        &self,
+        profile_id: ChargingProfileId,
+    ) -> Result<Option<DynamicScheduleUpdate>, Self::Error> {
+        let response = self
+            .client
+            .send_pull_dynamic_schedule_update(PullDynamicScheduleUpdateRequest {
+                charging_profile_id: i64::from(profile_id.0),
+                custom_data: None,
+            })
+            .await?;
+        // K28.FR.12: the CSMS refuses a profile it does not recognise as dynamic. That is an
+        // answer, not a failure - and an `Accepted` with no `scheduleUpdate` is equally "nothing
+        // to apply", so both collapse to `None` rather than to an update of nothing.
+        if response.status != ChargingProfileStatusEnum::Accepted {
+            return Ok(None);
+        }
+        Ok(response.schedule_update.as_ref().map(map_schedule_update))
+    }
+}
+
+#[async_trait::async_trait]
 impl<C: Clock + Clone + Send + Sync + 'static> PriorityChargingNotifier
     for Ocpp2_1SmartChargingHandler<C>
 {
@@ -759,6 +893,29 @@ mod std_impls {
             Ocpp2_1SmartChargingHandler::new(self.clone())
                 .register_use_priority_charging_handler(actor)
                 .await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UpdateDynamicScheduleHandler for OCPP2_1Client {
+        async fn register_update_dynamic_schedule_handler(&self, actor: ChargePointActor) {
+            Ocpp2_1SmartChargingHandler::new(self.clone())
+                .register_update_dynamic_schedule_handler(actor)
+                .await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DynamicSchedulePuller for OCPP2_1Client {
+        type Error = ocpp_client::ClientError<ocpp_client::ocpp_2_1::OCPP2_1Error>;
+
+        async fn pull_dynamic_schedule_update(
+            &self,
+            profile_id: ChargingProfileId,
+        ) -> Result<Option<DynamicScheduleUpdate>, Self::Error> {
+            Ocpp2_1SmartChargingHandler::new(self.clone())
+                .pull_dynamic_schedule_update(profile_id)
+                .await
         }
     }
 
@@ -1155,5 +1312,75 @@ mod tests {
             wire_priority_status(UsePriorityChargingOutcome::NoProfile),
             PriorityChargingStatusEnum::NoProfile
         );
+    }
+
+    fn wire_schedule_update(limit: Option<f64>) -> ChargingScheduleUpdate {
+        ChargingScheduleUpdate {
+            custom_data: None,
+            discharge_limit: None,
+            discharge_limit_l2: None,
+            discharge_limit_l3: None,
+            limit,
+            limit_l2: None,
+            limit_l3: None,
+            setpoint: None,
+            setpoint_l2: None,
+            setpoint_l3: None,
+            setpoint_reactive: None,
+            setpoint_reactive_l2: None,
+            setpoint_reactive_l3: None,
+        }
+    }
+
+    #[test]
+    fn a_dynamic_update_carries_its_charge_limit_across() {
+        let mapped = map_schedule_update(&wire_schedule_update(Some(24.0)));
+
+        assert_eq!(mapped.limit, Some(24.0));
+        assert!(!mapped.carried_unprojectable_values);
+    }
+
+    #[test]
+    fn setpoints_and_discharge_limits_are_flagged_rather_than_silently_dropped() {
+        // Nothing in `crate::hardware` can express a setpoint, a discharge limit or a per-phase
+        // asymmetry, so these cannot be applied - but the caller must be able to say so in a log
+        // rather than report a silent success. See `DynamicScheduleUpdate`.
+        for update in [
+            ChargingScheduleUpdate {
+                setpoint: Some(5.0),
+                ..wire_schedule_update(None)
+            },
+            ChargingScheduleUpdate {
+                discharge_limit: Some(-10.0),
+                ..wire_schedule_update(None)
+            },
+            ChargingScheduleUpdate {
+                limit_l2: Some(8.0),
+                ..wire_schedule_update(Some(16.0))
+            },
+        ] {
+            assert!(map_schedule_update(&update).carried_unprojectable_values);
+        }
+    }
+
+    #[test]
+    fn the_dynamic_profile_kind_round_trips_rather_than_degrading_to_relative() {
+        // 2.1 is the one version that has it, so nothing here should be lossy in either
+        // direction - unlike the 1.6J/2.0.1 adapters, which document their downgrade.
+        assert_eq!(
+            map_kind(&ChargingProfileKindEnum::Dynamic),
+            ChargingProfileKind::Dynamic
+        );
+        assert_eq!(
+            wire_kind(ChargingProfileKind::Dynamic),
+            ChargingProfileKindEnum::Dynamic
+        );
+    }
+
+    #[test]
+    fn a_reason_code_too_long_for_the_wire_field_is_dropped_rather_than_truncated() {
+        // A truncated reason code is a *different* reason code, and a CSMS may branch on it.
+        assert!(status_info("InvalidSchedule").is_some());
+        assert!(status_info("a-reason-code-far-longer-than-twenty-bytes").is_none());
     }
 }

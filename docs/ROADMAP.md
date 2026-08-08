@@ -1285,12 +1285,31 @@ Charging profiles and schedule negotiation.
   sits inert until the CSMS names a transaction, and the grant ends with that
   session rather than leaking into the next driver's.
 
-  Still missing: `NotifyChargingLimit`/`ClearedChargingLimit`,
-  `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`, and 2.1's dynamic
-  schedule updates (`PullDynamicScheduleUpdate`/`UpdateDynamicSchedule`, the
-  `Dynamic` profile kind, and the setpoint/discharge/per-phase period fields
-  the 2.1 adapter reads past). None of those is blocked upstream any more -
-  see `docs/PRODUCTION-ROADMAP.md` B2.6. The profile
+  2.1's **dynamic charging profiles** (OCPP K28) are wired too, and they invert
+  what a charging profile is: no curve laid out in advance, just one schedule of
+  one period whose limit the CSMS replaces as it goes - pushed with
+  `UpdateDynamicSchedule`, or pulled with `PullDynamicScheduleUpdate` when the
+  profile's own `dynUpdateInterval` comes round. `dynUpdateTime` does double
+  duty: it anchors the period (which is active from the moment it arrives, so
+  there is no `startSchedule` to measure from) and it runs a **dead-man's
+  switch** - with a `duration` set, a profile whose CSMS stops answering stops
+  applying and composition falls through to the next valid one, reviving on the
+  next update without a reinstall. So `duration` means something different here
+  than on a scheduled profile: not "when the curve runs out" but "how long one
+  pushed limit may be trusted unrefreshed". A CSMS outage releases the
+  connector instead of freezing a stale limit onto it.
+
+  What 2.1 sends that this crate deliberately drops: the setpoints, discharge
+  limits and per-phase (`_L2`/`_L3`) variants a `ChargingScheduleUpdate` may
+  carry. Each needs a hardware capability `crate::hardware` cannot express -
+  `set_current_limit` is a single import limit - so they are counted, logged and
+  dropped rather than stored as values nothing can act on. They land with §17's
+  bidirectional-power surface.
+
+  Still missing: `NotifyChargingLimit`/`ClearedChargingLimit` and
+  `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule` - all four report where a
+  limit *came from* rather than applying one, and the EV-side pair needs the ISO
+  15118 surface §13 covers. Nothing here is blocked upstream. The profile
   store itself is durable (`persistence::ChargingProfileSnapshotStore`, wired
   via `ChargePointBuilder::charging_profile_persistence`): installed load
   limits survive a power cut and are restored before the projection's first

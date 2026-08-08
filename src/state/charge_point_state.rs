@@ -249,6 +249,25 @@ impl ChargePointState {
                     }
                 }
             }
+            ChargePointEvent::DynamicScheduleUpdated {
+                profile_id,
+                limit,
+                updated_at,
+            } => {
+                let applied = self
+                    .charging_profiles
+                    .apply_dynamic_update(profile_id, limit, updated_at);
+                if !applied {
+                    // Reached only if a caller dispatched this without asking the store first
+                    // (`crate::smart_charging::handle_update_dynamic_schedule` does ask).
+                    tracing::warn!(
+                        profile_id = profile_id.0,
+                        "ignoring a dynamic schedule update for a profile that is absent or not \
+                         Dynamic"
+                    );
+                }
+                applied
+            }
             ChargePointEvent::PriorityChargingSet {
                 transaction_id,
                 activated,
@@ -2208,6 +2227,8 @@ mod tests {
                     number_phases: None,
                 }],
             }],
+            dyn_update_interval_secs: None,
+            dyn_update_time: None,
         }
     }
 

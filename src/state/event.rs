@@ -6,10 +6,11 @@ use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::{
     AuthorizationCacheEntry, AuthorizationStatus, ChargingProfile, ChargingProfileCriteria,
-    ChargingProfileScope, Component, ConnectorState, ConnectorStatus, DeviceModelEvent, IdToken,
-    InstalledChargingProfile, LocalListEntry, MeterSample, NetworkConnectionProfile,
-    NetworkProfileSlot, RegistrationStatus, Reservation, ReservationId, ResetKind, ResetTarget,
-    SecurityEvent, StopReason, Transaction, TransactionId, Variable, VariableAttributeType,
+    ChargingProfileId, ChargingProfileScope, Component, ConnectorState, ConnectorStatus,
+    DeviceModelEvent, IdToken, InstalledChargingProfile, LocalListEntry, MeterSample,
+    NetworkConnectionProfile, NetworkProfileSlot, RegistrationStatus, Reservation, ReservationId,
+    ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, TransactionId, Variable,
+    VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -121,6 +122,26 @@ pub enum ChargePointEvent {
     ChargingProfilesCleared {
         /// Which profiles to clear - see [`ChargingProfileCriteria`].
         criteria: ChargingProfileCriteria,
+    },
+    /// A dynamic charging profile took a new limit - OCPP 2.1's `UpdateDynamicSchedule` pushed by
+    /// the CSMS, or the response to a `PullDynamicScheduleUpdate` this charge point asked for
+    /// (`docs/PRODUCTION-ROADMAP.md` B2.6, OCPP K28.FR.06/K28.FR.08/K28.FR.09).
+    ///
+    /// Applied through [`crate::state::ChargingProfileStore::apply_dynamic_update`], so the rule
+    /// that only a `Dynamic` profile may be updated in place holds however the update arrived. An
+    /// update naming an absent or non-dynamic profile is logged and dropped;
+    /// `crate::smart_charging::handle_update_dynamic_schedule` checks first, so the CSMS gets the
+    /// real answer rather than an optimistic one.
+    DynamicScheduleUpdated {
+        /// Which profile the CSMS is updating.
+        profile_id: ChargingProfileId,
+        /// The new limit for the profile's single period, in that schedule's rate unit. `None`
+        /// when the update carried only values this crate cannot project onto hardware - see the
+        /// store method's docs for why the timestamp still moves.
+        limit: Option<f64>,
+        /// When the update was applied, per the receiving adapter's clock. Becomes the profile's
+        /// new [`ChargingProfile::dyn_update_time`](crate::state::ChargingProfile::dyn_update_time).
+        updated_at: DateTime<Utc>,
     },
     /// Priority charging was granted or withdrawn for one transaction - OCPP 2.1's
     /// `UsePriorityCharging` when the CSMS asked, or the charge point's own decision when it

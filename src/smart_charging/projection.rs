@@ -292,6 +292,8 @@ mod tests {
                     number_phases: None,
                 }],
             }],
+            dyn_update_interval_secs: None,
+            dyn_update_time: None,
         }
     }
 
@@ -346,6 +348,81 @@ mod tests {
         settle().await;
 
         assert_eq!(actor.state().evses[0].charging_limits[0], Some(16_000));
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_update_moves_the_connectors_limit_without_reinstalling_the_profile() {
+        let actor = Arc::new(ChargePointActor::spawn([1], &TokioExecutor));
+        let projection = Arc::new(ChargingLimitProjection::new());
+
+        let task_actor = actor.clone();
+        let task_projection = projection.clone();
+        tokio::spawn(async move {
+            run_charging_limit_projection(&task_actor, &task_projection, &fixed_clock()).await;
+        });
+
+        start_charging(&actor).await;
+        let mut dynamic = amp_profile(1, 16.0);
+        dynamic.kind = crate::state::ChargingProfileKind::Dynamic;
+        dynamic.dyn_update_time = Some(fixed_clock().now());
+        let _ = actor
+            .send(ChargePointEvent::ChargingProfileSet {
+                scope: ChargingProfileScope::Evse(0),
+                profile: alloc::boxed::Box::new(dynamic),
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(16_000));
+
+        // The whole point of a dynamic profile: a new limit without a new profile.
+        let _ = actor
+            .send(ChargePointEvent::DynamicScheduleUpdated {
+                profile_id: crate::state::ChargingProfileId(1),
+                limit: Some(10.0),
+                updated_at: fixed_clock().now(),
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(10_000));
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_profile_whose_updates_stopped_releases_the_connector() {
+        let actor = Arc::new(ChargePointActor::spawn([1], &TokioExecutor));
+        let projection = Arc::new(ChargingLimitProjection::new());
+
+        let task_actor = actor.clone();
+        let task_projection = projection.clone();
+        tokio::spawn(async move {
+            run_charging_limit_projection(&task_actor, &task_projection, &fixed_clock()).await;
+        });
+
+        start_charging(&actor).await;
+        let mut dynamic = amp_profile(1, 16.0);
+        dynamic.kind = crate::state::ChargingProfileKind::Dynamic;
+        dynamic.schedules[0].duration_secs = Some(300);
+        // Last updated an hour before the projection's clock: the CSMS has gone quiet well past
+        // the five minutes it said its own limit was good for (K28.FR.13).
+        dynamic.dyn_update_time = Some(fixed_clock().now() - chrono::Duration::seconds(3_600));
+        let _ = actor
+            .send(ChargePointEvent::ChargingProfileSet {
+                scope: ChargingProfileScope::Evse(0),
+                profile: alloc::boxed::Box::new(dynamic),
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], None);
+
+        // K28.FR.14: an update revives it, with no reinstall from the CSMS.
+        let _ = actor
+            .send(ChargePointEvent::DynamicScheduleUpdated {
+                profile_id: crate::state::ChargingProfileId(1),
+                limit: Some(12.0),
+                updated_at: fixed_clock().now(),
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(12_000));
     }
 
     #[tokio::test]

@@ -27,10 +27,25 @@ pub enum SetChargingProfileOutcome {
     /// The profile was installed.
     Accepted,
     /// The profile was refused - because the scope doesn't address anything on this charge point,
-    /// because the store is full, or because the profile itself is unusable. The reason is
-    /// carried for logging, not for the wire: every version collapses refusal to a single
-    /// `Rejected` status.
-    Rejected(&'static str),
+    /// because the store is full, or because the profile itself is unusable. Every version
+    /// collapses refusal to a single `Rejected` status; what varies is whether OCPP names a
+    /// reason code to go with it. See [`SetChargingProfileRejection`].
+    Rejected(SetChargingProfileRejection),
+}
+
+/// Why a `SetChargingProfile` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetChargingProfileRejection {
+    /// A human explanation, for this charge point's own logs.
+    pub explanation: &'static str,
+    /// OCPP's `statusInfo.reasonCode`, where the spec names one for this refusal - 2.1's K28
+    /// does, for the two dynamic-profile shape rules (`"InvalidSchedule"` for K28.FR.03,
+    /// `"InvalidProfile"` for K28.FR.04).
+    ///
+    /// `None` for the refusals OCPP leaves unnamed (an unknown EVSE, a full store). Inventing a
+    /// code for those would put a string a CSMS may branch on into a field the spec does not
+    /// define, which is worse than the silence the schema allows.
+    pub reason_code: Option<&'static str>,
 }
 
 /// Handles a CSMS-initiated `SetChargingProfile` against `actor`.
@@ -54,21 +69,33 @@ pub async fn handle_set_charging_profile(
     // C5 (docs/PRODUCTION-ROADMAP.md §5.5): registered whenever the `smart-charging` feature is
     // on, but the hardware may still declare the capability runtime-absent.
     if !crate::refusal::capability_present(&state.capabilities, "SetChargingProfile") {
-        return SetChargingProfileOutcome::Rejected("smart charging is not available");
+        return SetChargingProfileOutcome::Rejected(SetChargingProfileRejection {
+            explanation: "smart charging is not available",
+            reason_code: None,
+        });
     }
     if let ChargingProfileScope::Evse(evse_id) = scope
         && evse_id >= state.evses.len()
     {
-        return SetChargingProfileOutcome::Rejected("no such EVSE");
+        return SetChargingProfileOutcome::Rejected(SetChargingProfileRejection {
+            explanation: "no such EVSE",
+            reason_code: None,
+        });
     }
     for schedule in &mut profile.schedules {
         schedule.start_schedule.get_or_insert(installed_at);
+    }
+    if profile.kind == crate::state::ChargingProfileKind::Dynamic {
+        // K28.FR.05. A dynamic profile's period is active on receipt, so "now" is both its anchor
+        // and the start of the deadline its `duration` sets - and this adapter is the only place
+        // that knows when the profile arrived.
+        profile.dyn_update_time.get_or_insert(installed_at);
     }
 
     let mut trial = state.charging_profiles.clone();
     if let Err(rejection) = trial.install(scope, profile.clone()) {
         tracing::warn!(?rejection, "refusing a charging profile");
-        return SetChargingProfileOutcome::Rejected("the charge point cannot hold this profile");
+        return SetChargingProfileOutcome::Rejected(rejection_reason(&rejection));
     }
 
     let _ = actor
@@ -78,6 +105,40 @@ pub async fn handle_set_charging_profile(
         })
         .await;
     SetChargingProfileOutcome::Accepted
+}
+
+/// The store's reason for refusing a profile, as the CSMS should hear it.
+///
+/// 2.1's K28 is the only place OCPP names a reason code for `SetChargingProfile`, and it names
+/// exactly two - so those two are mapped and everything else refuses without one.
+fn rejection_reason(
+    rejection: &crate::state::ChargingProfileRejection,
+) -> SetChargingProfileRejection {
+    use crate::state::ChargingProfileRejection as Rejection;
+    match rejection {
+        // K28.FR.03.
+        Rejection::InvalidDynamicSchedule(_) => SetChargingProfileRejection {
+            explanation: "a Dynamic profile must carry exactly one single-period schedule",
+            reason_code: Some("InvalidSchedule"),
+        },
+        // K28.FR.04.
+        Rejection::DynUpdateIntervalOnNonDynamicProfile => SetChargingProfileRejection {
+            explanation: "dynUpdateInterval only applies to a Dynamic profile",
+            reason_code: Some("InvalidProfile"),
+        },
+        Rejection::TooManyProfiles => SetChargingProfileRejection {
+            explanation: "the charge point cannot hold another profile",
+            reason_code: None,
+        },
+        Rejection::NoSchedule => SetChargingProfileRejection {
+            explanation: "a profile with no schedule could never produce a limit",
+            reason_code: None,
+        },
+        Rejection::ScopeNotAllowedForPurpose(_) => SetChargingProfileRejection {
+            explanation: "this profile's purpose cannot be installed at that scope",
+            reason_code: None,
+        },
+    }
 }
 
 /// The outcome of a CSMS-initiated `ClearChargingProfile`, matching OCPP's
@@ -246,6 +307,175 @@ pub async fn handle_use_priority_charging(
     UsePriorityChargingOutcome::Accepted
 }
 
+/// A dynamic limit update, as it arrives from either direction - `UpdateDynamicSchedule` pushed by
+/// the CSMS, or the `scheduleUpdate` of a `PullDynamicScheduleUpdate` response
+/// (`docs/PRODUCTION-ROADMAP.md` B2.6).
+///
+/// **Only `limit` survives the translation from the wire, and that is a decision, not an
+/// omission.** 2.1's `ChargingScheduleUpdate` also carries setpoints, discharge limits, reactive
+/// setpoints and per-phase (`_L2`/`_L3`) variants of all of them. Every one of those needs a
+/// hardware capability [`crate::hardware`] cannot express: `Connector::set_current_limit` takes a
+/// single import limit, and there is no hook for discharging, for a setpoint, or for driving
+/// phases asymmetrically. Carrying them in this type would mean storing values nothing can act on
+/// and reporting a compliance this charge point does not have. They arrive, they are logged, and
+/// they are dropped - the same stance the 2.1 adapter takes for DER period fields, and the gap
+/// closes when B8.2's bidirectional-power hardware surface lands.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DynamicScheduleUpdate {
+    /// The new charge limit for the profile's single period, in that schedule's rate unit.
+    pub limit: Option<f64>,
+    /// Whether the update carried values this crate cannot project onto hardware (see the type's
+    /// docs). Recorded so the caller can log precisely what was ignored rather than reporting a
+    /// silent success.
+    pub carried_unprojectable_values: bool,
+}
+
+/// The outcome of a dynamic limit update, matching the `ChargingProfileStatusEnum` both
+/// `UpdateDynamicSchedule` and `PullDynamicScheduleUpdate` answer with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateDynamicScheduleOutcome {
+    /// The update was applied to the named profile.
+    Accepted,
+    /// No such profile is installed, or the one installed is not
+    /// [`ChargingProfileKind::Dynamic`](crate::state::ChargingProfileKind::Dynamic) - OCPP
+    /// K28.FR.11, reported with `statusInfo.reasonCode = "InvalidProfile"`.
+    Rejected,
+}
+
+/// Applies a dynamic limit update to the profile with `profile_id` (OCPP K28.FR.06/K28.FR.08).
+///
+/// Shared by both directions on purpose: a limit the CSMS pushed and a limit the charge point
+/// pulled are the same change to the same profile, and OCPP requires the same immediate
+/// application of both. Only the message that carried it differs.
+pub async fn handle_update_dynamic_schedule(
+    actor: &ChargePointActor,
+    profile_id: crate::state::ChargingProfileId,
+    update: DynamicScheduleUpdate,
+    updated_at: DateTime<Utc>,
+) -> UpdateDynamicScheduleOutcome {
+    let state = actor.state();
+    if !crate::refusal::capability_present(&state.capabilities, "UpdateDynamicSchedule") {
+        return UpdateDynamicScheduleOutcome::Rejected;
+    }
+    let addressable = state.charging_profiles.installed().iter().any(|installed| {
+        installed.profile.id == profile_id
+            && installed.profile.kind == crate::state::ChargingProfileKind::Dynamic
+    });
+    if !addressable {
+        return UpdateDynamicScheduleOutcome::Rejected;
+    }
+    if update.carried_unprojectable_values {
+        tracing::info!(
+            profile_id = profile_id.0,
+            "a dynamic schedule update carried setpoints, discharge limits or per-phase values \
+             this charge point has no hardware hook for; only the charge limit was applied"
+        );
+    }
+
+    let _ = actor
+        .send(ChargePointEvent::DynamicScheduleUpdated {
+            profile_id,
+            limit: update.limit,
+            updated_at,
+        })
+        .await;
+    UpdateDynamicScheduleOutcome::Accepted
+}
+
+/// Asks the CSMS for a fresh limit for one dynamic charging profile - OCPP 2.1's
+/// `PullDynamicScheduleUpdate`.
+///
+/// 2.1 only, and the *outbound* half of the same mechanism
+/// [`handle_update_dynamic_schedule`] serves inbound.
+#[async_trait::async_trait]
+pub trait DynamicSchedulePuller {
+    /// What went wrong asking.
+    type Error: core::fmt::Display;
+
+    /// Requests an update for `profile_id`, returning what the CSMS answered with. `Ok(None)`
+    /// means the CSMS refused (its own `Rejected`, K28.FR.12) or sent no `scheduleUpdate` -
+    /// either way there is nothing to apply, which is different from the request having failed.
+    async fn pull_dynamic_schedule_update(
+        &self,
+        profile_id: crate::state::ChargingProfileId,
+    ) -> Result<Option<DynamicScheduleUpdate>, Self::Error>;
+}
+
+#[async_trait::async_trait]
+impl<T: DynamicSchedulePuller + Send + Sync + ?Sized> DynamicSchedulePuller
+    for alloc::sync::Arc<T>
+{
+    type Error = T::Error;
+
+    async fn pull_dynamic_schedule_update(
+        &self,
+        profile_id: crate::state::ChargingProfileId,
+    ) -> Result<Option<DynamicScheduleUpdate>, Self::Error> {
+        (**self).pull_dynamic_schedule_update(profile_id).await
+    }
+}
+
+/// Pulls a fresh limit for every dynamic profile that is due one, every `interval_secs` (OCPP
+/// K28.FR.10).
+///
+/// **Skipped entirely while the clock is unsynchronized** ([`crate::clock::is_synchronized`]), the
+/// same stance [`crate::reservation::run_reservation_expiry`] takes and for the same reason: due-ness
+/// is `dyn_update_time + dyn_update_interval` against now, and a charge point that does not know
+/// the time would either pull continuously or never. Continuously is the worse failure - it is a
+/// request storm at the CSMS - and neither is worth guessing at.
+///
+/// The sweep interval is how often *due-ness is checked*, not how often a pull happens: each
+/// profile carries its own `dynUpdateInterval`, and the store only reports the ones that have
+/// reached it.
+pub async fn run_dynamic_schedule_pulls<P, C, B>(
+    actor: &ChargePointActor,
+    puller: &P,
+    clock: &C,
+    backoff: &B,
+    interval_secs: u32,
+) where
+    P: DynamicSchedulePuller,
+    C: Clock,
+    B: crate::provisioning::Backoff,
+{
+    let interval_secs = interval_secs.max(1);
+    loop {
+        backoff.wait(interval_secs).await;
+        let now = clock.now();
+        if !crate::clock::is_synchronized(&now) {
+            continue;
+        }
+        let due = actor.state().charging_profiles.dynamic_pulls_due(now);
+        for profile_id in due {
+            match puller.pull_dynamic_schedule_update(profile_id).await {
+                Ok(Some(update)) => {
+                    // K28.FR.08/K28.FR.09: a pulled update applies exactly like a pushed one, and
+                    // is stamped with the instant it was *applied* rather than the instant the
+                    // sweep started - a slow round trip must not shorten the next interval.
+                    handle_update_dynamic_schedule(actor, profile_id, update, clock.now()).await;
+                }
+                Ok(None) => {
+                    // The CSMS refused or sent nothing. Deliberately *not* stamping
+                    // `dyn_update_time`: this profile's K28.FR.13 deadline must keep running, or a
+                    // CSMS that answers "Rejected" forever would keep a stale limit alive by
+                    // replying at all.
+                    tracing::debug!(
+                        profile_id = profile_id.0,
+                        "the CSMS had no dynamic schedule update to give"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        profile_id = profile_id.0,
+                        "failed to pull a dynamic schedule update"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Reports a priority-charging change the charge point made itself, as OCPP 2.1's
 /// `NotifyPriorityCharging`.
 ///
@@ -381,6 +611,16 @@ pub trait SetChargingProfileHandler {
     async fn register_set_charging_profile_handler(&self, actor: ChargePointActor);
 }
 
+/// Registers this charge point's inbound `UpdateDynamicSchedule` handling with the CSMS
+/// connection.
+///
+/// 2.1 only - dynamic charging profiles are OCPP K28, which neither 1.6J nor 2.0.1 has.
+#[async_trait::async_trait]
+pub trait UpdateDynamicScheduleHandler {
+    /// Registers an `UpdateDynamicSchedule` handler dispatching against `actor`.
+    async fn register_update_dynamic_schedule_handler(&self, actor: ChargePointActor);
+}
+
 /// Registers this charge point's inbound `UsePriorityCharging` handling with the CSMS connection.
 ///
 /// 2.1 only - see [`PriorityChargingNotifier`] for why the other two versions have nothing to
@@ -457,6 +697,8 @@ mod tests {
                     number_phases: None,
                 }],
             }],
+            dyn_update_interval_secs: None,
+            dyn_update_time: None,
         }
     }
 
@@ -894,5 +1136,271 @@ mod tests {
         let outcome = handle_use_priority_charging(&actor, transaction, true).await;
 
         assert_eq!(outcome, UsePriorityChargingOutcome::Rejected);
+    }
+
+    fn dynamic_profile(id: i32) -> ChargingProfile {
+        ChargingProfile {
+            kind: crate::state::ChargingProfileKind::Dynamic,
+            ..profile(id)
+        }
+    }
+
+    fn limit_update(limit: f64) -> DynamicScheduleUpdate {
+        DynamicScheduleUpdate {
+            limit: Some(limit),
+            carried_unprojectable_values: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn installing_a_dynamic_profile_stamps_the_moment_it_arrived_as_its_anchor() {
+        let actor = actor_with_smart_charging().await;
+
+        handle_set_charging_profile(
+            &actor,
+            ChargingProfileScope::Evse(0),
+            dynamic_profile(1),
+            now(),
+        )
+        .await;
+
+        // K28.FR.05. Without it the profile has no anchor to be active from and no start for the
+        // deadline its `duration` sets.
+        assert_eq!(
+            actor.state().charging_profiles.installed()[0]
+                .profile
+                .dyn_update_time,
+            Some(now())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_profile_that_is_not_a_single_immediate_period_is_refused_with_a_reason_code()
+    {
+        let actor = actor_with_smart_charging().await;
+        let mut two_periods = dynamic_profile(1);
+        two_periods.schedules[0]
+            .periods
+            .push(ChargingSchedulePeriod {
+                start_period_secs: 600,
+                limit: 32.0,
+                number_phases: None,
+            });
+
+        let outcome =
+            handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), two_periods, now())
+                .await;
+
+        // K28.FR.03: the CSMS is told which rule it broke, not just that something was wrong.
+        assert_eq!(
+            outcome,
+            SetChargingProfileOutcome::Rejected(SetChargingProfileRejection {
+                explanation: "a Dynamic profile must carry exactly one single-period schedule",
+                reason_code: Some("InvalidSchedule"),
+            })
+        );
+        assert!(actor.state().charging_profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_profile_carrying_a_dyn_update_interval_is_refused_with_a_reason_code() {
+        let actor = actor_with_smart_charging().await;
+        let mut scheduled = profile(1);
+        scheduled.dyn_update_interval_secs = Some(60);
+
+        let outcome =
+            handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), scheduled, now())
+                .await;
+
+        // K28.FR.04.
+        assert_eq!(
+            outcome,
+            SetChargingProfileOutcome::Rejected(SetChargingProfileRejection {
+                explanation: "dynUpdateInterval only applies to a Dynamic profile",
+                reason_code: Some("InvalidProfile"),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pushed_dynamic_update_replaces_the_profiles_limit() {
+        let actor = actor_with_smart_charging().await;
+        handle_set_charging_profile(
+            &actor,
+            ChargingProfileScope::Evse(0),
+            dynamic_profile(1),
+            now(),
+        )
+        .await;
+
+        let later = now() + chrono::Duration::seconds(300);
+        let outcome =
+            handle_update_dynamic_schedule(&actor, ChargingProfileId(1), limit_update(24.0), later)
+                .await;
+
+        assert_eq!(outcome, UpdateDynamicScheduleOutcome::Accepted);
+        let state = actor.state();
+        let installed = &state.charging_profiles.installed()[0].profile;
+        assert_eq!(installed.schedules[0].periods[0].limit, 24.0);
+        assert_eq!(installed.dyn_update_time, Some(later));
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_update_naming_a_scheduled_profile_is_refused_before_anything_is_dispatched()
+    {
+        let actor = actor_with_smart_charging().await;
+        handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), profile(1), now()).await;
+
+        let outcome =
+            handle_update_dynamic_schedule(&actor, ChargingProfileId(1), limit_update(24.0), now())
+                .await;
+
+        assert_eq!(outcome, UpdateDynamicScheduleOutcome::Rejected);
+        // The CSMS's curve is untouched - K28.FR.11 refuses rather than rewriting it.
+        assert_eq!(
+            actor.state().charging_profiles.installed()[0]
+                .profile
+                .schedules[0]
+                .periods[0]
+                .limit,
+            16.0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_update_for_an_uninstalled_profile_is_refused() {
+        let actor = actor_with_smart_charging().await;
+
+        let outcome = handle_update_dynamic_schedule(
+            &actor,
+            ChargingProfileId(99),
+            limit_update(24.0),
+            now(),
+        )
+        .await;
+
+        assert_eq!(outcome, UpdateDynamicScheduleOutcome::Rejected);
+    }
+
+    /// A backoff that does not actually wait, so a sweep loop can be driven at test speed.
+    struct InstantBackoff;
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::Backoff for InstantBackoff {
+        async fn wait(&self, _seconds: u32) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A clock frozen at one instant, like the one `crate::transactions`' tests use.
+    #[derive(Clone, Copy)]
+    struct FixedClock(DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+
+    /// A puller that records what it was asked for and answers from a script.
+    struct ScriptedPuller {
+        answers: std::sync::Mutex<Vec<Option<DynamicScheduleUpdate>>>,
+        asked: std::sync::Mutex<Vec<ChargingProfileId>>,
+    }
+
+    impl ScriptedPuller {
+        fn new(answers: Vec<Option<DynamicScheduleUpdate>>) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers),
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DynamicSchedulePuller for ScriptedPuller {
+        type Error = core::convert::Infallible;
+
+        async fn pull_dynamic_schedule_update(
+            &self,
+            profile_id: ChargingProfileId,
+        ) -> Result<Option<DynamicScheduleUpdate>, Self::Error> {
+            self.asked.lock().unwrap().push(profile_id);
+            let mut answers = self.answers.lock().unwrap();
+            Ok(if answers.is_empty() {
+                None
+            } else {
+                answers.remove(0)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_due_dynamic_profile_is_pulled_and_the_answer_applied() {
+        let actor = alloc::sync::Arc::new(actor_with_smart_charging().await);
+        let mut pullable = dynamic_profile(1);
+        pullable.dyn_update_interval_secs = Some(60);
+        handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), pullable, now()).await;
+
+        let puller =
+            alloc::sync::Arc::new(ScriptedPuller::new(alloc::vec![Some(limit_update(20.0))]));
+        // A clock well past the profile's interval, so the first sweep finds it due.
+        let clock = FixedClock(now() + chrono::Duration::seconds(600));
+        let task_actor = actor.clone();
+        let task_puller = puller.clone();
+        let handle = tokio::spawn(async move {
+            run_dynamic_schedule_pulls(&task_actor, &task_puller, &clock, &InstantBackoff, 1).await;
+        });
+
+        for _ in 0..400 {
+            if actor.state().charging_profiles.installed()[0]
+                .profile
+                .schedules[0]
+                .periods[0]
+                .limit
+                == 20.0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+
+        assert_eq!(
+            puller.asked.lock().unwrap().as_slice(),
+            &[ChargingProfileId(1)]
+        );
+        assert_eq!(
+            actor.state().charging_profiles.installed()[0]
+                .profile
+                .schedules[0]
+                .periods[0]
+                .limit,
+            20.0
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_pulled_while_the_clock_is_unsynchronized() {
+        let actor = alloc::sync::Arc::new(actor_with_smart_charging().await);
+        let mut pullable = dynamic_profile(1);
+        pullable.dyn_update_interval_secs = Some(60);
+        handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), pullable, now()).await;
+
+        let puller = alloc::sync::Arc::new(ScriptedPuller::new(Vec::new()));
+        // An unset RTC. Due-ness is a time comparison, so asking here would either storm the CSMS
+        // or never fire - neither is worth guessing at.
+        let clock = FixedClock(DateTime::from_timestamp(0, 0).unwrap());
+        let task_actor = actor.clone();
+        let task_puller = puller.clone();
+        let handle = tokio::spawn(async move {
+            run_dynamic_schedule_pulls(&task_actor, &task_puller, &clock, &InstantBackoff, 1).await;
+        });
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+
+        assert!(puller.asked.lock().unwrap().is_empty());
     }
 }

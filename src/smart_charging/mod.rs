@@ -52,12 +52,14 @@ pub use self::ocpp_2_1::Ocpp2_1SmartChargingHandler;
 
 pub use self::handlers::{
     CHARGING_PROFILE_REPORT_CHUNK_SIZE, ChargingProfileReportChunk, ClearChargingProfileHandler,
-    ClearChargingProfileOutcome, GetChargingProfilesHandler, GetCompositeScheduleHandler,
-    GetCompositeScheduleOutcome, PriorityChargingNotifier, SetChargingProfileHandler,
-    SetChargingProfileOutcome, UsePriorityChargingHandler, UsePriorityChargingOutcome,
-    chunk_charging_profile_report, handle_clear_charging_profile, handle_get_charging_profiles,
-    handle_get_composite_schedule, handle_set_charging_profile, handle_use_priority_charging,
-    run_priority_charging_notifications,
+    ClearChargingProfileOutcome, DynamicSchedulePuller, DynamicScheduleUpdate,
+    GetChargingProfilesHandler, GetCompositeScheduleHandler, GetCompositeScheduleOutcome,
+    PriorityChargingNotifier, SetChargingProfileHandler, SetChargingProfileOutcome,
+    SetChargingProfileRejection, UpdateDynamicScheduleHandler, UpdateDynamicScheduleOutcome,
+    UsePriorityChargingHandler, UsePriorityChargingOutcome, chunk_charging_profile_report,
+    handle_clear_charging_profile, handle_get_charging_profiles, handle_get_composite_schedule,
+    handle_set_charging_profile, handle_update_dynamic_schedule, handle_use_priority_charging,
+    run_dynamic_schedule_pulls, run_priority_charging_notifications,
 };
 pub use self::projection::{
     ChargingLimitProjection, connector_composition_context, run_charging_limit_projection,
@@ -413,6 +415,11 @@ fn schedule_for<'a>(
 ///   before `at`.
 /// - [`ChargingProfileKind::Relative`]: the transaction's start
 ///   ([`CompositionContext::transaction_started_at`]); skipped when that isn't known.
+/// - [`ChargingProfileKind::Dynamic`]: its own
+///   [`dyn_update_time`](crate::state::ChargingProfile::dyn_update_time) - the instant its single
+///   period last took a value, which is when it became active (OCPP K28.FR.02: a dynamic period
+///   applies on receipt). Falling back to `now` when that is somehow unset keeps the profile
+///   applying rather than silently dropping the CSMS's live limit.
 fn schedule_anchor(
     profile: &crate::state::ChargingProfile,
     schedule: &ChargingSchedule,
@@ -422,6 +429,7 @@ fn schedule_anchor(
         ChargingProfileKind::Absolute => Some(schedule.start_schedule.unwrap_or(context.now)),
         ChargingProfileKind::Relative => context.transaction_started_at,
         ChargingProfileKind::Recurring => schedule.start_schedule,
+        ChargingProfileKind::Dynamic => Some(profile.dyn_update_time.unwrap_or(context.now)),
     }
 }
 

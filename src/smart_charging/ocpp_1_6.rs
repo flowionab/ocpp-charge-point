@@ -156,6 +156,10 @@ fn map_profile(profile: &CsChargingProfiles) -> ChargingProfile {
             .and_then(|id| u64::try_from(id).ok())
             .map(TransactionId),
         schedules: alloc::vec![map_schedule(&profile.charging_schedule)],
+        // 1.6J has no dynamic charging profiles (OCPP K28 is 2.1-only), so nothing on this wire
+        // can produce one.
+        dyn_update_interval_secs: None,
+        dyn_update_time: None,
     }
 }
 

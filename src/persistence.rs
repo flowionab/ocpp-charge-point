@@ -1613,6 +1613,7 @@ enum PersistedChargingProfileKind {
     Absolute,
     Recurring,
     Relative,
+    Dynamic,
 }
 
 impl From<ChargingProfileKind> for PersistedChargingProfileKind {
@@ -1621,6 +1622,7 @@ impl From<ChargingProfileKind> for PersistedChargingProfileKind {
             ChargingProfileKind::Absolute => Self::Absolute,
             ChargingProfileKind::Recurring => Self::Recurring,
             ChargingProfileKind::Relative => Self::Relative,
+            ChargingProfileKind::Dynamic => Self::Dynamic,
         }
     }
 }
@@ -1631,6 +1633,7 @@ impl From<PersistedChargingProfileKind> for ChargingProfileKind {
             PersistedChargingProfileKind::Absolute => Self::Absolute,
             PersistedChargingProfileKind::Recurring => Self::Recurring,
             PersistedChargingProfileKind::Relative => Self::Relative,
+            PersistedChargingProfileKind::Dynamic => Self::Dynamic,
         }
     }
 }
@@ -1745,6 +1748,15 @@ pub struct PersistedChargingProfile {
     valid_to: Option<DateTime<Utc>>,
     transaction_id: Option<u64>,
     schedules: Vec<PersistedChargingSchedule>,
+    /// Both `#[serde(default)]` so a snapshot written before dynamic profiles existed still
+    /// reads - it can only contain non-dynamic profiles, for which both are `None` anyway.
+    #[serde(default)]
+    dyn_update_interval_secs: Option<u32>,
+    /// Persisted rather than re-stamped on recovery, because it is what a dynamic profile's
+    /// K28.FR.13 expiry is measured from: re-stamping it at boot would silently grant a stale
+    /// limit a fresh lease, which is exactly the failure that expiry exists to prevent.
+    #[serde(default)]
+    dyn_update_time: Option<DateTime<Utc>>,
 }
 
 impl From<&InstalledChargingProfile> for PersistedChargingProfile {
@@ -1760,6 +1772,8 @@ impl From<&InstalledChargingProfile> for PersistedChargingProfile {
             valid_from: profile.valid_from,
             valid_to: profile.valid_to,
             transaction_id: profile.transaction_id.map(|id| id.0),
+            dyn_update_interval_secs: profile.dyn_update_interval_secs,
+            dyn_update_time: profile.dyn_update_time,
             schedules: profile
                 .schedules
                 .iter()
@@ -1797,6 +1811,8 @@ impl From<PersistedChargingProfile> for InstalledChargingProfile {
                 valid_from: persisted.valid_from,
                 valid_to: persisted.valid_to,
                 transaction_id: persisted.transaction_id.map(TransactionId),
+                dyn_update_interval_secs: persisted.dyn_update_interval_secs,
+                dyn_update_time: persisted.dyn_update_time,
                 schedules: persisted
                     .schedules
                     .into_iter()
@@ -4160,6 +4176,8 @@ mod tests {
                         },
                     ],
                 }],
+                dyn_update_interval_secs: None,
+                dyn_update_time: None,
             },
         }
     }

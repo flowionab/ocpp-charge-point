@@ -180,6 +180,10 @@ fn map_profile(
             .and_then(|id| id.parse().ok())
             .map(TransactionId),
         schedules: profile.charging_schedule.iter().map(map_schedule).collect(),
+        // 2.0.1 has no dynamic charging profiles (OCPP K28 is 2.1-only), so nothing on this wire
+        // can produce one.
+        dyn_update_interval_secs: None,
+        dyn_update_time: None,
     }
 }
 
@@ -250,6 +254,12 @@ fn wire_kind(kind: ChargingProfileKind) -> ChargingProfileKindEnum {
         ChargingProfileKind::Absolute => ChargingProfileKindEnum::Absolute,
         ChargingProfileKind::Recurring => ChargingProfileKindEnum::Recurring,
         ChargingProfileKind::Relative => ChargingProfileKindEnum::Relative,
+        // 2.0.1's enum has no `Dynamic`. A dynamic profile can only have been installed over a
+        // 2.1 connection, and reporting it here at all is a projection: `Relative` is the closest
+        // honest answer, since a dynamic period is likewise anchored to when it arrived rather
+        // than to a wall-clock start. The same documented loss `wire_purpose` takes for
+        // `PriorityCharging`.
+        ChargingProfileKind::Dynamic => ChargingProfileKindEnum::Relative,
     }
 }
 

@@ -502,8 +502,12 @@ version.
 
 ### B2 — Smart charging (R§11)
 
-Largest genuinely-missing block, and the one a real deployment demands
-first: without it there is no load management.
+Was the largest genuinely-missing block, and the one a real deployment demands
+first: without it there is no load management. **Complete as of B2.6**, except
+the three notify-flows below that report a limit's *origin* rather than apply
+one (`NotifyChargingLimit`/`ClearedChargingLimit`,
+`NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`), which have no task of their
+own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-15118-r1-r13) covers.
 
 | Message | 1.6J | 2.0.1 | 2.1 |
 |---------|:----:|:-----:|:---:|
@@ -514,8 +518,8 @@ first: without it there is no load management.
 | NotifyChargingLimit / ClearedChargingLimit | — | ⬜ | ⬜ |
 | NotifyEVChargingNeeds / NotifyEVChargingSchedule | — | ⬜ | ⬜ |
 | NotifyPriorityCharging / UsePriorityCharging | — | — | ✅ |
-| PullDynamicScheduleUpdate | — | — | ⬜ |
-| UpdateDynamicSchedule | — | — | ⬜ |
+| PullDynamicScheduleUpdate | — | — | ✅ |
+| UpdateDynamicSchedule | — | — | ✅ |
 | NotifyAllowedEnergyTransfer | — | — | ⬜ |
 
 **B2 tasks:**
@@ -648,19 +652,18 @@ first: without it there is no load management.
       since it was written. And 2.1's generated `ChargingProfile` is **56 KB by value** (see
       [D2.3](#62-d2--type-completeness-audit)), so building one to send is expensive in a way that
       matters on an MCU.
-- [ ] **B2.6** 2.1 dynamic schedule updates and priority charging. **Priority charging is done;
-      the dynamic-schedule half is not.**
+- [x] **B2.6** 2.1 dynamic schedule updates and priority charging.
 
       **The upstream blocker this row carried was stale.** `UpdateDynamicSchedule` was marked 🔒
       on [D1](#61-d1--missing-action-wrappers), but the pinned `ocpp-client` is now **0.2.2**, not
       0.2.0 — it generates **91** OCPP 2.1 actions, including all four that were listed as absent
       (`UpdateDynamicSchedule`, `SetDisplayMessage`, `GetDERControl`, `SetDERControl`) and 2.0.1's
       `SecurityEventNotification`. D1.1/D1.2 closed that and the per-row markers were never
-      re-swept. Nothing in B2.6 is blocked upstream; neither is [B6](#b6--display-message-r15) or
-      [B8.2](#b8--reservation-derv2x-battery-swap).
+      re-swept. Neither [B6](#b6--display-message-r15) nor
+      [B8.2](#b8--reservation-derv2x-battery-swap) is blocked either.
 
-      **Priority charging (done).** `UsePriorityCharging` inbound and `NotifyPriorityCharging`
-      outbound, both 2.1-only, plus the composition gate that makes them mean anything.
+      **Priority charging.** `UsePriorityCharging` inbound and `NotifyPriorityCharging` outbound,
+      plus the composition gate that makes them mean anything.
 
       The gate is the part that was a real defect rather than a missing message:
       `PriorityCharging` profiles applied to *any* running transaction the moment they were
@@ -668,10 +671,9 @@ first: without it there is no load management.
       priority profile is a **grant**, not another stack level - installing one now changes
       nothing until the CSMS names a transaction, which `CompositionContext::priority_charging`
       and `Transaction::priority_charging` carry. The grant lives on the transaction, so it ends
-      with the session rather than leaking into whatever plugs in next, and
-      `#[serde(default)]` makes a session persisted before the field existed recover as
-      *ungranted* - the safe reading, since the CSMS can no longer see a priority it never
-      re-granted.
+      with the session rather than leaking into whatever plugs in next, and `#[serde(default)]`
+      makes a session persisted before the field existed recover as *ungranted* - the safe
+      reading, since the CSMS can no longer see a priority it never re-granted.
 
       Two decisions worth recording. `NoProfile` is kept distinct from `Rejected` because it is
       the one refusal the CSMS can act on (install a priority profile, then ask again), and
@@ -682,16 +684,59 @@ first: without it there is no load management.
       so the effect fires only for `locally_initiated` changes, exactly the split
       [B8.1](#b8--reservation-derv2x-battery-swap)'s `ReservationEnded` makes.
 
+      **Dynamic charging profiles (OCPP K28)**, implemented against the vendored 2.1 spec's
+      K28.FR.01–.15 rather than from the message list: `ChargingProfileKind::Dynamic`,
+      `dynUpdateInterval`/`dynUpdateTime`, `UpdateDynamicSchedule` inbound, and a sweep that pulls
+      with `PullDynamicScheduleUpdate` for every profile whose own interval has come round.
+
+      A dynamic profile inverts what a charging profile *is*. There is no curve laid out in
+      advance - one schedule, one period, starting at 0 (K28.FR.01/.02, enforced on install and
+      refused with `reasonCode = "InvalidSchedule"` rather than trimmed to fit, because silently
+      dropping periods would apply a limit the CSMS never asked for). Its limit is replaced as it
+      goes, in place, by either direction of the same mechanism, which is why one
+      protocol-agnostic handler serves both.
+
+      **`dynUpdateTime` is the interesting field, and it does two jobs.** It is the schedule's
+      anchor - a dynamic period is active from the moment it arrives, so there is no
+      `startSchedule` to measure from, and the charge point stamps it on install (K28.FR.05) and
+      on every update (K28.FR.09). It is also the clock a **dead-man's switch** runs on: with a
+      `duration` set, a profile whose CSMS stops answering stops applying (K28.FR.13/.15) and
+      composition falls through to the next valid profile, with a later update reviving it
+      (K28.FR.14) without a reinstall. That makes `duration` mean something quite different on a
+      dynamic profile than on a scheduled one - not "when the curve runs out" but "how long one
+      pushed limit may be trusted unrefreshed" - and it is the difference between a CSMS outage
+      being survivable and it freezing a stale limit onto a connector indefinitely. Computed
+      rather than latched, so revival needs no extra event. A refused or empty pull deliberately
+      does **not** stamp the timestamp: a CSMS answering `Rejected` forever must not keep a stale
+      limit alive by replying at all.
+
+      **What the wire carries that this crate does not.** 2.1's `ChargingScheduleUpdate` also has
+      setpoints, discharge limits, reactive setpoints and per-phase `_L2`/`_L3` variants of all of
+      them. Every one needs a hardware capability `crate::hardware` cannot express -
+      `Connector::set_current_limit` takes a single import limit, with no hook for discharging, a
+      setpoint, or driving phases asymmetrically. They are counted, logged and dropped rather than
+      stored: keeping values nothing can act on would report a compliance this charge point does
+      not have. The gap closes with [B8.2](#b8--reservation-derv2x-battery-swap)'s
+      bidirectional-power hardware surface.
+
+      The pull sweep **skips entirely while the clock is unsynchronized**, the same stance
+      `run_reservation_expiry` takes: due-ness is `dynUpdateTime + dynUpdateInterval` against now,
+      and a charge point that does not know the time would either never pull or storm the CSMS.
+      Its interval is how often due-ness is *checked*, not how often a pull happens - each profile
+      carries its own, and a charge point with no dynamic profiles installed makes no requests at
+      all.
+
       Registered from `connect.rs`'s 2.1 path rather than `setup()`, because `setup()` is generic
       over a CSMS client that may equally be a 2.0.1 one and a 2.1-only bound there would make the
-      whole "everything on" wrapper unusable on 2.0.1 -
-      [`ChargePointBuilder::priority_charging`](../src/builder.rs) is the general entry point.
+      whole "everything on" wrapper unusable on 2.0.1 - that is the coupling C4's builder exists
+      to avoid. [`ChargePointBuilder::priority_charging`](../src/builder.rs) and
+      `dynamic_charging_profiles` are the general entry points.
 
-      **Still open:** `PullDynamicScheduleUpdate` / `UpdateDynamicSchedule`, 2.1's `Dynamic`
-      profile kind (`map_kind` currently folds it into `Relative`), `dynUpdateInterval` /
-      `dynUpdateTime`, and the dynamic period fields the 2.1 adapter reads past (`setpoint`,
-      `dischargeLimit`, `operationMode`, the per-phase `*_L2`/`*_L3` variants). All of them are
-      now ordinary work, not blocked work.
+      **Version projection.** 1.6J and 2.0.1 have neither the kind nor the messages, so their
+      adapters never produce a dynamic profile; reporting one installed over a 2.1 connection
+      degrades it to `Relative`, which is the closest honest answer (both are anchored to when
+      they arrived rather than to a wall-clock start) and the same documented loss `wire_purpose`
+      already takes for `PriorityCharging`.
 
 ### B3 — Firmware management (R§12)
 
@@ -2357,7 +2402,7 @@ SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 `ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
 [D1](#61-d1--missing-action-wrappers).
 
-### A.3 OCPP 2.1 — 34 of 91 wired
+### A.3 OCPP 2.1 — 36 of 91 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
@@ -2365,9 +2410,9 @@ GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
 GetReport, GetVariables, Heartbeat, NotifyPriorityCharging, NotifyReport,
 ReportChargingProfiles, ReservationStatusUpdate, RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
-MeterValues, SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
-StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector,
-UsePriorityCharging
+MeterValues, PullDynamicScheduleUpdate, SendLocalList, SetChargingProfile,
+SetNetworkProfile, SetVariables, StatusNotification, TransactionEvent,
+TriggerMessage, UnlockConnector, UpdateDynamicSchedule, UsePriorityCharging
 
 **Missing:** AFRRSignal, AdjustPeriodicEventStream, BatterySwap,
 CertificateSigned, ChangeTransactionTariff, ClearDERControl, ClearDisplayMessage, ClearTariffs,
@@ -2384,8 +2429,7 @@ NotifyEVChargingNeeds, NotifyEVChargingSchedule, NotifyEvent,
 NotifyMonitoringReport, NotifyPeriodicEventStream,
 NotifySettlement, NotifyWebPaymentStarted, OpenPeriodicEventStream,
 PublishFirmware, PublishFirmwareStatusNotification,
-PullDynamicScheduleUpdate, ReportDERControl,
-RequestBatterySwap,
+ReportDERControl, RequestBatterySwap,
 SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware,
 VatNumberValidation
@@ -2410,5 +2454,5 @@ gap is entirely this crate's to close.
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 803 | `#[test]` + `#[tokio::test]`, re-counted at the B2.6 priority-charging commit (792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 827 | `#[test]` + `#[tokio::test]`, re-counted at the B2.6 dynamic-schedule commit (803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

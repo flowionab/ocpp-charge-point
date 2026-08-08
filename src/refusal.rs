@@ -135,6 +135,11 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         shape: RefusalShape::CallResultStatus,
     },
     RefusalGate {
+        message: "UpdateDynamicSchedule",
+        capability: |c| c.smart_charging,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
         message: "UsePriorityCharging",
         capability: |c| c.smart_charging,
         shape: RefusalShape::CallResultStatus,

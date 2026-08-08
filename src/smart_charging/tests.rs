@@ -53,6 +53,8 @@ fn profile(
             valid_to: None,
             transaction_id: None,
             schedules: vec![schedule],
+            dyn_update_interval_secs: None,
+            dyn_update_time: None,
         },
     }
 }
@@ -688,4 +690,51 @@ fn a_schedule_that_ends_leaves_no_limit_behind() {
         current_limit_ma(&profiles.iter().collect::<Vec<_>>(), &after),
         None
     );
+}
+
+#[test]
+fn a_dynamic_schedule_is_anchored_to_when_its_limit_last_arrived() {
+    let mut dynamic = profile(
+        1,
+        ChargingProfilePurpose::TxDefault,
+        0,
+        schedule(&[(0, 16.0)]),
+    );
+    dynamic.profile.kind = ChargingProfileKind::Dynamic;
+    // Updated 10 minutes ago. A dynamic period has no `startSchedule` to measure from - it took
+    // effect when it arrived - so it must be limiting right now rather than waiting for anything.
+    dynamic.profile.dyn_update_time = Some(at(-600));
+    let profiles = [dynamic];
+
+    let composed = compose(&profiles.iter().collect::<Vec<_>>(), &context()).unwrap();
+
+    assert_eq!(limits(&composed), vec![(0, 16.0)]);
+}
+
+#[test]
+fn a_dynamic_profile_whose_csms_went_quiet_falls_through_to_the_next_profile() {
+    let mut dynamic = profile(
+        1,
+        ChargingProfilePurpose::TxDefault,
+        5,
+        schedule(&[(0, 32.0)]),
+    );
+    dynamic.profile.kind = ChargingProfileKind::Dynamic;
+    dynamic.profile.schedules[0].duration_secs = Some(300);
+    // Last updated 10 minutes ago against a 5-minute deadline the CSMS set itself: K28.FR.13.
+    dynamic.profile.dyn_update_time = Some(at(-600));
+    let profiles = [
+        dynamic,
+        profile(
+            2,
+            ChargingProfilePurpose::TxDefault,
+            0,
+            schedule(&[(0, 8.0)]),
+        ),
+    ];
+
+    // The stale profile outranks the fallback on stack level, so this is the expiry deciding -
+    // not precedence.
+    let composed = compose(&profiles.iter().collect::<Vec<_>>(), &context()).unwrap();
+    assert_eq!(limits(&composed), vec![(0, 8.0)]);
 }
