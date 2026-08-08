@@ -18,6 +18,7 @@ pub mod actor;
 pub mod authorization;
 pub mod availability;
 mod builder;
+pub mod certificates;
 pub mod clock;
 // `connect_and_setup` hands its negotiated client straight to `setup()`, so it needs the same
 // `reservation`/`local-auth-list`/`tariff-cost` features `setup()` itself does - see the `setup`

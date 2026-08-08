@@ -561,9 +561,14 @@ Secures the OCPP connection and reports security-relevant events.
   without one. The crate never sees a private key: the only question it asks is
   whether one exists, because security profile 3 needs to know whether a client
   certificate can be presented and nothing above needs the key. What is still
-  missing is the messages themselves and the crypto several of them need
+  missing is the crypto several of them need
   (parsing X.509, computing hashes, signing) - which is why the store takes hash
-  data from whoever parsed the certificate rather than deriving it. A
+  data from whoever parsed the certificate rather than deriving it.
+  `InstallCertificate`, `DeleteCertificate` and `GetInstalledCertificateIds` are
+  wired on 2.0.1 and 2.1 (B4.2); `SignCertificate`/`CertificateSigned`,
+  `GetCertificateStatus` and `Get15118EVCertificate` are not, and need the
+  signing and OCSP work B4.3/B4.4 cover. 1.6J has none of them - they are
+  Security Whitepaper messages, which `ocpp-types` does not generate. A
   `SecurityEvent` (`event_type: SecurityEventType`, `tech_info: Option<
   String>`) is reported via a new `src/security.rs` module, wired the same
   way as every other outbound report: a protocol-agnostic

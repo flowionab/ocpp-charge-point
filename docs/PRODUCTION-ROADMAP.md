@@ -892,7 +892,7 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 
 | Message | 1.6J | 2.0.1 | 2.1 |
 |---------|:----:|:-----:|:---:|
-| InstallCertificate / DeleteCertificate / GetInstalledCertificateIds | — | ⬜ | ⬜ |
+| InstallCertificate / DeleteCertificate / GetInstalledCertificateIds | — | ✅ | ✅ |
 | CertificateSigned / SignCertificate | — | ⬜ | ⬜ |
 | GetCertificateStatus | — | ⬜ | ⬜ |
 | GetCertificateChainStatus | — | — | ⬜ |
@@ -936,7 +936,42 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
       [E2.9](#72-e2--what-must-survive), [F1.3](#81-f1--security-profiles),
       [F2.2](#82-f2--tls) and [F3.2](#83-f3--credentials). Nothing wires it yet — the messages are
       B4.2.
-- [ ] **B4.2** Install / delete / enumerate, per certificate-use type.
+- [x] **B4.2** Install / delete / enumerate, per certificate-use type — `InstallCertificate`,
+      `DeleteCertificate` and `GetInstalledCertificateIds` on 2.0.1 and 2.1, answered from
+      [B4.1](#b4--certificates-and-iso-15118-r1-r13)'s store.
+
+      **2.x only**: 1.6J's certificate messages live in the Security Whitepaper, which
+      `ocpp-types` does not generate ([D2.2](#62-d2--type-completeness-audit)) — the same reason
+      `SecurityEventNotification` is 2.x-only here.
+
+      Each handler is a thin decision over the store, because that is where the work belongs:
+      parsing X.509, computing hashes and holding keys are the integrator's, possibly a secure
+      element's. What this block adds is the OCPP-shaped part — and three of those shapes are
+      decisions rather than transcription:
+
+      - **An absent capability answers `DeleteCertificate` with `NotFound`, not `Failed`.** A
+        charge point with no store genuinely does not have the certificate; `Failed` would send an
+        operator looking for a fault that isn't there.
+      - **Holding no certificates is `NotFound`, not an empty list.** That is OCPP's way of saying
+        "none", and sending an empty list alongside it would be a second way of saying the same
+        thing.
+      - **A hash too long for the wire drops its whole entry** rather than being truncated. A
+        truncated issuer hash identifies a *different* certificate, and a CSMS acting on it would
+        ask to delete the wrong one.
+
+      The charge point's own certificates are refused at this layer too, not just in the store:
+      they arrive by `CertificateSigned` in answer to a CSR, so `InstallCertificate` accepting one
+      would mean accepting a certificate for a key pair this station may not hold.
+
+      **Version difference:** 2.0.1's enums have no `OEMRootCertificate` (2.1 added it), so an OEM
+      root installed over 2.1 is reported to a 2.0.1 CSMS as the manufacturer root — both are "a
+      root this station's maker put here", which is the closest 2.0.1 can name. A documented loss,
+      like `wire_purpose`'s `PriorityCharging`.
+
+      New `certificate_management` capability and Cargo feature, registered through
+      `ChargePointBuilder::certificates`. Chained through `CAPABILITY_GATES` with
+      `has_handler: false`, since `setup()` cannot receive a store — C3.5's data-driven test
+      enforced that rather than letting it slide.
 - [ ] **B4.3** CSR generation and `SignCertificate` → `CertificateSigned`
       round trip, including automatic renewal before expiry.
 - [ ] **B4.4** OCSP status checking.
@@ -2700,12 +2735,14 @@ FirmwareStatusNotification, UnlockConnector, UpdateFirmware
 
 **Missing:** none — 1.6J's core profile is complete.
 
-### A.2 OCPP 2.0.1 — 36 of 64 wired
+### A.2 OCPP 2.0.1 — 39 of 64 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
-GetLog, GetReport, GetVariables, Heartbeat, LogStatusNotification, NotifyReport,
+DeleteCertificate, FirmwareStatusNotification, GetInstalledCertificateIds, GetLog,
+GetReport, GetVariables, Heartbeat, InstallCertificate, LogStatusNotification,
+NotifyReport, UpdateFirmware,
 ReportChargingProfiles, ReservationStatusUpdate, RequestStartTransaction,
 MeterValues, RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
 SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
@@ -2713,27 +2750,26 @@ StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
 
 **Missing:** CertificateSigned,
 ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
-CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
-Get15118EVCertificate, GetCertificateStatus,
-GetDisplayMessages, GetInstalledCertificateIds, GetMonitoringReport, GetTransactionStatus, InstallCertificate,
-LogStatusNotification, NotifyChargingLimit,
+CustomerInformation, Get15118EVCertificate, GetCertificateStatus,
+GetDisplayMessages, GetMonitoringReport, GetTransactionStatus, NotifyChargingLimit,
 NotifyCustomerInformation, NotifyDisplayMessages, NotifyEVChargingNeeds,
 NotifyEVChargingSchedule, NotifyEvent, NotifyMonitoringReport,
 PublishFirmware, PublishFirmwareStatusNotification, SetDisplayMessage,
 SetMonitoringBase, SetMonitoringLevel,
-SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
+SetVariableMonitoring, SignCertificate, UnpublishFirmware
 
 **Note:** `SecurityEventNotification` used to be listed here as present in the
 2.0.1 spec and in `ocpp-types` v201 but ungenerated by `ocpp-client` 0.2.0. D1
 fixed that upstream; 0.2.2 generates all 64 actions, and F4.4 wired this one.
 
-### A.3 OCPP 2.1 — 40 of 91 wired
+### A.3 OCPP 2.1 — 43 of 91 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
-GetLog, GetReport, GetVariables, Heartbeat, LogStatusNotification,
-NotifyPriorityCharging, NotifyReport,
+DeleteCertificate, FirmwareStatusNotification, GetInstalledCertificateIds, GetLog,
+GetReport, GetVariables, Heartbeat, InstallCertificate, LogStatusNotification,
+NotifyPriorityCharging, NotifyReport, UpdateFirmware,
 ReportChargingProfiles, ReservationStatusUpdate, RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
 MeterValues, PullDynamicScheduleUpdate, SendLocalList, SetChargingProfile,
@@ -2743,12 +2779,9 @@ TriggerMessage, UnlockConnector, UpdateDynamicSchedule, UsePriorityCharging
 **Missing:** AFRRSignal, AdjustPeriodicEventStream, BatterySwap,
 CertificateSigned, ChangeTransactionTariff, ClearDERControl, ClearDisplayMessage, ClearTariffs,
 ClearVariableMonitoring, ClearedChargingLimit, ClosePeriodicEventStream,
-CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
-Get15118EVCertificate, GetCertificateChainStatus, GetCertificateStatus,
-GetDisplayMessages,
-GetInstalledCertificateIds, GetMonitoringReport,
+CustomerInformation, Get15118EVCertificate, GetCertificateChainStatus,
+GetCertificateStatus, GetDisplayMessages, GetMonitoringReport,
 GetPeriodicEventStream, GetTariffs, GetTransactionStatus,
-InstallCertificate,
 NotifyAllowedEnergyTransfer, NotifyChargingLimit, NotifyCustomerInformation,
 NotifyDERAlarm, NotifyDERStartStop, NotifyDisplayMessages,
 NotifyEVChargingNeeds, NotifyEVChargingSchedule, NotifyEvent,
@@ -2757,8 +2790,12 @@ NotifySettlement, NotifyWebPaymentStarted, OpenPeriodicEventStream,
 PublishFirmware, PublishFirmwareStatusNotification,
 ReportDERControl, RequestBatterySwap,
 SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel,
-SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware,
-VatNumberValidation
+SetVariableMonitoring, SignCertificate, UnpublishFirmware, VatNumberValidation
+
+**Inventory reconciliation.** A.2's two lists account for exactly 64 of 64. A.3's account for 88
+of the 91 actions `ocpp-client` 0.2.2 generates — the three-message residue is unaudited and is a
+job for [H3.5](#103-h3--compliance)'s re-verification sweep, recorded here rather than papered
+over. A.1 reconciles at 28 of 28.
 
 **No message is missing an action wrapper any more.** This list used to name
 four (SetDisplayMessage, GetDERControl, SetDERControl, UpdateDynamicSchedule)
@@ -2781,5 +2818,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 920 | `#[test]` + `#[tokio::test]`, re-counted at the B4.1 commit (909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 942 | `#[test]` + `#[tokio::test]`, re-counted at the B4.2 commit (920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

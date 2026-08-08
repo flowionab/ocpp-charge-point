@@ -79,12 +79,18 @@ websocket = ["tokio-runtime", "ocpp-client/websocket"]
 # Gates nothing yet: OCPP 2.0.1/2.1 Smart Charging (SetChargingProfile, GetCompositeSchedule, and
 # related messages, roadmap workstream B2/B8.2) has no implementation in this crate yet.
 smart-charging = []
-# Gates nothing yet: firmware update/download/install (roadmap B3) has no implementation in this
-# crate yet.
+# Declares the Firmware Management capability. The block itself (roadmap B3.2) is registered
+# through `ChargePointBuilder::firmware_updates`, which needs hardware bindings the feature flag
+# cannot supply, so this gates advertisement rather than compilation.
 firmware-management = []
-# Gates nothing yet: GetLog/diagnostics upload, GetTransactionStatus, and CustomerInformation
-# (roadmap B5) have no implementation in this crate yet.
+# Declares the Diagnostics capability - log upload (roadmap B5.1) is registered through
+# `ChargePointBuilder::log_uploads`. GetTransactionStatus, CustomerInformation and the monitoring
+# engine are still unimplemented.
 diagnostics = []
+# Declares the certificate-management capability - Install/Delete/GetInstalledCertificateIds
+# (roadmap B4.2), registered through `ChargePointBuilder::certificates` with a
+# `hardware::CertificateStore`.
+certificate-management = []
 # Gates nothing yet: SetVariableMonitoring/NotifyEvent and the rest of the 2.x monitoring engine
 # (roadmap B5.2/B5.3) have no implementation in this crate yet.
 variable-monitoring = []

@@ -70,6 +70,11 @@ pub struct Capabilities {
     pub firmware_management: bool,
     /// The hardware supports the diagnostics functional block (log upload, etc.).
     pub diagnostics: bool,
+    /// The charge point can hold and manage X.509 certificates - see
+    /// [`crate::hardware::CertificateStore`]. Needed for `InstallCertificate`/`DeleteCertificate`/
+    /// `GetInstalledCertificateIds`, and for security profiles 2 and 3 to have a trust chain to
+    /// verify against.
+    pub certificate_management: bool,
     /// The hardware supports variable monitoring (thresholds/periodic monitors on device model
     /// variables).
     pub variable_monitoring: bool,
@@ -110,6 +115,7 @@ impl Default for Capabilities {
             smart_charging: false,
             firmware_management: false,
             diagnostics: false,
+            certificate_management: false,
             variable_monitoring: false,
             tariff_and_cost: false,
             payment: false,
@@ -202,6 +208,20 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         has_handler: false,
     },
     CapabilityGate {
+        name: "certificate_management",
+        cargo_feature: "certificate-management",
+        enabled: |c| c.certificate_management,
+        // No dedicated `*Ctrlr` component: OCPP puts certificate counts on `SecurityCtrlr`, which
+        // exists whether or not a store does.
+        ctrlr_component: None,
+        // 1.6J's certificate messages live in the Security Whitepaper, not in a core feature
+        // profile, so there is nothing to advertise there.
+        feature_profile_1_6: None,
+        // Builder-only, like diagnostics and firmware: registering these needs a
+        // `hardware::CertificateStore`, which `setup()`'s signature cannot receive.
+        has_handler: false,
+    },
+    CapabilityGate {
         name: "diagnostics",
         cargo_feature: "diagnostics",
         enabled: |c| c.diagnostics,
@@ -234,7 +254,7 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
 /// mistakes early, so it deliberately checks more than C3 needs to propagate).
 fn all_capability_feature_pairs(
     capabilities: &Capabilities,
-) -> [(&'static str, &'static str, bool); 14] {
+) -> [(&'static str, &'static str, bool); 15] {
     [
         (
             "smart_charging",
@@ -247,6 +267,11 @@ fn all_capability_feature_pairs(
             capabilities.firmware_management,
         ),
         ("diagnostics", "diagnostics", capabilities.diagnostics),
+        (
+            "certificate_management",
+            "certificate-management",
+            capabilities.certificate_management,
+        ),
         (
             "variable_monitoring",
             "variable-monitoring",
@@ -338,6 +363,7 @@ fn feature_enabled(feature: &str) -> bool {
         "smart-charging" => cfg!(feature = "smart-charging"),
         "firmware-management" => cfg!(feature = "firmware-management"),
         "diagnostics" => cfg!(feature = "diagnostics"),
+        "certificate-management" => cfg!(feature = "certificate-management"),
         "variable-monitoring" => cfg!(feature = "variable-monitoring"),
         "display-message" => cfg!(feature = "display-message"),
         "reservation" => cfg!(feature = "reservation"),

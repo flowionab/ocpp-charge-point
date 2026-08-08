@@ -1814,6 +1814,23 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers certificate management (`docs/PRODUCTION-ROADMAP.md` B4.2): `InstallCertificate`,
+    /// `DeleteCertificate` and `GetInstalledCertificateIds`, all answered from `store`.
+    ///
+    /// **2.x only** - 1.6J's certificate messages live in the Security Whitepaper, which
+    /// `ocpp-types` does not generate. Builder-only for the same reason
+    /// [`Self::log_uploads`] is: it needs a [`crate::hardware::CertificateStore`], which
+    /// `setup()`'s signature cannot receive.
+    pub async fn certificates<N, S>(self, csms: &N, store: S) -> Self
+    where
+        N: crate::certificates::CertificateHandler + Send + Sync + 'static,
+        S: crate::hardware::CertificateStore + Send + Sync + 'static,
+    {
+        csms.register_certificate_handlers(self.runtime.actor(), store)
+            .await;
+        self
+    }
+
     /// Finishes building, handing back the [`ChargePointRuntime`] every registered block is now
     /// wired to.
     pub fn build(self) -> ChargePointRuntime<T> {
