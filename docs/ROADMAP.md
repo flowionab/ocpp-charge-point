@@ -1502,7 +1502,10 @@ Messages shown to the driver on charge point UI.
 - Internal state needed: message store keyed by priority/state,
   hardware hook for rendering (LEDs/screen — ties into the "UI" hardware
   binding mentioned in the README).
-- Status: ⬜ not started.
+- Status: ✅ done (`docs/PRODUCTION-ROADMAP.md` B6.1/B6.2) - `crate::hardware::Display` is the
+  hardware hook, `crate::state::DisplayMessageStore`/`DisplayedMessage` the message store,
+  `crate::display_message` the four messages plus the pure `current_message` derivation that
+  picks which stored message applies from live `MessageState`/`MessagePriority`.
 - Version notes: not applicable to 1.6J.
 
 ## 16. Data transfer

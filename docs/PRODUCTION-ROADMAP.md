@@ -1219,13 +1219,62 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 ### B6 — Display message (R§15)
 
 `SetDisplayMessage`, `GetDisplayMessages`, `ClearDisplayMessage`,
-`NotifyDisplayMessages` — 2.x only, all ⬜. `SetDisplayMessage` for 2.1 was
-marked 🔒 on [D1](#61-d1--missing-action-wrappers); it no longer is. The pinned
-`ocpp-client` 0.2.2 generates it (see [B2.6](#b2--smart-charging-r11) for the
-full re-sweep), so this block is unblocked, just unwritten.
+`NotifyDisplayMessages` — 2.x only, both items now ✅. `SetDisplayMessage` for
+2.1 was marked 🔒 on [D1](#61-d1--missing-action-wrappers); it no longer is.
+The pinned `ocpp-client` 0.2.2 generates it (see
+[B2.6](#b2--smart-charging-r11) for the full re-sweep), which is what
+unblocked this block.
 
-- [ ] **B6.1** Display hardware hook + message store with priority/state.
-- [ ] **B6.2** The four messages, gated on a display capability.
+- [x] **B6.1** Display hardware hook + message store with priority/state.
+
+      `crate::hardware::Display` (`show`/`supported_formats`) is the hook,
+      shaped after `FileTransfer`/`CertificateStore`: builder-only (needs a
+      `ChargePointBuilder::display_messages` call, since `setup()`'s
+      signature has no way to receive one), with a `NoDisplay` implementor
+      that fails every render honestly rather than pretending a message was
+      shown. `crate::state::DisplayMessageStore` is the message store -
+      keyed by id, bounded by the new `StateLimits::max_display_messages`,
+      mutated only through `ChargePointEvent::DisplayMessageSet`/
+      `DisplayMessageCleared` - mirroring `LocalAuthorizationList`'s shape.
+      The interesting piece is `crate::display_message::current_message`:
+      which message is showing is *derived* from `MessageState`/
+      `MessagePriority` against live connector/EVSE/lifecycle state, pure
+      and hardware-free, so a fault or a transaction starting changes what's
+      shown with no CSMS round-trip - `run_display_updates` is the thin
+      loop that turns a change in that derivation into a real
+      `Display::show` call. Left out: `messageExtra` (2.1's multi-language
+      variants), routing a message to one of several physical `display`
+      components, and `startDateTime`/`endDateTime` enforcement - this
+      crate targets one display surface and derives *when* a message shows
+      from `MessageState` alone, not from a clock. A message scoped to a
+      transaction is also not yet auto-cleared when that transaction ends
+      (`DisplayMessageStore::clear_for_transaction` exists for whichever
+      transaction-ending path eventually calls it) - a real, named gap
+      rather than a silent one.
+
+- [x] **B6.2** The four messages, gated on a display capability.
+
+      `SetDisplayMessage`/`GetDisplayMessages`/`ClearDisplayMessage` are
+      registered per-protocol-version traits in `crate::display_message`,
+      wired for both 2.0.1 and 2.1 (1.6J has no display-message concept at
+      all, confirmed against both `ocpp-types` submodules). `GetDisplayMessages`
+      answers via one or more `NotifyDisplayMessages` (chunked the same way
+      `crate::reporting`'s `NotifyReport` is), `Unknown` when the filter
+      matches nothing - and, since `GetDisplayMessagesStatusEnum` has no
+      "capability absent" value of its own, that same `Unknown` is what an
+      absent `has_display` capability naturally produces too (an empty store
+      answers no differently whether the store is empty because nothing was
+      set or because there's no screen to set it on). `SetDisplayMessage`/
+      `ClearDisplayMessage` do have a `Rejected`-shaped refusal and go
+      through the same C5 `crate::refusal` gate every other capability-gated
+      handler does - except 2.0.1, whose `ClearMessageStatusEnum` has no
+      `Rejected` value at all (2.1 added it), so a refusal there projects
+      onto `Unknown` instead, documented at the mapping site rather than
+      silently degraded. Formats are checked against
+      `Display::supported_formats` before a message is ever stored, so a
+      format the hardware genuinely cannot render is refused with
+      `NotSupportedMessageFormat` up front rather than accepted and failing
+      silently on the driver's own screen.
 
 ### B7 — Tariff, cost and payment (R§9)
 

@@ -7,13 +7,13 @@ use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
     ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EventTrigger, EvseEvent, EvseState,
-    HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry, MeterSample,
-    NetworkProfileStore, PendingReset, RegistrationStatus, ReservationEndReason, ReservationUpdate,
-    ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, TariffStore,
-    Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
-    TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable, VariableAttributeType,
-    VariableMonitorStore, VariableMonitoringEvent,
+    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, DisplayMessageStore, EventTrigger,
+    EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
+    MeterSample, NetworkProfileStore, PendingReset, RegistrationStatus, ReservationEndReason,
+    ReservationUpdate, ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits,
+    StopReason, TariffStore, Transaction, TransactionChargingState, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable,
+    VariableAttributeType, VariableMonitorStore, VariableMonitoringEvent,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -89,6 +89,9 @@ pub struct ChargePointState {
     /// `ClearVariableMonitoring`, reported via `NotifyEvent`) - the variable monitoring engine's
     /// state. See [`VariableMonitorStore`] and `docs/ROADMAP.md` §2/§14 (B5.2).
     pub variable_monitors: VariableMonitorStore,
+    /// Messages the CSMS has asked to be shown to the driver (OCPP `SetDisplayMessage`/
+    /// `ClearDisplayMessage`). See [`crate::display_message`] and `docs/ROADMAP.md` §15.
+    pub display_messages: DisplayMessageStore,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -143,6 +146,7 @@ impl ChargePointState {
             tariffs: TariffStore::with_limit(limits.max_tariffs),
             time_sync: None,
             variable_monitors: VariableMonitorStore::with_limit(limits.max_variable_monitors),
+            display_messages: DisplayMessageStore::with_max_messages(limits.max_display_messages),
         }
     }
 
@@ -563,6 +567,8 @@ impl ChargePointState {
             ChargePointEvent::CapabilitiesDeclared(capabilities) => {
                 set_if_changed(&mut self.capabilities, capabilities)
             }
+            ChargePointEvent::DisplayMessageSet(message) => self.display_messages.set(*message),
+            ChargePointEvent::DisplayMessageCleared(id) => self.display_messages.clear(id),
             ChargePointEvent::TimeSynced {
                 csms_time,
                 recorded_at,

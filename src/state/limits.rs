@@ -60,6 +60,11 @@ pub const DEFAULT_MAX_VARIABLE_MONITORS: usize = 32;
 /// [`StateLimits::with_max_tariffs`] rather than have `SetDefaultTariff` refused.
 pub const DEFAULT_MAX_TARIFFS: usize = 8;
 
+/// Default maximum number of display messages the store holds - see
+/// [`crate::state::DEFAULT_MAX_DISPLAY_MESSAGES`], which documents the reasoning; this re-export
+/// exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
+pub use crate::state::display_message::DEFAULT_MAX_DISPLAY_MESSAGES;
+
 /// Default maximum number of cached authorization decisions - see
 /// [`crate::state::DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES`], which documents the reasoning; this
 /// re-export exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
@@ -134,6 +139,11 @@ pub struct StateLimits {
     /// with OCPP's `Rejected`; replacing an already-installed monitor's id always succeeds.
     /// Clamped to at least 1.
     pub max_variable_monitors: usize,
+    /// The most [`crate::state::DisplayedMessage`]s the display message store may hold. A
+    /// `SetDisplayMessage` for a *new* id beyond it is refused (see
+    /// [`crate::state::DisplayMessageStore::set`]); replacing an already-stored id always
+    /// succeeds. Clamped to at least 1.
+    pub max_display_messages: usize,
 }
 
 impl StateLimits {
@@ -148,6 +158,7 @@ impl StateLimits {
             max_authorization_cache_entries: DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
             max_network_profile_slots: DEFAULT_MAX_NETWORK_PROFILE_SLOTS,
             max_variable_monitors: DEFAULT_MAX_VARIABLE_MONITORS,
+            max_display_messages: DEFAULT_MAX_DISPLAY_MESSAGES,
         }
     }
 
@@ -166,6 +177,12 @@ impl StateLimits {
     /// Overrides [`Self::max_variable_monitors`].
     pub const fn with_max_variable_monitors(mut self, max: usize) -> Self {
         self.max_variable_monitors = max;
+        self
+    }
+
+    /// Overrides [`Self::max_display_messages`].
+    pub const fn with_max_display_messages(mut self, max: usize) -> Self {
+        self.max_display_messages = max;
         self
     }
 

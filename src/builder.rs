@@ -1996,6 +1996,41 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers the Display Message functional block (`docs/PRODUCTION-ROADMAP.md` B6):
+    /// `SetDisplayMessage`, `GetDisplayMessages`, `ClearDisplayMessage` inbound handling, plus the
+    /// worker that renders whichever message
+    /// [`crate::display_message::current_message`] derives onto `display` and keeps it current as
+    /// charge point state changes - with no CSMS involvement needed for that second part.
+    ///
+    /// **2.x only** - 1.6J has no display-message concept at all. Builder-only for the same reason
+    /// [`Self::log_uploads`]/[`Self::certificates`] are: it needs a
+    /// [`crate::hardware::Display`], which `setup()`'s signature cannot receive.
+    #[cfg(feature = "display-message")]
+    pub async fn display_messages<N, D>(self, csms: &N, display: D) -> Self
+    where
+        N: crate::display_message::SetDisplayMessageHandler
+            + crate::display_message::GetDisplayMessagesHandler
+            + crate::display_message::ClearDisplayMessageHandler
+            + Send
+            + Sync
+            + 'static,
+        D: crate::hardware::Display + Send + Sync + 'static,
+    {
+        let supported_formats = display.supported_formats().to_vec();
+        csms.register_set_display_message_handler(self.runtime.actor(), supported_formats)
+            .await;
+        csms.register_get_display_messages_handler(self.runtime.actor())
+            .await;
+        csms.register_clear_display_message_handler(self.runtime.actor())
+            .await;
+
+        let actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            crate::display_message::run_display_updates(&actor, &display).await;
+        }));
+        self
+    }
+
     /// Registers `GetTransactionStatus` (`docs/PRODUCTION-ROADMAP.md` B5.4): lets the CSMS ask
     /// whether a transaction is still ongoing and whether there are still transaction-related
     /// messages queued for it - see [`crate::transaction_status`] for the requirements this

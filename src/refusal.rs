@@ -53,6 +53,9 @@
 //! | `Reset`                      | CALLRESULT `ResetResponseStatus::Rejected` (N/A today - `Reset` is core, always registered) | CALLRESULT `ResetStatusEnum::Rejected` (N/A today) | CALLRESULT `ResetStatusEnum::Rejected` (N/A today) |
 //! | `DataTransfer`               | CALLRESULT `DataTransferResponseStatus::UnknownVendorId`/`Rejected` (N/A today - vendor-id routing, not a `Capabilities` field) | CALLRESULT `DataTransferStatusEnum::UnknownVendorId`/`Rejected` (N/A today) | same as 2.0.1 |
 //! | `Authorize`                  | CALLRESULT (`AuthorizeResponse.idTagInfo.status`; not "absent capability" - authorization always answers) - N/A, not capability-gated | CALLRESULT `AuthorizationStatusEnum` (N/A, not capability-gated) | same as 2.0.1 |
+//! | `SetDisplayMessage`          | n/a (2.x-only) | CALLRESULT `DisplayMessageStatusEnum::Rejected` | CALLRESULT `DisplayMessageStatusEnum::Rejected` |
+//! | `ClearDisplayMessage`        | n/a (2.x-only) | CALLRESULT `ClearMessageStatusEnum::Unknown` (no `Rejected` in 2.0.1) | CALLRESULT `ClearMessageStatusEnum::Rejected` |
+//! | `GetDisplayMessages`         | n/a (2.x-only) | CALLRESULT `GetDisplayMessagesStatusEnum::Unknown` (no `Rejected`/`NotSupported` in either version - an absent capability answers through the same "nothing matched" status an empty store would, not a separate refusal) | same as 2.0.1 |
 //!
 //! Nothing here needed to fall back on assumption where the vendored spec/generated types didn't
 //! settle it - every response type above either has a documented status enum or documented-empty
@@ -191,6 +194,16 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
     RefusalGate {
         message: "GetTariffs",
         capability: |c| c.tariff_and_cost,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "SetDisplayMessage",
+        capability: |c| c.has_display,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "ClearDisplayMessage",
+        capability: |c| c.has_display,
         shape: RefusalShape::CallResultStatus,
     },
 ];
