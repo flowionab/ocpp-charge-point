@@ -24,6 +24,9 @@ use crate::connection::{ReconnectHandler, reregister_on_reconnect};
 #[cfg(feature = "tariff-cost")]
 use crate::cost::CostUpdatedHandler;
 use crate::device_model::{GetVariablesHandler, SetVariablesHandler};
+use crate::variable_monitoring::{
+    ClearVariableMonitoringHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
+};
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
@@ -424,6 +427,54 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self.executor.spawn(Box::pin(async move {
             crate::meter_values::run_aligned_meter_values(&notifier, &backoff, &clock, &actor)
                 .await;
+        }));
+
+        self
+    }
+
+    /// Registers the variable monitoring engine's outbound reporting: every threshold/delta
+    /// monitor that fires is forwarded to the CSMS via `NotifyEvent` as it happens, and every
+    /// periodic monitor is swept and reported every `periodic_sweep_interval_secs`
+    /// (`docs/PRODUCTION-ROADMAP.md` §B5, B5.2).
+    ///
+    /// Two background loops, for the same reason [`Self::reservation_status_updates`] spawns two:
+    /// a threshold/delta trigger is event-driven (forwarded off
+    /// [`crate::actor::ChargePointActor::subscribe_variable_monitor_events`] as it happens) while
+    /// a periodic monitor has nothing to be "driven" by - it fires on its own clock regardless of
+    /// whether anything changed, which is exactly what
+    /// [`crate::variable_monitoring::run_periodic_variable_monitors`]'s sweep loop is for.
+    ///
+    /// **2.x only** - see [`Self::variable_monitoring`]'s docs. `backoff`/`clock` are
+    /// caller-supplied for the same no_std reason [`Self::provisioning`]'s are.
+    pub fn variable_monitor_events<N, B, K>(
+        self,
+        csms: &N,
+        backoff: B,
+        clock: K,
+        periodic_sweep_interval_secs: u32,
+    ) -> Self
+    where
+        N: VariableMonitorEventNotifier + Clone + Send + Sync + 'static,
+        B: Backoff + Clone + Send + Sync + 'static,
+        K: crate::clock::Clock + Clone + Send + Sync + 'static,
+    {
+        let events = self.runtime.actor().subscribe_variable_monitor_events();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::variable_monitoring::run_variable_monitor_events(events, &notifier).await;
+        }));
+
+        let actor = self.runtime.actor();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::variable_monitoring::run_periodic_variable_monitors(
+                &notifier,
+                &clock,
+                &backoff,
+                periodic_sweep_interval_secs,
+                &actor,
+            )
+            .await;
         }));
 
         self
@@ -1579,6 +1630,27 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         csms.register_get_variables_handler(self.runtime.actor())
             .await;
         csms.register_set_variables_handler(self.runtime.actor())
+            .await;
+
+        self
+    }
+
+    /// Registers the variable monitoring engine's inbound surface: `SetVariableMonitoring`/
+    /// `ClearVariableMonitoring` handlers both feed into the runtime's actor
+    /// (`docs/PRODUCTION-ROADMAP.md` §B5, B5.2).
+    ///
+    /// **2.x only** - 1.6J has no such messages, so this method (like [`Self::configuration`]'s
+    /// 2.x-specific siblings) is meaningless to call against a 1.6J-only connection; `ocpp-client`
+    /// simply never invokes a handler a 1.6J CSMS has no message to trigger. Pair with
+    /// [`Self::variable_monitor_events`] to also report triggered monitors outbound - registering
+    /// only this half lets a CSMS install/clear monitors that never fire anything back.
+    pub async fn variable_monitoring<N>(self, csms: &N) -> Self
+    where
+        N: SetVariableMonitoringHandler + ClearVariableMonitoringHandler + Send + Sync + 'static,
+    {
+        csms.register_set_variable_monitoring_handler(self.runtime.actor())
+            .await;
+        csms.register_clear_variable_monitoring_handler(self.runtime.actor())
             .await;
 
         self

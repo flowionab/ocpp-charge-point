@@ -201,6 +201,42 @@ impl SetVariablesHandler for AlwaysAcceptBootNotifier {
 }
 
 #[async_trait::async_trait]
+impl ocpp_charge_point::variable_monitoring::SetVariableMonitoringHandler
+    for AlwaysAcceptBootNotifier
+{
+    async fn register_set_variable_monitoring_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ocpp_charge_point::variable_monitoring::ClearVariableMonitoringHandler
+    for AlwaysAcceptBootNotifier
+{
+    async fn register_clear_variable_monitoring_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ocpp_charge_point::variable_monitoring::VariableMonitorEventNotifier
+    for AlwaysAcceptBootNotifier
+{
+    type Error = core::convert::Infallible;
+
+    async fn notify_variable_monitor_event(
+        &self,
+        _event: &ocpp_charge_point::state::TriggeredMonitor,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
 impl GetBaseReportHandler for AlwaysAcceptBootNotifier {
     async fn register_get_base_report_handler(
         &self,

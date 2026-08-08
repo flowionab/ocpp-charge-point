@@ -787,9 +787,10 @@ Boot, configuration, and the Component/Variable device model.
   in force, and `network_switch` moves the live connection onto it, rolling back
   to the last working address after `NetworkProfileConnectionAttempts` failures
   (A9). An integrator who built their own client has no transport this crate can
-  re-point and reads the selection to drive their own redial. Still missing:
-  variable monitoring
-  (`SetVariableMonitoring`/`GetMonitoringReport`/`NotifyMonitoringReport`).
+  re-point and reads the selection to drive their own redial. Variable
+  monitoring (`SetVariableMonitoring`/`ClearVariableMonitoring`, reported via
+  `NotifyEvent`) is now wired too - see §14 (B5.2) for the engine itself;
+  `GetMonitoringReport`/`NotifyMonitoringReport` remain open (B5.3).
   Two items previously listed here are done: device-model persistence across
   restarts (E2.3 - `VariableAttribute::persistent` is acted on now), and the
   standard 1.6J configuration keys (B1.6 - every *required* key is readable
@@ -1439,9 +1440,27 @@ Log/diagnostics retrieval for troubleshooting.
 
   1.6J is genuinely poorer rather than differently named: no log type (so a 1.6J
   CSMS cannot ask for the security log at all), no `requestId` to correlate
-  notifications with, and no `AcceptedCanceled`. Still missing here: variable
-  monitoring, monitoring reports, `GetTransactionStatus`, customer information,
-  and 2.1's periodic event streams.
+  notifications with, and no `AcceptedCanceled`. Still missing here: monitoring
+  reports, `GetTransactionStatus`, customer information, and 2.1's periodic
+  event streams.
+
+  **Variable monitoring (B5.2) is wired end to end, 2.x only** -
+  `SetVariableMonitoring`/`ClearVariableMonitoring` inbound, `NotifyEvent`
+  outbound. Thresholds (`UpperThreshold`/`LowerThreshold`) and deltas are
+  evaluated the moment a device-model variable's `Actual` attribute changes
+  (`crate::state::ChargePointState::apply` on `DeviceModelEvent::AttributeValueSet`
+  - the one place a value change originates, per `crate::device_model`'s own
+  docs), so no separate polling loop is needed for them; periodic monitors are
+  swept on their own clock by `crate::variable_monitoring::run_periodic_variable_monitors`,
+  since nothing about the charge point's state changes when a periodic
+  interval merely elapses. A monitor is only accepted on a variable whose
+  `VariableCharacteristics::supports_monitoring` is `true` - none of this
+  crate's own built-in default variables set it, so a hardware binding
+  registering a variable worth alerting on (a temperature, a voltage) is what
+  turns it on. 1.6J has none of these messages at all, so there is no
+  `ocpp_1_6` projection to write. `GetMonitoringReport`/`NotifyMonitoringReport`
+  (B5.3) remain open - this only sets up, evaluates, and reports monitors, not
+  what's installed.
 - Version notes: 1.6J's diagnostics flow maps to 2.x's `GetLog` flow with
   a narrower log-type set.
 

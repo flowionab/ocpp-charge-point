@@ -7,12 +7,13 @@ use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
     ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
-    IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, NetworkProfileStore,
-    PendingReset, RegistrationStatus, ReservationEndReason, ReservationUpdate, ResetKind,
-    ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
-    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
-    TransactionUpdateReason, Variable, VariableAttributeType,
+    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EventTrigger, EvseEvent, EvseState,
+    HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry, MeterSample,
+    NetworkProfileStore, PendingReset, RegistrationStatus, ReservationEndReason,
+    ReservationUpdate, ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits,
+    StopReason, Transaction, TransactionChargingState, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable,
+    VariableAttributeType, VariableMonitorStore, VariableMonitoringEvent,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -78,6 +79,10 @@ pub struct ChargePointState {
     /// [`ChargePointEvent::TimeSynced`]. `None` until the first exchange that carried a
     /// parseable `currentTime`.
     pub time_sync: Option<TimeSyncAnchor>,
+    /// Every variable monitor installed on the charge point (OCPP `SetVariableMonitoring`/
+    /// `ClearVariableMonitoring`, reported via `NotifyEvent`) - the variable monitoring engine's
+    /// state. See [`VariableMonitorStore`] and `docs/ROADMAP.md` §2/§14 (B5.2).
+    pub variable_monitors: VariableMonitorStore,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -130,6 +135,7 @@ impl ChargePointState {
             ),
             charging_profiles: ChargingProfileStore::with_limit(limits.max_charging_profiles),
             time_sync: None,
+            variable_monitors: VariableMonitorStore::with_limit(limits.max_variable_monitors),
         }
     }
 
@@ -367,12 +373,57 @@ impl ChargePointState {
                     variable,
                     attribute_type,
                     value,
-                } => self.device_model.set_attribute_value(
-                    &component,
-                    &variable,
-                    attribute_type,
-                    value,
-                ),
+                } => {
+                    // Only the `Actual` attribute is what a monitor watches (OCPP monitors are
+                    // defined in terms of a variable's actual value - `Target`/`MinSet`/`MaxSet`
+                    // are setpoint bookkeeping, not a reading). The old value is read *before*
+                    // mutating, since `evaluate` needs the transition, not just the new value -
+                    // see `crate::state::VariableMonitorStore::evaluate`'s docs.
+                    let old_value = (attribute_type == VariableAttributeType::Actual)
+                        .then(|| self.device_model.get(&component, &variable))
+                        .flatten()
+                        .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+                        .and_then(|attribute| attribute.value.parse::<f64>().ok());
+                    let applied = self.device_model.set_attribute_value(
+                        &component,
+                        &variable,
+                        attribute_type,
+                        value.clone(),
+                    );
+                    if applied && attribute_type == VariableAttributeType::Actual
+                        && let Ok(new_value) = value.parse::<f64>()
+                    {
+                        for monitor_id in
+                            self.variable_monitors
+                                .evaluate(&component, &variable, old_value, new_value)
+                        {
+                            if let Some(monitor) = self.variable_monitors.get(monitor_id) {
+                                let trigger = match monitor.monitor_type {
+                                    crate::state::MonitorType::UpperThreshold
+                                    | crate::state::MonitorType::LowerThreshold => {
+                                        EventTrigger::Alerting
+                                    }
+                                    crate::state::MonitorType::Delta => EventTrigger::Delta,
+                                    // `evaluate` never triggers a `Periodic` monitor - see its
+                                    // own docs - so this arm is unreachable in practice; `Alerting`
+                                    // is as good a fallback as any other if that ever changes.
+                                    crate::state::MonitorType::Periodic => EventTrigger::Alerting,
+                                };
+                                effects.push(ChargePointEffect::VariableMonitorTriggered(
+                                    TriggeredMonitor {
+                                        monitor_id,
+                                        component: component.clone(),
+                                        variable: variable.clone(),
+                                        actual_value: value.clone(),
+                                        severity: monitor.severity,
+                                        trigger,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    applied
+                }
             },
             ChargePointEvent::PersistedTransactionsRestored {
                 next_transaction_id,
@@ -501,6 +552,21 @@ impl ChargePointState {
                     .evses
                     .get_mut(evse_id)
                     .is_some_and(|evse| evse.apply(event)),
+            },
+            ChargePointEvent::VariableMonitoring(event) => match event {
+                VariableMonitoringEvent::MonitorSet {
+                    id,
+                    component,
+                    variable,
+                    monitor_type,
+                    value,
+                    severity,
+                } => self
+                    .variable_monitors
+                    .set(id, component, variable, monitor_type, value, severity),
+                VariableMonitoringEvent::MonitorCleared { id } => {
+                    self.variable_monitors.clear(id)
+                }
             },
         };
 

@@ -92,6 +92,7 @@ pub mod sync;
 mod topology;
 pub mod transaction_status;
 pub mod transactions;
+pub mod variable_monitoring;
 
 pub use self::builder::ChargePointBuilder;
 #[cfg(all(

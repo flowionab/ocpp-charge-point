@@ -38,6 +38,18 @@ pub const DEFAULT_MAX_DEVICE_MODEL_VARIABLES: usize = 256;
 /// exists at all.
 pub const DEFAULT_MAX_CHARGING_PROFILES: usize = 16;
 
+/// Default maximum number of variable monitors the store holds (see
+/// [`StateLimits::max_variable_monitors`]).
+///
+/// 32 covers a generous handful of thresholds/deltas/periodics per variable a CSMS actually wants
+/// watched (a temperature or voltage upper bound, a meter delta, an occasional periodic check) on
+/// a small-to-mid-size charge point, while bounding the store to a few KB (a monitor is a handful
+/// of scalars, no schedule attached). A CSMS driving a larger fleet-monitoring deployment should
+/// raise it via [`StateLimits::with_max_variable_monitors`] rather than have
+/// `SetVariableMonitoring` refused; see `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2) for why the
+/// bound exists at all.
+pub const DEFAULT_MAX_VARIABLE_MONITORS: usize = 32;
+
 /// Default maximum number of cached authorization decisions - see
 /// [`crate::state::DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES`], which documents the reasoning; this
 /// re-export exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
@@ -101,6 +113,11 @@ pub struct StateLimits {
     /// for a *new* slot beyond it is refused with OCPP's `Rejected`; replacing an already-occupied
     /// slot always succeeds. Clamped to at least 1.
     pub max_network_profile_slots: usize,
+    /// The most variable monitors the store may hold. A `SetVariableMonitoring` request for a
+    /// *new* monitor (see [`crate::state::VariableMonitorStore::precheck`]) beyond it is refused
+    /// with OCPP's `Rejected`; replacing an already-installed monitor's id always succeeds.
+    /// Clamped to at least 1.
+    pub max_variable_monitors: usize,
 }
 
 impl StateLimits {
@@ -113,12 +130,19 @@ impl StateLimits {
             max_charging_profiles: DEFAULT_MAX_CHARGING_PROFILES,
             max_authorization_cache_entries: DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
             max_network_profile_slots: DEFAULT_MAX_NETWORK_PROFILE_SLOTS,
+            max_variable_monitors: DEFAULT_MAX_VARIABLE_MONITORS,
         }
     }
 
     /// Overrides [`Self::max_network_profile_slots`].
     pub const fn with_max_network_profile_slots(mut self, max: usize) -> Self {
         self.max_network_profile_slots = max;
+        self
+    }
+
+    /// Overrides [`Self::max_variable_monitors`].
+    pub const fn with_max_variable_monitors(mut self, max: usize) -> Self {
+        self.max_variable_monitors = max;
         self
     }
 
