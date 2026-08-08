@@ -11,8 +11,10 @@ This document is scoped to *production readiness*. It is a companion to
 block in depth; where a task here has a detailed design discussion there,
 it's cross-referenced as "R§n". Where the two disagree on facts, this
 document wins — every number and claim below was re-verified against the
-working tree, `ocpp-client` 0.2.0 / `ocpp-types` 0.1.2 as locked in
-`Cargo.lock`, and the vendored spec appendices, on 2026-08-05.
+working tree, `ocpp-client` 0.5.0 / `ocpp-types` 0.3.0 as locked in
+`Cargo.lock`, and the vendored spec appendices. Task rows were last swept on
+2026-08-05; the **message inventory** (§2.1 and Appendix A) was re-counted from
+source on 2026-08-08, which is the date to trust for any per-message claim.
 
 Status legend: ✅ done · 🚧 partial · ⬜ not started · 🔒 blocked upstream
 
@@ -58,14 +60,16 @@ certification profiles we claim, on all three protocol versions.
 ### 2.1 Message coverage, verified
 
 Counted by matching every `.on_*(` / `.send_*(` call inside this crate's
-per-version adapter modules against the action list `ocpp-client` 0.2.0
-generates for that version:
+per-version adapter modules against the action list `ocpp-client` **0.5.0**
+generates for that version (re-counted 2026-08-08; the figures here were
+last accurate against 0.2.0 and understated 2.x coverage by 24 messages —
+see [Appendix A](#appendix-a--verified-message-inventory)):
 
-| Version | Wired | Available in `ocpp-client` | Spec messages (approx.) |
-|---------|-------|---------------------------|-------------------------|
-| **1.6J** | **19** | 28 | 28 core + security-whitepaper extensions |
-| **2.0.1** | **21** | 64 (0.2.2; the 63 here was 0.2.0) | 64 (`ocpp-types` has 64 request types) |
-| **2.1** | **22** | 91 (0.2.2; the 86 here was 0.2.0) | 90+ (`ocpp-types` has 90 request types) |
+| Version | Wired | Available in `ocpp-client` 0.5.0 | Remaining |
+|---------|-------|---------------------------------|-----------|
+| **1.6J** | **28** | 39 | 11 — the whole security-whitepaper set ([D2.2](#62-d2--type-completeness-audit)) |
+| **2.0.1** | **49** | 64 | 15 |
+| **2.1** | **57** | 91 | 34, of which 18 are 2.1-only hardware blocks |
 
 Two things this table hides, both good news:
 
@@ -991,7 +995,7 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 | GetMonitoringReport / NotifyMonitoringReport | — | ⬜ | ⬜ |
 | NotifyEvent | — | ✅ | ✅ |
 | CustomerInformation / NotifyCustomerInformation | — | ✅ | ✅ |
-| GetTransactionStatus | — | ⬜ | ⬜ |
+| GetTransactionStatus | — | ✅ | ✅ |
 | Open/Close/Adjust/Get PeriodicEventStream, NotifyPeriodicEventStream | — | — | ⬜ |
 
 - [x] **B5.1** Log upload — `GetLog` (2.x) and `GetDiagnostics` (1.6J) end to end, on top of
@@ -1954,8 +1958,15 @@ mid-transaction currently loses the transaction.
       the blocks that would (`GetLog`, customer-information erasure) are [B5.1](#b5--diagnostics-and-monitoring-r14)/[B5.5](#b5--diagnostics-and-monitoring-r14) - which is
       the honest remaining half of [F4.3](#84-f4--security-events): the durable log exists, the `GetLog` reader
       does not.
-- [ ] **E2.9** Certificates — **no longer blocked**: [B4.1](#b4--certificates-and-iso-15118-r1-r13)'s `StoredCertificates` is already `Storage`-backed and survives a reboot, so this row is now about a secure-element-backed store's own durability rather than about a store existing. Formerly blocked on
-      which does not exist.
+- [ ] **E2.9** Certificates — **no longer blocked, and the durability half is done**:
+      [B4.1](#b4--certificates-and-iso-15118-r1-r13)'s `StoredCertificates` is `Storage`-backed
+      and survives a reboot, so the CSMS-installed certificate set is already as durable as every
+      other E2 row. (The sentence that stood here — "Formerly blocked on … which does not exist"
+      — lost its subject in an edit; the blocker it named was B4.1, which has since landed.)
+      What remains is narrower than the row title suggests: once [F2.4](#82-f2--tls) introduces a
+      secure element, a *private key* must live there rather than in `Storage`, and this row
+      becomes "the key handle persists and the key itself never leaves the element". Blocked on
+      F2.4 for that reason, not on B4.
 - [x] **E2.11** Network profiles — `persistence::NetworkProfileSnapshotStore`/
       `restore_network_profiles`/`run_network_profile_persistence`, wired via
       `ChargePointBuilder::network_profile_persistence`. One whole-store JSON snapshot per change,
@@ -2219,11 +2230,15 @@ certificates.**
       carries both `username`/`password` and a `rustls::ClientConfig`, so an operator can run
       profile 2 today. Validating the CSMS certificate against a *managed* trust store is
       [F2.2](#82-f2--tls), which needs B4.
-- [ ] **F1.3** Profile 3 — mutual TLS with a charge point certificate. **Blocked on
-      [B4.1](#b4--certificates-and-iso-15118-r1-r13)** (a client certificate to present) and
-      [F2.4](#82-f2--tls) (somewhere to keep the private key). `SecurityProfile::is_implemented`
-      reports `false` for it rather than letting a station behave as though it presents a
-      certificate it does not have.
+- [ ] **F1.3** Profile 3 — mutual TLS with a charge point certificate. **Half of the stated
+      blocker is gone.** This row named two: [B4.1](#b4--certificates-and-iso-15118-r1-r13) (a
+      client certificate to present) and [F2.4](#82-f2--tls) (somewhere to keep the private key).
+      B4.1 has landed, so there is a store and a certificate to present — but a charge point
+      certificate is only meaningful if the station generated the key and can prove it holds it,
+      which is [B4.3](#b4--certificates-and-iso-15118-r1-r13)'s CSR round trip, and the key needs
+      F2.4's home. **Genuinely blocked on F2.4 and B4.3**, not on B4.1.
+      `SecurityProfile::is_implemented` reports `false` for it rather than letting a station
+      behave as though it presents a certificate it does not have.
 - [x] **F1.4** Profile selection and switching via `SetNetworkProfile`, **with the §A05 downgrade
       rule enforced** — which is the substance of this row.
 
@@ -2248,7 +2263,13 @@ certificates.**
       threads through every redial. Embedded still needs an `embedded-tls`-shaped alternative;
       `ocpp-client` exposes none today, so that remains open upstream rather than here.
 - [ ] **F2.2** Trust store management fed by [B4](#b4--certificates-and-iso-15118-r1-r13)'s
-      installed certificates. **Blocked on B4.1.**
+      installed certificates. **No longer blocked** — this row carried "Blocked on B4.1" written
+      before B4.1 landed; `hardware::CertificateStore` and its `StoredCertificates` exist and are
+      `Storage`-backed, so the certificates a CSMS installs are there to be turned into a rustls
+      trust root. What is left is the turning: building a `RootCertStore` from the installed
+      `CSMSRootCertificate` set and handing it to `ConnectOptions::tls_config` on every redial,
+      plus deciding what a station does when the CSMS deletes the root it is currently connected
+      through. Actionable today.
 - [x] **F2.3** TLS version policy — `TlsVersion::is_permitted` encodes OCPP's floor of 1.2, so a
       transport that can report what it negotiated has something to check against and an event to
       raise (`InvalidTLSVersion`/`InvalidTLSCipherSuite` are both modelled and correctly spelled).
@@ -3114,99 +3135,113 @@ not every deployment.
 
 ## Appendix A — verified message inventory
 
-Method: every `.on_*(` / `.send_*(` call inside a `mod ocpp_1_6` /
-`ocpp_2_0_1` / `ocpp_2_1` block in `src/`, matched against the action names
-`ocpp-client` 0.2.0 generates per version. Re-run it after any coverage
+Method: every `.on_*(` / `.send_*(` call inside a per-version adapter module in
+`src/` (any `mod` whose name contains `ocpp_1_6` / `ocpp_2_0_1` / `ocpp_2_1`,
+plus files under a path of that name), matched against the action names
+`ocpp-client` **0.5.0** generates per version. Re-run it after any coverage
 work; it's the honest number.
 
-### A.1 OCPP 1.6J — 28 of 28 wired
+**Last re-counted 2026-08-08**, and the previous count was badly stale: it
+predated B5.2–B5.5, B6 and B7.1, so it listed display messages, variable
+monitoring, customer information, `GetTransactionStatus` and the whole 2.1
+tariff set as missing when the B-tables above already marked them ✅. 2.0.1
+moved 39 → 49 and 2.1 moved 43 → 57 on re-count, with no code written. The
+lesson is the one this appendix already states — re-run it after coverage work,
+which had not been happening.
 
-**Complete.** Every message OCPP 1.6J's core profile defines is handled. The old "25 of 28"
-heading here also disagreed with its own list, which had 24 entries; both are now moot.
+| Version | Wired | Total | Remaining |
+|---------|------:|------:|----------:|
+| 1.6J | 28 | 39 | 11 |
+| 2.0.1 | 49 | 64 | 15 |
+| 2.1 | 57 | 91 | 34 |
+| **All three** | **134** | **194** | **60** |
 
-**Wired:** Authorize, BootNotification, CancelReservation,
-ChangeAvailability, ChangeConfiguration, ClearCache, DataTransfer, GetConfiguration,
-ClearChargingProfile, GetCompositeSchedule, GetLocalListVersion, Heartbeat,
-MeterValues, RemoteStartTransaction, RemoteStopTransaction, ReserveNow, Reset,
-DiagnosticsStatusNotification, GetDiagnostics, SendLocalList, SetChargingProfile,
-StartTransaction, StatusNotification, StopTransaction, TriggerMessage,
-FirmwareStatusNotification, UnlockConnector, UpdateFirmware
+### A.1 OCPP 1.6J — 28 of 39 wired
 
-**Missing:** none — 1.6J's core profile is complete.
+**The core profile is complete.** Every message OCPP 1.6J's core profile defines is handled;
+the denominator moved because `ocpp-client` 0.4.0 added the security whitepaper set to its 1.6
+action list, raising it from 28 actions to 39. All 11 gaps are that set, and they are one
+decision — [D2.2](#62-d2--type-completeness-audit) — rather than eleven pieces of work.
 
-### A.2 OCPP 2.0.1 — 39 of 64 wired
+**Wired:** Authorize, BootNotification, CancelReservation, ChangeAvailability,
+ChangeConfiguration, ClearCache, ClearChargingProfile, DataTransfer,
+DiagnosticsStatusNotification, FirmwareStatusNotification, GetCompositeSchedule,
+GetConfiguration, GetDiagnostics, GetLocalListVersion, Heartbeat, MeterValues,
+RemoteStartTransaction, RemoteStopTransaction, ReserveNow, Reset, SendLocalList,
+SetChargingProfile, StartTransaction, StatusNotification, StopTransaction, TriggerMessage,
+UnlockConnector, UpdateFirmware
 
-**Wired:** Authorize, BootNotification, CancelReservation,
-ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
-GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
-DeleteCertificate, FirmwareStatusNotification, GetInstalledCertificateIds, GetLog,
-GetReport, GetVariables, Heartbeat, InstallCertificate, LogStatusNotification,
-NotifyReport, UpdateFirmware,
-ReportChargingProfiles, ReservationStatusUpdate, RequestStartTransaction,
-MeterValues, RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
-SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
-StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
+**Missing:** CertificateSigned, DeleteCertificate, ExtendedTriggerMessage,
+GetInstalledCertificateIds, GetLog, InstallCertificate, LogStatusNotification,
+SecurityEventNotification, SignCertificate, SignedFirmwareStatusNotification,
+SignedUpdateFirmware
 
-**Missing:** CertificateSigned,
-ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
-CustomerInformation, Get15118EVCertificate, GetCertificateStatus,
-GetDisplayMessages, GetMonitoringReport, GetTransactionStatus, NotifyChargingLimit,
-NotifyCustomerInformation, NotifyDisplayMessages, NotifyEVChargingNeeds,
-NotifyEVChargingSchedule, NotifyEvent, NotifyMonitoringReport,
-PublishFirmware, PublishFirmwareStatusNotification, SetDisplayMessage,
-SetMonitoringBase, SetMonitoringLevel,
-SetVariableMonitoring, SignCertificate, UnpublishFirmware
+### A.2 OCPP 2.0.1 — 49 of 64 wired
 
-**Note:** `SecurityEventNotification` used to be listed here as present in the
-2.0.1 spec and in `ocpp-types` v201 but ungenerated by `ocpp-client` 0.2.0. D1
-fixed that upstream; 0.2.2 generates all 64 actions, and F4.4 wired this one.
+**Wired:** Authorize, BootNotification, CancelReservation, ChangeAvailability, ClearCache,
+ClearChargingProfile, ClearDisplayMessage, ClearVariableMonitoring, CostUpdated,
+CustomerInformation, DataTransfer, DeleteCertificate, FirmwareStatusNotification,
+GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetDisplayMessages,
+GetInstalledCertificateIds, GetLocalListVersion, GetLog, GetReport, GetTransactionStatus,
+GetVariables, Heartbeat, InstallCertificate, LogStatusNotification, MeterValues,
+NotifyCustomerInformation, NotifyDisplayMessages, NotifyEvent, NotifyReport,
+ReportChargingProfiles, RequestStartTransaction, RequestStopTransaction,
+ReservationStatusUpdate, ReserveNow, Reset, SecurityEventNotification, SendLocalList,
+SetChargingProfile, SetDisplayMessage, SetNetworkProfile, SetVariableMonitoring, SetVariables,
+StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector, UpdateFirmware
 
-### A.3 OCPP 2.1 — 43 of 91 wired
+**Missing**, and it falls into exactly four blocks:
 
-**Wired:** Authorize, BootNotification, CancelReservation,
-ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
-GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
-DeleteCertificate, FirmwareStatusNotification, GetInstalledCertificateIds, GetLog,
-GetReport, GetVariables, Heartbeat, InstallCertificate, LogStatusNotification,
-NotifyPriorityCharging, NotifyReport, UpdateFirmware,
-ReportChargingProfiles, ReservationStatusUpdate, RequestStartTransaction,
-RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
-MeterValues, PullDynamicScheduleUpdate, SendLocalList, SetChargingProfile,
-SetNetworkProfile, SetVariables, StatusNotification, TransactionEvent,
-TriggerMessage, UnlockConnector, UpdateDynamicSchedule, UsePriorityCharging
+| Block | Messages | Owner |
+|-------|----------|-------|
+| Certificates / ISO 15118 | CertificateSigned, SignCertificate, GetCertificateStatus, Get15118EVCertificate | [B4.3](#b4--certificates-and-iso-15118-r1-r13)–[B4.5](#b4--certificates-and-iso-15118-r1-r13) |
+| Monitoring reports | GetMonitoringReport, NotifyMonitoringReport, SetMonitoringBase, SetMonitoringLevel | [B5.3](#b5--diagnostics-and-monitoring-r14) |
+| Smart-charging notifications | NotifyChargingLimit, ClearedChargingLimit, NotifyEVChargingNeeds, NotifyEVChargingSchedule | [B2](#b2--smart-charging-r11) residue |
+| Firmware publishing | PublishFirmware, UnpublishFirmware, PublishFirmwareStatusNotification | [B3.4](#b3--firmware-management-r12) |
 
-**Missing:** AFRRSignal, AdjustPeriodicEventStream, BatterySwap,
-CertificateSigned, ChangeTransactionTariff, ClearDERControl, ClearDisplayMessage, ClearTariffs,
-ClearVariableMonitoring, ClearedChargingLimit, ClosePeriodicEventStream,
-CustomerInformation, Get15118EVCertificate, GetCertificateChainStatus,
-GetCertificateStatus, GetDisplayMessages, GetMonitoringReport,
-GetPeriodicEventStream, GetTariffs, GetTransactionStatus,
-NotifyAllowedEnergyTransfer, NotifyChargingLimit, NotifyCustomerInformation,
-NotifyDERAlarm, NotifyDERStartStop, NotifyDisplayMessages,
-NotifyEVChargingNeeds, NotifyEVChargingSchedule, NotifyEvent,
-NotifyMonitoringReport, NotifyPeriodicEventStream,
-NotifySettlement, NotifyWebPaymentStarted, OpenPeriodicEventStream,
-PublishFirmware, PublishFirmwareStatusNotification,
-ReportDERControl, RequestBatterySwap,
-SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel,
-SetVariableMonitoring, SignCertificate, UnpublishFirmware, VatNumberValidation
+### A.3 OCPP 2.1 — 57 of 91 wired
 
-**Inventory reconciliation.** A.2's two lists account for exactly 64 of 64. A.3's account for 88
-of the 91 actions `ocpp-client` generates — the three-message residue is unaudited and is a
-job for [H3.5](#103-h3--compliance)'s re-verification sweep, recorded here rather than papered
-over. A.1 reconciles at 28 of 28 **against the 1.6 action list as it stood through 0.4.0's
-predecessor**; `ocpp-client` 0.4.0 raised 1.6 from 28 actions to 39 by adding the security
-whitepaper set, so the 1.6 denominator is now 39 and the eleven additions are unwired - see
-[D2.2](#62-d2--type-completeness-audit).
+**Wired:** Authorize, BootNotification, CancelReservation, ChangeAvailability,
+ChangeTransactionTariff, ClearCache, ClearChargingProfile, ClearDisplayMessage, ClearTariffs,
+ClearVariableMonitoring, CostUpdated, CustomerInformation, DataTransfer, DeleteCertificate,
+FirmwareStatusNotification, GetBaseReport, GetChargingProfiles, GetCompositeSchedule,
+GetDisplayMessages, GetInstalledCertificateIds, GetLocalListVersion, GetLog, GetReport,
+GetTariffs, GetTransactionStatus, GetVariables, Heartbeat, InstallCertificate,
+LogStatusNotification, MeterValues, NotifyCustomerInformation, NotifyDisplayMessages,
+NotifyEvent, NotifyPriorityCharging, NotifyReport, PullDynamicScheduleUpdate,
+ReportChargingProfiles, RequestStartTransaction, RequestStopTransaction,
+ReservationStatusUpdate, ReserveNow, Reset, SecurityEventNotification, SendLocalList,
+SetChargingProfile, SetDefaultTariff, SetDisplayMessage, SetNetworkProfile,
+SetVariableMonitoring, SetVariables, StatusNotification, TransactionEvent, TriggerMessage,
+UnlockConnector, UpdateDynamicSchedule, UpdateFirmware, UsePriorityCharging
 
-**No message is missing an action wrapper any more.** This list used to name
-four (SetDisplayMessage, GetDERControl, SetDERControl, UpdateDynamicSchedule)
-plus TriggerMessage; the pinned `ocpp-client` moved past 0.2.0 (it is **0.5.0**
-today), and generates **91** OCPP 2.1 actions including every one of them. Re-verified by counting
-`ocpp_2_1_action!`/`ocpp_2_1_send_action!` invocations in the pinned registry
-source at the B2.6 commit. The "86 available" figure above and in §2.1 is
-therefore stale in this crate's favour — it should read 91, and the remaining
-gap is entirely this crate's to close.
+**Missing**, grouped the same way. 2.0.1's four blocks all recur here, plus four that are
+2.1-only:
+
+| Block | Messages | Owner |
+|-------|----------|-------|
+| Certificates / ISO 15118 | CertificateSigned, SignCertificate, GetCertificateStatus, Get15118EVCertificate, GetCertificateChainStatus | [B4.3](#b4--certificates-and-iso-15118-r1-r13)–[B4.5](#b4--certificates-and-iso-15118-r1-r13) |
+| Monitoring reports | GetMonitoringReport, NotifyMonitoringReport, SetMonitoringBase, SetMonitoringLevel | [B5.3](#b5--diagnostics-and-monitoring-r14) |
+| Smart-charging notifications | NotifyChargingLimit, ClearedChargingLimit, NotifyEVChargingNeeds, NotifyEVChargingSchedule | [B2](#b2--smart-charging-r11) residue |
+| Firmware publishing | PublishFirmware, UnpublishFirmware, PublishFirmwareStatusNotification | [B3.4](#b3--firmware-management-r12) |
+| DER control / V2X | GetDERControl, SetDERControl, ClearDERControl, ReportDERControl, NotifyDERAlarm, NotifyDERStartStop, AFRRSignal, NotifyAllowedEnergyTransfer | [B8.2](#b8--reservation-derv2x-battery-swap) |
+| Periodic event streams | OpenPeriodicEventStream, ClosePeriodicEventStream, AdjustPeriodicEventStream, GetPeriodicEventStream, NotifyPeriodicEventStream | [B5.6](#b5--diagnostics-and-monitoring-r14) |
+| Payment / settlement | NotifySettlement, NotifyWebPaymentStarted, VatNumberValidation | [B7.2](#b7--tariff-cost-and-payment-r9) |
+| Battery swap | BatterySwap, RequestBatterySwap | [B8.3](#b8--reservation-derv2x-battery-swap) |
+
+**Inventory reconciliation.** All three versions now reconcile exactly: 28 + 11 = 39,
+49 + 15 = 64, 57 + 34 = 91. The **three-message residue** the previous count could not
+account for is resolved — it was `GetDERControl`, `SetDERControl` and
+`NotifyPeriodicEventStream`, the last of which `ocpp-client` generates as
+`NotifyPeriodicEventStreamAction` (the bare name collides with its own stream type), which is
+why a name-match sweep missed it. Nothing is unaudited any more, so
+[H3.5](#103-h3--compliance)'s sweep no longer inherits this.
+
+**No message is missing an action wrapper.** This list used to name four
+(SetDisplayMessage, GetDERControl, SetDERControl, UpdateDynamicSchedule) plus TriggerMessage;
+the pinned `ocpp-client` is **0.5.0** and generates 39 / 64 / 91 actions including every one of
+them. Every remaining gap in this appendix is this crate's own to close — with the single
+exception of 1.6J's eleven, whose *types* are absent upstream ([D2.2](#62-d2--type-completeness-audit)).
 
 ### A.4 Other verified figures
 
