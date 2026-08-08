@@ -81,6 +81,7 @@ pub mod state;
 pub mod sync;
 #[cfg(feature = "ocpp_1_6")]
 mod topology;
+pub mod transaction_status;
 pub mod transactions;
 
 pub use self::builder::ChargePointBuilder;

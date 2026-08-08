@@ -1052,8 +1052,35 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
       device-model variables → `NotifyEvent`.
 - [ ] **B5.3** Monitoring report generation, chunked like `NotifyReport`
       already is.
-- [ ] **B5.4** `GetTransactionStatus` — cheap, and needed for CSMS
-      reconciliation after an offline period.
+- [x] **B5.4** `GetTransactionStatus` (2.x only — 1.6J has no such message) —
+      implemented against the vendored spec's E14 "Check transaction status"
+      use case and its E14.FR.01–.08.
+
+      **Two questions, not one.** A request naming a `transactionId` asks
+      whether *that* transaction is ongoing and whether messages about it are
+      queued; a request naming none asks only whether anything at all is
+      queued (E14.FR.06–.08 — `ongoingIndicator` must then be *absent*, not
+      `false`). `handle_get_transaction_status` takes an
+      `Option<TransactionId>` through to the response rather than collapsing
+      the two shapes.
+
+      **A finished transaction and an unknown one answer identically, on
+      purpose.** E14.FR.01/.03 both require `ongoingIndicator = false`, and
+      E14's own remarks say the CSMS isn't meant to tell the two apart. This
+      crate's state already matches that for free:
+      `advance_transaction`/`ChargePointState` clears a connector's
+      transaction slot the moment its `Ended` event fires, so "not present in
+      any slot" already means both things at once — no graveyard of finished
+      transaction ids needed for a distinction the spec doesn't grant anyway.
+
+      **`messagesInQueue` reads the real backlog.** `ChargePointBuilder` now
+      keeps the `Arc<OfflineQueue<TransactionEventOccurred>>`
+      `transaction_events`/`transaction_events_persisted` creates (previously
+      local to those methods), so `get_transaction_status` can answer from
+      the actual queue rather than a fabricated `false`. Registering
+      `get_transaction_status` without either of those first still answers
+      correctly — `false`, because nothing is ever queued through a queue
+      that doesn't exist — just less usefully.
 - [ ] **B5.5** Customer information / GDPR erasure.
 - [ ] **B5.6** 2.1 periodic event streams.
 
@@ -2828,5 +2855,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 942 | `#[test]` + `#[tokio::test]`, re-counted at the B4.2 commit (920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 956 | `#[test]` + `#[tokio::test]`, re-counted at the B5.4 commit (942 at B4.2, 920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

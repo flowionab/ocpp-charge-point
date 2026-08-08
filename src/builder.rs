@@ -116,6 +116,14 @@ pub struct ChargePointBuilder<T, X> {
     // and must not starve - or be starved by - the CSMS forwarder. Taken in `start()` so an event
     // raised during hardware start-up is logged rather than missed.
     security_log_events: Option<BroadcastReceiver<SecurityEvent>>,
+    // The offline queue `Self::transaction_events`/`Self::transaction_events_persisted` created
+    // for the Transactions block's CSMS forwarding, kept so `Self::get_transaction_status` can
+    // answer `GetTransactionStatus`'s `messagesInQueue` from the real backlog rather than a
+    // fabricated "always false". `None` until one of those two is registered - and stays `None`
+    // forever if neither ever is, which is still correct: nothing this crate forwards is ever
+    // queued through a queue that doesn't exist, so `messagesInQueue` genuinely is always false
+    // in that case. See `crate::transaction_status`.
+    transaction_queue: Option<Arc<OfflineQueue<TransactionEventOccurred>>>,
     // One entry per offline queue registered so far, each a closure that flushes that queue
     // exactly as its reconnect handler does. `Self::offline_queue_retries` drives them all on a
     // timer; collecting closures rather than the queues themselves keeps the builder free of the
@@ -276,6 +284,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             security_events: Some(security_events),
             transaction_persistence_events: Some(transaction_persistence_events),
             security_log_events: Some(security_log_events),
+            transaction_queue: None,
             queue_flushes: Vec::new(),
             offline_queue_capacity: crate::offline_queue::DEFAULT_CAPACITY,
             boot_reason: None,
@@ -894,6 +903,8 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             OfflineQueue::with_capacity(self.offline_queue_capacity)
                 .with_overflow_policy(OverflowPolicy::DropNewest),
         );
+        // Kept for `Self::get_transaction_status` - see the `transaction_queue` field's docs.
+        self.transaction_queue = Some(transaction_queue.clone());
         let forwarder_queue = transaction_queue.clone();
         let forwarder_csms = csms.clone();
         let overflow_actor = self.runtime.actor();
@@ -979,6 +990,8 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         // Restore before any live traffic is wired up - so an event that arrives during start-up
         // can never be delivered ahead of an older one the backlog restores.
         restore_transaction_event_queue(&transaction_queue, &store).await;
+        // Kept for `Self::get_transaction_status` - see the `transaction_queue` field's docs.
+        self.transaction_queue = Some(transaction_queue.clone());
         let store = Arc::new(store);
         let forwarder_queue = transaction_queue.clone();
         let forwarder_store = store.clone();
@@ -1828,6 +1841,32 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     {
         csms.register_certificate_handlers(self.runtime.actor(), store)
             .await;
+        self
+    }
+
+    /// Registers `GetTransactionStatus` (`docs/PRODUCTION-ROADMAP.md` B5.4): lets the CSMS ask
+    /// whether a transaction is still ongoing and whether there are still transaction-related
+    /// messages queued for it - see [`crate::transaction_status`] for the requirements this
+    /// answers from.
+    ///
+    /// **2.x only** - see that module's docs for why 1.6J has no such message.
+    ///
+    /// Answers `messagesInQueue` from whatever offline queue
+    /// [`Self::transaction_events`]/[`Self::transaction_events_persisted`] created, so **register
+    /// one of those first** if the CSMS is to see a real backlog rather than always `false` - the
+    /// same ordering requirement [`Self::boot_reason_persistence`] documents for its own
+    /// dependency. Calling this without either is still correct, just less informative: with no
+    /// queue wired, nothing this crate produces is ever queued, so `false` is the honest answer,
+    /// not a fallback standing in for one.
+    pub async fn get_transaction_status<N>(self, csms: &N) -> Self
+    where
+        N: crate::transaction_status::GetTransactionStatusHandler + Send + Sync + 'static,
+    {
+        csms.register_get_transaction_status_handler(
+            self.runtime.actor(),
+            self.transaction_queue.clone(),
+        )
+        .await;
         self
     }
 
@@ -3804,5 +3843,141 @@ mod tests {
             BootReasonStore::new(storage).load().await,
             Some(BootReasonCause::ScheduledReset)
         );
+    }
+
+    /// Captures whatever queue `ChargePointBuilder::get_transaction_status` hands its
+    /// `register_get_transaction_status_handler`, so a test can drive
+    /// [`crate::transaction_status::handle_get_transaction_status`] against the exact same queue
+    /// [`Self::transaction_events`] filled - proving the two are wired to the same
+    /// `OfflineQueue`, not two independent ones.
+    #[derive(Clone, Default)]
+    struct RecordingTransactionStatusCsms {
+        should_fail: Arc<AtomicBool>,
+        captured_queue: Arc<
+            std::sync::Mutex<
+                Option<
+                    Arc<crate::offline_queue::OfflineQueue<crate::state::TransactionEventOccurred>>,
+                >,
+            >,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transactions::TransactionNotifier for RecordingTransactionStatusCsms {
+        type Error = FlakyCsmsError;
+
+        async fn notify_transaction_event(
+            &self,
+            _evse_id: usize,
+            _connector_id: usize,
+            _kind: crate::state::TransactionEventKind,
+            _transaction: crate::state::Transaction,
+        ) -> Result<(), FlakyCsmsError> {
+            if self.should_fail.load(Ordering::SeqCst) {
+                return Err(FlakyCsmsError);
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connection::ReconnectHandler for RecordingTransactionStatusCsms {
+        async fn register_reconnect_handler<F, FF>(&self, _callback: F)
+        where
+            F: FnMut() -> FF + Send + Sync + 'static,
+            FF: Future<Output = ()> + Send + 'static,
+        {
+            // Not exercised here - this test is about queue wiring, not reconnect flush.
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transaction_status::GetTransactionStatusHandler for RecordingTransactionStatusCsms {
+        async fn register_get_transaction_status_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+            queue: Option<
+                Arc<crate::offline_queue::OfflineQueue<crate::state::TransactionEventOccurred>>,
+            >,
+        ) {
+            *self.captured_queue.lock().unwrap() = queue;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_transaction_status_answers_from_the_same_queue_transaction_events_fills() {
+        use crate::state::{
+            ChargePointEvent, ConnectorEvent, EvseEvent, IdToken, IdTokenKind, TransactionId,
+        };
+        use crate::transaction_status::{TransactionStatusQuery, handle_get_transaction_status};
+
+        let charge_point = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms = RecordingTransactionStatusCsms {
+            // Offline throughout, so the transaction below sits in the queue rather than going
+            // out - otherwise there would be nothing left to find when this test looks.
+            should_fail: Arc::new(AtomicBool::new(true)),
+            ..Default::default()
+        };
+
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .transaction_events(&csms)
+            .await
+            .get_transaction_status(&csms)
+            .await
+            .build();
+
+        // Starts transaction id 0 on the one connector this fixture has.
+        for event in [
+            ConnectorEvent::CableConnected,
+            ConnectorEvent::LockConfirmed,
+            ConnectorEvent::IdTokenPresented(IdToken {
+                value: "04A224B2".into(),
+                kind: IdTokenKind::ISO14443,
+            }),
+            ConnectorEvent::ChargingAuthorized(IdToken {
+                value: "04A224B2".into(),
+                kind: IdTokenKind::ISO14443,
+            }),
+        ] {
+            runtime
+                .actor()
+                .send(ChargePointEvent::Evse {
+                    evse_id: 0,
+                    event: EvseEvent::Connector {
+                        connector_id: 0,
+                        event,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        let queue = csms.captured_queue.lock().unwrap().clone().expect(
+            "get_transaction_status registers after transaction_events, so a queue must \
+                     have been captured",
+        );
+        assert!(!queue.is_empty());
+
+        let status = handle_get_transaction_status(
+            &runtime.actor(),
+            Some(&queue),
+            TransactionStatusQuery {
+                transaction_id: Some(TransactionId(0)),
+            },
+        );
+        assert_eq!(status.ongoing_indicator, Some(true));
+        assert!(status.messages_in_queue);
     }
 }
