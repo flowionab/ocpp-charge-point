@@ -2668,7 +2668,33 @@ coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match 
 ### 10.4 H4 — Longevity
 
 - [ ] **H4.1** Multi-day soak with induced network flapping.
-- [ ] **H4.2** Memory-growth assertion over thousands of transactions.
+- [x] **H4.2** Memory-growth assertion over thousands of transactions —
+      [`tests/memory_growth.rs`](../tests/memory_growth.rs). `tests/memory_budget.rs` (G2.3)
+      answers a different question: what a charge point retains *at* its configured bounds, a
+      snapshot. This asks whether retained memory *climbs* as transactions keep running through
+      it — the signature of a per-transaction leak, which a one-shot snapshot cannot see no matter
+      how the bounds are set.
+
+      Its own counting-`GlobalAlloc` binary (same reasoning as `memory_budget.rs`: sharing the lib
+      test binary's counter across 974 concurrently running tests would make any one reading
+      meaningless) drives a real `ChargePointState` — two EVSEs, two connectors each — through a
+      2,000-transaction warm-up and then 3,000 more, each transaction a complete lifecycle (cable
+      connect, lock, present a maximum-length 36-character id token, authorize and cache the
+      decision, close the contactor, three meter samples, stop, open, unlock, disconnect), with
+      every `StatusNotification`/`TransactionEvent`/`SecurityEventOccurred` effect routed through a
+      real offline queue and immediately flushed, and a synthetic security event raised
+      periodically. Two readings are taken — after warm-up, and after the follow-up batch — and the
+      test asserts the second stays within a small, fixed tolerance of the first, regardless of how
+      many more transactions ran. On this run the two readings were 115,015 B and 115,112 B: 97 B
+      of allocator noise over 3,000 further transactions, not growth.
+
+      This deliberately sweeps every collection PRODUCTION-ROADMAP calls out as a leak candidate —
+      the authorization cache (LRU-bounded), the offline queues and security log (capacity-bounded,
+      evicting), and each connector's transaction slot (`Option<Transaction>`, `slot.take()`n when
+      a session ends per `advance_transaction`) — and the test asserts each individually stays at
+      or under its configured bound at the end, so a failure names which collection grew rather
+      than just the total. No leak was found: every collection in this crate's transaction path is
+      already bounded, and this test now stands as the regression guard that keeps it that way.
 - [ ] **H4.3** Sustained-throughput test on a multi-EVSE configuration.
 
 ### 10.5 H5 — Release
