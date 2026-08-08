@@ -36,6 +36,7 @@ default = [
     "ocpp_2_1",
     "smart-charging",
     "firmware-management",
+    "firmware-publishing",
     "diagnostics",
     "variable-monitoring",
     "display-message",
@@ -83,6 +84,12 @@ smart-charging = []
 # through `ChargePointBuilder::firmware_updates`, which needs hardware bindings the feature flag
 # cannot supply, so this gates advertisement rather than compilation.
 firmware-management = []
+# Declares the Firmware Publishing (local controller) capability - `PublishFirmware`/
+# `UnpublishFirmware`/`PublishFirmwareStatusNotification` (roadmap B3.4, 2.x only), registered
+# through `ChargePointBuilder::publish_firmware` with a `hardware::FileTransfer` and a
+# `hardware::FirmwarePublisher`. Independent of `firmware-management`: a charge point can update
+# its own firmware without being a local controller, and vice versa.
+firmware-publishing = []
 # Declares the Diagnostics capability - log upload (roadmap B5.1) is registered through
 # `ChargePointBuilder::log_uploads`. GetTransactionStatus, CustomerInformation and the monitoring
 # engine are still unimplemented.
