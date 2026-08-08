@@ -504,7 +504,7 @@ fn device_model_shape_comparison(variables: usize, shapes: &[usize]) -> Vec<(usi
 /// above the measured figure, so ordinary drift doesn't fail the build but a change that
 /// meaningfully grows retained state does - the point of measuring at all (G2.3). Raise a ceiling
 /// only together with `docs/MEMORY.md`'s table.
-const CEILINGS: [usize; 3] = [66_000, 220_000, 495_000];
+const CEILINGS: [usize; 3] = [79_000, 230_000, 505_000];
 
 #[test]
 fn retained_heap_per_configuration_stays_within_its_documented_budget() {

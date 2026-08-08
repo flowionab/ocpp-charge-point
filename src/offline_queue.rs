@@ -12,7 +12,7 @@ use alloc::collections::VecDeque;
 use core::cell::RefCell;
 use core::fmt;
 use core::future::Future;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
@@ -80,6 +80,14 @@ pub struct OfflineQueue<M> {
     /// `.await`, which the `embassy-sync` blocking mutex this crate's no_std-safe state uses
     /// cannot.
     flushing: AtomicBool,
+    /// How many times the *current front message* has been attempted and failed. Reset whenever
+    /// the front changes, so it counts attempts at one message rather than at the queue.
+    ///
+    /// Kept beside the queue rather than inside each entry so the snapshot/restore path
+    /// ([`Self::snapshot`], used by `crate::persistence`) keeps carrying plain messages: attempt
+    /// counts are a property of *this* connection's attempts, and a count restored from before a
+    /// reboot would be counting against a CSMS link that no longer exists.
+    front_attempts: AtomicU32,
 }
 
 impl<M> OfflineQueue<M> {
@@ -97,6 +105,7 @@ impl<M> OfflineQueue<M> {
             capacity: capacity.max(1),
             policy: OverflowPolicy::default(),
             flushing: AtomicBool::new(false),
+            front_attempts: AtomicU32::new(0),
         }
     }
 
@@ -153,6 +162,16 @@ impl<M> OfflineQueue<M> {
     fn end_flush(&self) {
         self.flushing.store(false, Ordering::SeqCst);
     }
+
+    /// Records a failed attempt at the front message and reports how many it has now had.
+    fn record_failed_attempt(&self) -> u32 {
+        self.front_attempts.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Forgets the attempt count, because the front message changed (delivered or dropped).
+    fn reset_attempts(&self) {
+        self.front_attempts.store(0, Ordering::SeqCst);
+    }
 }
 
 impl<M: Clone> OfflineQueue<M> {
@@ -164,6 +183,7 @@ impl<M: Clone> OfflineQueue<M> {
         self.pending.lock(|queue| {
             queue.borrow_mut().pop_front();
         });
+        self.reset_attempts();
     }
 
     /// How many messages are currently queued. Used by [`crate::persistence`]'s queue-persistence
@@ -208,8 +228,34 @@ impl<M: Clone> OfflineQueue<M> {
 /// failure - re-queuing it rather than dropping it or skipping ahead - so a later message can
 /// never be delivered before an earlier one that's still stuck; that would misorder e.g.
 /// `TransactionEvent`s the CSMS relies on arriving in sequence.
-pub async fn flush_offline_queue<M, F, Fut, E>(queue: &OfflineQueue<M>, mut send: F)
+pub async fn flush_offline_queue<M, F, Fut, E>(queue: &OfflineQueue<M>, send: F)
 where
+    M: Clone,
+    F: FnMut(M) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+{
+    flush_offline_queue_with_attempts(queue, None, send).await
+}
+
+/// [`flush_offline_queue`], with a cap on how many times one message may be attempted before it is
+/// given up on - OCPP's `OCPPCommCtrlr`/`MessageAttempts[TransactionEvent]` (A6).
+///
+/// **This is head-of-line unblocking, and that is the point.** Without a cap, a message the CSMS
+/// will never accept - a malformed report, a transaction the CSMS has already closed - is retried
+/// forever at the front of the queue, and every message behind it waits on that retry. The queue
+/// then stops being an outage buffer and becomes a permanent blockage. With a cap, the stuck
+/// message is dropped after `max_attempts` failures and the rest drain.
+///
+/// Dropping is logged at error level, and deliberately not softened: for a transaction event it is
+/// billable data leaving the charge point unreported, which an operator needs to see. `None`
+/// disables the cap entirely, which is the old behaviour and remains right for a caller who would
+/// rather block than lose anything.
+pub async fn flush_offline_queue_with_attempts<M, F, Fut, E>(
+    queue: &OfflineQueue<M>,
+    max_attempts: Option<u32>,
+    mut send: F,
+) where
     M: Clone,
     F: FnMut(M) -> Fut,
     Fut: Future<Output = Result<(), E>>,
@@ -225,12 +271,65 @@ where
         match send(message).await {
             Ok(()) => queue.pop_front(),
             Err(err) => {
-                tracing::warn!(error = %err, "offline queue flush failed, will retry");
-                break;
+                let attempts = queue.record_failed_attempt();
+                match max_attempts {
+                    Some(max) if attempts >= max => {
+                        tracing::error!(
+                            error = %err,
+                            attempts,
+                            "giving up on a queued message after the configured attempts and \
+                             dropping it - the messages behind it were blocked by this one"
+                        );
+                        queue.pop_front();
+                        continue;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            error = %err,
+                            attempts,
+                            "offline queue flush failed, will retry"
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
     queue.end_flush();
+}
+
+/// The `(Component, Variable)` OCPP defines for how many times a queued message may be attempted -
+/// `OCPPCommCtrlr`/`MessageAttempts[TransactionEvent]`.
+fn message_attempts_variable() -> (crate::state::Component, crate::state::Variable) {
+    (
+        crate::state::Component {
+            name: "OCPPCommCtrlr".into(),
+            instance: None,
+            evse: None,
+        },
+        crate::state::Variable {
+            name: "MessageAttempts".into(),
+            instance: Some("TransactionEvent".into()),
+        },
+    )
+}
+
+/// How many times a queued message may be attempted before it is dropped, from
+/// `OCPPCommCtrlr`/`MessageAttempts[TransactionEvent]`.
+///
+/// `None` - no cap, retry forever - when the variable is absent, unparseable or `0`. Zero meaning
+/// "unlimited" rather than "never try" is deliberate and matches how OCPP's other `0`-valued
+/// intervals read in this crate: a charge point that dropped every report on its first failure
+/// would be worse than one that blocks, and nobody configuring `0` can plausibly mean that.
+pub fn message_attempts(actor: &crate::actor::ChargePointActor) -> Option<u32> {
+    let (component, variable) = message_attempts_variable();
+    actor
+        .state()
+        .device_model
+        .get(&component, &variable)
+        .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
+        .and_then(|attribute| attribute.value.parse::<u32>().ok())
+        .filter(|attempts| *attempts != 0)
 }
 
 /// The `(Component, Variable)` OCPP defines for how long to wait between attempts at a queued
@@ -301,7 +400,7 @@ pub async fn run_offline_queue_retries<M, B, F, Fut, E>(
         if queue.is_empty() {
             continue;
         }
-        flush_offline_queue(queue, &mut send).await;
+        flush_offline_queue_with_attempts(queue, message_attempts(actor), &mut send).await;
     }
 }
 
@@ -337,8 +436,9 @@ pub async fn run_with_offline_queue<M, F, Fut, E, H, HFut>(
 #[cfg(test)]
 mod tests {
     use super::{
-        OfflineQueue, flush_offline_queue, message_attempt_interval_secs,
-        run_offline_queue_retries, run_with_offline_queue,
+        OfflineQueue, flush_offline_queue, flush_offline_queue_with_attempts,
+        message_attempt_interval_secs, message_attempts, run_offline_queue_retries,
+        run_with_offline_queue,
     };
     use crate::sync::broadcast_channel;
     use alloc::vec::Vec;
@@ -588,6 +688,121 @@ mod tests {
 
         assert_eq!(delivered.load(Ordering::SeqCst), 1);
         assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_message_the_csms_will_never_accept_stops_blocking_the_ones_behind_it() {
+        // The failure this exists for: without a cap, a permanently-rejected message is retried
+        // forever at the front and everything behind it waits on that retry - the queue stops
+        // being an outage buffer and becomes a permanent blockage.
+        let queue = OfflineQueue::new();
+        queue.push(1); // the CSMS will never accept this one
+        queue.push(2);
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for _ in 0..3 {
+            let seen = delivered.clone();
+            flush_offline_queue_with_attempts(&queue, Some(3), move |message: i32| {
+                let seen = seen.clone();
+                async move {
+                    if message == 1 {
+                        return Err(SendError);
+                    }
+                    seen.lock().unwrap().push(message);
+                    Ok(())
+                }
+            })
+            .await;
+        }
+
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            alloc::vec![2],
+            "the message behind the stuck one should have gone out once the cap was reached"
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attempts_are_counted_per_message_not_per_queue() {
+        // A queue that failed twice on an earlier message must not give up early on the next one.
+        let queue = OfflineQueue::new();
+        queue.push(1);
+        queue.push(2);
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        // Two failures against message 1, then it succeeds - the counter must reset for 2.
+        for _ in 0..2 {
+            flush_offline_queue_with_attempts(&queue, Some(3), |_message: i32| async {
+                Err::<(), _>(SendError)
+            })
+            .await;
+        }
+        let counted = attempts.clone();
+        flush_offline_queue_with_attempts(&queue, Some(3), move |message: i32| {
+            let attempts = counted.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                // Message 2 fails once; with a per-queue counter it would already be at the cap.
+                if message == 2 {
+                    return Err(SendError);
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+        assert_eq!(
+            queue.len(),
+            1,
+            "message 2 should still be queued, not dropped"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn no_cap_means_retry_forever_which_is_still_the_default() {
+        let queue = OfflineQueue::new();
+        queue.push(1);
+
+        for _ in 0..10 {
+            flush_offline_queue(&queue, |_message: i32| async { Err::<(), _>(SendError) }).await;
+        }
+
+        assert_eq!(queue.len(), 1, "an uncapped queue keeps the message");
+    }
+
+    #[tokio::test]
+    async fn the_attempt_cap_comes_from_the_device_model_and_zero_means_unlimited() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+        use crate::state::{ChargePointEvent, DeviceModelEvent, VariableAttributeType};
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        // B1.7 registers this with a value of 3.
+        assert_eq!(message_attempts(&actor), Some(3));
+
+        let set = |value: &str| {
+            ChargePointEvent::DeviceModel(DeviceModelEvent::AttributeValueSet {
+                component: crate::state::Component {
+                    name: "OCPPCommCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: "MessageAttempts".into(),
+                    instance: Some("TransactionEvent".into()),
+                },
+                attribute_type: VariableAttributeType::Actual,
+                value: value.into(),
+            })
+        };
+
+        let _ = actor.send(set("10")).await;
+        assert_eq!(message_attempts(&actor), Some(10));
+        // `0` reads as unlimited, not as "drop on first failure" - see `message_attempts`' docs.
+        let _ = actor.send(set("0")).await;
+        assert_eq!(message_attempts(&actor), None);
     }
 
     #[tokio::test]

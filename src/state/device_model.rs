@@ -678,6 +678,43 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
     },
     DefaultVariable {
         component: "OCPPCommCtrlr",
+        variable: "RetryBackOffWaitMinimum",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        // `ocpp_client`'s own `ReconnectPolicy` default, so what a CSMS reads here is what the
+        // connection actually does rather than a number this crate invented alongside it.
+        value: "1",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "RetryBackOffRepeatTimes",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: None,
+        // How many times the wait doubles before it stops growing. The transport expresses the
+        // same idea as a maximum delay, so this is converted rather than stored twice - see
+        // `crate::connect`.
+        value: "5",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "RetryBackOffRandomRange",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        // `0`, honestly: the transport's reconnect policy has no jitter parameter at all, so any
+        // other value would be a number this charge point reports and does not apply.
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
         variable: "WebSocketPingInterval",
         instance: None,
         data_type: VariableDataType::Integer,

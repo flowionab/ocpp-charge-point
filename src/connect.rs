@@ -30,6 +30,7 @@ use crate::executor::Executor;
 use crate::hardware::{ChargePoint, Connector, Evse};
 use crate::provisioning::Backoff;
 use crate::setup::setup;
+use crate::state::{Component, DeviceModel, Variable, VariableAttributeType};
 use core::fmt;
 use ocpp_client::{ConnectOptions, NegotiatedClient, OcppVersion};
 
@@ -88,6 +89,10 @@ where
     X: Executor,
     B: Backoff + Clone + Send + Sync + 'static,
 {
+    // A5/A6: a caller who supplied `ConnectOptions` is configuring the transport deliberately and
+    // is left alone; one who didn't gets the reconnect backoff and per-call timeout OCPP models as
+    // device-model variables, so what a CSMS reads there matches what the connection does.
+    let options = Some(options.unwrap_or_else(connection_options_from_device_model));
     let negotiated = ocpp_client::connect(address, versions, options)
         .await
         .map_err(ConnectAndSetupError::Connect)?;
@@ -115,6 +120,71 @@ where
         NegotiatedClient::V1_6(client) => {
             setup_ocpp_1_6(charge_point, client, executor, backoff).await
         }
+    }
+}
+
+/// Reads an integer `OCPPCommCtrlr` variable out of a fresh [`DeviceModel`], falling back to
+/// `default` when it is absent, unparseable or `0`.
+///
+/// A *fresh* model on purpose: these values are needed to build the connection, which happens
+/// before there is an actor to ask. See [`connection_options_from_device_model`] for what that
+/// means and what it costs.
+fn ocpp_comm_ctrlr_secs(model: &DeviceModel, variable: &str, default: u64) -> u64 {
+    let component = Component {
+        name: "OCPPCommCtrlr".into(),
+        instance: None,
+        evse: None,
+    };
+    let variable = Variable {
+        name: variable.into(),
+        instance: None,
+    };
+    model
+        .get(&component, &variable)
+        .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+        .and_then(|attribute| attribute.value.parse::<u64>().ok())
+        .filter(|value| *value != 0)
+        .unwrap_or(default)
+}
+
+/// Fills in the transport settings OCPP models as device-model variables - the reconnect backoff
+/// (`RetryBackOffWaitMinimum`/`RetryBackOffRepeatTimes`, A5) and the per-call timeout
+/// (`MessageTimeout[Default]`, A6) - for a caller who did not supply its own
+/// [`ConnectOptions`].
+///
+/// **What this does and does not give you.** The values are read from a freshly-built
+/// [`DeviceModel`], i.e. this crate's registered defaults, because the connection has to exist
+/// before the actor that owns the live model does. So a CSMS *reading* these variables sees the
+/// values genuinely in force, and a CSMS *writing* them changes what the next connection uses -
+/// not the current one. Applying a change to a live connection means tearing it down and dialling
+/// again, which is [A9](../docs/PRODUCTION-ROADMAP.md)'s job and is not implemented.
+///
+/// Two honest gaps rather than approximations. `RetryBackOffRandomRange` (jitter) has **no**
+/// counterpart in the transport's reconnect policy, so it is registered as `0` and applied
+/// nowhere; reporting a jitter this charge point does not add would be worse than reporting none.
+/// And `RetryBackOffRepeatTimes` is a *doubling count* where the transport takes a maximum delay,
+/// so it is converted (`minimum × 2^repeats`) rather than stored twice - the two express the same
+/// curve, and keeping both would let them disagree.
+///
+/// An explicit `options` is left exactly as the caller wrote it: someone who reached for
+/// `ConnectOptions` is configuring the transport deliberately, and silently overriding their
+/// timeout with a device-model default would be the opposite of helpful.
+fn connection_options_from_device_model<'a>() -> ConnectOptions<'a> {
+    use core::time::Duration;
+
+    let model = DeviceModel::new();
+    let minimum = ocpp_comm_ctrlr_secs(&model, "RetryBackOffWaitMinimum", 1);
+    let repeats = ocpp_comm_ctrlr_secs(&model, "RetryBackOffRepeatTimes", 5).min(16);
+    let message_timeout = ocpp_comm_ctrlr_secs(&model, "MessageTimeout", 30);
+
+    ConnectOptions {
+        timeout: Some(Duration::from_secs(message_timeout)),
+        reconnect: ocpp_client::ReconnectBehavior::Enabled(ocpp_client::ReconnectPolicy {
+            initial_delay: Duration::from_secs(minimum),
+            max_delay: Duration::from_secs(minimum.saturating_mul(1u64 << repeats)),
+            multiplier: 2,
+        }),
+        ..Default::default()
     }
 }
 
@@ -289,4 +359,49 @@ where
     // A7: sweep the queues registered above on OCPP's own MessageAttemptInterval - see
     // `ChargePointBuilder::offline_queue_retries`.
     Ok(builder.offline_queue_retries(backoff, 60).build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_connection_settings_come_from_the_device_models_own_values() {
+        use core::time::Duration;
+
+        let options = connection_options_from_device_model();
+
+        // `MessageTimeout[Default]`'s registered value, so a CSMS reading it sees what the
+        // connection actually waits.
+        assert_eq!(options.timeout, Some(Duration::from_secs(30)));
+
+        let ocpp_client::ReconnectBehavior::Enabled(policy) = options.reconnect else {
+            panic!("reconnect should stay enabled");
+        };
+        // `RetryBackOffWaitMinimum` = 1 s, doubling `RetryBackOffRepeatTimes` = 5 times.
+        assert_eq!(policy.initial_delay, Duration::from_secs(1));
+        assert_eq!(policy.max_delay, Duration::from_secs(32));
+        assert_eq!(policy.multiplier, 2);
+    }
+
+    #[test]
+    fn a_repeat_count_a_csms_could_write_cannot_overflow_the_maximum_delay() {
+        // `1 << repeats` with an unbounded `repeats` is a shift overflow, and a CSMS can write any
+        // integer into this variable - so the conversion clamps rather than trusting it.
+        let model = crate::state::DeviceModel::new();
+        let repeats = ocpp_comm_ctrlr_secs(&model, "RetryBackOffRepeatTimes", 5).min(16);
+        assert!(repeats <= 16);
+        assert!(1u64.checked_shl(repeats as u32).is_some());
+    }
+
+    #[test]
+    fn an_absent_or_zero_variable_falls_back_rather_than_producing_a_zero_delay() {
+        let model = crate::state::DeviceModel::new();
+
+        // A variable this crate does not register at all.
+        assert_eq!(ocpp_comm_ctrlr_secs(&model, "NotAVariable", 7), 7);
+        // `WebSocketPingInterval` is registered as `0` (A4 has no transport support), so it
+        // exercises the zero path against a real registered variable.
+        assert_eq!(ocpp_comm_ctrlr_secs(&model, "WebSocketPingInterval", 7), 7);
+    }
 }
