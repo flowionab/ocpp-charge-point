@@ -22,13 +22,14 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "ocpp_1_6")]
 pub use self::ocpp_1_6::Ocpp1_6ReserveNowHandler;
 
-/// Parses a wire `expiryDateTime` (OCPP 2.x)/`expiryDate` (1.6J) string, as carried by
+/// Converts a wire `expiryDateTime` (OCPP 2.x)/`expiryDate` (1.6J), as carried by
 /// `ReserveNowRequest`, into a [`DateTime<Utc>`] for [`crate::state::Reservation::expires_at`].
-/// `None` if the CSMS sent something that doesn't parse as RFC 3339 - mirrors
-/// [`crate::provisioning::parse_csms_current_time`]'s "don't treat a malformed value as fatal"
-/// stance: a reservation is still made, just with `expires_at: None` (i.e. it is treated as never
-/// expiring, per [`Reservation`]'s docs), rather than the whole `ReserveNow` being rejected over
-/// an unparseable but otherwise-honorable request.
+///
+/// Infallible since `ocpp-types` 0.2.0. This used to parse an RFC 3339 string and treat a
+/// malformed value as `None` (never expires) rather than rejecting an otherwise-honorable
+/// `ReserveNow`. The value now arrives as an already-validated `OcppTimestamp`, so a malformed
+/// one is refused by `ocpp-client`'s decoder and answered with a `CALLERROR` before this crate
+/// sees it - the lenient case has no input left to be lenient about.
 // Only called from the `ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1` adapter modules below, each gated on
 // its own feature - unused (and so a `dead_code` warning without this) when none of them are
 // compiled in, e.g. `--no-default-features`.
@@ -36,10 +37,12 @@ pub use self::ocpp_1_6::Ocpp1_6ReserveNowHandler;
     not(any(feature = "ocpp_1_6", feature = "ocpp_2_0_1", feature = "ocpp_2_1")),
     allow(dead_code)
 )]
-fn parse_expiry_date_time(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+fn parse_expiry_date_time(raw: &crate::wire::OcppTimestamp) -> DateTime<Utc> {
+    // Returns the value rather than an `Option` since `ocpp-types` 0.2.0: `expiryDateTime` is
+    // required on the wire and now arrives as an already-validated `OcppTimestamp`, so there is
+    // no malformed case left for the caller to fall back on. `handle_reserve_now` still takes an
+    // `Option` because a reservation without an expiry is meaningful; a *malformed* one is not.
+    (*raw).into()
 }
 
 /// The outcome of a CSMS-initiated `ReserveNow` request, matching OCPP's
@@ -70,9 +73,10 @@ pub enum ReserveNowOutcome {
 /// CSMS to target one specific connector directly.
 ///
 /// `expires_at` becomes [`Reservation::expires_at`] directly - callers (the `ocpp_1_6`/
-/// `ocpp_2_0_1`/`ocpp_2_1` adapters below) are expected to have already parsed it from the wire
-/// request via [`parse_expiry_date_time`], so a malformed wire value has already become `None`
-/// (never-expires) before it gets here.
+/// `ocpp_2_0_1`/`ocpp_2_1` adapters below) convert it from the wire request via
+/// [`parse_expiry_date_time`]. `None` means a reservation that never expires, per
+/// [`Reservation`]'s docs; it no longer doubles as "the CSMS sent something unparseable", which
+/// the wire types now rule out.
 pub async fn handle_reserve_now(
     actor: &ChargePointActor,
     evse_id: Option<usize>,
@@ -380,15 +384,39 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_rfc3339_expiry_parses() {
-        let parsed = parse_expiry_date_time("2030-01-01T00:00:00Z");
+    fn a_wire_expiry_converts_to_the_instant_it_names() {
+        let wire: crate::wire::OcppTimestamp = "2030-01-01T00:00:00Z".try_into().unwrap();
 
-        assert_eq!(parsed, Some("2030-01-01T00:00:00Z".parse().unwrap()));
+        assert_eq!(
+            parse_expiry_date_time(&wire),
+            "2030-01-01T00:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+        );
     }
 
+    /// Replaces an older test asserting a malformed `expiryDateTime` became `None` (reserve
+    /// without an expiry). Since `ocpp-types` 0.2.0 that case cannot reach this module:
+    /// `expiryDateTime` is an `OcppTimestamp`, so a malformed value is refused while the CALL is
+    /// decoded and answered with a `CALLERROR`. The guard moved rather than disappeared, and
+    /// this pins it there.
     #[test]
-    fn a_malformed_expiry_parses_to_none() {
-        assert_eq!(parse_expiry_date_time("not a date"), None);
+    fn a_malformed_expiry_is_refused_by_the_decoder_before_it_reaches_this_crate() {
+        assert!(crate::wire::OcppTimestamp::parse_rfc3339("not a date").is_err());
+    }
+
+    /// An expiry that names the same instant in a different UTC offset is the same reservation
+    /// deadline. `OcppTimestamp` compares as an instant, so this is now guaranteed by the type
+    /// rather than by every call site remembering to normalise.
+    #[test]
+    fn an_expiry_written_in_another_offset_names_the_same_deadline() {
+        let utc: crate::wire::OcppTimestamp = "2030-01-01T00:00:00Z".try_into().unwrap();
+        let offset: crate::wire::OcppTimestamp = "2030-01-01T02:00:00+02:00".try_into().unwrap();
+
+        assert_eq!(
+            parse_expiry_date_time(&utc),
+            parse_expiry_date_time(&offset)
+        );
     }
 
     /// Spawns an actor with the `reservation` capability declared present - every test in this
@@ -785,16 +813,16 @@ mod ocpp_2_1 {
     use crate::state::{
         IdToken, IdTokenKind, ReservationEndReason, ReservationId, ReservationUpdate,
     };
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{
+    use crate::wire::v21::common::{
         CancelReservationStatusEnum, ReservationUpdateStatusEnum, ReserveNowStatusEnum,
     };
-    use ocpp_client::ocpp_types::v21::{
+    use crate::wire::v21::{
         CancelReservationResponse, ReservationStatusUpdateRequest, ReserveNowRequest,
         ReserveNowResponse,
     };
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
     fn map_id_token_kind(kind: &str) -> IdTokenKind {
         match kind {
@@ -812,7 +840,7 @@ mod ocpp_2_1 {
         }
     }
 
-    fn map_id_token(id_token: &ocpp_client::ocpp_types::v21::common::IdToken) -> IdToken {
+    fn map_id_token(id_token: &crate::wire::v21::common::IdToken) -> IdToken {
         IdToken {
             value: id_token.id_token.to_string(),
             kind: map_id_token_kind(id_token.r#type.as_str()),
@@ -860,7 +888,7 @@ mod ocpp_2_1 {
                                 evse_id,
                                 ReservationId(request.id),
                                 map_id_token(&request.id_token),
-                                super::parse_expiry_date_time(&request.expiry_date_time),
+                                Some(super::parse_expiry_date_time(&request.expiry_date_time)),
                             )
                             .await
                         }
@@ -968,8 +996,8 @@ mod ocpp_2_1 {
             );
         }
 
-        fn wire_id_token() -> ocpp_client::ocpp_types::v21::common::IdToken {
-            ocpp_client::ocpp_types::v21::common::IdToken {
+        fn wire_id_token() -> crate::wire::v21::common::IdToken {
+            crate::wire::v21::common::IdToken {
                 additional_info: None,
                 id_token: heapless::String::try_from("04A224B2").unwrap(),
                 r#type: heapless::String::try_from("ISO14443").unwrap(),
@@ -989,7 +1017,7 @@ mod ocpp_2_1 {
                 connector_type: None,
                 custom_data: None,
                 evse_id,
-                expiry_date_time: "2026-01-01T00:00:00Z".to_string(),
+                expiry_date_time: "2026-01-01T00:00:00Z".try_into().unwrap(),
                 group_id_token: None,
                 id: 1,
                 id_token: wire_id_token(),
@@ -1029,18 +1057,18 @@ mod ocpp_2_0_1 {
     use crate::actor::ChargePointActor;
     use crate::remote_control::ocpp_2_0_1::map_id_token_kind;
     use crate::state::{IdToken, ReservationEndReason, ReservationId, ReservationUpdate};
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{
+    use crate::wire::v201::common::{
         CancelReservationStatusEnum, ReservationUpdateStatusEnum, ReserveNowStatusEnum,
     };
-    use ocpp_client::ocpp_types::v201::{
+    use crate::wire::v201::{
         CancelReservationResponse, ReservationStatusUpdateRequest, ReserveNowRequest,
         ReserveNowResponse,
     };
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
 
-    fn map_id_token(id_token: &ocpp_client::ocpp_types::v201::common::IdToken) -> IdToken {
+    fn map_id_token(id_token: &crate::wire::v201::common::IdToken) -> IdToken {
         IdToken {
             value: id_token.id_token.to_string(),
             kind: map_id_token_kind(id_token.r#type.clone()),
@@ -1086,7 +1114,7 @@ mod ocpp_2_0_1 {
                                 evse_id,
                                 ReservationId(request.id),
                                 map_id_token(&request.id_token),
-                                super::parse_expiry_date_time(&request.expiry_date_time),
+                                Some(super::parse_expiry_date_time(&request.expiry_date_time)),
                             )
                             .await
                         }
@@ -1190,11 +1218,11 @@ mod ocpp_2_0_1 {
             );
         }
 
-        fn wire_id_token() -> ocpp_client::ocpp_types::v201::common::IdToken {
-            ocpp_client::ocpp_types::v201::common::IdToken {
+        fn wire_id_token() -> crate::wire::v201::common::IdToken {
+            crate::wire::v201::common::IdToken {
                 additional_info: None,
                 id_token: heapless::String::try_from("04A224B2").unwrap(),
-                r#type: ocpp_client::ocpp_types::v201::common::IdTokenEnum::ISO14443,
+                r#type: crate::wire::v201::common::IdTokenEnum::ISO14443,
                 custom_data: None,
             }
         }
@@ -1211,7 +1239,7 @@ mod ocpp_2_0_1 {
                 connector_type: None,
                 custom_data: None,
                 evse_id,
-                expiry_date_time: "2026-01-01T00:00:00Z".to_string(),
+                expiry_date_time: "2026-01-01T00:00:00Z".try_into().unwrap(),
                 group_id_token: None,
                 id: 1,
                 id_token: wire_id_token(),
@@ -1265,15 +1293,11 @@ mod ocpp_1_6 {
     use crate::id_tag::map_id_token;
     use crate::state::ReservationId;
     use crate::topology::unflatten_ocpp_1_6_connector_id;
+    use crate::wire::v16::common::{CancelReservationResponseStatus, ReserveNowResponseStatus};
+    use crate::wire::v16::{CancelReservationResponse, ReserveNowRequest, ReserveNowResponse};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::common::{
-        CancelReservationResponseStatus, ReserveNowResponseStatus,
-    };
-    use ocpp_client::ocpp_types::v16::{
-        CancelReservationResponse, ReserveNowRequest, ReserveNowResponse,
-    };
 
     pub(super) fn map_reserve_now_outcome(outcome: ReserveNowOutcome) -> ReserveNowResponseStatus {
         match outcome {
@@ -1348,7 +1372,7 @@ mod ocpp_1_6 {
                                     evse_id,
                                     ReservationId(request.reservation_id),
                                     map_id_token(&request.id_tag),
-                                    super::parse_expiry_date_time(&request.expiry_date),
+                                    Some(super::parse_expiry_date_time(&request.expiry_date)),
                                 )
                                 .await
                             }
@@ -1437,8 +1461,8 @@ mod ocpp_1_6 {
         fn request(connector_id: i64) -> ReserveNowRequest {
             ReserveNowRequest {
                 connector_id,
-                expiry_date: "2030-01-01T00:00:00Z".into(),
-                id_tag: ocpp_client::ocpp_types::v16::IdTag::try_from("04A224B2").unwrap(),
+                expiry_date: "2030-01-01T00:00:00Z".try_into().unwrap(),
+                id_tag: crate::wire::v16::IdTag::try_from("04A224B2").unwrap(),
                 parent_id_tag: None,
                 reservation_id: 1,
             }

@@ -55,6 +55,7 @@ pub mod firmware;
 pub mod hardware;
 #[cfg(feature = "ocpp_1_6")]
 mod id_tag;
+pub mod keepalive;
 #[cfg(feature = "local-auth-list")]
 pub mod local_authorization_list;
 pub mod meter_values;
@@ -101,6 +102,7 @@ mod topology;
 pub mod transaction_status;
 pub mod transactions;
 pub mod variable_monitoring;
+mod wire;
 
 pub use self::builder::ChargePointBuilder;
 #[cfg(all(

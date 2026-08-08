@@ -495,13 +495,13 @@ mod ocpp_2_1 {
     use super::{SetNetworkProfileHandler, SetNetworkProfileOutcome, handle_set_network_profile};
     use crate::actor::ChargePointActor;
     use crate::state::{NetworkConnectionProfile, NetworkInterface, NetworkTransport};
+    use crate::wire::v21::common::{
+        OCPPInterfaceEnum, OCPPTransportEnum, SetNetworkProfileStatusEnum,
+    };
+    use crate::wire::v21::{SetNetworkProfileRequest, SetNetworkProfileResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{
-        OCPPInterfaceEnum, OCPPTransportEnum, SetNetworkProfileStatusEnum,
-    };
-    use ocpp_client::ocpp_types::v21::{SetNetworkProfileRequest, SetNetworkProfileResponse};
 
     fn map_interface(interface: &OCPPInterfaceEnum) -> NetworkInterface {
         match interface {
@@ -529,7 +529,7 @@ mod ocpp_2_1 {
     /// `basicAuthPassword` (a credential this crate cannot use; see
     /// [`NetworkConnectionProfile::security_profile`]).
     fn map_profile(
-        connection: &ocpp_client::ocpp_types::v21::common::NetworkConnectionProfile,
+        connection: &crate::wire::v21::common::NetworkConnectionProfile,
     ) -> NetworkConnectionProfile {
         NetworkConnectionProfile {
             csms_url: connection.ocpp_csms_url.to_string(),
@@ -615,13 +615,13 @@ mod ocpp_2_0_1 {
     use super::{SetNetworkProfileHandler, SetNetworkProfileOutcome, handle_set_network_profile};
     use crate::actor::ChargePointActor;
     use crate::state::{NetworkConnectionProfile, NetworkInterface, NetworkTransport};
+    use crate::wire::v201::common::{
+        OCPPInterfaceEnum, OCPPTransportEnum, SetNetworkProfileStatusEnum,
+    };
+    use crate::wire::v201::{SetNetworkProfileRequest, SetNetworkProfileResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{
-        OCPPInterfaceEnum, OCPPTransportEnum, SetNetworkProfileStatusEnum,
-    };
-    use ocpp_client::ocpp_types::v201::{SetNetworkProfileRequest, SetNetworkProfileResponse};
 
     fn map_interface(interface: &OCPPInterfaceEnum) -> NetworkInterface {
         match interface {
@@ -651,7 +651,7 @@ mod ocpp_2_0_1 {
     /// `basicAuthPassword` (a credential this crate cannot use; see
     /// [`NetworkConnectionProfile::security_profile`]).
     fn map_profile(
-        connection: &ocpp_client::ocpp_types::v201::common::NetworkConnectionProfile,
+        connection: &crate::wire::v201::common::NetworkConnectionProfile,
     ) -> NetworkConnectionProfile {
         NetworkConnectionProfile {
             csms_url: connection.ocpp_csms_url.to_string(),

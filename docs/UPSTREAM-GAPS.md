@@ -1,5 +1,29 @@
 # Upstream type/action completeness audit (D2)
 
+> **Stale as of the `ocpp-client` 0.4.0/0.5.0 migration (2026-08-08).** Everything below was
+> measured against `ocpp-types` 0.1.2 / `ocpp-client` 0.2.0; `Cargo.toml` now requires
+> `ocpp-client` 0.5.0 (`ocpp-types` 0.3.0). Three of its findings have since changed:
+>
+> - **1.6J security whitepaper (§D2.2, and the 1.6J table).** The audit's central 1.6J finding -
+>   that all ten whitepaper messages are absent from `ocpp-types` *entirely*, so closing D2.2
+>   means contributing types upstream - no longer holds. `ocpp-types` 0.2.0 generates them and
+>   `ocpp-client` 0.4.0 wraps eleven as actions (the ten below plus `ExtendedTriggerMessage`);
+>   1.6 went from 28 wired actions to 39. Wiring them in this crate is still open.
+> - **2.1 and 2.0.1 action coverage.** The five 2.1 messages listed as missing from
+>   `ocpp-client` were added in 0.2.1, and 2.0.1's `SecurityEventNotification` in 0.2.2.
+> - **`DataTransfer`.** A new upstream defect applies from 0.4.0 - see
+>   [`MIGRATION-ocpp-client-0.4.md`](./MIGRATION-ocpp-client-0.4.md) §"DataTransfer".
+>
+> **Unchanged:** D2.3 (`ChargingProfile` 56 KB by value). Verified directly against `ocpp-types`
+> 0.2.0: `ChargingSchedule` still holds `AbsolutePriceSchedule`/`PriceLevelSchedule` inline
+> rather than boxed. Some structures did shrink, because 48 2.x fields moved from
+> `heapless::String<N>` to `String`, but the cause D2.3 names is untouched.
+>
+> `ocpp-types` 0.3.0 changed none of this again - that release is purely additive, with the same
+> 39 / 64 / 91 actions and no type reshaped - so the corrections above are current.
+>
+> Re-run the audit against 0.3.0/0.5.0 before planning D2.2; the method below still applies.
+
 This document answers [D2 in `PRODUCTION-ROADMAP.md` §6.2](./PRODUCTION-ROADMAP.md#62-d2--type-completeness-audit):
 does `ocpp-types` actually contain every message OCPP 1.6J / 2.0.1 / 2.1
 define, does `ocpp-client` wrap all of them as callable actions, and does

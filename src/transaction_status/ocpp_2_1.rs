@@ -3,8 +3,8 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
+use crate::wire::v21::{GetTransactionStatusRequest, GetTransactionStatusResponse};
 use ocpp_client::ocpp_2_1::OCPP2_1Client;
-use ocpp_client::ocpp_types::v21::{GetTransactionStatusRequest, GetTransactionStatusResponse};
 
 use crate::actor::ChargePointActor;
 use crate::offline_queue::OfflineQueue;

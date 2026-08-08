@@ -602,17 +602,17 @@ pub mod ocpp_2_1 {
     use crate::actor::ChargePointActor;
     use crate::state::{Tariff, TariffId, TariffScope, TransactionId};
     use alloc::vec::Vec;
-    use chrono::{DateTime, Utc};
-    use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::ocpp_types::v21::common::{
+
+    use crate::wire::v21::common::{
         ClearTariffsResult, TariffAssignment, TariffChangeStatusEnum, TariffClearStatusEnum,
         TariffGetStatusEnum, TariffKindEnum, TariffSetStatusEnum,
     };
-    use ocpp_client::ocpp_types::v21::{
+    use crate::wire::v21::{
         ChangeTransactionTariffRequest, ChangeTransactionTariffResponse, ClearTariffsRequest,
         ClearTariffsResponse, GetTariffsRequest, GetTariffsResponse, SetDefaultTariffRequest,
         SetDefaultTariffResponse,
     };
+    use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
 
     /// OCPP addresses tariff scope as an `evseId` where `0` means "the whole charge point" and
     /// `n > 0` means the EVSE this crate indexes as `n - 1` - the same 1-based/0-based split
@@ -641,15 +641,13 @@ pub mod ocpp_2_1 {
         usize::try_from(evse_id - 1).ok()
     }
 
-    fn wire_tariff(tariff: &ocpp_client::ocpp_types::v21::common::Tariff) -> Tariff {
+    fn wire_tariff(tariff: &crate::wire::v21::common::Tariff) -> Tariff {
         Tariff {
             id: TariffId(tariff.tariff_id.as_str().into()),
             currency: tariff.currency.as_str().into(),
-            valid_from: tariff
-                .valid_from
-                .as_deref()
-                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
+            // Infallible since `ocpp-types` 0.2.0: `validFrom` arrives as an already-validated
+            // `OcppTimestamp`, so the "unparseable becomes absent" fallback has no case left.
+            valid_from: tariff.valid_from.map(Into::into),
         }
     }
 
@@ -792,7 +790,7 @@ pub mod ocpp_2_1 {
                 TariffKind::Default => TariffKindEnum::DefaultTariff,
                 TariffKind::Driver => TariffKindEnum::DriverTariff,
             },
-            valid_from: report.valid_from.map(|when| when.to_rfc3339()),
+            valid_from: report.valid_from.map(Into::into),
         })
     }
 
@@ -837,8 +835,8 @@ pub mod ocpp_2_1 {
         use crate::executor::TokioExecutor;
         use crate::hardware::Capabilities;
         use crate::state::ChargePointEvent;
-        use ocpp_client::ocpp_types::v21::RpcErrorCode;
-        use ocpp_client::ocpp_types::v21::common::Tariff as WireTariff;
+        use crate::wire::v21::RpcErrorCode;
+        use crate::wire::v21::common::Tariff as WireTariff;
 
         fn wire_tariff_request(id: &str) -> WireTariff {
             WireTariff {

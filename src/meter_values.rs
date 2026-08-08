@@ -437,10 +437,10 @@ mod ocpp_2_1 {
     use super::MeterValuesNotifier;
     use crate::clock::{Clock, is_synchronized};
     use crate::state::MeterSample;
+    use crate::wire::v21::MeterValuesRequest;
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::ocpp_types::v21::MeterValuesRequest;
 
     /// Builds the wire request for one reading. The `meterValue` body itself comes from
     /// [`crate::transactions`]' own builder rather than a second copy - see that function's docs.
@@ -563,7 +563,10 @@ mod ocpp_2_1 {
 
             assert_eq!(request.evse_id, 1, "2.x numbers EVSEs from 1");
             assert_eq!(request.meter_value.len(), 1);
-            assert_eq!(request.meter_value[0].timestamp, fixed().to_rfc3339());
+            assert_eq!(
+                request.meter_value[0].timestamp,
+                crate::wire::OcppTimestamp::from(fixed())
+            );
             // Energy plus the one optional measurand the sample carried.
             assert_eq!(request.meter_value[0].sampled_value.len(), 2);
         }
@@ -575,7 +578,10 @@ mod ocpp_2_1 {
 
             let request = build_meter_values_request(&unset_rtc, 0, MeterSample::default());
 
-            assert_eq!(request.meter_value[0].timestamp, unset_rtc.0.to_rfc3339());
+            assert_eq!(
+                request.meter_value[0].timestamp,
+                crate::wire::OcppTimestamp::from(unset_rtc.0)
+            );
         }
     }
 }
@@ -587,10 +593,10 @@ mod ocpp_2_0_1 {
     use super::MeterValuesNotifier;
     use crate::clock::{Clock, is_synchronized};
     use crate::state::MeterSample;
+    use crate::wire::v201::MeterValuesRequest;
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-    use ocpp_client::ocpp_types::v201::MeterValuesRequest;
 
     fn build_meter_values_request<C: Clock>(
         clock: &C,
@@ -700,7 +706,10 @@ mod ocpp_2_0_1 {
             );
 
             assert_eq!(request.evse_id, 3);
-            assert_eq!(request.meter_value[0].timestamp, fixed.to_rfc3339());
+            assert_eq!(
+                request.meter_value[0].timestamp,
+                crate::wire::OcppTimestamp::from(fixed)
+            );
         }
     }
 }
@@ -718,11 +727,11 @@ mod ocpp_1_6 {
     use crate::clock::{Clock, is_synchronized};
     use crate::state::MeterSample;
     use crate::topology::flatten_ocpp_1_6_connector_id;
+    use crate::wire::v16::MeterValuesRequest;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
-    use ocpp_client::ocpp_types::v16::MeterValuesRequest;
 
     /// Wraps an [`OCPP1_6Client`] with the connector topology its flat `connectorId` addressing
     /// needs, and the [`Clock`] that stamps each reading - the same pairing
@@ -851,7 +860,10 @@ mod ocpp_1_6 {
 
             assert_eq!(request.connector_id, 3);
             assert_eq!(request.transaction_id, None);
-            assert_eq!(request.meter_value[0].timestamp, fixed().to_rfc3339());
+            assert_eq!(
+                request.meter_value[0].timestamp,
+                crate::wire::OcppTimestamp::from(fixed())
+            );
         }
 
         #[test]

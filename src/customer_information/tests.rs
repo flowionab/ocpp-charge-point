@@ -59,13 +59,13 @@ impl CustomerInformationNotifier for RecordingNotifier {
         request_id: i64,
         seq_no: i64,
         tbc: bool,
-        generated_at: &str,
+        generated_at: chrono::DateTime<chrono::Utc>,
         data: String,
     ) -> Result<(), Self::Error> {
         self.seen
             .lock()
             .unwrap()
-            .push((request_id, seq_no, tbc, generated_at.to_string(), data));
+            .push((request_id, seq_no, tbc, generated_at.to_rfc3339(), data));
         Ok(())
     }
 }

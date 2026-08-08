@@ -725,12 +725,12 @@ mod ocpp_2_1 {
         handle_change_availability_request,
     };
     use crate::state::ConnectorStatus;
-    use alloc::boxed::Box;
-    use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{
+    use crate::wire::v21::common::{
         ChangeAvailabilityStatusEnum, ConnectorStatusEnum, OperationalStatusEnum,
     };
-    use ocpp_client::ocpp_types::v21::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
+    use crate::wire::v21::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
+    use alloc::boxed::Box;
+    use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
     pub(super) fn map_status(status: ConnectorStatus) -> ConnectorStatusEnum {
         match status {
@@ -750,10 +750,10 @@ mod ocpp_2_1 {
         use crate::availability::StatusNotifier;
         use crate::clock::{Clock, is_synchronized};
         use crate::state::{ConnectorState, ConnectorStatus};
+        use crate::wire::v21::StatusNotificationRequest;
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-        use ocpp_client::ocpp_types::v21::StatusNotificationRequest;
 
         /// Builds the `StatusNotificationRequest` for `status`, timestamped from `clock.now()`.
         /// Pure (no network I/O), so a fixed [`Clock`] fake can assert the exact timestamp that
@@ -773,7 +773,7 @@ mod ocpp_2_1 {
             }
             StatusNotificationRequest {
                 custom_data: None,
-                timestamp: now.to_rfc3339(),
+                timestamp: now.into(),
                 connector_status: map_status(status),
                 evse_id: evse_id as i64,
                 connector_id: connector_id as i64,
@@ -877,7 +877,7 @@ mod ocpp_2_1 {
                 let request =
                     build_status_notification_request(&clock, 0, 0, ConnectorStatus::Available);
 
-                assert_eq!(request.timestamp, fixed.to_rfc3339());
+                assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
             }
 
             #[test]
@@ -888,7 +888,10 @@ mod ocpp_2_1 {
                 let request =
                     build_status_notification_request(&unset_rtc, 0, 0, ConnectorStatus::Available);
 
-                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
+                assert_eq!(
+                    request.timestamp,
+                    crate::wire::OcppTimestamp::from(unset_rtc.0)
+                );
             }
         }
     }
@@ -971,13 +974,11 @@ mod ocpp_2_1 {
 
         fn request(evse: Option<(i64, Option<i64>)>) -> ChangeAvailabilityRequest {
             ChangeAvailabilityRequest {
-                evse: evse.map(
-                    |(id, connector_id)| ocpp_client::ocpp_types::v21::common::EVSE {
-                        id,
-                        connector_id,
-                        custom_data: None,
-                    },
-                ),
+                evse: evse.map(|(id, connector_id)| crate::wire::v21::common::EVSE {
+                    id,
+                    connector_id,
+                    custom_data: None,
+                }),
                 operational_status: OperationalStatusEnum::Inoperative,
                 custom_data: None,
             }
@@ -1042,12 +1043,12 @@ mod ocpp_2_0_1 {
         handle_change_availability_request,
     };
     use crate::state::ConnectorStatus;
-    use alloc::boxed::Box;
-    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{
+    use crate::wire::v201::common::{
         ChangeAvailabilityStatusEnum, ConnectorStatusEnum, OperationalStatusEnum,
     };
-    use ocpp_client::ocpp_types::v201::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
+    use crate::wire::v201::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
+    use alloc::boxed::Box;
+    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
 
     pub(super) fn map_status(status: ConnectorStatus) -> ConnectorStatusEnum {
         match status {
@@ -1067,10 +1068,10 @@ mod ocpp_2_0_1 {
         use crate::availability::StatusNotifier;
         use crate::clock::{Clock, is_synchronized};
         use crate::state::{ConnectorState, ConnectorStatus};
+        use crate::wire::v201::StatusNotificationRequest;
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-        use ocpp_client::ocpp_types::v201::StatusNotificationRequest;
 
         fn build_status_notification_request<C: Clock>(
             clock: &C,
@@ -1087,7 +1088,7 @@ mod ocpp_2_0_1 {
             }
             StatusNotificationRequest {
                 custom_data: None,
-                timestamp: now.to_rfc3339(),
+                timestamp: now.into(),
                 connector_status: map_status(status),
                 evse_id: evse_id as i64,
                 connector_id: connector_id as i64,
@@ -1185,7 +1186,7 @@ mod ocpp_2_0_1 {
                 let request =
                     build_status_notification_request(&clock, 0, 0, ConnectorStatus::Available);
 
-                assert_eq!(request.timestamp, fixed.to_rfc3339());
+                assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
             }
 
             #[test]
@@ -1196,7 +1197,10 @@ mod ocpp_2_0_1 {
                 let request =
                     build_status_notification_request(&unset_rtc, 0, 0, ConnectorStatus::Available);
 
-                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
+                assert_eq!(
+                    request.timestamp,
+                    crate::wire::OcppTimestamp::from(unset_rtc.0)
+                );
             }
         }
     }
@@ -1277,13 +1281,11 @@ mod ocpp_2_0_1 {
 
         fn request(evse: Option<(i64, Option<i64>)>) -> ChangeAvailabilityRequest {
             ChangeAvailabilityRequest {
-                evse: evse.map(
-                    |(id, connector_id)| ocpp_client::ocpp_types::v201::common::EVSE {
-                        id,
-                        connector_id,
-                        custom_data: None,
-                    },
-                ),
+                evse: evse.map(|(id, connector_id)| crate::wire::v201::common::EVSE {
+                    id,
+                    connector_id,
+                    custom_data: None,
+                }),
                 operational_status: OperationalStatusEnum::Inoperative,
                 custom_data: None,
             }
@@ -1354,12 +1356,12 @@ mod ocpp_1_6 {
     use crate::availability::StatusNotifier;
     use crate::state::ConnectorState;
     use crate::topology::flatten_ocpp_1_6_connector_id;
+    use crate::wire::v16::StatusNotificationRequest;
+    use crate::wire::v16::common::{ErrorCode, StatusNotificationRequestStatus};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
-    use ocpp_client::ocpp_types::v16::StatusNotificationRequest;
-    use ocpp_client::ocpp_types::v16::common::{ErrorCode, StatusNotificationRequestStatus};
 
     /// Maps this crate's full `ConnectorState` down to 1.6J's `StatusNotificationRequestStatus` -
     /// richer than [`crate::state::ConnectorStatus`]'s 5 values, so this reads `ConnectorState`
@@ -1561,10 +1563,10 @@ mod ocpp_1_6 {
         handle_change_availability_request,
     };
     use crate::topology::unflatten_ocpp_1_6_connector_id;
-    use ocpp_client::ocpp_types::v16::common::{
+    use crate::wire::v16::common::{
         ChangeAvailabilityRequestType, ChangeAvailabilityResponseStatus,
     };
-    use ocpp_client::ocpp_types::v16::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
+    use crate::wire::v16::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 
     /// `None` only if `connector_id` is negative or past the last real connector under
     /// `connector_counts` - `0` always resolves to [`AvailabilityTarget::ChargePoint`].

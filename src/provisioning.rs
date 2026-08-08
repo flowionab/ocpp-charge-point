@@ -12,9 +12,22 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "tokio-runtime")]
 use core::time::Duration;
 
-/// Default interval to wait before retrying BootNotification after a transport-level failure
+/// The longest this crate waits before retrying BootNotification after a transport-level failure
 /// (as opposed to a `Pending`/`Rejected` response, which carries its own retry interval).
+///
+/// Reached by doubling from [`FIRST_RETRY_INTERVAL_SECS`] rather than applied to the first retry -
+/// see [`register_until_accepted`] for why the first failure after a reconnect deserves a much
+/// shorter wait than a CSMS that is simply down.
 pub const DEFAULT_RETRY_INTERVAL_SECS: u32 = 30;
+
+/// How long to wait before the *first* retry after a transport-level BootNotification failure.
+///
+/// A transport failure is not always a CSMS that is down: the common case in this crate is a send
+/// that raced a redial, where the connection is back within a second and waiting
+/// [`DEFAULT_RETRY_INTERVAL_SECS`] would leave the charge point unregistered - and so unable to
+/// start a transaction - for half a minute with a perfectly good socket open. Retrying quickly
+/// first and doubling from there covers both cases without needing to tell them apart.
+pub const FIRST_RETRY_INTERVAL_SECS: u32 = 1;
 
 /// The CSMS's answer to a BootNotification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +146,15 @@ pub async fn register<N: BootNotifier, M: MonotonicClock>(
 /// Runs BootNotification against `actor` repeatedly until the CSMS accepts registration,
 /// applying every intermediate decision to the charge point's state. Per OCPP, a charge point
 /// does not give up: on `Pending`/`Rejected` it waits the response's `interval_secs` before
-/// retrying, and on a transport-level failure it waits [`DEFAULT_RETRY_INTERVAL_SECS`] instead.
+/// retrying, and on a transport-level failure it backs off exponentially from
+/// [`FIRST_RETRY_INTERVAL_SECS`] to [`DEFAULT_RETRY_INTERVAL_SECS`], resetting the moment an
+/// attempt reaches the CSMS at all.
+///
+/// The escalation matters for how fast a charge point comes back rather than for how hard it
+/// tries. A transport failure here is often a send that raced a redial - the profile switch in
+/// [`crate::network_switch`] can produce exactly that - and in those cases the socket is healthy
+/// again almost immediately, so the first retry should be prompt. A CSMS that is genuinely down
+/// still ends up at the same half-minute cadence within a few attempts.
 ///
 /// Every response (including intermediate `Pending`/`Rejected` ones) that carries a parseable
 /// `currentTime` is evaluated for a time-sync step, exactly as [`register`] does - see that
@@ -154,9 +175,13 @@ pub async fn register_until_accepted<N: BootNotifier, B: Backoff, M: MonotonicCl
     model_name: &str,
     reason: Option<BootReasonCause>,
 ) -> BootNotificationOutcome {
+    let mut retry_secs = FIRST_RETRY_INTERVAL_SECS;
     loop {
         match notifier.notify_boot(vendor_name, model_name, reason).await {
             Ok(outcome) => {
+                // The CSMS answered, so whatever the answer is, the transport is healthy: the
+                // next transport failure starts its escalation from the bottom again.
+                retry_secs = FIRST_RETRY_INTERVAL_SECS;
                 let _ = actor
                     .send(ChargePointEvent::RegistrationStatusReceived(outcome.status))
                     .await;
@@ -169,8 +194,15 @@ pub async fn register_until_accepted<N: BootNotifier, B: Backoff, M: MonotonicCl
                 backoff.wait(outcome.interval_secs).await;
             }
             Err(err) => {
-                tracing::warn!(error = %err, "boot notification failed, retrying");
-                backoff.wait(DEFAULT_RETRY_INTERVAL_SECS).await;
+                tracing::warn!(
+                    error = %err,
+                    retry_in_secs = retry_secs,
+                    "boot notification failed, retrying"
+                );
+                backoff.wait(retry_secs).await;
+                retry_secs = retry_secs
+                    .saturating_mul(2)
+                    .min(DEFAULT_RETRY_INTERVAL_SECS);
             }
         }
     }
@@ -302,10 +334,14 @@ pub fn parse_csms_current_time(raw: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// [`parse_csms_current_time`], but logs a warning on a non-empty value that failed to parse -
-/// see that function's docs. Every version adapter's `currentTime` handling below goes through
-/// this rather than the bare parse, so a malformed wire value is visible in logs instead of
-/// silently becoming "no sync available".
+/// A CSMS `currentTime` onto this crate's clock type.
+///
+/// Since `ocpp-types` 0.2.0 this cannot fail and no longer logs: `currentTime` arrives as an
+/// already-validated [`OcppTimestamp`], so a malformed value is refused by `ocpp-client`'s
+/// decoder and answered with a `CALLERROR` rather than reaching this crate as an unparseable
+/// string. [`parse_csms_current_time`] remains for callers holding a raw string.
+///
+/// [`OcppTimestamp`]: ocpp_client::ocpp_types::OcppTimestamp
 // Only called from the `ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1` adapter modules below, each gated on
 // its own feature - unused (and so a `dead_code` warning without this) when none of them are
 // compiled in, e.g. `--no-default-features`.
@@ -313,12 +349,8 @@ pub fn parse_csms_current_time(raw: &str) -> Option<DateTime<Utc>> {
     not(any(feature = "ocpp_1_6", feature = "ocpp_2_0_1", feature = "ocpp_2_1")),
     allow(dead_code)
 )]
-fn parse_csms_current_time_logged(raw: &str) -> Option<DateTime<Utc>> {
-    let parsed = parse_csms_current_time(raw);
-    if parsed.is_none() && !raw.is_empty() {
-        tracing::warn!(raw, "CSMS currentTime did not parse as RFC 3339");
-    }
-    parsed
+fn parse_csms_current_time_logged(raw: &crate::wire::OcppTimestamp) -> DateTime<Utc> {
+    (*raw).into()
 }
 
 impl TimeSyncStep {
@@ -1267,14 +1299,12 @@ pub(crate) mod test_support {
 mod ocpp_2_1 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
     use crate::state::{BootReasonCause, RegistrationStatus};
+    use crate::wire::v21::BootNotificationRequest;
+    use crate::wire::v21::HeartbeatRequest;
+    use crate::wire::v21::common::{BootReasonEnum, ChargingStation, RegistrationStatusEnum};
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::ocpp_types::v21::BootNotificationRequest;
-    use ocpp_client::ocpp_types::v21::HeartbeatRequest;
-    use ocpp_client::ocpp_types::v21::common::{
-        BootReasonEnum, ChargingStation, RegistrationStatusEnum,
-    };
 
     /// This crate's internal [`BootReasonCause`] onto OCPP 2.1's `BootReasonEnum`. `None` -
     /// no persisted cause found for this boot, i.e. an *uncommanded* restart (power cut, watchdog,
@@ -1341,7 +1371,9 @@ mod ocpp_2_1 {
             Ok(BootNotificationOutcome {
                 status: map_status(response.status),
                 interval_secs: response.interval.max(0) as u32,
-                current_time: super::parse_csms_current_time_logged(&response.current_time),
+                current_time: Some(super::parse_csms_current_time_logged(
+                    &response.current_time,
+                )),
             })
         }
     }
@@ -1356,9 +1388,9 @@ mod ocpp_2_1 {
             let response = self
                 .send_heartbeat(HeartbeatRequest { custom_data: None })
                 .await?;
-            Ok(super::parse_csms_current_time_logged(
+            Ok(Some(super::parse_csms_current_time_logged(
                 &response.current_time,
-            ))
+            )))
         }
     }
 
@@ -1416,14 +1448,12 @@ mod ocpp_2_1 {
 mod ocpp_2_0_1 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
     use crate::state::RegistrationStatus;
+    use crate::wire::v201::BootNotificationRequest;
+    use crate::wire::v201::HeartbeatRequest;
+    use crate::wire::v201::common::{BootReasonEnum, ChargingStation, RegistrationStatusEnum};
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-    use ocpp_client::ocpp_types::v201::BootNotificationRequest;
-    use ocpp_client::ocpp_types::v201::HeartbeatRequest;
-    use ocpp_client::ocpp_types::v201::common::{
-        BootReasonEnum, ChargingStation, RegistrationStatusEnum,
-    };
 
     /// Same mapping as OCPP 2.1's `map_reason` - 2.0.1's `BootReasonEnum` has the identical
     /// variant set - see that function's docs for why absence maps to `Unknown` rather than
@@ -1486,7 +1516,9 @@ mod ocpp_2_0_1 {
             Ok(BootNotificationOutcome {
                 status: map_status(response.status),
                 interval_secs: response.interval.max(0) as u32,
-                current_time: super::parse_csms_current_time_logged(&response.current_time),
+                current_time: Some(super::parse_csms_current_time_logged(
+                    &response.current_time,
+                )),
             })
         }
     }
@@ -1501,9 +1533,9 @@ mod ocpp_2_0_1 {
             let response = self
                 .send_heartbeat(HeartbeatRequest { custom_data: None })
                 .await?;
-            Ok(super::parse_csms_current_time_logged(
+            Ok(Some(super::parse_csms_current_time_logged(
                 &response.current_time,
-            ))
+            )))
         }
     }
 
@@ -1570,12 +1602,12 @@ mod ocpp_2_0_1 {
 mod ocpp_1_6 {
     use super::{BootNotificationOutcome, BootNotifier, HeartbeatSender};
     use crate::state::{BootReasonCause, RegistrationStatus};
+    use crate::wire::v16::BootNotificationRequest;
+    use crate::wire::v16::HeartbeatRequest;
+    use crate::wire::v16::common::BootNotificationResponseStatus;
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
-    use ocpp_client::ocpp_types::v16::BootNotificationRequest;
-    use ocpp_client::ocpp_types::v16::HeartbeatRequest;
-    use ocpp_client::ocpp_types::v16::common::BootNotificationResponseStatus;
 
     pub(super) fn build_request(vendor_name: &str, model_name: &str) -> BootNotificationRequest {
         BootNotificationRequest {
@@ -1621,7 +1653,9 @@ mod ocpp_1_6 {
             Ok(BootNotificationOutcome {
                 status: map_status(response.status),
                 interval_secs: response.interval.max(0) as u32,
-                current_time: super::parse_csms_current_time_logged(&response.current_time),
+                current_time: Some(super::parse_csms_current_time_logged(
+                    &response.current_time,
+                )),
             })
         }
     }
@@ -1634,9 +1668,9 @@ mod ocpp_1_6 {
             &self,
         ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Self::Error> {
             let response = self.send_heartbeat(HeartbeatRequest {}).await?;
-            Ok(super::parse_csms_current_time_logged(
+            Ok(Some(super::parse_csms_current_time_logged(
                 &response.current_time,
-            ))
+            )))
         }
     }
 

@@ -989,18 +989,18 @@ mod ocpp_2_1 {
     use crate::actor::ChargePointActor;
     use crate::availability::AvailabilityTarget;
     use crate::state::{IdToken, IdTokenKind, TransactionId};
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{
+    use crate::wire::v21::common::{
         EVSE, MessageTriggerEnum, RequestStartStopStatusEnum, TriggerMessageStatusEnum,
         UnlockStatusEnum,
     };
-    use ocpp_client::ocpp_types::v21::{
+    use crate::wire::v21::{
         RequestStartTransactionRequest, RequestStartTransactionResponse,
         RequestStopTransactionRequest, RequestStopTransactionResponse, TriggerMessageRequest,
         TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
     };
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
     /// Mirrors [`crate::local_authorization_list::ocpp_2_1::map_id_token_kind`] - each `ocpp_2_1`
     /// submodule keeps its own copy of this small mapping rather than sharing one, matching this
@@ -1021,7 +1021,7 @@ mod ocpp_2_1 {
         }
     }
 
-    fn map_id_token(id_token: &ocpp_client::ocpp_types::v21::common::IdToken) -> IdToken {
+    fn map_id_token(id_token: &crate::wire::v21::common::IdToken) -> IdToken {
         IdToken {
             value: id_token.id_token.to_string(),
             kind: map_id_token_kind(id_token.r#type.as_str()),
@@ -1229,7 +1229,7 @@ mod ocpp_2_1 {
                 custom_data: None,
                 evse_id,
                 group_id_token: None,
-                id_token: ocpp_client::ocpp_types::v21::common::IdToken {
+                id_token: crate::wire::v21::common::IdToken {
                     additional_info: None,
                     id_token: heapless::String::try_from("04A224B2").unwrap(),
                     r#type: heapless::String::try_from("ISO14443").unwrap(),
@@ -1482,18 +1482,18 @@ pub(crate) mod ocpp_2_0_1 {
     use crate::actor::ChargePointActor;
     use crate::availability::AvailabilityTarget;
     use crate::state::{IdToken, IdTokenKind, TransactionId};
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{
+    use crate::wire::v201::common::{
         EVSE, IdTokenEnum, MessageTriggerEnum, RequestStartStopStatusEnum,
         TriggerMessageStatusEnum, UnlockStatusEnum,
     };
-    use ocpp_client::ocpp_types::v201::{
+    use crate::wire::v201::{
         RequestStartTransactionRequest, RequestStartTransactionResponse,
         RequestStopTransactionRequest, RequestStopTransactionResponse, TriggerMessageRequest,
         TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
     };
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
 
     /// The reverse of [`crate::authorization::ocpp_2_0_1::map_id_token_kind`] - 2.0.1's
     /// `IdTokenEnumType` has no `DirectPayment`/`EVCCID`/`Vin` variant to map *from* either, so
@@ -1512,7 +1512,7 @@ pub(crate) mod ocpp_2_0_1 {
         }
     }
 
-    fn map_id_token(id_token: &ocpp_client::ocpp_types::v201::common::IdToken) -> IdToken {
+    fn map_id_token(id_token: &crate::wire::v201::common::IdToken) -> IdToken {
         IdToken {
             value: id_token.id_token.to_string(),
             kind: map_id_token_kind(id_token.r#type.clone()),
@@ -1712,7 +1712,7 @@ pub(crate) mod ocpp_2_0_1 {
                 custom_data: None,
                 evse_id,
                 group_id_token: None,
-                id_token: ocpp_client::ocpp_types::v201::common::IdToken {
+                id_token: crate::wire::v201::common::IdToken {
                     additional_info: None,
                     id_token: heapless::String::try_from("04A224B2").unwrap(),
                     r#type: IdTokenEnum::ISO14443,
@@ -1831,19 +1831,24 @@ mod ocpp_1_6 {
     use crate::id_tag::map_id_token;
     use crate::state::TransactionId;
     use crate::topology::unflatten_ocpp_1_6_connector_id;
-    use alloc::boxed::Box;
-    use alloc::sync::Arc;
-    use alloc::vec::Vec;
-    use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::common::{
-        RemoteStartTransactionResponseStatus, RemoteStopTransactionResponseStatus,
-        RequestedMessage, TriggerMessageResponseStatus, UnlockConnectorResponseStatus,
+    use crate::wire::v16::common::{
+        RemoteStartTransactionResponseStatus,
+        RemoteStopTransactionResponseStatus,
+        // Renamed upstream in `ocpp-types` 0.2.0 to make room for
+        // `ExtendedTriggerMessageRequestRequestedMessage`; a pure rename, no variants changed.
+        TriggerMessageRequestRequestedMessage as RequestedMessage,
+        TriggerMessageResponseStatus,
+        UnlockConnectorResponseStatus,
     };
-    use ocpp_client::ocpp_types::v16::{
+    use crate::wire::v16::{
         RemoteStartTransactionRequest, RemoteStartTransactionResponse,
         RemoteStopTransactionResponse, TriggerMessageRequest, TriggerMessageResponse,
         UnlockConnectorResponse,
     };
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use ocpp_client::ocpp_1_6::OCPP1_6Client;
 
     // --- TriggerMessage (B1.3) ---
 
@@ -2292,7 +2297,7 @@ mod ocpp_1_6 {
             RemoteStartTransactionRequest {
                 charging_profile: None,
                 connector_id,
-                id_tag: ocpp_client::ocpp_types::v16::IdTag::try_from("04A224B2").unwrap(),
+                id_tag: crate::wire::v16::IdTag::try_from("04A224B2").unwrap(),
             }
         }
 

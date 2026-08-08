@@ -827,14 +827,14 @@ mod ocpp_2_1 {
         Component, Variable, VariableAttribute, VariableAttributeType, VariableCharacteristics,
         VariableDataType, VariableMutability,
     };
-    use alloc::string::ToString;
-    use ocpp_client::ocpp_types::v21::common::{
+    use crate::wire::v21::common::{
         AttributeEnum, Component as WireComponent, ComponentCriterionEnum, ComponentVariable,
         DataEnum, EVSE, GenericDeviceModelStatusEnum, MutabilityEnum, ReportBaseEnum,
         ReportData as WireReportData, Variable as WireVariable,
         VariableAttribute as WireVariableAttribute,
         VariableCharacteristics as WireVariableCharacteristics,
     };
+    use alloc::string::ToString;
 
     /// Truncates/bounds `value` to fit a `heapless::String<N>` on the wire, matching this crate's
     /// established truncate-over-drop convention (see e.g.
@@ -846,6 +846,22 @@ mod ocpp_2_1 {
             end -= 1;
         }
         heapless::String::try_from(&value[..end]).expect("truncated to fit the wire bound")
+    }
+
+    /// Truncates `value` to at most `max_bytes` bytes, on a UTF-8 boundary, and hands back an
+    /// owned `String`.
+    ///
+    /// The sibling of [`bounded_string`] for the wire fields `ocpp-types` 0.2.0 retyped from
+    /// `heapless::String<N>` to an unbounded `String` - the specification leaves their length to
+    /// a device-model variable rather than fixing it, so the bound became this crate's to apply
+    /// instead of the type's. The byte bounds are kept exactly where the `heapless` capacities
+    /// had them, so what goes on the wire is unchanged.
+    fn bounded_owned(value: &str, max_bytes: usize) -> alloc::string::String {
+        let mut end = value.len().min(max_bytes);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end].into()
     }
 
     fn map_report_base(base: &ReportBaseEnum) -> ReportBase {
@@ -973,7 +989,7 @@ mod ocpp_2_1 {
             persistent: Some(attribute.persistent),
             r#type: Some(build_attribute_type(attribute.attribute_type)),
             value: (attribute.mutability != VariableMutability::WriteOnly)
-                .then(|| bounded_string::<2500>(&attribute.value)),
+                .then(|| bounded_owned(&attribute.value, 2500)),
         }
     }
 
@@ -991,7 +1007,7 @@ mod ocpp_2_1 {
             values_list: characteristics
                 .values_list
                 .as_ref()
-                .map(|values| bounded_string::<1000>(&values.join(","))),
+                .map(|values| bounded_owned(&values.join(","), 1000)),
         }
     }
 
@@ -1177,17 +1193,15 @@ mod ocpp_2_1 {
             GetBaseReportHandler, GetReportHandler, ReportEntry, ReportOutcome, chunk_report,
             handle_get_base_report, handle_get_report,
         };
+        use crate::wire::v21::{GetBaseReportResponse, GetReportResponse, NotifyReportRequest};
         use alloc::boxed::Box;
         use alloc::vec::Vec;
         use ocpp_client::ocpp_2_1::OCPP2_1Client;
-        use ocpp_client::ocpp_types::v21::{
-            GetBaseReportResponse, GetReportResponse, NotifyReportRequest,
-        };
 
         /// The `NotifyReport.generatedAt` timestamp, sourced from `clock.now()` - pure (no
         /// network I/O), so a fixed [`Clock`] fake can assert the exact value used, without
         /// needing a live `OCPP2_1Client` - see this module's tests.
-        fn generated_at<C: Clock>(clock: &C) -> alloc::string::String {
+        fn generated_at<C: Clock>(clock: &C) -> crate::wire::OcppTimestamp {
             let now = clock.now();
             if !is_synchronized(&now) {
                 tracing::warn!(
@@ -1195,7 +1209,7 @@ mod ocpp_2_1 {
                     "NotifyReport generatedAt sourced from an unsynchronized clock"
                 );
             }
-            now.to_rfc3339()
+            now.into()
         }
 
         /// Sends `entries` (already decided `Accepted` by the caller) to the CSMS as one or more
@@ -1214,7 +1228,7 @@ mod ocpp_2_1 {
                 let report_data: Vec<_> = chunk.entries.iter().map(build_report_data).collect();
                 let request = NotifyReportRequest {
                     custom_data: None,
-                    generated_at: generated_at.clone(),
+                    generated_at,
                     report_data: (!report_data.is_empty()).then_some(report_data),
                     request_id,
                     seq_no: chunk.seq_no,
@@ -1430,7 +1444,10 @@ mod ocpp_2_1 {
                     .with_timezone(&Utc);
                 let clock = FixedClock(fixed);
 
-                assert_eq!(generated_at(&clock), fixed.to_rfc3339());
+                assert_eq!(
+                    generated_at(&clock),
+                    crate::wire::OcppTimestamp::from(fixed)
+                );
             }
 
             #[test]
@@ -1438,7 +1455,10 @@ mod ocpp_2_1 {
                 let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
                 assert!(!is_synchronized(&unset_rtc.now()));
 
-                assert_eq!(generated_at(&unset_rtc), unset_rtc.0.to_rfc3339());
+                assert_eq!(
+                    generated_at(&unset_rtc),
+                    crate::wire::OcppTimestamp::from(unset_rtc.0)
+                );
             }
         }
     }
@@ -1462,14 +1482,14 @@ mod ocpp_2_0_1 {
         Component, Variable, VariableAttribute, VariableAttributeType, VariableCharacteristics,
         VariableDataType, VariableMutability,
     };
-    use alloc::string::ToString;
-    use ocpp_client::ocpp_types::v201::common::{
+    use crate::wire::v201::common::{
         AttributeEnum, Component as WireComponent, ComponentCriterionEnum, ComponentVariable,
         DataEnum, EVSE, GenericDeviceModelStatusEnum, MutabilityEnum, ReportBaseEnum,
         ReportData as WireReportData, Variable as WireVariable,
         VariableAttribute as WireVariableAttribute,
         VariableCharacteristics as WireVariableCharacteristics,
     };
+    use alloc::string::ToString;
 
     fn bounded_string<const N: usize>(value: &str) -> heapless::String<N> {
         let mut end = value.len().min(N);
@@ -1477,6 +1497,22 @@ mod ocpp_2_0_1 {
             end -= 1;
         }
         heapless::String::try_from(&value[..end]).expect("truncated to fit the wire bound")
+    }
+
+    /// Truncates `value` to at most `max_bytes` bytes, on a UTF-8 boundary, and hands back an
+    /// owned `String`.
+    ///
+    /// The sibling of [`bounded_string`] for the wire fields `ocpp-types` 0.2.0 retyped from
+    /// `heapless::String<N>` to an unbounded `String` - the specification leaves their length to
+    /// a device-model variable rather than fixing it, so the bound became this crate's to apply
+    /// instead of the type's. The byte bounds are kept exactly where the `heapless` capacities
+    /// had them, so what goes on the wire is unchanged.
+    fn bounded_owned(value: &str, max_bytes: usize) -> alloc::string::String {
+        let mut end = value.len().min(max_bytes);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end].into()
     }
 
     fn map_report_base(base: &ReportBaseEnum) -> ReportBase {
@@ -1598,7 +1634,7 @@ mod ocpp_2_0_1 {
             persistent: Some(attribute.persistent),
             r#type: Some(build_attribute_type(attribute.attribute_type)),
             value: (attribute.mutability != VariableMutability::WriteOnly)
-                .then(|| bounded_string::<2500>(&attribute.value)),
+                .then(|| bounded_owned(&attribute.value, 2500)),
         }
     }
 
@@ -1615,7 +1651,7 @@ mod ocpp_2_0_1 {
             values_list: characteristics
                 .values_list
                 .as_ref()
-                .map(|values| bounded_string::<1000>(&values.join(","))),
+                .map(|values| bounded_owned(&values.join(","), 1000)),
         }
     }
 
@@ -1694,14 +1730,12 @@ mod ocpp_2_0_1 {
             GetBaseReportHandler, GetReportHandler, ReportEntry, ReportOutcome, chunk_report,
             handle_get_base_report, handle_get_report,
         };
+        use crate::wire::v201::{GetBaseReportResponse, GetReportResponse, NotifyReportRequest};
         use alloc::boxed::Box;
         use alloc::vec::Vec;
         use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-        use ocpp_client::ocpp_types::v201::{
-            GetBaseReportResponse, GetReportResponse, NotifyReportRequest,
-        };
 
-        fn generated_at<C: Clock>(clock: &C) -> alloc::string::String {
+        fn generated_at<C: Clock>(clock: &C) -> crate::wire::OcppTimestamp {
             let now = clock.now();
             if !is_synchronized(&now) {
                 tracing::warn!(
@@ -1709,7 +1743,7 @@ mod ocpp_2_0_1 {
                     "NotifyReport generatedAt sourced from an unsynchronized clock"
                 );
             }
-            now.to_rfc3339()
+            now.into()
         }
 
         async fn send_report_chunks<C: Clock>(
@@ -1723,7 +1757,7 @@ mod ocpp_2_0_1 {
                 let report_data: Vec<_> = chunk.entries.iter().map(build_report_data).collect();
                 let request = NotifyReportRequest {
                     custom_data: None,
-                    generated_at: generated_at.clone(),
+                    generated_at,
                     report_data: (!report_data.is_empty()).then_some(report_data),
                     request_id,
                     seq_no: chunk.seq_no,
@@ -1933,7 +1967,10 @@ mod ocpp_2_0_1 {
                     .with_timezone(&Utc);
                 let clock = FixedClock(fixed);
 
-                assert_eq!(generated_at(&clock), fixed.to_rfc3339());
+                assert_eq!(
+                    generated_at(&clock),
+                    crate::wire::OcppTimestamp::from(fixed)
+                );
             }
 
             #[test]
@@ -1941,7 +1978,10 @@ mod ocpp_2_0_1 {
                 let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
                 assert!(!is_synchronized(&unset_rtc.now()));
 
-                assert_eq!(generated_at(&unset_rtc), unset_rtc.0.to_rfc3339());
+                assert_eq!(
+                    generated_at(&unset_rtc),
+                    crate::wire::OcppTimestamp::from(unset_rtc.0)
+                );
             }
         }
     }

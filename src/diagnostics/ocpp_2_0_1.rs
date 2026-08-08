@@ -5,9 +5,9 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use chrono::{DateTime, Utc};
 
+use crate::wire::v201::common::{LogEnum, LogStatusEnum, UploadLogStatusEnum};
+use crate::wire::v201::{GetLogRequest, GetLogResponse, LogStatusNotificationRequest};
 use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-use ocpp_client::ocpp_types::v201::common::{LogEnum, LogStatusEnum, UploadLogStatusEnum};
-use ocpp_client::ocpp_types::v201::{GetLogRequest, GetLogResponse, LogStatusNotificationRequest};
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
@@ -30,10 +30,11 @@ fn map_log_kind(log_type: &LogEnum) -> LogKind {
 /// Parses a wire timestamp, treating an unparseable one as absent - the same stance the rest of
 /// this crate's adapters take. A filter this charge point cannot understand becomes no filter,
 /// which sends the CSMS more of its own log rather than less.
-fn parse_time(raw: &Option<alloc::string::String>) -> Option<DateTime<Utc>> {
-    raw.as_ref()
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|parsed| parsed.with_timezone(&Utc))
+fn parse_time(raw: &Option<crate::wire::OcppTimestamp>) -> Option<DateTime<Utc>> {
+    // Infallible since `ocpp-types` 0.2.0: the value arrives already validated, so the
+    // "unparseable becomes absent" case this used to cover can no longer occur - a malformed
+    // `dateTime` is refused by `ocpp-client`'s decoder before it reaches this crate.
+    raw.map(Into::into)
 }
 
 fn map_request(request: &GetLogRequest) -> LogUploadRequest {
@@ -194,14 +195,14 @@ mod std_impls {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocpp_client::ocpp_types::v201::common::LogParameters;
+    use crate::wire::v201::common::LogParameters;
 
     fn wire_request(log_type: LogEnum) -> GetLogRequest {
         GetLogRequest {
             custom_data: None,
             log: LogParameters {
                 custom_data: None,
-                latest_timestamp: Some("2026-03-04T05:06:07Z".into()),
+                latest_timestamp: Some("2026-03-04T05:06:07Z".try_into().unwrap()),
                 oldest_timestamp: None,
                 remote_location: heapless::String::try_from("https://logs.example/up").unwrap(),
             },

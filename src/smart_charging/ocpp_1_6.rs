@@ -23,18 +23,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use chrono::{DateTime, Utc};
 
-use ocpp_client::ocpp_1_6::OCPP1_6Client;
-use ocpp_client::ocpp_types::v16::common::{
+use crate::wire::v16::common::{
     ChargingProfileKind as WireKind, ChargingProfilePurpose as WirePurpose,
     ChargingRateUnit as WireRateUnit, ChargingSchedule as WireSchedule,
     ChargingSchedulePeriodItem as WirePeriod, ClearChargingProfileResponseStatus,
     CsChargingProfiles, GetCompositeScheduleResponseStatus, RecurrencyKind as WireRecurrency,
     SetChargingProfileResponseStatus,
 };
-use ocpp_client::ocpp_types::v16::{
+use crate::wire::v16::{
     ClearChargingProfileRequest, ClearChargingProfileResponse, GetCompositeScheduleRequest,
     GetCompositeScheduleResponse, SetChargingProfileRequest, SetChargingProfileResponse,
 };
+use ocpp_client::ocpp_1_6::OCPP1_6Client;
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
@@ -107,10 +107,16 @@ fn wire_rate_unit(unit: ChargingRateUnit) -> WireRateUnit {
     }
 }
 
-fn parse_time(raw: &Option<alloc::string::String>) -> Option<DateTime<Utc>> {
-    raw.as_ref()
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|parsed| parsed.with_timezone(&Utc))
+/// A wire timestamp onto this crate's clock type.
+///
+/// Infallible since `ocpp-types` 0.2.0: a `dateTime` reaches this crate as an already-validated
+/// [`OcppTimestamp`], so a malformed one is rejected by `ocpp-client`'s decoder and surfaces as a
+/// `CALLERROR` to the CSMS rather than arriving here as an unparseable string. This used to treat
+/// an unparseable value as absent; there is no longer such a case to treat.
+///
+/// [`OcppTimestamp`]: ocpp_client::ocpp_types::OcppTimestamp
+fn parse_time(raw: &Option<crate::wire::OcppTimestamp>) -> Option<DateTime<Utc>> {
+    raw.map(Into::into)
 }
 
 fn map_schedule(schedule: &WireSchedule) -> ChargingSchedule {
@@ -179,7 +185,7 @@ fn wire_composite_schedule(composed: &CompositeSchedule) -> WireSchedule {
             .collect(),
         duration: Some(i64::from(composed.duration_secs)),
         min_charging_rate: composed.min_charging_rate,
-        start_schedule: Some(composed.start.to_rfc3339()),
+        start_schedule: Some(composed.start.into()),
     }
 }
 
@@ -370,7 +376,7 @@ impl<C: Clock + Clone + Send + Sync + 'static> GetCompositeScheduleHandler
                                 ),
                                 schedule_start: composed
                                     .as_ref()
-                                    .map(|composed| composed.start.to_rfc3339()),
+                                    .map(|composed| composed.start.into()),
                                 status: GetCompositeScheduleResponseStatus::Accepted,
                             }
                         }
@@ -403,7 +409,7 @@ mod tests {
             ],
             duration: Some(3_600),
             min_charging_rate: Some(6.0),
-            start_schedule: Some("2026-03-04T05:06:07Z".into()),
+            start_schedule: Some("2026-03-04T05:06:07Z".try_into().unwrap()),
         }
     }
 
@@ -505,7 +511,10 @@ mod tests {
 
         assert_eq!(wire.duration, Some(3_600));
         assert_eq!(wire.min_charging_rate, Some(6.0));
-        assert_eq!(wire.start_schedule, Some(composed.start.to_rfc3339()));
+        assert_eq!(
+            wire.start_schedule,
+            Some(crate::wire::OcppTimestamp::from(composed.start))
+        );
         assert_eq!(wire.charging_schedule_period[0].limit, 16.0);
         assert_eq!(wire.charging_schedule_period[0].number_phases, Some(1));
     }

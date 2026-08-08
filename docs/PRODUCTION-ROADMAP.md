@@ -134,7 +134,7 @@ that can't reliably reconnect is worse than one missing a functional block.
 | **A1** | `connect_and_setup` for 1.6J and 2.0.1 — **done.** All three versions run a session; the 1.6J and 2.0.1 paths register blocks through `ChargePointBuilder` (1.6J needs topology-aware wrappers, 2.0.1 lacks `SecurityEventNotification` upstream), which is exactly the limitation [C4](#54-c4--builder-refactor) removed. | ✅ |
 | **A2** | **Version negotiation** — **done.** The handshake already offered every compiled-in version; what was missing was running the result, which [A1](#3-workstream-a--transport-negotiation-connection-lifecycle) supplied. `UnsupportedNegotiatedVersion` is now only reachable for a version this build wasn't compiled with. An end-to-end test negotiates 1.6J and asserts the *1.6J* BootNotification shape on the wire, so it proves the right adapter set ran rather than that something connected. | ✅ |
 | **A3** | Configurable subprotocol preference order — **done** (`connect_and_setup`'s `versions`, which existed but was only meaningful once [A1](#3-workstream-a--transport-negotiation-connection-lifecycle) made non-2.1 outcomes usable). Tested: naming one version offers only that one, even against a CSMS that would speak another. | ✅ |
-| **A4** | WebSocket keepalive — **blocked upstream.** `ocpp-client` 0.2.1's `ConnectOptions` has no ping-interval field and its WebSocket transport only *replies* to pings; there is nothing to configure from here. `WebSocketPingInterval` is registered and readable, with a value of `0` (disabled), which is the honest reading of a cadence this charge point does not drive. Needs an `ocpp-client` change, the same shape as [D1](#61-d1--missing-action-wrappers)'s wrappers. | 🔒 |
+| **A4** | WebSocket keepalive — **done; the upstream blocker is gone.** `ocpp-client` 0.3.0 added `KeepalivePolicy`/`KeepaliveBehavior`, `ConnectOptions::keepalive`, and the two calls this row actually needed: `Client::ping_interval()`/`set_ping_interval()`, both non-`async` so a `GetVariables`/`SetVariables` handler can use them directly. `crate::keepalive` drives `OCPPCommCtrlr.WebSocketPingInterval` onto the live connection, so a CSMS write takes effect immediately rather than at the next connection — the same live-variable shape [A5](#3-workstream-a--transport-negotiation-connection-lifecycle) uses for `RetryBackOffRandomRange`. The registered default stays `0` (do not ping) rather than adopting `ocpp-client`'s own 60 s default, deliberately: a station pinging on a cadence its own device model reports as `0` would misreport its behaviour. | ✅ |
 | **A5** | Reconnect backoff from the device model — **done.** All three variables are registered, readable, and now applied. `RetryBackOffWaitMinimum`/`RetryBackOffRepeatTimes` become the transport's `ReconnectPolicy` when the caller supplies no `ConnectOptions`, so what a CSMS reads is what the connection does. `RetryBackOffRandomRange` — previously registered as `0` and applied nowhere, because `ocpp-client`'s `ReconnectPolicy` still has no jitter field — turns out **not to need one**: this crate already owns the reconnector (`network_switch::ConnectionTarget`, built for [A9](#3-workstream-a--transport-negotiation-connection-lifecycle)), so the random part is added here, on every redial, before dialling. See below for the seeding problem that is the whole difficulty, and for the split in what a CSMS write reaches. | ✅ |
 | **A6** | Per-message timeouts and retry — **done.** `MessageTimeout[Default]` becomes the transport's per-call timeout at connect time (same next-connection caveat as [A5](#3-workstream-a--transport-negotiation-connection-lifecycle)); `MessageAttempts[TransactionEvent]` now caps how many times a queued message is retried, which is **head-of-line unblocking**: without it a message the CSMS will never accept is retried forever at the front of the queue and blocks everything behind it. `MessageAttemptInterval` landed with [A7](#3-workstream-a--transport-negotiation-connection-lifecycle). | ✅ |
 | **A7** | `MessageAttemptInterval` / queue-depth limits — **done.** Queue depth is now configurable (`ChargePointBuilder::offline_queue_capacity`, previously hardcoded at the default); `MessageAttemptInterval[TransactionEvent]` drives a retry timer that sweeps every registered queue, re-read each cycle. Drop policy and the `MemoryExhaustion` event on overflow were already done ([G2.1](#92-g2--bounded-memory)) and are unchanged - including the security queue's deliberate exception, which must not report its own overflow through itself. | ✅ |
@@ -689,8 +689,9 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 - [x] **B2.6** 2.1 dynamic schedule updates and priority charging.
 
       **The upstream blocker this row carried was stale.** `UpdateDynamicSchedule` was marked 🔒
-      on [D1](#61-d1--missing-action-wrappers), but the pinned `ocpp-client` is now **0.2.2**, not
-      0.2.0 — it generates **91** OCPP 2.1 actions, including all four that were listed as absent
+      on [D1](#61-d1--missing-action-wrappers), but the pinned `ocpp-client` had already moved
+      past 0.2.0 (it is **0.5.0** today) — it generates **91** OCPP 2.1 actions, including all
+      four that were listed as absent
       (`UpdateDynamicSchedule`, `SetDisplayMessage`, `GetDERControl`, `SetDERControl`) and 2.0.1's
       `SecurityEventNotification`. D1.1/D1.2 closed that and the per-row markers were never
       re-swept. Neither [B6](#b6--display-message-r15) nor
@@ -1221,7 +1222,7 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 `SetDisplayMessage`, `GetDisplayMessages`, `ClearDisplayMessage`,
 `NotifyDisplayMessages` — 2.x only, both items now ✅. `SetDisplayMessage` for
 2.1 was marked 🔒 on [D1](#61-d1--missing-action-wrappers); it no longer is.
-The pinned `ocpp-client` 0.2.2 generates it (see
+The pinned `ocpp-client` generates it (from 0.2.2 on; see
 [B2.6](#b2--smart-charging-r11) for the full re-sweep), which is what
 unblocked this block.
 
@@ -1628,11 +1629,22 @@ exists).
       `SignCertificate`) are absent from `ocpp-client`'s 1.6 action list
       entirely. Decide: contribute them upstream, or declare 1.6J security
       profiles out of scope — and say so in the README either way.
-      **Audited, decision still open** — and the gap is bigger than this
-      line assumed: all 10 are missing from `ocpp-types`' v16 module
-      *entirely*, not merely unwrapped in `ocpp-client`, so this is type
-      work upstream, not another round of D1's macro lines. Absent from
-      `rust-ocpp` too, so switching type crates wouldn't help.
+      **Upstream answered it: the types now exist, so the decision is no
+      longer "contribute or declare out of scope" but simply "wire them".**
+      `ocpp-types` 0.2.0 generates all of them and `ocpp-client` 0.4.0 wraps
+      them as actions — 1.6 went from 28 to 39. The audit note below (all 10
+      absent from `ocpp-types` v16 entirely, and from `rust-ocpp`) described
+      0.1.x and is now stale; `UPSTREAM-GAPS.md`'s 1.6J table needs redoing
+      against 0.2.0 before this is planned.
+
+      **Still open here**, and deliberately not taken with the 0.4.0
+      migration: wiring 11 actions is a functional-block workstream, not a
+      port. It needs handler traits, hardware bindings for certificate and
+      signed-firmware handling, `crate::refusal` entries and per-action tests,
+      and it overlaps workstream F (security profiles). The 1.6J notes in
+      `crate::firmware::ocpp_1_6` and `crate::diagnostics::ocpp_1_6` that say
+      these messages do not exist upstream have been corrected to say they
+      exist and are unwired.
       [`UPSTREAM-GAPS.md`](./UPSTREAM-GAPS.md) lays out the cost either way;
       **the user decides.**
 
@@ -1650,8 +1662,11 @@ exists).
 
 ### 6.3 D3 — Dependency policy
 
-- [ ] **D3.1** Pin `ocpp-client` to a version range this crate has actually
-      tested against; today `"0.2"` accepts any 0.2.x.
+- [x] **D3.1** Pin `ocpp-client` to a version range this crate has actually
+      tested against. Done with the 0.4.0 migration and carried forward: the
+      requirement is now `"0.5.0"` (`ocpp-types` 0.3.0), and the whole suite
+      runs against it. The 0.5.0 step needed no source changes - see
+      [`MIGRATION-ocpp-client-0.4.md`](./MIGRATION-ocpp-client-0.4.md).
 - [ ] **D3.2** Vendor-or-fork contingency if upstream PRs stall.
 - [x] **D3.3** `cargo-deny` for licences and advisories, in CI. Done
       alongside [H1.5](#101-h1--ci-hardening) — `deny.toml` plus a `deny` job,
@@ -2308,7 +2323,7 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
       (monitoring reports, and 2.1's data-collector log), so the security-log half of F4.3 is
       done.
 - [x] **F4.4** `SecurityEventNotification` for 2.0.1 — **done**, and the "after D1" caveat was
-      stale: D1 landed and the pinned `ocpp-client` 0.2.2 generates the 2.0.1 action. The wire
+      stale: D1 landed and the pinned `ocpp-client` generates the 2.0.1 action (from 0.2.2 on). The wire
       request is field-for-field identical to 2.1's, so the adapter shares `wire_type` exactly as
       that function's docs anticipated, and `connect_and_setup`'s 2.0.1 path registers the block.
 
@@ -3062,12 +3077,12 @@ Three honest caveats, none of them a hole in the exit criteria:
 
 Smart charging is the block real deployments demand first.
 
-**All three exit conditions are met.** Every A-row is ✅ except
-[A4](#3-workstream-a--transport-negotiation-connection-lifecycle), which is 🔒 on an `ocpp-client`
-`ConnectOptions` that still has no ping-interval field in 0.2.2 (re-verified at the A5 commit, not
-carried over from the old note). That is a keepalive cadence this charge point does not drive, not
-a Core-profile message going unhandled, so it does not hold the milestone: `WebSocketPingInterval`
-reads `0`, which is the honest value.
+**All three exit conditions are met**, and every A-row is now ✅ — including
+[A4](#3-workstream-a--transport-negotiation-connection-lifecycle), which was 🔒 on an
+`ocpp-client` `ConnectOptions` with no ping-interval field through 0.2.2. `ocpp-client` 0.3.0
+added one; the migration to 0.4.0 wired it up (`crate::keepalive`). `WebSocketPingInterval` still
+reads `0` by default, but it is now a setting a CSMS can change and have honoured on the running
+connection, rather than a value nothing could act on.
 
 One caveat on "load management works end to end": it works for the *limits* this crate can
 project. 2.1's setpoints, discharge limits and per-phase asymmetries are parsed and dropped, because
@@ -3177,14 +3192,17 @@ SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, VatNumberValidation
 
 **Inventory reconciliation.** A.2's two lists account for exactly 64 of 64. A.3's account for 88
-of the 91 actions `ocpp-client` 0.2.2 generates — the three-message residue is unaudited and is a
+of the 91 actions `ocpp-client` generates — the three-message residue is unaudited and is a
 job for [H3.5](#103-h3--compliance)'s re-verification sweep, recorded here rather than papered
-over. A.1 reconciles at 28 of 28.
+over. A.1 reconciles at 28 of 28 **against the 1.6 action list as it stood through 0.4.0's
+predecessor**; `ocpp-client` 0.4.0 raised 1.6 from 28 actions to 39 by adding the security
+whitepaper set, so the 1.6 denominator is now 39 and the eleven additions are unwired - see
+[D2.2](#62-d2--type-completeness-audit).
 
 **No message is missing an action wrapper any more.** This list used to name
 four (SetDisplayMessage, GetDERControl, SetDERControl, UpdateDynamicSchedule)
-plus TriggerMessage; the pinned `ocpp-client` is now **0.2.2**, which generates
-**91** OCPP 2.1 actions and includes every one of them. Re-verified by counting
+plus TriggerMessage; the pinned `ocpp-client` moved past 0.2.0 (it is **0.5.0**
+today), and generates **91** OCPP 2.1 actions including every one of them. Re-verified by counting
 `ocpp_2_1_action!`/`ocpp_2_1_send_action!` invocations in the pinned registry
 source at the B2.6 commit. The "86 available" figure above and in §2.1 is
 therefore stale in this crate's favour — it should read 91, and the remaining

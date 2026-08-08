@@ -130,7 +130,14 @@ certificates = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
-ocpp-client = { version = "0.2.2", default-features = false }
+# The `chrono` feature forwards to `ocpp-types`' own: `From` between `OcppTimestamp` and
+# `chrono::DateTime<Utc>` and back. `ocpp-types` 0.2.0 made every wire `dateTime` an
+# `OcppTimestamp` rather than a
+# `String`, and this crate keeps time as `chrono::DateTime<Utc>` internally (see `crate::clock`),
+# so the conversion is on every outbound and inbound protocol path. Enabled unconditionally, not
+# behind this crate's `std`: `ocpp-types` takes chrono as `default-features = false`, so it costs
+# the bare-metal build nothing, and chrono is already a direct dependency below.
+ocpp-client = { version = "0.5.0", default-features = false, features = ["chrono"] }
 async-trait = "^0.1"
 # `default-features = false` drops `tracing`'s (really `tracing-core`'s) `std` feature, which
 # pulls in `once_cell` - and `once_cell`'s default build does not compile for a bare-metal

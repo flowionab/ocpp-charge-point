@@ -2,11 +2,11 @@
 
 use alloc::string::{String, ToString};
 
-use ocpp_client::ocpp_2_1::OCPP2_1Client;
-use ocpp_client::ocpp_types::v21::common::CustomerInformationStatusEnum;
-use ocpp_client::ocpp_types::v21::{
+use crate::wire::v21::common::CustomerInformationStatusEnum;
+use crate::wire::v21::{
     CustomerInformationRequest, CustomerInformationResponse, NotifyCustomerInformationRequest,
 };
+use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
 use crate::actor::ChargePointActor;
 use crate::customer_information::{
@@ -34,7 +34,7 @@ fn map_id_token_kind(kind: &str) -> IdTokenKind {
     }
 }
 
-fn map_id_token(id_token: &ocpp_client::ocpp_types::v21::common::IdToken) -> IdToken {
+fn map_id_token(id_token: &crate::wire::v21::common::IdToken) -> IdToken {
     IdToken {
         value: id_token.id_token.to_string(),
         kind: map_id_token_kind(id_token.r#type.as_str()),
@@ -117,14 +117,14 @@ impl CustomerInformationNotifier for Ocpp2_1CustomerInformationHandler {
         request_id: i64,
         seq_no: i64,
         tbc: bool,
-        generated_at: &str,
+        generated_at: chrono::DateTime<chrono::Utc>,
         data: String,
     ) -> Result<(), Self::Error> {
         self.client
             .send_notify_customer_information(NotifyCustomerInformationRequest {
                 custom_data: None,
                 data: heapless::String::try_from(data.as_str()).unwrap_or_default(),
-                generated_at: generated_at.to_string(),
+                generated_at: generated_at.into(),
                 request_id,
                 seq_no,
                 tbc: Some(tbc),
@@ -161,7 +161,7 @@ mod std_impls {
             request_id: i64,
             seq_no: i64,
             tbc: bool,
-            generated_at: &str,
+            generated_at: chrono::DateTime<chrono::Utc>,
             data: String,
         ) -> Result<(), Self::Error> {
             Ocpp2_1CustomerInformationHandler::new(self.clone())
@@ -175,8 +175,8 @@ mod std_impls {
 mod tests {
     use super::*;
 
-    fn wire_id_token(value: &str, kind: &str) -> ocpp_client::ocpp_types::v21::common::IdToken {
-        ocpp_client::ocpp_types::v21::common::IdToken {
+    fn wire_id_token(value: &str, kind: &str) -> crate::wire::v21::common::IdToken {
+        crate::wire::v21::common::IdToken {
             additional_info: None,
             custom_data: None,
             id_token: heapless::String::try_from(value).unwrap(),

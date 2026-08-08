@@ -159,13 +159,13 @@ pub(crate) mod ocpp_2_1 {
         MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
         TransactionUpdateReason,
     };
-    use alloc::vec;
-    use alloc::vec::Vec;
-    use chrono::{DateTime, Utc};
-    use ocpp_client::ocpp_types::v21::common::{
+    use crate::wire::v21::common::{
         ChargingStateEnum, MeasurandEnum, MeterValue, ReadingContextEnum, ReasonEnum, SampledValue,
         TransactionEventEnum, TriggerReasonEnum,
     };
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use chrono::{DateTime, Utc};
 
     pub(super) fn map_event_type(kind: TransactionEventKind) -> TransactionEventEnum {
         match kind {
@@ -282,7 +282,7 @@ pub(crate) mod ocpp_2_1 {
             return Vec::new();
         };
         vec![MeterValue {
-            timestamp: timestamp.to_rfc3339(),
+            timestamp: timestamp.into(),
             sampled_value: sampled_values(sample),
             custom_data: None,
         }]
@@ -299,11 +299,11 @@ pub(crate) mod ocpp_2_1 {
         use crate::clock::{Clock, is_synchronized};
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::TransactionNotifier;
+        use crate::wire::v21::TransactionEventRequest;
+        use crate::wire::v21::common::{EVSE, Transaction as WireTransaction};
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-        use ocpp_client::ocpp_types::v21::TransactionEventRequest;
-        use ocpp_client::ocpp_types::v21::common::{EVSE, Transaction as WireTransaction};
 
         /// Builds the `TransactionEventRequest` for `kind`/`transaction`, timestamped from
         /// `clock.now()`. Pure (no network I/O), so a fixed [`Clock`] fake can assert the exact
@@ -336,7 +336,7 @@ pub(crate) mod ocpp_2_1 {
                 } else {
                     Some(meter_value)
                 },
-                timestamp: now.to_rfc3339(),
+                timestamp: now.into(),
                 trigger_reason: trigger_reason_for(kind, &transaction),
                 seq_no: transaction.seq_no as i64,
                 preconditioning_status: None,
@@ -499,7 +499,7 @@ pub(crate) mod ocpp_2_1 {
                     transaction(),
                 );
 
-                assert_eq!(request.timestamp, fixed.to_rfc3339());
+                assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
             }
 
             #[test]
@@ -518,7 +518,10 @@ pub(crate) mod ocpp_2_1 {
                     transaction(),
                 );
 
-                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
+                assert_eq!(
+                    request.timestamp,
+                    crate::wire::OcppTimestamp::from(unset_rtc.0)
+                );
             }
         }
     }
@@ -743,13 +746,13 @@ pub(crate) mod ocpp_2_0_1 {
         MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
         TransactionUpdateReason,
     };
-    use alloc::vec;
-    use alloc::vec::Vec;
-    use chrono::{DateTime, Utc};
-    use ocpp_client::ocpp_types::v201::common::{
+    use crate::wire::v201::common::{
         ChargingStateEnum, MeasurandEnum, MeterValue, ReadingContextEnum, ReasonEnum, SampledValue,
         TransactionEventEnum, TriggerReasonEnum,
     };
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use chrono::{DateTime, Utc};
 
     pub(super) fn map_event_type(kind: TransactionEventKind) -> TransactionEventEnum {
         match kind {
@@ -855,7 +858,7 @@ pub(crate) mod ocpp_2_0_1 {
             return Vec::new();
         };
         vec![MeterValue {
-            timestamp: timestamp.to_rfc3339(),
+            timestamp: timestamp.into(),
             sampled_value: sampled_values(sample),
             custom_data: None,
         }]
@@ -872,11 +875,11 @@ pub(crate) mod ocpp_2_0_1 {
         use crate::clock::{Clock, is_synchronized};
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::TransactionNotifier;
+        use crate::wire::v201::TransactionEventRequest;
+        use crate::wire::v201::common::{EVSE, Transaction as WireTransaction};
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-        use ocpp_client::ocpp_types::v201::TransactionEventRequest;
-        use ocpp_client::ocpp_types::v201::common::{EVSE, Transaction as WireTransaction};
 
         /// Mirrors `super::ocpp_2_1::with_clock::build_transaction_event_request` - pure, so a
         /// fixed [`Clock`] fake can assert the exact timestamp reaching the wire request.
@@ -903,7 +906,7 @@ pub(crate) mod ocpp_2_0_1 {
                 } else {
                     Some(meter_value)
                 },
-                timestamp: now.to_rfc3339(),
+                timestamp: now.into(),
                 trigger_reason: trigger_reason_for(kind, &transaction),
                 seq_no: transaction.seq_no as i64,
                 transaction_info: WireTransaction {
@@ -1059,7 +1062,7 @@ pub(crate) mod ocpp_2_0_1 {
                     transaction(),
                 );
 
-                assert_eq!(request.timestamp, fixed.to_rfc3339());
+                assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
             }
 
             #[test]
@@ -1075,7 +1078,10 @@ pub(crate) mod ocpp_2_0_1 {
                     transaction(),
                 );
 
-                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
+                assert_eq!(
+                    request.timestamp,
+                    crate::wire::OcppTimestamp::from(unset_rtc.0)
+                );
             }
         }
     }
@@ -1272,6 +1278,7 @@ pub(crate) mod ocpp_2_0_1 {
 #[cfg(feature = "ocpp_1_6")]
 pub(crate) mod ocpp_1_6 {
     use crate::state::{MeterSample, StopReason, TransactionId};
+    use crate::wire::v16::common::{Measurand, MeterValueItem, Reason, SampledValueItem};
     use alloc::collections::BTreeMap;
     use alloc::string::ToString;
     use alloc::vec;
@@ -1280,9 +1287,6 @@ pub(crate) mod ocpp_1_6 {
     use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::common::{
-        Measurand, MeterValueItem, Reason, SampledValueItem,
-    };
 
     pub(super) fn map_stop_reason(reason: StopReason) -> Reason {
         match reason {
@@ -1308,7 +1312,7 @@ pub(crate) mod ocpp_1_6 {
         timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Vec<MeterValueItem> {
         vec![MeterValueItem {
-            timestamp: timestamp.to_rfc3339(),
+            timestamp: timestamp.into(),
             sampled_value: sampled_values(sample),
         }]
     }
@@ -1407,14 +1411,14 @@ pub(crate) mod ocpp_1_6 {
         use crate::state::{Transaction, TransactionEventKind};
         use crate::topology::flatten_ocpp_1_6_connector_id;
         use crate::transactions::TransactionNotifier;
+        use crate::wire::v16::common::MeterValueItem;
+        use crate::wire::v16::{
+            MeterValuesRequest, StartTransactionRequest, StopTransactionRequest,
+        };
         use alloc::boxed::Box;
         use alloc::vec::Vec;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_1_6::OCPP1_6Error;
-        use ocpp_client::ocpp_types::v16::common::MeterValueItem;
-        use ocpp_client::ocpp_types::v16::{
-            MeterValuesRequest, StartTransactionRequest, StopTransactionRequest,
-        };
 
         /// Delegates to the wrapped client: a reconnect is a property of the *connection*, and
         /// this wrapper adds topology and an id cache on top of one rather than owning a
@@ -1475,7 +1479,7 @@ pub(crate) mod ocpp_1_6 {
                                 id_tag: map_id_tag(transaction.id_token.as_ref()),
                                 meter_start: meter_reading,
                                 reservation_id: None,
-                                timestamp: now.to_rfc3339(),
+                                timestamp: now.into(),
                             })
                             .await?;
                         self.csms_transaction_ids.lock(|cache| {
@@ -1499,7 +1503,7 @@ pub(crate) mod ocpp_1_6 {
                                 connector_id,
                                 meter_value: Vec::from([MeterValueItem {
                                     sampled_value: sampled_values(sample),
-                                    timestamp: now.to_rfc3339(),
+                                    timestamp: now.into(),
                                 }]),
                                 transaction_id: csms_transaction_id,
                             })
@@ -1520,7 +1524,7 @@ pub(crate) mod ocpp_1_6 {
                                 id_tag: Some(map_id_tag(transaction.id_token.as_ref())),
                                 meter_stop: meter_reading,
                                 reason: transaction.stop_reason.map(map_stop_reason),
-                                timestamp: now.to_rfc3339(),
+                                timestamp: now.into(),
                                 transaction_data: None,
                                 transaction_id: csms_transaction_id,
                             })

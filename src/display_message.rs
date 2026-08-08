@@ -788,19 +788,19 @@ mod ocpp_2_1 {
         DisplayMessageId, DisplayedMessage, MessageContent, MessageFormat, MessagePriority,
         MessageState, TransactionId,
     };
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use alloc::vec::Vec;
-    use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{
+    use crate::wire::v21::common::{
         ClearMessageStatusEnum, DisplayMessageStatusEnum, GetDisplayMessagesStatusEnum,
         MessageContent as WireMessageContent, MessageFormatEnum, MessageInfo, MessagePriorityEnum,
         MessageStateEnum,
     };
-    use ocpp_client::ocpp_types::v21::{
+    use crate::wire::v21::{
         ClearDisplayMessageResponse, GetDisplayMessagesRequest, GetDisplayMessagesResponse,
         NotifyDisplayMessagesRequest, SetDisplayMessageResponse,
     };
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+    use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
     /// Truncates/bounds `value` to fit a `heapless::String<N>`, mirroring
     /// `crate::reporting::ocpp_2_1::bounded_string` - duplicated per this crate's small-helper
@@ -811,6 +811,22 @@ mod ocpp_2_1 {
             end -= 1;
         }
         heapless::String::try_from(&value[..end]).expect("truncated to fit the wire bound")
+    }
+
+    /// Truncates `value` to at most `max_bytes` bytes, on a UTF-8 boundary, and hands back an
+    /// owned `String`.
+    ///
+    /// The sibling of [`bounded_string`] for the wire fields `ocpp-types` 0.2.0 retyped from
+    /// `heapless::String<N>` to an unbounded `String` - the specification leaves their length to
+    /// a device-model variable rather than fixing it, so the bound became this crate's to apply
+    /// instead of the type's. The byte bounds are kept exactly where the `heapless` capacities
+    /// had them, so what goes on the wire is unchanged.
+    fn bounded_owned(value: &str, max_bytes: usize) -> alloc::string::String {
+        let mut end = value.len().min(max_bytes);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end].into()
     }
 
     fn map_message_format(format: &MessageFormatEnum) -> MessageFormat {
@@ -890,7 +906,7 @@ mod ocpp_2_1 {
 
     fn build_message_content(content: &MessageContent) -> WireMessageContent {
         WireMessageContent {
-            content: bounded_string::<1024>(&content.content),
+            content: bounded_owned(&content.content, 1024),
             custom_data: None,
             format: build_message_format(content.format),
             language: content.language.as_deref().map(bounded_string::<8>),
@@ -1193,19 +1209,19 @@ mod ocpp_2_0_1 {
         DisplayMessageId, DisplayedMessage, MessageContent, MessageFormat, MessagePriority,
         MessageState, TransactionId,
     };
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use alloc::vec::Vec;
-    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{
+    use crate::wire::v201::common::{
         ClearMessageStatusEnum, DisplayMessageStatusEnum, GetDisplayMessagesStatusEnum,
         MessageContent as WireMessageContent, MessageFormatEnum, MessageInfo, MessagePriorityEnum,
         MessageStateEnum,
     };
-    use ocpp_client::ocpp_types::v201::{
+    use crate::wire::v201::{
         ClearDisplayMessageResponse, GetDisplayMessagesRequest, GetDisplayMessagesResponse,
         NotifyDisplayMessagesRequest, SetDisplayMessageResponse,
     };
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+    use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
 
     fn bounded_string<const N: usize>(value: &str) -> heapless::String<N> {
         let mut end = value.len().min(N);

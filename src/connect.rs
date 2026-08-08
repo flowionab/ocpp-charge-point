@@ -192,6 +192,15 @@ where
         }));
     }
 
+    // A4: carries a CSMS `SetVariables` on `WebSocketPingInterval` onto the running connection.
+    // Spawned rather than folded into the switching loop below because the two watch the same
+    // state for unrelated reasons, and a keepalive change must not wait on a switch grace period.
+    let ping_actor = runtime.actor();
+    let ping_client = client.clone();
+    executor.spawn(alloc::boxed::Box::pin(async move {
+        crate::keepalive::run_ping_interval_updates(&ping_actor, &ping_client).await;
+    }));
+
     let actor = runtime.actor();
     executor.spawn(alloc::boxed::Box::pin(async move {
         crate::network_switch::run_network_profile_switching(&actor, &target, &client, &backoff)
@@ -260,12 +269,34 @@ fn connection_options_from_device_model<'a>() -> ConnectOptions<'a> {
     let repeats = ocpp_comm_ctrlr_secs(&model, "RetryBackOffRepeatTimes", 5).min(16);
     let message_timeout = ocpp_comm_ctrlr_secs(&model, "MessageTimeout", 30);
 
+    // A4: what a CSMS reads from `WebSocketPingInterval` has to be what the connection does.
+    // `ConnectOptions::default()` enables keepalive at 60s from `ocpp-client` 0.3.0, which would
+    // make this charge point ping on a cadence its own device model reports as `0`. Seeding from
+    // the registered value instead keeps the two honest; `crate::keepalive` then carries CSMS
+    // *writes* onto the running connection, which is the half a connect-time read cannot cover.
+    let ping_interval = ocpp_comm_ctrlr_secs(&model, "WebSocketPingInterval", 0);
+
     ConnectOptions {
         timeout: Some(Duration::from_secs(message_timeout)),
+        keepalive: if ping_interval == 0 {
+            ocpp_client::KeepaliveBehavior::Disabled
+        } else {
+            ocpp_client::KeepaliveBehavior::Enabled(ocpp_client::KeepalivePolicy {
+                interval: Duration::from_secs(ping_interval),
+                ..Default::default()
+            })
+        },
         reconnect: ocpp_client::ReconnectBehavior::Enabled(ocpp_client::ReconnectPolicy {
             initial_delay: Duration::from_secs(minimum),
             max_delay: Duration::from_secs(minimum.saturating_mul(1u64 << repeats)),
             multiplier: 2,
+            // `false` on purpose, against the upstream default of `true`: as the doc comment
+            // above says, jitter is applied by this crate's own reconnector from the live
+            // `RetryBackOffRandomRange`. Leaving the transport's own half-jitter on as well
+            // would compound two independent random draws into a delay curve neither the
+            // device model nor `ocpp-client` describes, and would silently ignore a CSMS that
+            // set `RetryBackOffRandomRange` to `0` to ask for exact delays.
+            jitter: false,
         }),
         ..Default::default()
     }
@@ -499,8 +530,23 @@ mod tests {
 
         // A variable this crate does not register at all.
         assert_eq!(ocpp_comm_ctrlr_secs(&model, "NotAVariable", 7), 7);
-        // `WebSocketPingInterval` is registered as `0` (A4 has no transport support), so it
-        // exercises the zero path against a real registered variable.
+        // `WebSocketPingInterval` is registered as `0` - OCPP's spelling of "do not ping", and
+        // now a real setting rather than a placeholder (see `crate::keepalive`) - so it exercises
+        // the zero path against a variable this crate actually registers.
         assert_eq!(ocpp_comm_ctrlr_secs(&model, "WebSocketPingInterval", 7), 7);
+    }
+
+    /// A4. `ConnectOptions::default()` enables keepalive at 60s from `ocpp-client` 0.3.0, so
+    /// taking the default would have this charge point pinging on a cadence its own
+    /// `WebSocketPingInterval` reports as `0`. The registered value wins instead, in both
+    /// directions.
+    #[test]
+    fn keepalive_follows_the_registered_ping_interval_rather_than_the_transports_default() {
+        let options = connection_options_from_device_model();
+
+        assert!(
+            matches!(options.keepalive, ocpp_client::KeepaliveBehavior::Disabled),
+            "a registered WebSocketPingInterval of 0 must mean no unsolicited traffic"
+        );
     }
 }

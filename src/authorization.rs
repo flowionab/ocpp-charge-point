@@ -341,11 +341,11 @@ mod tests {
 mod ocpp_2_1 {
     use super::Authorizer;
     use crate::state::{AuthorizationStatus, IdToken, IdTokenKind};
+    use crate::wire::v21::AuthorizeRequest;
+    use crate::wire::v21::common::{AuthorizationStatusEnum, IdToken as WireIdToken};
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::ocpp_types::v21::AuthorizeRequest;
-    use ocpp_client::ocpp_types::v21::common::{AuthorizationStatusEnum, IdToken as WireIdToken};
 
     pub(super) fn wire_type(kind: IdTokenKind) -> &'static str {
         match kind {
@@ -464,13 +464,11 @@ mod ocpp_2_1 {
 mod ocpp_2_0_1 {
     use super::Authorizer;
     use crate::state::{AuthorizationStatus, IdToken, IdTokenKind};
+    use crate::wire::v201::AuthorizeRequest;
+    use crate::wire::v201::common::{AuthorizationStatusEnum, IdToken as WireIdToken, IdTokenEnum};
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-    use ocpp_client::ocpp_types::v201::AuthorizeRequest;
-    use ocpp_client::ocpp_types::v201::common::{
-        AuthorizationStatusEnum, IdToken as WireIdToken, IdTokenEnum,
-    };
 
     /// Unlike 2.1's free-form `type` string (see [`super::ocpp_2_1::wire_type`]), 2.0.1's
     /// `IdTokenEnumType` is a closed 8-value enum with no catch-all - it has no
@@ -622,11 +620,11 @@ mod ocpp_1_6 {
     use super::Authorizer;
     use crate::id_tag::map_id_tag;
     use crate::state::{AuthorizationStatus, IdToken};
+    use crate::wire::v16::AuthorizeRequest;
+    use crate::wire::v16::common::IdTagInfoStatus;
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
-    use ocpp_client::ocpp_types::v16::AuthorizeRequest;
-    use ocpp_client::ocpp_types::v16::common::IdTagInfoStatus;
 
     pub(super) fn build_request(id_token: &IdToken) -> AuthorizeRequest {
         AuthorizeRequest {
@@ -1071,10 +1069,10 @@ mod offline_tests {
 mod clear_cache_ocpp_2_1 {
     use super::{ClearCacheHandler, ClearCacheOutcome, handle_clear_cache};
     use crate::actor::ChargePointActor;
+    use crate::wire::v21::common::ClearCacheStatusEnum;
+    use crate::wire::v21::{ClearCacheRequest, ClearCacheResponse};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::ClearCacheStatusEnum;
-    use ocpp_client::ocpp_types::v21::{ClearCacheRequest, ClearCacheResponse};
 
     #[async_trait::async_trait]
     impl ClearCacheHandler for OCPP2_1Client {
@@ -1102,10 +1100,10 @@ mod clear_cache_ocpp_2_1 {
 mod clear_cache_ocpp_2_0_1 {
     use super::{ClearCacheHandler, ClearCacheOutcome, handle_clear_cache};
     use crate::actor::ChargePointActor;
+    use crate::wire::v201::common::ClearCacheStatusEnum;
+    use crate::wire::v201::{ClearCacheRequest, ClearCacheResponse};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::ClearCacheStatusEnum;
-    use ocpp_client::ocpp_types::v201::{ClearCacheRequest, ClearCacheResponse};
 
     #[async_trait::async_trait]
     impl ClearCacheHandler for OCPP2_0_1Client {
@@ -1134,10 +1132,10 @@ mod clear_cache_ocpp_2_0_1 {
 mod clear_cache_ocpp_1_6 {
     use super::{ClearCacheHandler, ClearCacheOutcome, handle_clear_cache};
     use crate::actor::ChargePointActor;
+    use crate::wire::v16::common::ClearCacheResponseStatus;
+    use crate::wire::v16::{ClearCacheRequest, ClearCacheResponse};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::common::ClearCacheResponseStatus;
-    use ocpp_client::ocpp_types::v16::{ClearCacheRequest, ClearCacheResponse};
 
     #[async_trait::async_trait]
     impl ClearCacheHandler for OCPP1_6Client {

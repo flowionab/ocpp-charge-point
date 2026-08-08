@@ -7,8 +7,8 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
+use crate::wire::v201::{GetTransactionStatusRequest, GetTransactionStatusResponse};
 use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-use ocpp_client::ocpp_types::v201::{GetTransactionStatusRequest, GetTransactionStatusResponse};
 
 use crate::actor::ChargePointActor;
 use crate::offline_queue::OfflineQueue;

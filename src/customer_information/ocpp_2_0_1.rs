@@ -2,11 +2,11 @@
 
 use alloc::string::{String, ToString};
 
-use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-use ocpp_client::ocpp_types::v201::common::{CustomerInformationStatusEnum, IdTokenEnum};
-use ocpp_client::ocpp_types::v201::{
+use crate::wire::v201::common::{CustomerInformationStatusEnum, IdTokenEnum};
+use crate::wire::v201::{
     CustomerInformationRequest, CustomerInformationResponse, NotifyCustomerInformationRequest,
 };
+use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
 
 use crate::actor::ChargePointActor;
 use crate::customer_information::{
@@ -31,7 +31,7 @@ fn map_id_token_kind(kind: IdTokenEnum) -> IdTokenKind {
     }
 }
 
-fn map_id_token(id_token: &ocpp_client::ocpp_types::v201::common::IdToken) -> IdToken {
+fn map_id_token(id_token: &crate::wire::v201::common::IdToken) -> IdToken {
     IdToken {
         value: id_token.id_token.to_string(),
         kind: map_id_token_kind(id_token.r#type.clone()),
@@ -114,14 +114,14 @@ impl CustomerInformationNotifier for Ocpp2_0_1CustomerInformationHandler {
         request_id: i64,
         seq_no: i64,
         tbc: bool,
-        generated_at: &str,
+        generated_at: chrono::DateTime<chrono::Utc>,
         data: String,
     ) -> Result<(), Self::Error> {
         self.client
             .send_notify_customer_information(NotifyCustomerInformationRequest {
                 custom_data: None,
                 data: heapless::String::try_from(data.as_str()).unwrap_or_default(),
-                generated_at: generated_at.to_string(),
+                generated_at: generated_at.into(),
                 request_id,
                 seq_no,
                 tbc: Some(tbc),
@@ -158,7 +158,7 @@ mod std_impls {
             request_id: i64,
             seq_no: i64,
             tbc: bool,
-            generated_at: &str,
+            generated_at: chrono::DateTime<chrono::Utc>,
             data: String,
         ) -> Result<(), Self::Error> {
             Ocpp2_0_1CustomerInformationHandler::new(self.clone())
@@ -172,11 +172,8 @@ mod std_impls {
 mod tests {
     use super::*;
 
-    fn wire_id_token(
-        value: &str,
-        kind: IdTokenEnum,
-    ) -> ocpp_client::ocpp_types::v201::common::IdToken {
-        ocpp_client::ocpp_types::v201::common::IdToken {
+    fn wire_id_token(value: &str, kind: IdTokenEnum) -> crate::wire::v201::common::IdToken {
+        crate::wire::v201::common::IdToken {
             additional_info: None,
             custom_data: None,
             id_token: heapless::String::try_from(value).unwrap(),
@@ -245,16 +242,13 @@ mod tests {
         let request = CustomerInformationRequest {
             clear: false,
             custom_data: None,
-            customer_certificate: Some(
-                ocpp_client::ocpp_types::v201::common::CertificateHashData {
-                    custom_data: None,
-                    hash_algorithm:
-                        ocpp_client::ocpp_types::v201::common::HashAlgorithmEnum::SHA256,
-                    issuer_key_hash: heapless::String::try_from("issuer-key-hash").unwrap(),
-                    issuer_name_hash: heapless::String::try_from("issuer-name-hash").unwrap(),
-                    serial_number: heapless::String::try_from("1").unwrap(),
-                },
-            ),
+            customer_certificate: Some(crate::wire::v201::common::CertificateHashData {
+                custom_data: None,
+                hash_algorithm: crate::wire::v201::common::HashAlgorithmEnum::SHA256,
+                issuer_key_hash: heapless::String::try_from("issuer-key-hash").unwrap(),
+                issuer_name_hash: heapless::String::try_from("issuer-name-hash").unwrap(),
+                serial_number: heapless::String::try_from("1").unwrap(),
+            }),
             customer_identifier: None,
             id_token: None,
             report: true,

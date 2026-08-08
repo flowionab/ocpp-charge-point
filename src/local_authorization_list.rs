@@ -441,15 +441,15 @@ mod ocpp_2_1 {
     };
     use crate::actor::ChargePointActor;
     use crate::state::{AuthorizationStatus, IdToken, IdTokenKind, LocalListEntry};
+    use crate::wire::v21::common::{
+        AuthorizationData, AuthorizationStatusEnum, SendLocalListStatusEnum, UpdateEnum,
+    };
+    use crate::wire::v21::{
+        GetLocalListVersionResponse, SendLocalListRequest, SendLocalListResponse,
+    };
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{
-        AuthorizationData, AuthorizationStatusEnum, SendLocalListStatusEnum, UpdateEnum,
-    };
-    use ocpp_client::ocpp_types::v21::{
-        GetLocalListVersionResponse, SendLocalListRequest, SendLocalListResponse,
-    };
 
     fn map_id_token_kind(kind: &str) -> IdTokenKind {
         match kind {
@@ -467,7 +467,7 @@ mod ocpp_2_1 {
         }
     }
 
-    fn map_id_token(id_token: &ocpp_client::ocpp_types::v21::common::IdToken) -> IdToken {
+    fn map_id_token(id_token: &crate::wire::v21::common::IdToken) -> IdToken {
         IdToken {
             value: id_token.id_token.to_string(),
             kind: map_id_token_kind(id_token.r#type.as_str()),
@@ -605,7 +605,7 @@ mod ocpp_2_1 {
         async fn get_local_list_version_is_a_not_supported_call_error_when_the_capability_is_absent()
          {
             use crate::executor::TokioExecutor;
-            use ocpp_client::ocpp_types::v21::RpcErrorCode;
+            use crate::wire::v21::RpcErrorCode;
 
             let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
 
@@ -635,8 +635,8 @@ mod ocpp_2_1 {
             assert_eq!(result.unwrap().version_number, 0);
         }
 
-        fn wire_id_token() -> ocpp_client::ocpp_types::v21::common::IdToken {
-            ocpp_client::ocpp_types::v21::common::IdToken {
+        fn wire_id_token() -> crate::wire::v21::common::IdToken {
+            crate::wire::v21::common::IdToken {
                 additional_info: None,
                 id_token: heapless::String::try_from("04A224B2").unwrap(),
                 r#type: heapless::String::try_from("ISO14443").unwrap(),
@@ -644,8 +644,8 @@ mod ocpp_2_1 {
             }
         }
 
-        fn wire_id_token_info() -> ocpp_client::ocpp_types::v21::common::IdTokenInfo {
-            ocpp_client::ocpp_types::v21::common::IdTokenInfo {
+        fn wire_id_token_info() -> crate::wire::v21::common::IdTokenInfo {
+            crate::wire::v21::common::IdTokenInfo {
                 cache_expiry_date_time: None,
                 charging_priority: None,
                 custom_data: None,
@@ -749,17 +749,17 @@ mod ocpp_2_0_1 {
     use crate::actor::ChargePointActor;
     use crate::remote_control::ocpp_2_0_1::map_id_token_kind;
     use crate::state::{AuthorizationStatus, IdToken, LocalListEntry};
+    use crate::wire::v201::common::{
+        AuthorizationData, AuthorizationStatusEnum, SendLocalListStatusEnum, UpdateEnum,
+    };
+    use crate::wire::v201::{
+        GetLocalListVersionResponse, SendLocalListRequest, SendLocalListResponse,
+    };
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{
-        AuthorizationData, AuthorizationStatusEnum, SendLocalListStatusEnum, UpdateEnum,
-    };
-    use ocpp_client::ocpp_types::v201::{
-        GetLocalListVersionResponse, SendLocalListRequest, SendLocalListResponse,
-    };
 
-    fn map_id_token(id_token: &ocpp_client::ocpp_types::v201::common::IdToken) -> IdToken {
+    fn map_id_token(id_token: &crate::wire::v201::common::IdToken) -> IdToken {
         IdToken {
             value: id_token.id_token.to_string(),
             kind: map_id_token_kind(id_token.r#type.clone()),
@@ -885,7 +885,7 @@ mod ocpp_2_0_1 {
         async fn get_local_list_version_is_a_not_supported_call_error_when_the_capability_is_absent()
          {
             use crate::executor::TokioExecutor;
-            use ocpp_client::ocpp_types::v201::RpcErrorCode;
+            use crate::wire::v201::RpcErrorCode;
 
             let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
 
@@ -915,17 +915,17 @@ mod ocpp_2_0_1 {
             assert_eq!(result.unwrap().version_number, 0);
         }
 
-        fn wire_id_token() -> ocpp_client::ocpp_types::v201::common::IdToken {
-            ocpp_client::ocpp_types::v201::common::IdToken {
+        fn wire_id_token() -> crate::wire::v201::common::IdToken {
+            crate::wire::v201::common::IdToken {
                 additional_info: None,
                 id_token: heapless::String::try_from("04A224B2").unwrap(),
-                r#type: ocpp_client::ocpp_types::v201::common::IdTokenEnum::ISO14443,
+                r#type: crate::wire::v201::common::IdTokenEnum::ISO14443,
                 custom_data: None,
             }
         }
 
-        fn wire_id_token_info() -> ocpp_client::ocpp_types::v201::common::IdTokenInfo {
-            ocpp_client::ocpp_types::v201::common::IdTokenInfo {
+        fn wire_id_token_info() -> crate::wire::v201::common::IdTokenInfo {
+            crate::wire::v201::common::IdTokenInfo {
                 cache_expiry_date_time: None,
                 charging_priority: None,
                 custom_data: None,
@@ -1036,14 +1036,14 @@ mod ocpp_1_6 {
     use crate::actor::ChargePointActor;
     use crate::id_tag::map_id_token;
     use crate::state::{AuthorizationStatus, LocalListEntry};
-    use alloc::boxed::Box;
-    use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::common::{
+    use crate::wire::v16::common::{
         IdTagInfoStatus, LocalAuthorizationListItem, SendLocalListResponseStatus, UpdateType,
     };
-    use ocpp_client::ocpp_types::v16::{
+    use crate::wire::v16::{
         GetLocalListVersionResponse, SendLocalListRequest, SendLocalListResponse,
     };
+    use alloc::boxed::Box;
+    use ocpp_client::ocpp_1_6::OCPP1_6Client;
 
     /// Only `Accepted` maps to our `Accepted` - see [`crate::authorization::ocpp_1_6::map_status`].
     fn map_status(status: IdTagInfoStatus) -> AuthorizationStatus {
@@ -1162,7 +1162,7 @@ mod ocpp_1_6 {
         async fn get_local_list_version_is_a_not_supported_call_error_when_the_capability_is_absent()
          {
             use crate::executor::TokioExecutor;
-            use ocpp_client::ocpp_types::v16::RpcErrorCode;
+            use crate::wire::v16::RpcErrorCode;
 
             let actor = crate::actor::ChargePointActor::spawn([1], &TokioExecutor);
 
@@ -1192,8 +1192,8 @@ mod ocpp_1_6 {
             assert_eq!(result.unwrap().list_version, 0);
         }
 
-        fn id_tag_info(status: IdTagInfoStatus) -> ocpp_client::ocpp_types::v16::common::IdTagInfo {
-            ocpp_client::ocpp_types::v16::common::IdTagInfo {
+        fn id_tag_info(status: IdTagInfoStatus) -> crate::wire::v16::common::IdTagInfo {
+            crate::wire::v16::common::IdTagInfo {
                 expiry_date: None,
                 parent_id_tag: None,
                 status,
@@ -1202,7 +1202,7 @@ mod ocpp_1_6 {
 
         fn item(id_tag_info: Option<IdTagInfoStatus>) -> LocalAuthorizationListItem {
             LocalAuthorizationListItem {
-                id_tag: ocpp_client::ocpp_types::v16::IdTag::try_from("04A224B2").unwrap(),
+                id_tag: crate::wire::v16::IdTag::try_from("04A224B2").unwrap(),
                 id_tag_info: id_tag_info.map(self::id_tag_info),
             }
         }

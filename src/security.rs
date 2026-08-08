@@ -579,10 +579,10 @@ mod ocpp_2_1 {
         use crate::security::SecurityEventNotifier;
         use crate::security::wire_type;
         use crate::state::SecurityEventType;
+        use crate::wire::v21::SecurityEventNotificationRequest;
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-        use ocpp_client::ocpp_types::v21::SecurityEventNotificationRequest;
 
         /// Builds the `SecurityEventNotificationRequest` for `event_type`/`tech_info`,
         /// timestamped from `clock.now()`. Pure (no network I/O), so a fixed [`Clock`] fake can
@@ -606,7 +606,7 @@ mod ocpp_2_1 {
                 // truncate safely mid-UTF-8, and dropping it still delivers the (bounded,
                 // always-fitting) `type` below.
                 tech_info: tech_info.and_then(|info| heapless::String::try_from(info).ok()),
-                timestamp: now.to_rfc3339(),
+                timestamp: now.into(),
                 // Falls back to a fixed literal if a vendor-supplied `Other` string exceeds
                 // OCPP's 50-byte bound - every standardized value fits by construction. The
                 // fallback itself cannot fail (G4.2): `OVERSIZED_EVENT_TYPE` is asserted to fit at
@@ -710,7 +710,7 @@ mod ocpp_2_1 {
                     None,
                 );
 
-                assert_eq!(request.timestamp, fixed.to_rfc3339());
+                assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
             }
 
             #[test]
@@ -724,7 +724,10 @@ mod ocpp_2_1 {
                     None,
                 );
 
-                assert_eq!(request.timestamp, unset_rtc.0.to_rfc3339());
+                assert_eq!(
+                    request.timestamp,
+                    crate::wire::OcppTimestamp::from(unset_rtc.0)
+                );
             }
         }
     }
@@ -741,10 +744,10 @@ mod ocpp_2_1 {
 mod ocpp_2_0_1 {
     use super::{SecurityEventNotifier, SecurityEventType, wire_type};
     use crate::clock::{Clock, is_synchronized};
+    use crate::wire::v201::SecurityEventNotificationRequest;
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-    use ocpp_client::ocpp_types::v201::SecurityEventNotificationRequest;
 
     /// The 2.0.1 counterpart of the 2.1 builder - same fields, same bounds, same fallbacks. Kept
     /// as its own function rather than made generic over the two request types: they are distinct
@@ -765,7 +768,7 @@ mod ocpp_2_0_1 {
         SecurityEventNotificationRequest {
             custom_data: None,
             tech_info: tech_info.and_then(|info| heapless::String::try_from(info).ok()),
-            timestamp: now.to_rfc3339(),
+            timestamp: now.into(),
             r#type: heapless::String::try_from(wire_type(event_type).as_str())
                 .unwrap_or_else(|_| crate::security::oversized_event_type()),
         }
@@ -861,7 +864,7 @@ mod ocpp_2_0_1 {
             // is `InvalidCSMSCertificate` rather than the Rust variant's spelling.
             assert_eq!(request.r#type, "InvalidCSMSCertificate");
             assert_eq!(request.tech_info.as_deref(), Some("chain does not verify"));
-            assert_eq!(request.timestamp, fixed.to_rfc3339());
+            assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
         }
     }
 }

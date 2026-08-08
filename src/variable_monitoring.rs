@@ -793,19 +793,19 @@ mod ocpp_2_1 {
     use crate::actor::ChargePointActor;
     use crate::clock::Clock;
     use crate::state::{Component, Variable};
+    use crate::wire::v21::common::{
+        ClearMonitoringResult, ClearMonitoringStatusEnum, EVSE, EventData, EventNotificationEnum,
+        EventTriggerEnum, MonitorEnum, SetMonitoringData, SetMonitoringResult,
+        SetMonitoringStatusEnum,
+    };
+    use crate::wire::v21::{
+        ClearVariableMonitoringResponse, NotifyEventRequest, SetVariableMonitoringResponse,
+    };
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use alloc::vec::Vec;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::ocpp_types::v21::common::{
-        ClearMonitoringResult, ClearMonitoringStatusEnum, EVSE, EventData, EventNotificationEnum,
-        EventTriggerEnum, MonitorEnum, SetMonitoringData, SetMonitoringResult,
-        SetMonitoringStatusEnum,
-    };
-    use ocpp_client::ocpp_types::v21::{
-        ClearVariableMonitoringResponse, NotifyEventRequest, SetVariableMonitoringResponse,
-    };
 
     /// Truncates/bounds `value` to fit a `heapless::String<N>` on the wire, matching this crate's
     /// established truncate-over-drop convention - mirrors
@@ -819,7 +819,23 @@ mod ocpp_2_1 {
         heapless::String::try_from(&value[..end]).expect("truncated to fit the wire bound")
     }
 
-    fn map_component(component: &ocpp_client::ocpp_types::v21::common::Component) -> Component {
+    /// Truncates `value` to at most `max_bytes` bytes, on a UTF-8 boundary, and hands back an
+    /// owned `String`.
+    ///
+    /// The sibling of [`bounded_string`] for the wire fields `ocpp-types` 0.2.0 retyped from
+    /// `heapless::String<N>` to an unbounded `String` - the specification leaves their length to
+    /// a device-model variable rather than fixing it, so the bound became this crate's to apply
+    /// instead of the type's. The byte bounds are kept exactly where the `heapless` capacities
+    /// had them, so what goes on the wire is unchanged.
+    fn bounded_owned(value: &str, max_bytes: usize) -> alloc::string::String {
+        let mut end = value.len().min(max_bytes);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end].into()
+    }
+
+    fn map_component(component: &crate::wire::v21::common::Component) -> Component {
         let evse = component.evse.as_ref().map(|evse| {
             let evse_id = usize::try_from(evse.id).unwrap_or(usize::MAX);
             let connector_id = evse.connector_id.and_then(|id| usize::try_from(id).ok());
@@ -835,8 +851,8 @@ mod ocpp_2_1 {
         }
     }
 
-    fn build_component(component: &Component) -> ocpp_client::ocpp_types::v21::common::Component {
-        ocpp_client::ocpp_types::v21::common::Component {
+    fn build_component(component: &Component) -> crate::wire::v21::common::Component {
+        crate::wire::v21::common::Component {
             custom_data: None,
             evse: component.evse.map(|(evse_id, connector_id)| EVSE {
                 connector_id: connector_id.and_then(|id| i64::try_from(id).ok()),
@@ -848,7 +864,7 @@ mod ocpp_2_1 {
         }
     }
 
-    fn map_variable(variable: &ocpp_client::ocpp_types::v21::common::Variable) -> Variable {
+    fn map_variable(variable: &crate::wire::v21::common::Variable) -> Variable {
         Variable {
             name: variable.name.to_string(),
             instance: variable
@@ -858,8 +874,8 @@ mod ocpp_2_1 {
         }
     }
 
-    fn build_variable(variable: &Variable) -> ocpp_client::ocpp_types::v21::common::Variable {
-        ocpp_client::ocpp_types::v21::common::Variable {
+    fn build_variable(variable: &Variable) -> crate::wire::v21::common::Variable {
+        crate::wire::v21::common::Variable {
             custom_data: None,
             instance: variable.instance.as_deref().map(bounded_string::<50>),
             name: bounded_string::<50>(&variable.name),
@@ -964,11 +980,11 @@ mod ocpp_2_1 {
         event_id: i64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> NotifyEventRequest {
-        let timestamp = now.to_rfc3339();
+        let timestamp = crate::wire::OcppTimestamp::from(now);
         NotifyEventRequest {
             custom_data: None,
             event_data: alloc::vec![EventData {
-                actual_value: bounded_string::<2500>(&event.actual_value),
+                actual_value: bounded_owned(&event.actual_value, 2500),
                 cause: None,
                 cleared: None,
                 component: build_component(&event.component),
@@ -978,7 +994,7 @@ mod ocpp_2_1 {
                 severity: Some(i64::from(event.severity)),
                 tech_code: None,
                 tech_info: None,
-                timestamp: timestamp.clone(),
+                timestamp,
                 transaction_id: None,
                 trigger: map_trigger(event.trigger),
                 variable: build_variable(&event.variable),
@@ -1186,7 +1202,7 @@ mod ocpp_2_1 {
         #[test]
         fn an_accepted_result_carries_the_assigned_id_and_severity() {
             let item = SetMonitoringData {
-                component: ocpp_client::ocpp_types::v21::common::Component {
+                component: crate::wire::v21::common::Component {
                     custom_data: None,
                     evse: None,
                     instance: None,
@@ -1199,7 +1215,7 @@ mod ocpp_2_1 {
                 transaction: None,
                 r#type: MonitorEnum::UpperThreshold,
                 value: 1.0,
-                variable: ocpp_client::ocpp_types::v21::common::Variable {
+                variable: crate::wire::v21::common::Variable {
                     custom_data: None,
                     instance: None,
                     name: heapless::String::try_from("Temperature").unwrap(),
@@ -1222,7 +1238,7 @@ mod ocpp_2_1 {
         #[test]
         fn a_rejected_result_carries_no_id_and_echoes_the_requested_severity() {
             let item = SetMonitoringData {
-                component: ocpp_client::ocpp_types::v21::common::Component {
+                component: crate::wire::v21::common::Component {
                     custom_data: None,
                     evse: None,
                     instance: None,
@@ -1235,7 +1251,7 @@ mod ocpp_2_1 {
                 transaction: None,
                 r#type: MonitorEnum::UpperThreshold,
                 value: 1.0,
-                variable: ocpp_client::ocpp_types::v21::common::Variable {
+                variable: crate::wire::v21::common::Variable {
                     custom_data: None,
                     instance: None,
                     name: heapless::String::try_from("Temperature").unwrap(),
@@ -1266,19 +1282,19 @@ mod ocpp_2_0_1 {
     use crate::actor::ChargePointActor;
     use crate::clock::Clock;
     use crate::state::{Component, Variable};
+    use crate::wire::v201::common::{
+        ClearMonitoringResult, ClearMonitoringStatusEnum, EVSE, EventData, EventNotificationEnum,
+        EventTriggerEnum, MonitorEnum, SetMonitoringData, SetMonitoringResult,
+        SetMonitoringStatusEnum,
+    };
+    use crate::wire::v201::{
+        ClearVariableMonitoringResponse, NotifyEventRequest, SetVariableMonitoringResponse,
+    };
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use alloc::vec::Vec;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-    use ocpp_client::ocpp_types::v201::common::{
-        ClearMonitoringResult, ClearMonitoringStatusEnum, EVSE, EventData, EventNotificationEnum,
-        EventTriggerEnum, MonitorEnum, SetMonitoringData, SetMonitoringResult,
-        SetMonitoringStatusEnum,
-    };
-    use ocpp_client::ocpp_types::v201::{
-        ClearVariableMonitoringResponse, NotifyEventRequest, SetVariableMonitoringResponse,
-    };
 
     fn bounded_string<const N: usize>(value: &str) -> heapless::String<N> {
         let mut end = value.len().min(N);
@@ -1288,7 +1304,23 @@ mod ocpp_2_0_1 {
         heapless::String::try_from(&value[..end]).expect("truncated to fit the wire bound")
     }
 
-    fn map_component(component: &ocpp_client::ocpp_types::v201::common::Component) -> Component {
+    /// Truncates `value` to at most `max_bytes` bytes, on a UTF-8 boundary, and hands back an
+    /// owned `String`.
+    ///
+    /// The sibling of [`bounded_string`] for the wire fields `ocpp-types` 0.2.0 retyped from
+    /// `heapless::String<N>` to an unbounded `String` - the specification leaves their length to
+    /// a device-model variable rather than fixing it, so the bound became this crate's to apply
+    /// instead of the type's. The byte bounds are kept exactly where the `heapless` capacities
+    /// had them, so what goes on the wire is unchanged.
+    fn bounded_owned(value: &str, max_bytes: usize) -> alloc::string::String {
+        let mut end = value.len().min(max_bytes);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end].into()
+    }
+
+    fn map_component(component: &crate::wire::v201::common::Component) -> Component {
         let evse = component.evse.as_ref().map(|evse| {
             let evse_id = usize::try_from(evse.id).unwrap_or(usize::MAX);
             let connector_id = evse.connector_id.and_then(|id| usize::try_from(id).ok());
@@ -1304,8 +1336,8 @@ mod ocpp_2_0_1 {
         }
     }
 
-    fn build_component(component: &Component) -> ocpp_client::ocpp_types::v201::common::Component {
-        ocpp_client::ocpp_types::v201::common::Component {
+    fn build_component(component: &Component) -> crate::wire::v201::common::Component {
+        crate::wire::v201::common::Component {
             custom_data: None,
             evse: component.evse.map(|(evse_id, connector_id)| EVSE {
                 connector_id: connector_id.and_then(|id| i64::try_from(id).ok()),
@@ -1317,7 +1349,7 @@ mod ocpp_2_0_1 {
         }
     }
 
-    fn map_variable(variable: &ocpp_client::ocpp_types::v201::common::Variable) -> Variable {
+    fn map_variable(variable: &crate::wire::v201::common::Variable) -> Variable {
         Variable {
             name: variable.name.to_string(),
             instance: variable
@@ -1327,8 +1359,8 @@ mod ocpp_2_0_1 {
         }
     }
 
-    fn build_variable(variable: &Variable) -> ocpp_client::ocpp_types::v201::common::Variable {
-        ocpp_client::ocpp_types::v201::common::Variable {
+    fn build_variable(variable: &Variable) -> crate::wire::v201::common::Variable {
+        crate::wire::v201::common::Variable {
             custom_data: None,
             instance: variable.instance.as_deref().map(bounded_string::<50>),
             name: bounded_string::<50>(&variable.name),
@@ -1426,11 +1458,11 @@ mod ocpp_2_0_1 {
         event_id: i64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> NotifyEventRequest {
-        let timestamp = now.to_rfc3339();
+        let timestamp = crate::wire::OcppTimestamp::from(now);
         NotifyEventRequest {
             custom_data: None,
             event_data: alloc::vec![EventData {
-                actual_value: bounded_string::<2500>(&event.actual_value),
+                actual_value: bounded_owned(&event.actual_value, 2500),
                 cause: None,
                 cleared: None,
                 component: build_component(&event.component),
@@ -1439,7 +1471,7 @@ mod ocpp_2_0_1 {
                 event_notification_type: EventNotificationEnum::CustomMonitor,
                 tech_code: None,
                 tech_info: None,
-                timestamp: timestamp.clone(),
+                timestamp,
                 transaction_id: None,
                 trigger: map_trigger(event.trigger),
                 variable: build_variable(&event.variable),

@@ -128,9 +128,9 @@ mod ocpp_2_1 {
     use super::{CostUpdatedHandler, handle_cost_updated};
     use crate::actor::ChargePointActor;
     use crate::state::TransactionId;
+    use crate::wire::v21::{CostUpdatedRequest, CostUpdatedResponse};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::ocpp_types::v21::{CostUpdatedRequest, CostUpdatedResponse};
 
     /// A `transactionId` that doesn't parse as a `u64` can't address a transaction - treated the
     /// same as an unknown one, without needing to consult the actor. Mirrors
@@ -177,7 +177,7 @@ mod ocpp_2_1 {
         use crate::executor::TokioExecutor;
         use crate::hardware::Capabilities;
         use crate::state::ChargePointEvent;
-        use ocpp_client::ocpp_types::v21::RpcErrorCode;
+        use crate::wire::v21::RpcErrorCode;
 
         fn request(transaction_id: &str) -> CostUpdatedRequest {
             CostUpdatedRequest {
@@ -234,9 +234,9 @@ mod ocpp_2_0_1 {
     use super::{CostUpdatedHandler, handle_cost_updated};
     use crate::actor::ChargePointActor;
     use crate::state::TransactionId;
+    use crate::wire::v201::{CostUpdatedRequest, CostUpdatedResponse};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-    use ocpp_client::ocpp_types::v201::{CostUpdatedRequest, CostUpdatedResponse};
 
     fn parse_transaction_id(request: &CostUpdatedRequest) -> Option<TransactionId> {
         request
@@ -277,7 +277,7 @@ mod ocpp_2_0_1 {
         use crate::executor::TokioExecutor;
         use crate::hardware::Capabilities;
         use crate::state::ChargePointEvent;
-        use ocpp_client::ocpp_types::v201::RpcErrorCode;
+        use crate::wire::v201::RpcErrorCode;
 
         fn request(transaction_id: &str) -> CostUpdatedRequest {
             CostUpdatedRequest {

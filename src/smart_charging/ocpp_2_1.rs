@@ -11,21 +11,21 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use chrono::{DateTime, Utc};
 
-use ocpp_client::ocpp_2_1::OCPP2_1Client;
-use ocpp_client::ocpp_types::v21::common::{
+use crate::wire::v21::common::{
     ChargingProfile as WireChargingProfile, ChargingProfileKindEnum, ChargingProfilePurposeEnum,
     ChargingProfileStatusEnum, ChargingRateUnitEnum, ChargingSchedule as WireChargingSchedule,
     ChargingScheduleUpdate, ClearChargingProfileStatusEnum,
     CompositeSchedule as WireCompositeSchedule, GenericStatusEnum, GetChargingProfileStatusEnum,
     PriorityChargingStatusEnum, RecurrencyKindEnum, StatusInfo,
 };
-use ocpp_client::ocpp_types::v21::{
+use crate::wire::v21::{
     ClearChargingProfileRequest, ClearChargingProfileResponse, GetChargingProfilesRequest,
     GetChargingProfilesResponse, GetCompositeScheduleRequest, GetCompositeScheduleResponse,
     NotifyPriorityChargingRequest, PullDynamicScheduleUpdateRequest, ReportChargingProfilesRequest,
     SetChargingProfileRequest, SetChargingProfileResponse, UpdateDynamicScheduleRequest,
     UpdateDynamicScheduleResponse, UsePriorityChargingRequest, UsePriorityChargingResponse,
 };
+use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
@@ -111,12 +111,16 @@ pub(super) fn wire_rate_unit(unit: ChargingRateUnit) -> ChargingRateUnitEnum {
     }
 }
 
-/// Parses a wire timestamp, treating an unparseable one as absent rather than failing the whole
-/// request - the same stance [`crate::reservation`] takes for `expiryDateTime`.
-fn parse_time(raw: &Option<alloc::string::String>) -> Option<DateTime<Utc>> {
-    raw.as_ref()
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|parsed| parsed.with_timezone(&Utc))
+/// A wire timestamp onto this crate's clock type.
+///
+/// Infallible since `ocpp-types` 0.2.0: a `dateTime` reaches this crate as an already-validated
+/// [`OcppTimestamp`], so a malformed one is rejected by `ocpp-client`'s decoder and surfaces as a
+/// `CALLERROR` to the CSMS rather than arriving here as an unparseable string. This used to treat
+/// an unparseable value as absent; there is no longer such a case to treat.
+///
+/// [`OcppTimestamp`]: ocpp_client::ocpp_types::OcppTimestamp
+fn parse_time(raw: &Option<crate::wire::OcppTimestamp>) -> Option<DateTime<Utc>> {
+    raw.map(Into::into)
 }
 
 /// One wire schedule onto this crate's.
@@ -125,9 +129,7 @@ fn parse_time(raw: &Option<alloc::string::String>) -> Option<DateTime<Utc>> {
 /// model) is dropped: a period that says nothing about how much current may flow cannot
 /// contribute to a current limit, and inventing one would be worse than leaving the neighbouring
 /// periods to cover the time.
-fn map_schedule(
-    schedule: &ocpp_client::ocpp_types::v21::common::ChargingSchedule,
-) -> ChargingSchedule {
+fn map_schedule(schedule: &crate::wire::v21::common::ChargingSchedule) -> ChargingSchedule {
     ChargingSchedule {
         id: schedule.id as i32,
         start_schedule: parse_time(&schedule.start_schedule),
@@ -156,7 +158,7 @@ fn map_schedule(
 }
 
 /// A wire profile onto this crate's.
-fn map_profile(profile: &ocpp_client::ocpp_types::v21::common::ChargingProfile) -> ChargingProfile {
+fn map_profile(profile: &crate::wire::v21::common::ChargingProfile) -> ChargingProfile {
     ChargingProfile {
         id: ChargingProfileId(profile.id as i32),
         stack_level: u32::try_from(profile.stack_level).unwrap_or(0),
@@ -226,37 +228,35 @@ pub(super) fn wire_composite_schedule(
         charging_schedule_period: composed
             .periods
             .iter()
-            .map(
-                |period| ocpp_client::ocpp_types::v21::common::ChargingSchedulePeriod {
-                    custom_data: None,
-                    discharge_limit: None,
-                    discharge_limit_l2: None,
-                    discharge_limit_l3: None,
-                    evse_sleep: None,
-                    limit: Some(period.limit),
-                    limit_l2: None,
-                    limit_l3: None,
-                    number_phases: period.number_phases.map(i64::from),
-                    operation_mode: None,
-                    phase_to_use: None,
-                    preconditioning_request: None,
-                    setpoint: None,
-                    setpoint_l2: None,
-                    setpoint_l3: None,
-                    setpoint_reactive: None,
-                    setpoint_reactive_l2: None,
-                    setpoint_reactive_l3: None,
-                    start_period: i64::from(period.start_period_secs),
-                    v2x_baseline: None,
-                    v2x_freq_watt_curve: None,
-                    v2x_signal_watt_curve: None,
-                },
-            )
+            .map(|period| crate::wire::v21::common::ChargingSchedulePeriod {
+                custom_data: None,
+                discharge_limit: None,
+                discharge_limit_l2: None,
+                discharge_limit_l3: None,
+                evse_sleep: None,
+                limit: Some(period.limit),
+                limit_l2: None,
+                limit_l3: None,
+                number_phases: period.number_phases.map(i64::from),
+                operation_mode: None,
+                phase_to_use: None,
+                preconditioning_request: None,
+                setpoint: None,
+                setpoint_l2: None,
+                setpoint_l3: None,
+                setpoint_reactive: None,
+                setpoint_reactive_l2: None,
+                setpoint_reactive_l3: None,
+                start_period: i64::from(period.start_period_secs),
+                v2x_baseline: None,
+                v2x_freq_watt_curve: None,
+                v2x_signal_watt_curve: None,
+            })
             .collect(),
         custom_data: None,
         duration: i64::from(composed.duration_secs),
         evse_id: evse_id as i64 + 1,
-        schedule_start: composed.start.to_rfc3339(),
+        schedule_start: composed.start.into(),
     }
 }
 
@@ -288,32 +288,30 @@ fn wire_schedule(schedule: &ChargingSchedule) -> WireChargingSchedule {
         charging_schedule_period: schedule
             .periods
             .iter()
-            .map(
-                |period| ocpp_client::ocpp_types::v21::common::ChargingSchedulePeriod {
-                    custom_data: None,
-                    discharge_limit: None,
-                    discharge_limit_l2: None,
-                    discharge_limit_l3: None,
-                    evse_sleep: None,
-                    limit: Some(period.limit),
-                    limit_l2: None,
-                    limit_l3: None,
-                    number_phases: period.number_phases.map(i64::from),
-                    operation_mode: None,
-                    phase_to_use: None,
-                    preconditioning_request: None,
-                    setpoint: None,
-                    setpoint_l2: None,
-                    setpoint_l3: None,
-                    setpoint_reactive: None,
-                    setpoint_reactive_l2: None,
-                    setpoint_reactive_l3: None,
-                    start_period: i64::from(period.start_period_secs),
-                    v2x_baseline: None,
-                    v2x_freq_watt_curve: None,
-                    v2x_signal_watt_curve: None,
-                },
-            )
+            .map(|period| crate::wire::v21::common::ChargingSchedulePeriod {
+                custom_data: None,
+                discharge_limit: None,
+                discharge_limit_l2: None,
+                discharge_limit_l3: None,
+                evse_sleep: None,
+                limit: Some(period.limit),
+                limit_l2: None,
+                limit_l3: None,
+                number_phases: period.number_phases.map(i64::from),
+                operation_mode: None,
+                phase_to_use: None,
+                preconditioning_request: None,
+                setpoint: None,
+                setpoint_l2: None,
+                setpoint_l3: None,
+                setpoint_reactive: None,
+                setpoint_reactive_l2: None,
+                setpoint_reactive_l3: None,
+                start_period: i64::from(period.start_period_secs),
+                v2x_baseline: None,
+                v2x_freq_watt_curve: None,
+                v2x_signal_watt_curve: None,
+            })
             .collect(),
         custom_data: None,
         digest_value: None,
@@ -326,7 +324,7 @@ fn wire_schedule(schedule: &ChargingSchedule) -> WireChargingSchedule {
         randomized_delay: None,
         sales_tariff: None,
         signature_id: None,
-        start_schedule: schedule.start_schedule.map(|start| start.to_rfc3339()),
+        start_schedule: schedule.start_schedule.map(Into::into),
         use_local_time: None,
     }
 }
@@ -360,13 +358,13 @@ fn wire_profile(profile: &ChargingProfile) -> WireChargingProfile {
         price_schedule_signature: None,
         recurrency_kind: profile.recurrency.map(wire_recurrency),
         dyn_update_interval: profile.dyn_update_interval_secs.map(i64::from),
-        dyn_update_time: profile.dyn_update_time.map(|at| at.to_rfc3339()),
+        dyn_update_time: profile.dyn_update_time.map(Into::into),
         stack_level: i64::from(profile.stack_level),
         transaction_id: profile
             .transaction_id
             .and_then(|id| heapless::String::try_from(alloc::format!("{}", id.0).as_str()).ok()),
-        valid_from: profile.valid_from.map(|valid| valid.to_rfc3339()),
-        valid_to: profile.valid_to.map(|valid| valid.to_rfc3339()),
+        valid_from: profile.valid_from.map(Into::into),
+        valid_to: profile.valid_to.map(Into::into),
     }
 }
 
@@ -950,7 +948,7 @@ mod std_impls {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocpp_client::ocpp_types::v21::common::{
+    use crate::wire::v21::common::{
         ChargingProfile as WireChargingProfile, ChargingSchedule as WireChargingSchedule,
         ChargingSchedulePeriod as WirePeriod,
     };
@@ -1004,7 +1002,7 @@ mod tests {
             randomized_delay: None,
             sales_tariff: None,
             signature_id: None,
-            start_schedule: Some("2026-03-04T05:06:07Z".into()),
+            start_schedule: Some("2026-03-04T05:06:07Z".try_into().unwrap()),
             use_local_time: None,
         }
     }
@@ -1112,14 +1110,12 @@ mod tests {
     fn clear_criteria_map_every_field_the_wire_can_carry() {
         let request = ClearChargingProfileRequest {
             charging_profile_id: Some(9),
-            charging_profile_criteria: Some(
-                ocpp_client::ocpp_types::v21::common::ClearChargingProfile {
-                    charging_profile_purpose: Some(ChargingProfilePurposeEnum::TxProfile),
-                    evse_id: Some(2),
-                    stack_level: Some(4),
-                    custom_data: None,
-                },
-            ),
+            charging_profile_criteria: Some(crate::wire::v21::common::ClearChargingProfile {
+                charging_profile_purpose: Some(ChargingProfilePurposeEnum::TxProfile),
+                evse_id: Some(2),
+                stack_level: Some(4),
+                custom_data: None,
+            }),
             custom_data: None,
         };
 
@@ -1163,7 +1159,10 @@ mod tests {
 
         assert_eq!(wire.evse_id, 1);
         assert_eq!(wire.duration, 3_600);
-        assert_eq!(wire.schedule_start, composed.start.to_rfc3339());
+        assert_eq!(
+            wire.schedule_start,
+            crate::wire::OcppTimestamp::from(composed.start)
+        );
         assert_eq!(wire.charging_schedule_period[0].limit, Some(16.0));
         assert_eq!(wire.charging_schedule_period[0].number_phases, Some(1));
     }
@@ -1177,8 +1176,8 @@ mod tests {
         // The fixture leaves the optional fields empty; a round-trip test that did the same
         // would pass just as happily against a mapping that dropped every one of them.
         original.recurrency_kind = Some(RecurrencyKindEnum::Daily);
-        original.valid_from = Some("2024-01-01T00:00:00+00:00".into());
-        original.valid_to = Some("2024-02-01T00:00:00+00:00".into());
+        original.valid_from = Some("2024-01-01T00:00:00+00:00".try_into().unwrap());
+        original.valid_to = Some("2024-02-01T00:00:00+00:00".try_into().unwrap());
         let stored = map_profile(&original);
 
         let reported = wire_profile(&stored);
@@ -1233,7 +1232,7 @@ mod tests {
     #[test]
     fn a_get_request_maps_every_criterion_the_wire_can_carry() {
         let query = map_query(&GetChargingProfilesRequest {
-            charging_profile: ocpp_client::ocpp_types::v21::common::ChargingProfileCriterion {
+            charging_profile: crate::wire::v21::common::ChargingProfileCriterion {
                 charging_limit_source: Some(
                     [heapless::String::try_from("EMS").unwrap()]
                         .into_iter()
@@ -1262,7 +1261,7 @@ mod tests {
     #[test]
     fn an_omitted_evse_id_asks_about_every_scope_rather_than_the_charge_point() {
         let query = map_query(&GetChargingProfilesRequest {
-            charging_profile: ocpp_client::ocpp_types::v21::common::ChargingProfileCriterion {
+            charging_profile: crate::wire::v21::common::ChargingProfileCriterion {
                 charging_limit_source: None,
                 charging_profile_id: None,
                 charging_profile_purpose: None,

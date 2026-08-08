@@ -208,11 +208,35 @@ async fn a_set_network_profile_moves_the_connection_to_the_new_address() {
     });
 
     // The address the profile names. Seeing a BootNotification here is the whole assertion.
+    //
+    // More than one connection may arrive before it does, which is why this loops rather than
+    // reading a single socket. `ConnectionCloser::close_connection` forces a redial (it must not
+    // *close* - see `crate::network_switch::ConnectionCloser`), and from `ocpp-client` 0.3.0
+    // `Client::force_reconnect` tears down whichever connection is current when the read loop
+    // observes the request. When the CSMS closes its own side as this one does - immediately
+    // after answering `SetNetworkProfile` - the client's own redial and the forced one race, and
+    // the forced one can land on the connection the natural redial just established. The charge
+    // point recovers by redialling again, so what is guaranteed is that it ends up connected to
+    // the new address and boots there, not that it gets there in exactly one attempt.
     let arrival = tokio::spawn(async move {
-        let mut socket = accept(&second).await;
-        let boot = next_call(&mut socket, "BootNotification").await;
-        assert_eq!(boot[3]["chargingStation"]["vendorName"], "Acme");
-        accept_boot(&mut socket, &boot).await;
+        for _ in 0..4 {
+            let mut socket = accept(&second).await;
+            loop {
+                let frame = match socket.next().await {
+                    Some(Ok(Message::Text(text))) => text.to_string(),
+                    Some(Ok(_)) => continue,
+                    // This connection went away before booting; wait for the next one.
+                    _ => break,
+                };
+                let call: Value = serde_json::from_str(&frame).unwrap();
+                if call[0] == 2 && call[2] == "BootNotification" {
+                    assert_eq!(call[3]["chargingStation"]["vendorName"], "Acme");
+                    accept_boot(&mut socket, &call).await;
+                    return;
+                }
+            }
+        }
+        panic!("the charge point never booted at the address the profile named");
     });
 
     let _runtime = connect_and_setup(

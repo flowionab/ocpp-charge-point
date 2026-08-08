@@ -225,7 +225,7 @@ pub fn capability_present(capabilities: &Capabilities, message: &str) -> bool {
 /// table.
 #[cfg(feature = "ocpp_2_1")]
 pub fn ocpp_2_1_not_supported(action: &str) -> ocpp_client::ocpp_2_1::OCPP2_1Error {
-    use ocpp_client::ocpp_types::v21::RpcErrorCode;
+    use crate::wire::v21::RpcErrorCode;
     ocpp_client::ocpp_2_1::OCPP2_1Error {
         code: RpcErrorCode::NotSupported,
         description: alloc::format!(
@@ -239,7 +239,7 @@ pub fn ocpp_2_1_not_supported(action: &str) -> ocpp_client::ocpp_2_1::OCPP2_1Err
 /// its gating capability is runtime-absent. Mirrors [`ocpp_2_1_not_supported`].
 #[cfg(feature = "ocpp_2_0_1")]
 pub fn ocpp_2_0_1_not_supported(action: &str) -> ocpp_client::ocpp_2_0_1::OCPP2_0_1Error {
-    use ocpp_client::ocpp_types::v201::RpcErrorCode;
+    use crate::wire::v201::RpcErrorCode;
     ocpp_client::ocpp_2_0_1::OCPP2_0_1Error {
         code: RpcErrorCode::NotSupported,
         description: alloc::format!(
@@ -253,7 +253,7 @@ pub fn ocpp_2_0_1_not_supported(action: &str) -> ocpp_client::ocpp_2_0_1::OCPP2_
 /// gating capability is runtime-absent. Mirrors [`ocpp_2_1_not_supported`].
 #[cfg(feature = "ocpp_1_6")]
 pub fn ocpp_1_6_not_supported(action: &str) -> ocpp_client::ocpp_1_6::OCPP1_6Error {
-    use ocpp_client::ocpp_types::v16::RpcErrorCode;
+    use crate::wire::v16::RpcErrorCode;
     ocpp_client::ocpp_1_6::OCPP1_6Error {
         code: RpcErrorCode::NotSupported,
         description: alloc::format!(
@@ -325,7 +325,7 @@ mod tests {
     #[cfg(feature = "ocpp_2_1")]
     #[test]
     fn ocpp_2_1_not_supported_uses_the_not_supported_rpc_error_code() {
-        use ocpp_client::ocpp_types::v21::RpcErrorCode;
+        use crate::wire::v21::RpcErrorCode;
         let error = ocpp_2_1_not_supported("GetLocalListVersion");
         assert_eq!(error.code, RpcErrorCode::NotSupported);
     }
@@ -333,7 +333,7 @@ mod tests {
     #[cfg(feature = "ocpp_2_0_1")]
     #[test]
     fn ocpp_2_0_1_not_supported_uses_the_not_supported_rpc_error_code() {
-        use ocpp_client::ocpp_types::v201::RpcErrorCode;
+        use crate::wire::v201::RpcErrorCode;
         let error = ocpp_2_0_1_not_supported("GetLocalListVersion");
         assert_eq!(error.code, RpcErrorCode::NotSupported);
     }
@@ -341,7 +341,7 @@ mod tests {
     #[cfg(feature = "ocpp_1_6")]
     #[test]
     fn ocpp_1_6_not_supported_uses_the_not_supported_rpc_error_code() {
-        use ocpp_client::ocpp_types::v16::RpcErrorCode;
+        use crate::wire::v16::RpcErrorCode;
         let error = ocpp_1_6_not_supported("GetLocalListVersion");
         assert_eq!(error.code, RpcErrorCode::NotSupported);
     }

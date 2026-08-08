@@ -845,15 +845,15 @@ mod ocpp_2_1 {
     };
     use crate::actor::ChargePointActor;
     use crate::state::{Component, Variable, VariableAttributeType};
+    use crate::wire::v21::common::{
+        AttributeEnum, GetVariableData, GetVariableResult, GetVariableStatusEnum, SetVariableData,
+        SetVariableResult, SetVariableStatusEnum,
+    };
+    use crate::wire::v21::{GetVariablesResponse, SetVariablesResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use alloc::vec::Vec;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{
-        AttributeEnum, GetVariableData, GetVariableResult, GetVariableStatusEnum, SetVariableData,
-        SetVariableResult, SetVariableStatusEnum,
-    };
-    use ocpp_client::ocpp_types::v21::{GetVariablesResponse, SetVariablesResponse};
 
     /// The largest byte-boundary-safe prefix of `value` no longer than `max_bytes` - mirrors
     /// `crate::id_tag`'s private helper of the same shape; duplicated here (and in the
@@ -886,7 +886,7 @@ mod ocpp_2_1 {
     /// rather than needing a separate fallible parse path (the same "let it resolve to the
     /// correct-anyway outcome" reasoning behind truncating an over-long string elsewhere in this
     /// crate, rather than dropping the whole message).
-    fn map_component(component: &ocpp_client::ocpp_types::v21::common::Component) -> Component {
+    fn map_component(component: &crate::wire::v21::common::Component) -> Component {
         let evse = component.evse.as_ref().map(|evse| {
             let evse_id = usize::try_from(evse.id).unwrap_or(usize::MAX);
             let connector_id = evse.connector_id.and_then(|id| usize::try_from(id).ok());
@@ -902,7 +902,7 @@ mod ocpp_2_1 {
         }
     }
 
-    fn map_variable(variable: &ocpp_client::ocpp_types::v21::common::Variable) -> Variable {
+    fn map_variable(variable: &crate::wire::v21::common::Variable) -> Variable {
         Variable {
             name: variable.name.to_string(),
             instance: variable
@@ -939,7 +939,10 @@ mod ocpp_2_1 {
         let attribute_status = map_get_variable_status(&outcome);
         let attribute_value = match outcome {
             GetVariableOutcome::Accepted(value) => {
-                heapless::String::try_from(truncate_to_byte_boundary(&value, 2500)).ok()
+                // `attributeValue` is an unbounded `String` since `ocpp-types` 0.2.0 (its
+                // length is a device-model variable, not a fixed cap), so this truncates to the
+                // same 2500 bytes the `heapless` capacity used to enforce and cannot fail.
+                Some(truncate_to_byte_boundary(&value, 2500).into())
             }
             _ => None,
         };
@@ -1102,18 +1105,14 @@ mod ocpp_2_1 {
             );
         }
 
-        fn wire_component(
-            evse: Option<(i64, Option<i64>)>,
-        ) -> ocpp_client::ocpp_types::v21::common::Component {
-            ocpp_client::ocpp_types::v21::common::Component {
+        fn wire_component(evse: Option<(i64, Option<i64>)>) -> crate::wire::v21::common::Component {
+            crate::wire::v21::common::Component {
                 custom_data: None,
-                evse: evse.map(
-                    |(id, connector_id)| ocpp_client::ocpp_types::v21::common::EVSE {
-                        connector_id,
-                        custom_data: None,
-                        id,
-                    },
-                ),
+                evse: evse.map(|(id, connector_id)| crate::wire::v21::common::EVSE {
+                    connector_id,
+                    custom_data: None,
+                    id,
+                }),
                 instance: None,
                 name: heapless::String::try_from("OCPPCommCtrlr").unwrap(),
             }
@@ -1152,7 +1151,7 @@ mod ocpp_2_1 {
                 attribute_type: None,
                 component: wire_component(None),
                 custom_data: None,
-                variable: ocpp_client::ocpp_types::v21::common::Variable {
+                variable: crate::wire::v21::common::Variable {
                     custom_data: None,
                     instance: None,
                     name: heapless::String::try_from("HeartbeatInterval").unwrap(),
@@ -1183,15 +1182,15 @@ mod ocpp_2_0_1 {
     };
     use crate::actor::ChargePointActor;
     use crate::state::{Component, Variable, VariableAttributeType};
+    use crate::wire::v201::common::{
+        AttributeEnum, GetVariableData, GetVariableResult, GetVariableStatusEnum, SetVariableData,
+        SetVariableResult, SetVariableStatusEnum,
+    };
+    use crate::wire::v201::{GetVariablesResponse, SetVariablesResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use alloc::vec::Vec;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{
-        AttributeEnum, GetVariableData, GetVariableResult, GetVariableStatusEnum, SetVariableData,
-        SetVariableResult, SetVariableStatusEnum,
-    };
-    use ocpp_client::ocpp_types::v201::{GetVariablesResponse, SetVariablesResponse};
 
     fn truncate_to_byte_boundary(value: &str, max_bytes: usize) -> &str {
         if value.len() <= max_bytes {
@@ -1214,7 +1213,7 @@ mod ocpp_2_0_1 {
     }
 
     /// Mirrors [`super::ocpp_2_1::map_component`].
-    fn map_component(component: &ocpp_client::ocpp_types::v201::common::Component) -> Component {
+    fn map_component(component: &crate::wire::v201::common::Component) -> Component {
         let evse = component.evse.as_ref().map(|evse| {
             let evse_id = usize::try_from(evse.id).unwrap_or(usize::MAX);
             let connector_id = evse.connector_id.and_then(|id| usize::try_from(id).ok());
@@ -1230,7 +1229,7 @@ mod ocpp_2_0_1 {
         }
     }
 
-    fn map_variable(variable: &ocpp_client::ocpp_types::v201::common::Variable) -> Variable {
+    fn map_variable(variable: &crate::wire::v201::common::Variable) -> Variable {
         Variable {
             name: variable.name.to_string(),
             instance: variable
@@ -1267,7 +1266,10 @@ mod ocpp_2_0_1 {
         let attribute_status = map_get_variable_status(&outcome);
         let attribute_value = match outcome {
             GetVariableOutcome::Accepted(value) => {
-                heapless::String::try_from(truncate_to_byte_boundary(&value, 2500)).ok()
+                // `attributeValue` is an unbounded `String` since `ocpp-types` 0.2.0 (its
+                // length is a device-model variable, not a fixed cap), so this truncates to the
+                // same 2500 bytes the `heapless` capacity used to enforce and cannot fail.
+                Some(truncate_to_byte_boundary(&value, 2500).into())
             }
             _ => None,
         };
@@ -1409,9 +1411,9 @@ mod ocpp_2_0_1 {
 
         #[test]
         fn a_negative_evse_id_maps_to_a_sentinel_that_never_matches() {
-            let component = ocpp_client::ocpp_types::v201::common::Component {
+            let component = crate::wire::v201::common::Component {
                 custom_data: None,
-                evse: Some(ocpp_client::ocpp_types::v201::common::EVSE {
+                evse: Some(crate::wire::v201::common::EVSE {
                     connector_id: None,
                     custom_data: None,
                     id: -1,
@@ -1495,14 +1497,12 @@ mod ocpp_1_6 {
         Component, DeviceModel, Variable, VariableAttributeType, VariableDefinition,
         VariableMutability,
     };
+    use crate::wire::v16::common::{ChangeConfigurationResponseStatus, ConfigurationKeyItem};
+    use crate::wire::v16::{ChangeConfigurationResponse, GetConfigurationResponse};
     use alloc::boxed::Box;
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
     use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::common::{
-        ChangeConfigurationResponseStatus, ConfigurationKeyItem,
-    };
-    use ocpp_client::ocpp_types::v16::{ChangeConfigurationResponse, GetConfigurationResponse};
 
     /// The largest byte-boundary-safe prefix of `value` no longer than `max_bytes` - mirrors
     /// `crate::id_tag`'s private helper of the same shape (a small intentional duplicate rather

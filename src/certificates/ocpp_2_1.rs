@@ -4,16 +4,16 @@ use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use ocpp_client::ocpp_2_1::OCPP2_1Client;
-use ocpp_client::ocpp_types::v21::common::{
+use crate::wire::v21::common::{
     CertificateHashData as WireHashData, CertificateHashDataChain, DeleteCertificateStatusEnum,
     GetCertificateIdUseEnum, GetInstalledCertificateStatusEnum, HashAlgorithmEnum,
     InstallCertificateStatusEnum, InstallCertificateUseEnum,
 };
-use ocpp_client::ocpp_types::v21::{
+use crate::wire::v21::{
     DeleteCertificateRequest, DeleteCertificateResponse, GetInstalledCertificateIdsRequest,
     GetInstalledCertificateIdsResponse, InstallCertificateRequest, InstallCertificateResponse,
 };
+use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
 use crate::actor::ChargePointActor;
 use crate::certificates::{

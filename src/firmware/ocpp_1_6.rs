@@ -11,20 +11,22 @@
 //!   the installation; installation follows as soon as the charge point is able (L01.FR.05).
 //! - **Seven statuses, not fourteen.** `DownloadScheduled`, `InstallScheduled` and
 //!   `InstallRebooting` have no 1.6J value; see [`wire_status`] for what each becomes and why.
-//! - **No signature or certificate.** 1.6J's plain `UpdateFirmware` carries neither (the Security
-//!   Whitepaper's `SignedUpdateFirmware` does, and `ocpp-types` does not generate that message
-//!   set - see D2.2), so a 1.6J update is unsigned by construction.
+//! - **No signature or certificate.** 1.6J's plain `UpdateFirmware` carries neither, so a 1.6J
+//!   update handled here is unsigned by construction. The Security Whitepaper's
+//!   `SignedUpdateFirmware`/`SignedFirmwareStatusNotification` do carry them, and as of
+//!   `ocpp-types` 0.2.0 / `ocpp-client` 0.4.0 both are generated and wrapped as actions - this
+//!   crate simply does not wire them yet (roadmap D2.2). Until it does, the limitation stands;
+//!   it is now a gap here rather than upstream.
 
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::sync::Arc;
-use chrono::{DateTime, Utc};
 
-use ocpp_client::ocpp_1_6::OCPP1_6Client;
-use ocpp_client::ocpp_types::v16::common::FirmwareStatusNotificationRequestStatus;
-use ocpp_client::ocpp_types::v16::{
+use crate::wire::v16::common::FirmwareStatusNotificationRequestStatus;
+use crate::wire::v16::{
     FirmwareStatusNotificationRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
+use ocpp_client::ocpp_1_6::OCPP1_6Client;
 
 use crate::actor::ChargePointActor;
 use crate::firmware::{
@@ -32,17 +34,13 @@ use crate::firmware::{
     FirmwareUpdateState, UpdateFirmwareHandler, handle_update_firmware,
 };
 
-fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|parsed| parsed.with_timezone(&Utc))
-}
-
 fn map_request(request: &UpdateFirmwareRequest) -> FirmwareUpdateRequest {
     FirmwareUpdateRequest {
         request_id: None,
         location: request.location.to_string(),
-        retrieve_at: parse_time(&request.retrieve_date),
+        // Infallible since `ocpp-types` 0.2.0 - `retrieveDate` arrives already validated,
+        // so an unparseable one is refused by `ocpp-client`'s decoder rather than reaching here.
+        retrieve_at: Some(request.retrieve_date.into()),
         // 1.6J has no `installDate`: installation happens as soon as the charge point is able.
         install_at: None,
         signature: None,
@@ -191,7 +189,7 @@ mod tests {
         let mapped = map_request(&UpdateFirmwareRequest {
             location: "ftp://fw.example/image.bin".into(),
             retries: Some(1),
-            retrieve_date: "2026-03-04T05:00:00Z".into(),
+            retrieve_date: "2026-03-04T05:00:00Z".try_into().unwrap(),
             retry_interval: Some(60),
         });
 

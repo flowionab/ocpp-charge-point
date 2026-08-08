@@ -7,7 +7,9 @@
 //!
 //! - **No log type.** 1.6J has only "diagnostics", so a 1.6J CSMS cannot ask for the security log
 //!   at all - see [`crate::diagnostics::render_security_log`] for what it is missing. Every 1.6J
-//!   request maps to [`LogKind::Diagnostics`].
+//!   request maps to [`LogKind::Diagnostics`]. The Security Whitepaper's `GetLog`/
+//!   `LogStatusNotification` would close this, and `ocpp-client` 0.4.0 wraps both for 1.6; this
+//!   crate does not wire them yet (roadmap D2.2), so the loss is currently real.
 //! - **No `requestId`.** Nothing correlates a status notification with the request that caused it,
 //!   so this adapter reports `None` and the wire message has no field for one either. 2.x's
 //!   N01.FR.07 has no 1.6J counterpart to violate.
@@ -20,11 +22,11 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use chrono::{DateTime, Utc};
 
-use ocpp_client::ocpp_1_6::OCPP1_6Client;
-use ocpp_client::ocpp_types::v16::common::DiagnosticsStatusNotificationRequestStatus;
-use ocpp_client::ocpp_types::v16::{
+use crate::wire::v16::common::DiagnosticsStatusNotificationRequestStatus;
+use crate::wire::v16::{
     DiagnosticsStatusNotificationRequest, GetDiagnosticsRequest, GetDiagnosticsResponse,
 };
+use ocpp_client::ocpp_1_6::OCPP1_6Client;
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
@@ -36,10 +38,11 @@ use crate::hardware::LogKind;
 
 /// 1.6J timestamps are the same RFC 3339 strings 2.x uses; an unparseable one becomes no filter,
 /// exactly as in the 2.x adapters.
-fn parse_time(raw: &Option<alloc::string::String>) -> Option<DateTime<Utc>> {
-    raw.as_ref()
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|parsed| parsed.with_timezone(&Utc))
+fn parse_time(raw: &Option<crate::wire::OcppTimestamp>) -> Option<DateTime<Utc>> {
+    // Infallible since `ocpp-types` 0.2.0: the value arrives already validated, so the
+    // "unparseable becomes absent" case this used to cover can no longer occur - a malformed
+    // `dateTime` is refused by `ocpp-client`'s decoder before it reaches this crate.
+    raw.map(Into::into)
 }
 
 fn map_request(request: &GetDiagnosticsRequest) -> LogUploadRequest {
@@ -189,7 +192,7 @@ mod tests {
             location: "ftp://logs.example/up".into(),
             retries: Some(2),
             retry_interval: Some(20),
-            start_time: Some("2026-03-04T05:06:07Z".into()),
+            start_time: Some("2026-03-04T05:06:07Z".try_into().unwrap()),
             stop_time: None,
         }
     }

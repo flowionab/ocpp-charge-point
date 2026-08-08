@@ -448,10 +448,10 @@ mod ocpp_2_1 {
     use super::{ResetHandler, ResetOutcome, handle_reset};
     use crate::actor::ChargePointActor;
     use crate::state::{ResetKind, ResetTarget};
+    use crate::wire::v21::common::{ResetEnum, ResetStatusEnum};
+    use crate::wire::v21::{ResetRequest, ResetResponse};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
-    use ocpp_client::ocpp_types::v21::common::{ResetEnum, ResetStatusEnum};
-    use ocpp_client::ocpp_types::v21::{ResetRequest, ResetResponse};
 
     /// OCPP 2.1 adds `ImmediateAndResume` (reset immediately, then automatically resume the
     /// transaction that was interrupted) alongside `Immediate`/`OnIdle`. This crate doesn't yet
@@ -574,10 +574,10 @@ mod ocpp_2_0_1 {
     use super::{ResetHandler, ResetOutcome, handle_reset};
     use crate::actor::ChargePointActor;
     use crate::state::{ResetKind, ResetTarget};
+    use crate::wire::v201::common::{ResetEnum, ResetStatusEnum};
+    use crate::wire::v201::{ResetRequest, ResetResponse};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
-    use ocpp_client::ocpp_types::v201::common::{ResetEnum, ResetStatusEnum};
-    use ocpp_client::ocpp_types::v201::{ResetRequest, ResetResponse};
 
     /// OCPP 2.0.1's `ResetEnum` only has `Immediate`/`OnIdle` - a direct 1:1 mapping, unlike
     /// 2.1's `ImmediateAndResume` addition (see `super::ocpp_2_1::map_kind`).
@@ -689,10 +689,10 @@ mod ocpp_1_6 {
     use super::{ResetHandler, ResetOutcome, handle_reset};
     use crate::actor::ChargePointActor;
     use crate::state::{ResetKind, ResetTarget};
+    use crate::wire::v16::ResetResponse;
+    use crate::wire::v16::common::{ResetRequestType, ResetResponseStatus};
     use alloc::boxed::Box;
     use ocpp_client::ocpp_1_6::OCPP1_6Client;
-    use ocpp_client::ocpp_types::v16::ResetResponse;
-    use ocpp_client::ocpp_types::v16::common::{ResetRequestType, ResetResponseStatus};
 
     /// OCPP 1.6J's `Reset.req` has no `evseId` - a Reset always targets the whole charge point.
     /// Its `type` is `Hard`/`Soft` rather than 2.0.1/2.1's `Immediate`/`OnIdle`, with different

@@ -58,6 +58,7 @@ use crate::actor::ChargePointActor;
 use crate::clock::{Clock, is_synchronized};
 use crate::state::{AuthorizationStatus, ChargePointEvent, IdToken, TransactionId};
 use crate::sync::Chan;
+use chrono::{DateTime, Utc};
 
 /// The most bytes of report text carried in a single `NotifyCustomerInformation` chunk (see
 /// [`chunk_customer_information`]). Matches `ocpp-types`' own `NotifyCustomerInformationRequest`
@@ -293,7 +294,7 @@ fn split_at_char_boundaries(data: &str, max_bytes: usize) -> Vec<&str> {
 /// The `NotifyCustomerInformation.generatedAt` timestamp, sourced from `clock.now()` - the same
 /// unsynchronized-clock stance [`crate::reporting`]'s equivalent helper takes: send it as-is and
 /// warn, never fabricate or drop it.
-fn generated_at<C: Clock>(clock: &C) -> String {
+fn generated_at<C: Clock>(clock: &C) -> DateTime<Utc> {
     let now = clock.now();
     if !is_synchronized(&now) {
         tracing::warn!(
@@ -301,7 +302,7 @@ fn generated_at<C: Clock>(clock: &C) -> String {
             "NotifyCustomerInformation generatedAt sourced from an unsynchronized clock"
         );
     }
-    now.to_rfc3339()
+    now
 }
 
 /// Reports one `CustomerInformation` chunk to the CSMS, logging (and swallowing) a failure - a
@@ -309,7 +310,7 @@ fn generated_at<C: Clock>(clock: &C) -> String {
 async fn send_chunk<N: CustomerInformationNotifier>(
     notifier: &N,
     request_id: i64,
-    generated_at: &str,
+    generated_at: DateTime<Utc>,
     chunk: CustomerInformationChunk,
 ) {
     if let Err(err) = notifier
@@ -363,7 +364,7 @@ pub async fn run_customer_information_requests<N, C>(
             let data = render(&job.id_token, &record);
             let generated_at = generated_at(clock);
             for chunk in chunk_customer_information(&data) {
-                send_chunk(notifier, job.request_id, &generated_at, chunk).await;
+                send_chunk(notifier, job.request_id, generated_at, chunk).await;
             }
         }
         if job.clear {
@@ -385,7 +386,7 @@ pub trait CustomerInformationNotifier {
         request_id: i64,
         seq_no: i64,
         tbc: bool,
-        generated_at: &str,
+        generated_at: DateTime<Utc>,
         data: String,
     ) -> Result<(), Self::Error>;
 }
@@ -401,7 +402,7 @@ impl<T: CustomerInformationNotifier + Send + Sync + ?Sized> CustomerInformationN
         request_id: i64,
         seq_no: i64,
         tbc: bool,
-        generated_at: &str,
+        generated_at: DateTime<Utc>,
         data: String,
     ) -> Result<(), Self::Error> {
         (**self)

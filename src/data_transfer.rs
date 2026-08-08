@@ -156,12 +156,12 @@ mod ocpp_2_1 {
         DataTransferHandler, DataTransferMessage, DataTransferOutcome, DataTransferRegistrar,
         DataTransferResult, DataTransferSender,
     };
+    use crate::wire::v21::common::DataTransferStatusEnum;
+    use crate::wire::v21::{DataTransferRequest, DataTransferResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
-    use ocpp_client::ocpp_types::v21::common::DataTransferStatusEnum;
-    use ocpp_client::ocpp_types::v21::{DataTransferRequest, DataTransferResponse};
 
     fn map_status_to_outcome(status: DataTransferStatusEnum) -> DataTransferOutcome {
         match status {
@@ -330,12 +330,12 @@ mod ocpp_2_0_1 {
         DataTransferHandler, DataTransferMessage, DataTransferOutcome, DataTransferRegistrar,
         DataTransferResult, DataTransferSender,
     };
+    use crate::wire::v201::common::DataTransferStatusEnum;
+    use crate::wire::v201::{DataTransferRequest, DataTransferResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
-    use ocpp_client::ocpp_types::v201::common::DataTransferStatusEnum;
-    use ocpp_client::ocpp_types::v201::{DataTransferRequest, DataTransferResponse};
 
     fn map_status_to_outcome(status: DataTransferStatusEnum) -> DataTransferOutcome {
         match status {
@@ -498,12 +498,12 @@ mod ocpp_1_6 {
         DataTransferHandler, DataTransferMessage, DataTransferOutcome, DataTransferRegistrar,
         DataTransferResult, DataTransferSender,
     };
+    use crate::wire::v16::common::DataTransferResponseStatus;
+    use crate::wire::v16::{DataTransferRequest, DataTransferResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
-    use ocpp_client::ocpp_types::v16::common::DataTransferResponseStatus;
-    use ocpp_client::ocpp_types::v16::{DataTransferRequest, DataTransferResponse};
 
     fn map_status_to_outcome(status: DataTransferResponseStatus) -> DataTransferOutcome {
         match status {

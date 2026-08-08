@@ -6,7 +6,7 @@
 //! `docs/ROADMAP.md` §0.
 
 use crate::state::{IdToken, IdTokenKind};
-use ocpp_client::ocpp_types::v16::IdTag;
+use crate::wire::v16::IdTag;
 
 /// The largest byte-boundary-safe prefix of `value` no longer than `max_bytes`.
 fn truncate_to_byte_boundary(value: &str, max_bytes: usize) -> &str {
@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn an_id_tag_maps_back_to_an_id_token_with_a_central_kind() {
-        let id_tag = ocpp_client::ocpp_types::v16::IdTag::try_from("04A224B2").unwrap();
+        let id_tag = crate::wire::v16::IdTag::try_from("04A224B2").unwrap();
 
         assert_eq!(
             map_id_token(&id_tag),

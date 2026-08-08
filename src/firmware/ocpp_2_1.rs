@@ -3,13 +3,12 @@
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::sync::Arc;
-use chrono::{DateTime, Utc};
 
-use ocpp_client::ocpp_2_1::OCPP2_1Client;
-use ocpp_client::ocpp_types::v21::common::{FirmwareStatusEnum, UpdateFirmwareStatusEnum};
-use ocpp_client::ocpp_types::v21::{
+use crate::wire::v21::common::{FirmwareStatusEnum, UpdateFirmwareStatusEnum};
+use crate::wire::v21::{
     FirmwareStatusNotificationRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
+use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
 use crate::actor::ChargePointActor;
 use crate::firmware::{
@@ -17,21 +16,17 @@ use crate::firmware::{
     FirmwareUpdateState, UpdateFirmwareHandler, UpdateFirmwareOutcome, handle_update_firmware,
 };
 
-fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|parsed| parsed.with_timezone(&Utc))
-}
-
 fn map_request(request: &UpdateFirmwareRequest) -> FirmwareUpdateRequest {
     let firmware = &request.firmware;
     FirmwareUpdateRequest {
         request_id: Some(request.request_id),
         location: firmware.location.to_string(),
-        // `retrieveDateTime` is required on the wire; an unparseable one becomes "now", which
-        // starts the update the CSMS asked for rather than stalling it on a formatting problem.
-        retrieve_at: parse_time(&firmware.retrieve_date_time),
-        install_at: firmware.install_date_time.as_deref().and_then(parse_time),
+        // `retrieveDateTime` is required on the wire, and since `ocpp-types` 0.2.0 it arrives
+        // already validated as an `OcppTimestamp`, so this can no longer fail: an unparseable
+        // one is rejected by `ocpp-client`'s decoder before it reaches this crate. The old
+        // "unparseable becomes now" fallback therefore has no case left to cover.
+        retrieve_at: Some(firmware.retrieve_date_time.into()),
+        install_at: firmware.install_date_time.map(Into::into),
         signature: firmware.signature.as_deref().map(Into::into),
         signing_certificate: firmware.signing_certificate.as_deref().map(Into::into),
         retries: request
@@ -176,18 +171,18 @@ mod std_impls {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocpp_client::ocpp_types::v21::common::Firmware;
+    use crate::wire::v21::common::Firmware;
 
     fn wire_request() -> UpdateFirmwareRequest {
         UpdateFirmwareRequest {
             custom_data: None,
             firmware: Firmware {
                 custom_data: None,
-                install_date_time: Some("2026-03-04T06:00:00Z".into()),
-                location: heapless::String::try_from("https://fw.example/image.bin").unwrap(),
-                retrieve_date_time: "2026-03-04T05:00:00Z".into(),
-                signature: Some(heapless::String::try_from("c2ln").unwrap()),
-                signing_certificate: Some(heapless::String::try_from("Y2VydA==").unwrap()),
+                install_date_time: Some("2026-03-04T06:00:00Z".try_into().unwrap()),
+                location: "https://fw.example/image.bin".into(),
+                retrieve_date_time: "2026-03-04T05:00:00Z".try_into().unwrap(),
+                signature: Some("c2ln".into()),
+                signing_certificate: Some("Y2VydA==".into()),
             },
             request_id: 77,
             retries: Some(2),
@@ -211,14 +206,31 @@ mod tests {
         assert_eq!(mapped.signing_certificate.as_deref(), Some("Y2VydA=="));
     }
 
+    /// Replaces an older test that fed `map_request` a malformed `retrieveDateTime` and asserted
+    /// it degraded to `retrieve_at: None` ("start now"). Since `ocpp-types` 0.2.0 that input
+    /// cannot reach `map_request` at all: `retrieveDateTime` is an `OcppTimestamp`, so a
+    /// malformed value is refused while the CALL is being decoded and answered with a
+    /// `CALLERROR` - the charge point never builds a `FirmwareUpdateRequest` from it. This pins
+    /// the guard at its new location rather than dropping the coverage.
     #[test]
-    fn an_unparseable_retrieve_time_starts_the_update_rather_than_stalling_it() {
-        let mut request = wire_request();
-        request.firmware.retrieve_date_time = "not a timestamp".into();
+    fn a_malformed_retrieve_time_is_refused_by_the_decoder_before_it_reaches_this_crate() {
+        assert!(crate::wire::OcppTimestamp::parse_rfc3339("not a timestamp").is_err());
+    }
 
-        // `None` means "now" downstream - the CSMS asked for an update, and refusing it over a
-        // formatting problem in a field whose whole job is "when" would serve nobody.
-        assert_eq!(map_request(&request).retrieve_at, None);
+    /// The flip side: a well-formed `retrieveDateTime` reaches `map_request` as the instant the
+    /// CSMS named, so scheduling the download is exact rather than "close enough".
+    #[test]
+    fn a_well_formed_retrieve_time_maps_to_the_instant_the_csms_named() {
+        let request = wire_request();
+
+        assert_eq!(
+            map_request(&request).retrieve_at,
+            Some(
+                "2026-03-04T05:00:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+            ),
+        );
     }
 
     #[test]

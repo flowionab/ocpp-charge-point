@@ -114,6 +114,10 @@ struct Inner {
     jitter_range_secs: u32,
     /// The jitter PRNG's state - see [`ConnectionTarget::next_jitter_secs`].
     jitter_state: u64,
+    /// How many redials this target has been asked for, ever. Only the *difference* matters:
+    /// [`run_network_profile_switching`] snapshots it across the switch grace period to tell
+    /// "the connection has not moved yet" from "it already moved on its own".
+    dials: u64,
 }
 
 impl ConnectionTarget {
@@ -134,6 +138,7 @@ impl ConnectionTarget {
                 version: None,
                 jitter_range_secs: 0,
                 jitter_state: jitter_seed(address, options.username),
+                dials: 0,
             }),
         })
     }
@@ -256,6 +261,17 @@ impl ConnectionTarget {
     }
 
     /// Marks the active address as working: it becomes the address a future rollback returns to.
+    /// Counts a redial through this target, whatever its outcome. See [`Inner::dials`].
+    fn record_dial(&self) {
+        let mut inner = self.inner.lock().expect("target lock");
+        inner.dials = inner.dials.saturating_add(1);
+    }
+
+    /// How many redials this target has been asked for. See [`Inner::dials`].
+    fn dial_count(&self) -> u64 {
+        self.inner.lock().expect("target lock").dials
+    }
+
     fn record_success(&self) {
         let mut inner = self.inner.lock().expect("target lock");
         inner.fallback = None;
@@ -317,6 +333,7 @@ impl ConnectionTarget {
             ..Default::default()
         };
 
+        self.record_dial();
         match websocket_transport(&address, version, Some(options)).await {
             Ok(transport) => {
                 self.record_success();
@@ -391,15 +408,29 @@ impl Reconnector for TargetReconnector {
     }
 }
 
-/// Closes the current CSMS connection, so the transport redials through the
+/// Abandons the current CSMS connection, so the transport redials through the
 /// [`ConnectionTarget`].
 ///
 /// Kept as this crate's own trait, like every other CSMS-facing capability, so the switching loop
 /// is testable without a live socket and works for whichever OCPP version was negotiated.
+///
+/// **This must not close the client.** The implementations below call
+/// [`Client::force_reconnect`], not `Client::disconnect`. From `ocpp-client` 0.3.0 `disconnect()`
+/// is sticky and outranks every automatic recovery path - the read loop exits instead of
+/// redialling, `force_reconnect()` becomes a no-op, and later sends fail with
+/// `ClientError::Closed` - so using it here would take the charge point permanently offline on
+/// the first network-profile switch, needing a reboot to recover. Before 0.3.0 the two were
+/// indistinguishable from the read loop's side, which is why this used to be spelled as a close.
+///
+/// The method name is retained from that era; it describes the intent (give up this connection)
+/// rather than the mechanism.
+///
+/// [`Client::force_reconnect`]: ocpp_client::Client::force_reconnect
 #[async_trait::async_trait]
 pub trait ConnectionCloser {
-    /// Closes the connection. A failure is not an error worth propagating: the connection is
-    /// being deliberately discarded, and one that is already broken needs no closing.
+    /// Abandons the connection so it is redialled through the [`ConnectionTarget`]. Infallible:
+    /// the connection is being deliberately discarded, and one that is already broken needs no
+    /// help being abandoned.
     async fn close_connection(&self);
 }
 
@@ -443,8 +474,26 @@ pub async fn run_network_profile_switching<D: ConnectionCloser, B: crate::provis
             && target.switch_to(&address)
         {
             tracing::info!(%address, "switching the CSMS connection to a network profile");
+            let dials_before = target.dial_count();
             backoff.wait(SWITCH_GRACE_SECS).await;
-            closer.close_connection().await;
+            // Only abandon the connection if it is still the old one. `switch_to` has already
+            // re-pointed the target, so a redial that happened during the grace period - the CSMS
+            // dropping us, a keepalive giving up, anything - has *already* landed on the new
+            // address, and there is nothing left to move.
+            //
+            // Forcing anyway is actively harmful: `Client::force_reconnect` tears down whatever
+            // connection is current when it is observed, so a force racing an in-flight redial
+            // kills the freshly-established one. The charge point recovers (it redials again),
+            // but it pays an extra round trip and, because the resend of `BootNotification` from
+            // `on_reconnect` lands in that torn-down window, a full boot-retry interval offline.
+            if target.dial_count() == dials_before {
+                closer.close_connection().await;
+            } else {
+                tracing::debug!(
+                    %address,
+                    "the connection already redialled through the new target; not forcing another"
+                );
+            }
         }
 
         states.changed().await;
@@ -486,7 +535,8 @@ fn connection_attempts(state: &crate::state::ChargePointState) -> u32 {
 #[async_trait::async_trait]
 impl ConnectionCloser for ocpp_client::ocpp_2_1::OCPP2_1Client {
     async fn close_connection(&self) {
-        let _ = self.disconnect().await;
+        // `force_reconnect`, never `disconnect` - see the trait's docs.
+        self.force_reconnect();
     }
 }
 
@@ -494,7 +544,8 @@ impl ConnectionCloser for ocpp_client::ocpp_2_1::OCPP2_1Client {
 #[async_trait::async_trait]
 impl ConnectionCloser for ocpp_client::ocpp_2_0_1::OCPP2_0_1Client {
     async fn close_connection(&self) {
-        let _ = self.disconnect().await;
+        // `force_reconnect`, never `disconnect` - see the trait's docs.
+        self.force_reconnect();
     }
 }
 
@@ -502,7 +553,8 @@ impl ConnectionCloser for ocpp_client::ocpp_2_0_1::OCPP2_0_1Client {
 #[async_trait::async_trait]
 impl ConnectionCloser for ocpp_client::ocpp_1_6::OCPP1_6Client {
     async fn close_connection(&self) {
-        let _ = self.disconnect().await;
+        // `force_reconnect`, never `disconnect` - see the trait's docs.
+        self.force_reconnect();
     }
 }
 
@@ -692,6 +744,57 @@ mod tests {
 
         assert_eq!(target.address(), "wss://elsewhere");
         assert_eq!(*closes.lock().unwrap(), 1);
+        switching.abort();
+    }
+
+    /// A redial that happens on its own during the switch grace period has already landed on the
+    /// new address (`switch_to` re-pointed the target before the wait), so there is nothing left
+    /// to abandon.
+    ///
+    /// Forcing anyway is not merely redundant: `Client::force_reconnect` tears down whichever
+    /// connection is current when the read loop observes it, so a force racing an in-flight
+    /// redial destroys the connection that just came up. The charge point recovers, but only
+    /// after another redial *and* a boot-retry interval, because the `BootNotification` resent
+    /// from `on_reconnect` is written into the torn-down window. Seen for real against
+    /// `ocpp-client` 0.4.0 in `tests/network_profile_switch.rs`, where the CSMS closes its side
+    /// as soon as it has answered `SetNetworkProfile`.
+    #[tokio::test]
+    async fn a_connection_that_already_redialled_itself_is_not_forced_to_redial_again() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let target = target("wss://origin");
+        let closes = Arc::new(Mutex::new(0));
+        let closer = RecordingCloser {
+            closes: closes.clone(),
+        };
+
+        let switching = {
+            let actor = actor.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                run_network_profile_switching(&actor, &target, &closer, &TokioBackoff).await;
+            })
+        };
+
+        let _ = actor
+            .send(ChargePointEvent::NetworkProfileSet {
+                slot: 1,
+                profile: Box::new(profile("wss://elsewhere")),
+            })
+            .await;
+
+        // Stand in for the transport redialling of its own accord during the grace period - what
+        // `ConnectionTarget::dial` records on every redial it is asked for.
+        target.record_dial();
+
+        // Long enough for the grace period to elapse and the loop to decide.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(target.address(), "wss://elsewhere");
+        assert_eq!(
+            *closes.lock().unwrap(),
+            0,
+            "the connection had already moved; forcing another redial would kill it"
+        );
         switching.abort();
     }
 
