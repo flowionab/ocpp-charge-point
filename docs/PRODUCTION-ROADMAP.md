@@ -528,10 +528,11 @@ version.
       `identity` field at all. The 2.0.1 adapter matches its enum exhaustively with no catch-all,
       so a value added upstream becomes a compile error rather than a silent `Any`.
 
-      **E2.11 (persisting the slots) is unblocked by this** and left outstanding —
-      `ChargePointEvent::PersistedNetworkProfilesRestored` is already in place for a restore to
-      use. It matters more now that A9 has landed: a charge point that reboots forgets which
-      profile it was moved onto and comes back on the address its integrator compiled in.
+      **E2.11 (persisting the slots) is done** —
+      `ChargePointBuilder::network_profile_persistence` recovers the slot store at boot, before
+      either `network_profiles` or `network_profile_switching` can touch it, so a charge point
+      that reboots comes back on the profile it was moved onto rather than the address its
+      integrator compiled in.
 
 ### B2 — Smart charging (R§11)
 
@@ -1692,12 +1693,31 @@ mid-transaction currently loses the transaction.
       does not.
 - [ ] **E2.9** Certificates — **no longer blocked**: [B4.1](#b4--certificates-and-iso-15118-r1-r13)'s `StoredCertificates` is already `Storage`-backed and survives a reboot, so this row is now about a secure-element-backed store's own durability rather than about a store existing. Formerly blocked on
       which does not exist.
-- [ ] **E2.11** Network profiles. **No longer blocked** —
-      [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)'s slot store landed
-      and `ChargePointEvent::PersistedNetworkProfilesRestored` is in place for a restore to use.
-      Lower value than the other rows until [A9](#3-workstream-a--transport-negotiation-connection-lifecycle):
-      profiles this crate does not dial with are worth less after a reboot than a load limit or a
-      cached authorization decision.
+- [x] **E2.11** Network profiles — `persistence::NetworkProfileSnapshotStore`/
+      `restore_network_profiles`/`run_network_profile_persistence`, wired via
+      `ChargePointBuilder::network_profile_persistence`. One whole-store JSON snapshot per change,
+      versioned and discarded on decode failure or version mismatch like every other record here.
+      `NetworkProfileSlot`/`NetworkConnectionProfile` are persisted directly rather than through a
+      mirror type - the same call [E2.5](#72-e2--what-must-survive) makes for
+      `AuthorizationCacheEntry`: every field is already a scalar or a `serde`-deriving state type
+      (`NetworkInterface`, `NetworkTransport`), so there is no closed wire enum for a mirror to
+      protect against drifting.
+
+      Closes the gap [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) opened: a
+      charge point moved onto a CSMS-written profile now comes back on it after a reboot instead
+      of on the address its integrator compiled in.
+      `ChargePointBuilder::network_profile_persistence` must be registered before both
+      `network_profiles` (the inbound `SetNetworkProfile` handler) and
+      `network_profile_switching`, or a live write could race the restore, or a switch could pick
+      a profile before the operator's own choice is back in the store - documented on the method
+      and enforced by call order, not by the type system, matching
+      [E2.7](#72-e2--what-must-survive)'s `charging_profile_persistence`/`smart_charging`
+      ordering. No age or reachability filtering happens at boot: a network profile has no
+      `validTo` to filter on, and "unreachable" is a judgment [A9](#3-workstream-a--transport-negotiation-connection-lifecycle)'s
+      own rollback makes when it actually tries to connect, not one boot-time recovery can make in
+      advance. The slot bound (`StateLimits::max_network_profile_slots`) is already applied by
+      `NetworkProfileStore::replace`, which `PersistedNetworkProfilesRestored` was already wired
+      to at [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment).
 - [x] **E2.5** Authorization cache — `persistence::AuthorizationCacheStore`/
       `restore_authorization_cache`/`run_authorization_cache_persistence`, wired via
       `ChargePointBuilder::authorization_cache_persistence`. Unblocked by
@@ -2818,5 +2838,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 942 | `#[test]` + `#[tokio::test]`, re-counted at the B4.2 commit (920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 949 | `#[test]` + `#[tokio::test]`, re-counted at the E2.11 commit (942 at B4.2, 920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

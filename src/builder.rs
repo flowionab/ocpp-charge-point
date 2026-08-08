@@ -36,14 +36,15 @@ use crate::offline_queue::{
 };
 use crate::persistence::{
     AuthorizationCacheStore, BootReasonStore, ChargingProfileSnapshotStore, DeviceModelStore,
-    LocalAuthorizationListStore, QueueStore, ReservationStore, TransactionStore,
-    flush_and_persist_security_event_queue, flush_and_persist_status_notification_queue,
-    flush_and_persist_transaction_event_queue, restore_authorization_cache,
-    restore_charging_profiles, restore_device_model, restore_local_authorization_list,
-    restore_reservations, restore_security_event_queue, restore_security_log,
-    restore_status_notification_queue, restore_transaction_event_queue, restore_transactions,
-    run_authorization_cache_persistence, run_charging_profile_persistence,
-    run_device_model_persistence, run_local_authorization_list_persistence,
+    LocalAuthorizationListStore, NetworkProfileSnapshotStore, QueueStore, ReservationStore,
+    TransactionStore, flush_and_persist_security_event_queue,
+    flush_and_persist_status_notification_queue, flush_and_persist_transaction_event_queue,
+    restore_authorization_cache, restore_charging_profiles, restore_device_model,
+    restore_local_authorization_list, restore_network_profiles, restore_reservations,
+    restore_security_event_queue, restore_security_log, restore_status_notification_queue,
+    restore_transaction_event_queue, restore_transactions, run_authorization_cache_persistence,
+    run_charging_profile_persistence, run_device_model_persistence,
+    run_local_authorization_list_persistence, run_network_profile_persistence,
     run_persisted_security_event_queue, run_persisted_status_notification_queue,
     run_persisted_transaction_event_queue, run_reservation_persistence,
     run_security_log_persistence, run_transaction_persistence,
@@ -1068,6 +1069,45 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers durable network-connection-profile state (`docs/PRODUCTION-ROADMAP.md` §7.2,
+    /// E2.11): recovers whatever configuration slots the CSMS had written before the charge point
+    /// last lost power, then persists every subsequent change through `storage` for the life of
+    /// the process.
+    ///
+    /// **Call this before [`Self::network_profiles`] and before
+    /// [`Self::network_profile_switching`]** - the restore must land before either one can touch
+    /// the store: `network_profiles` could otherwise let a live `SetNetworkProfile` race the
+    /// restore (an inbound write landing in the empty store just before `replace` overwrites it
+    /// with the stale snapshot), and `network_profile_switching` could select a profile before the
+    /// operator's own choice is back in place. Registering all three in this order is all that
+    /// takes; the restore completes before this method returns, exactly like
+    /// [`Self::charging_profile_persistence`].
+    ///
+    /// Without it, a charge point moved onto a CSMS-written profile after [A9] comes back on the
+    /// address its integrator compiled in rather than the one the operator moved it to - the whole
+    /// point of storing profiles is defeated by the very event (a reboot) they most need to
+    /// survive. `storage` may be [`crate::hardware::NoStorage`], in which case this behaves exactly
+    /// as if it were never called.
+    ///
+    /// No age or reachability filtering happens at boot - see
+    /// [`crate::persistence::restore_network_profiles`] for why neither applies here.
+    ///
+    /// [A9]: crate::network_switch
+    pub async fn network_profile_persistence<S>(self, storage: S) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+    {
+        let store = Arc::new(NetworkProfileSnapshotStore::new(storage));
+        restore_network_profiles(&self.runtime.actor(), &store).await;
+
+        let state_changes = self.runtime.actor().subscribe();
+        self.executor.spawn(Box::pin(async move {
+            run_network_profile_persistence(state_changes, &store).await;
+        }));
+
+        self
+    }
+
     /// Registers inbound `SetNetworkProfile` handling (`docs/ROADMAP.md` §2,
     /// `docs/PRODUCTION-ROADMAP.md` B1.8): the CSMS writing a network connection profile into a
     /// configuration slot.
@@ -1075,6 +1115,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// **Storing a profile does not by itself switch the connection** - that is
     /// [`Self::network_profile_switching`], registered separately because it needs a transport
     /// this crate can re-point, which only [`crate::connect_and_setup`] builds.
+    ///
+    /// If [`Self::network_profile_persistence`] is used, register it before this method - see its
+    /// docs for why.
     ///
     /// 2.x only - 1.6J has no such message.
     pub async fn network_profiles<N>(self, csms: &N) -> Self
@@ -3273,6 +3316,80 @@ mod tests {
             state.evses[0].charging_limits[0],
             Some(20_000),
             "the recovered limit must reach hardware, not just the store"
+        );
+    }
+
+    /// The E2.11 end-to-end guarantee: a network profile slot the CSMS wrote before a reboot is
+    /// back in the store before anything could write to it or select from it again.
+    #[tokio::test]
+    async fn network_profile_persistence_survives_a_reboot_and_restores_before_registration() {
+        use crate::state::{
+            ChargePointEvent, NetworkConnectionProfile, NetworkInterface, NetworkTransport,
+        };
+
+        fn moved_profile() -> NetworkConnectionProfile {
+            NetworkConnectionProfile {
+                csms_url: "wss://operator.example/ocpp".into(),
+                interface: NetworkInterface::Any,
+                transport: NetworkTransport::Json,
+                security_profile: 2,
+                message_timeout_secs: 30,
+                identity: None,
+            }
+        }
+
+        let storage = Arc::new(InMemoryStorage::new());
+
+        // --- before the cut: the CSMS moves the charge point onto a new profile (A9).
+        let charge_point1 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
+            .await
+            .unwrap()
+            .network_profile_persistence(storage.clone())
+            .await;
+        let _ = builder1
+            .runtime
+            .actor()
+            .send(ChargePointEvent::NetworkProfileSet {
+                slot: 1,
+                profile: Box::new(moved_profile()),
+            })
+            .await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        drop(builder1);
+
+        // --- after the reboot: the slot is back before `network_profiles` can register the
+        // inbound handler that would otherwise race the restore.
+        let charge_point2 = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
+            .await
+            .unwrap()
+            .network_profile_persistence(storage.clone())
+            .await
+            .build();
+
+        let state = runtime2.actor().state();
+        assert_eq!(
+            state.network_profiles.get(1).map(|p| p.csms_url.as_str()),
+            Some("wss://operator.example/ocpp"),
+            "a charge point that reboots must come back on the profile the operator moved it to, \
+             not the one its integrator compiled in"
         );
     }
 

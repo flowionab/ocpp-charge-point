@@ -52,10 +52,10 @@ use crate::state::{
     ChargingProfileId, ChargingProfileKind, ChargingProfilePurpose, ChargingProfileScope,
     ChargingRateUnit, ChargingSchedule, ChargingSchedulePeriod, Component, ConnectorState,
     ConnectorStatus, ConnectorStatusChanged, InstalledChargingProfile, LocalListEntry, MeterSample,
-    RecoveredDeviceModelAttribute, RecoveredReservation, RecoveredTransaction, RecurrencyKind,
-    Reservation, SecurityEvent, SecurityEventType, Transaction, TransactionEventKind,
-    TransactionEventOccurred, TransactionId, TransactionUpdateReason, Variable,
-    VariableAttributeType,
+    NetworkProfileSlot, RecoveredDeviceModelAttribute, RecoveredReservation, RecoveredTransaction,
+    RecurrencyKind, Reservation, SecurityEvent, SecurityEventType, Transaction,
+    TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
+    Variable, VariableAttributeType,
 };
 use crate::sync::{BroadcastReceiver, WatchReceiver};
 
@@ -2105,6 +2105,194 @@ pub async fn run_charging_profile_persistence<S: Storage>(
     }
 }
 
+// --- network profile persistence (E2.11, docs/PRODUCTION-ROADMAP.md §7.2) ---
+
+/// The version stamped into every [`PersistedNetworkProfiles`] record. Independent of the other
+/// schema constants here - see [`SCHEMA_VERSION`]'s docs.
+pub const NETWORK_PROFILE_SCHEMA_VERSION: u32 = 1;
+
+/// The key the whole network profile store is written under - one whole-store snapshot, for the
+/// same reason [`CHARGING_PROFILE_KEY`] is: [`crate::state::NetworkProfileStore`] only ever
+/// changes as a unit already resolved by `NetworkProfileStore::set`/`replace`, so there is no
+/// per-slot addressing to gain.
+const NETWORK_PROFILE_KEY: &str = "ocpp-cp/network-profiles";
+
+/// The whole network profile store as written to durable storage.
+///
+/// Unlike [`PersistedChargingProfiles`], this holds [`NetworkProfileSlot`] directly rather than
+/// through a mirror type. Every field of it and of
+/// [`NetworkConnectionProfile`](crate::state::NetworkConnectionProfile) is already a scalar or a
+/// `serde`-deriving state type (`NetworkInterface`, `NetworkTransport`) - there is no closed wire
+/// enum here for a mirror to protect against drifting, the same reasoning
+/// [`PersistedAuthorizationCache`] gives for reusing `AuthorizationCacheEntry` directly.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedNetworkProfiles {
+    /// The [`NETWORK_PROFILE_SCHEMA_VERSION`] this record was written with.
+    pub schema_version: u32,
+    /// Every occupied slot, in the order [`crate::state::NetworkProfileStore::slots`] returns
+    /// them.
+    pub slots: Vec<NetworkProfileSlot>,
+}
+
+/// A borrowing twin of [`PersistedNetworkProfiles`], mirroring [`SerializablePersistedQueue`]'s
+/// role.
+#[derive(serde::Serialize)]
+struct SerializablePersistedNetworkProfiles<'a> {
+    schema_version: u32,
+    slots: &'a [NetworkProfileSlot],
+}
+
+/// Reads and writes the network profile store, as one whole-store snapshot, through a
+/// [`Storage`].
+///
+/// Named for what it persists rather than following the `<State type>Store` convention the other
+/// stores here use, for the same reason [`ChargingProfileSnapshotStore`] is: the state type is
+/// *itself* called [`NetworkProfileStore`](crate::state::NetworkProfileStore), and two types one
+/// letter apart would be a footgun at every call site.
+///
+/// Every method degrades rather than failing, exactly like [`TransactionStore`].
+#[derive(Debug, Clone)]
+pub struct NetworkProfileSnapshotStore<S> {
+    storage: S,
+}
+
+impl<S: Storage> NetworkProfileSnapshotStore<S> {
+    /// Creates a store over `storage`.
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Writes `slots` as the whole store, replacing whatever snapshot was there. Returns whether
+    /// the write reached storage.
+    pub async fn save(&self, slots: &[NetworkProfileSlot]) -> bool {
+        let Ok(encoded) = serde_json::to_vec(&SerializablePersistedNetworkProfiles {
+            schema_version: NETWORK_PROFILE_SCHEMA_VERSION,
+            slots,
+        }) else {
+            tracing::error!("failed to encode the network profiles for storage");
+            return false;
+        };
+        match self.storage.set(NETWORK_PROFILE_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to persist the network profiles; a CSMS-written connection address \
+                     will not survive a restart"
+                );
+                false
+            }
+        }
+    }
+
+    /// Reads back the persisted slots, or an empty `Vec` if there are none, they can't be read, or
+    /// they were written by an incompatible [`NETWORK_PROFILE_SCHEMA_VERSION`] - discarded rather
+    /// than guessed at, exactly like [`TransactionStore::load`].
+    pub async fn load(&self) -> Vec<NetworkProfileSlot> {
+        let encoded = match self.storage.get(NETWORK_PROFILE_KEY).await {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read the persisted network profiles; treating them as absent"
+                );
+                return Vec::new();
+            }
+        };
+        let record: PersistedNetworkProfiles = match serde_json::from_slice(&encoded) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "the persisted network profiles could not be decoded; discarding them"
+                );
+                return Vec::new();
+            }
+        };
+        if record.schema_version != NETWORK_PROFILE_SCHEMA_VERSION {
+            tracing::warn!(
+                found = record.schema_version,
+                expected = NETWORK_PROFILE_SCHEMA_VERSION,
+                "discarding persisted network profiles written by an incompatible schema version"
+            );
+            return Vec::new();
+        }
+        record.slots
+    }
+}
+
+impl<S: Storage + Send + Sync> NetworkProfileSnapshotStore<AtomicStorage<S>> {
+    /// Creates a store over `storage`, wrapped in [`AtomicStorage`] for the same reason
+    /// [`TransactionStore::new_atomic`] does - and with the same amplification
+    /// [`SecurityLogStore::new_atomic`] notes: this is one whole-store record, so a torn write
+    /// costs every stored slot rather than one.
+    pub fn new_atomic(storage: S) -> Self {
+        NetworkProfileSnapshotStore::new(AtomicStorage::new(storage))
+    }
+}
+
+/// Recovers the network profile slots the CSMS had written before the charge point last lost
+/// power, and hands them to the state machine as a single
+/// [`ChargePointEvent::PersistedNetworkProfilesRestored`].
+///
+/// Call this once at boot, **before**
+/// [`crate::builder::ChargePointBuilder::network_profiles`] registers the inbound
+/// `SetNetworkProfile` handler and before
+/// [`crate::builder::ChargePointBuilder::network_profile_switching`] first selects a profile to
+/// dial. Either one running ahead of the restore would race it: a CSMS write could land in an
+/// empty store just before `replace` overwrites it with the stale snapshot, silently discarding a
+/// live instruction, and a switch could select a profile before the one the operator actually
+/// wants is back in the store. [`crate::builder::ChargePointBuilder::network_profile_persistence`]
+/// orders its own registration to guarantee this.
+///
+/// No age or reachability filtering happens here, unlike [`restore_reservations`] and
+/// [`restore_charging_profiles`]: a network profile has no `validTo`/expiry field in the OCPP
+/// model to filter on, and "unreachable" is not something this crate can know before it actually
+/// tries to connect - that judgment belongs to [`crate::network_switch`]'s own rollback, not to
+/// boot-time recovery.
+///
+/// Returns the number of slots handed to the state machine (the configured bound may still drop
+/// some, from the highest slot number down - see the event's docs).
+pub async fn restore_network_profiles<S: Storage>(
+    actor: &ChargePointActor,
+    store: &NetworkProfileSnapshotStore<S>,
+) -> usize {
+    let slots = store.load().await;
+    let recovered = slots.len();
+    if recovered > 0 {
+        tracing::info!(
+            count = recovered,
+            "recovering network connection profiles from durable storage"
+        );
+    }
+    let _ = actor
+        .send(ChargePointEvent::PersistedNetworkProfilesRestored { slots })
+        .await;
+    recovered
+}
+
+/// Persists the network profile store whenever it changes, forever.
+///
+/// Writes are driven by the store's contents rather than by a counter, mirroring
+/// [`run_charging_profile_persistence`]: `SetNetworkProfile` is an operator/CSMS-driven event rare
+/// enough that every change is worth a flash write, with no high-rate traffic here for a threshold
+/// to protect against.
+pub async fn run_network_profile_persistence<S: Storage>(
+    mut state_changes: WatchReceiver<ChargePointState>,
+    store: &NetworkProfileSnapshotStore<S>,
+) {
+    let mut last: Vec<NetworkProfileSlot> = Vec::new();
+    loop {
+        state_changes.changed().await;
+        let slots = state_changes.borrow().network_profiles.slots().to_vec();
+        if slots != last {
+            store.save(&slots).await;
+            last = slots;
+        }
+    }
+}
+
 // --- security log persistence (E2.10, docs/PRODUCTION-ROADMAP.md §7.2) ---
 
 /// The version stamped into every [`PersistedSecurityLog`] record. Independent of the other schema
@@ -3235,7 +3423,10 @@ mod tests {
     use super::*;
     use crate::clock::SystemClock;
     use crate::hardware::{InMemoryStorage, NoStorage};
-    use crate::state::{IdToken, IdTokenKind, StopReason, TransactionChargingState, TransactionId};
+    use crate::state::{
+        IdToken, IdTokenKind, NetworkConnectionProfile, NetworkInterface, NetworkTransport,
+        StopReason, TransactionChargingState, TransactionId,
+    };
     use chrono::Duration as ChronoDuration;
 
     /// A [`Clock`] that always reads a fixed, caller-chosen instant - used to simulate both a
@@ -4457,6 +4648,136 @@ mod tests {
             restore_charging_profiles(&actor, &store, &SystemClock).await,
             0
         );
+    }
+
+    // --- network profile persistence (E2.11) ---
+
+    fn test_network_profile_slot(slot: i32, url: &str) -> NetworkProfileSlot {
+        NetworkProfileSlot {
+            slot,
+            profile: NetworkConnectionProfile {
+                csms_url: url.into(),
+                interface: NetworkInterface::Wired(0),
+                transport: NetworkTransport::Json,
+                security_profile: 2,
+                message_timeout_secs: 30,
+                identity: Some("cp001".into()),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_network_profile_snapshot_round_trips_through_storage() {
+        let store = NetworkProfileSnapshotStore::new(InMemoryStorage::new());
+        let slots = alloc::vec![
+            test_network_profile_slot(1, "wss://a"),
+            test_network_profile_slot(2, "wss://b"),
+        ];
+
+        assert!(store.save(&slots).await);
+        assert_eq!(store.load().await, slots);
+    }
+
+    #[tokio::test]
+    async fn a_network_profile_snapshot_from_an_incompatible_schema_version_is_discarded() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = NetworkProfileSnapshotStore::new(storage.clone());
+        let encoded = serde_json::to_vec(&PersistedNetworkProfiles {
+            schema_version: NETWORK_PROFILE_SCHEMA_VERSION + 1,
+            slots: alloc::vec![test_network_profile_slot(1, "wss://a")],
+        })
+        .unwrap();
+        storage.set(NETWORK_PROFILE_KEY, &encoded).await.unwrap();
+
+        assert_eq!(store.load().await, alloc::vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_network_profile_snapshot_is_discarded_rather_than_panicking() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = NetworkProfileSnapshotStore::new(storage.clone());
+        storage.set(NETWORK_PROFILE_KEY, b"not json").await.unwrap();
+
+        assert_eq!(store.load().await, alloc::vec![]);
+    }
+
+    /// The end-to-end guarantee E2.11 exists for: a charge point moved onto a CSMS-written
+    /// network profile (A9) must come back on it after a reboot, not on the address its
+    /// integrator compiled in.
+    #[tokio::test]
+    async fn network_profiles_interrupted_by_a_power_cut_are_recovered_after_reboot() {
+        use crate::executor::TokioExecutor;
+
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+
+        // --- before the cut: the CSMS writes a profile, which the persistence loop saves.
+        let before = ChargePointActor::spawn([1], &TokioExecutor);
+        let store = NetworkProfileSnapshotStore::new(storage.clone());
+        let state_changes = before.subscribe();
+        tokio::spawn(async move {
+            run_network_profile_persistence(state_changes, &store).await;
+        });
+        let _ = before
+            .send(ChargePointEvent::NetworkProfileSet {
+                slot: 1,
+                profile: alloc::boxed::Box::new(
+                    test_network_profile_slot(1, "wss://operator.example").profile,
+                ),
+            })
+            .await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        drop(before);
+
+        // --- after the reboot: a fresh charge point recovers it from storage alone.
+        let after = ChargePointActor::spawn([1], &TokioExecutor);
+        let store = NetworkProfileSnapshotStore::new(storage.clone());
+        assert_eq!(restore_network_profiles(&after, &store).await, 1);
+
+        let recovered = after.state().network_profiles.get(1).cloned();
+        assert_eq!(
+            recovered.map(|profile| profile.csms_url),
+            Some("wss://operator.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_slots_beyond_the_bound_are_truncated_from_the_highest_slot_down() {
+        use crate::executor::TokioExecutor;
+        use crate::state::StateLimits;
+
+        let actor = ChargePointActor::spawn_with_limits(
+            [1],
+            &TokioExecutor,
+            StateLimits::default().with_max_network_profile_slots(1),
+        );
+        let store = NetworkProfileSnapshotStore::new(InMemoryStorage::new());
+        store
+            .save(&alloc::vec![
+                test_network_profile_slot(1, "wss://a"),
+                test_network_profile_slot(2, "wss://b"),
+            ])
+            .await;
+
+        assert_eq!(restore_network_profiles(&actor, &store).await, 2);
+
+        assert_eq!(actor.state().network_profiles.len(), 1);
+        assert!(actor.state().network_profiles.get(1).is_some());
+        assert!(actor.state().network_profiles.get(2).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_charge_point_without_storage_persists_and_recovers_no_network_profiles() {
+        use crate::executor::TokioExecutor;
+
+        let store = NetworkProfileSnapshotStore::new(NoStorage);
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        store
+            .save(&alloc::vec![test_network_profile_slot(1, "wss://a")])
+            .await;
+
+        assert_eq!(restore_network_profiles(&actor, &store).await, 0);
     }
 
     // --- security log persistence (E2.10) ---
