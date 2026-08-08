@@ -109,6 +109,11 @@ struct Inner {
     /// The negotiated OCPP version, which a redial has to keep speaking. `None` only before the
     /// first connection completes - see [`ConnectionTarget::set_version`].
     version: Option<OcppVersion>,
+    /// `OCPPCommCtrlr`/`RetryBackOffRandomRange`: the largest random delay, in seconds, added
+    /// before a redial. `0` disables jitter entirely, which is this crate's registered default.
+    jitter_range_secs: u32,
+    /// The jitter PRNG's state - see [`ConnectionTarget::next_jitter_secs`].
+    jitter_state: u64,
 }
 
 impl ConnectionTarget {
@@ -127,6 +132,8 @@ impl ConnectionTarget {
                 failures: 0,
                 attempts_before_rollback: DEFAULT_CONNECTION_ATTEMPTS,
                 version: None,
+                jitter_range_secs: 0,
+                jitter_state: jitter_seed(address, options.username),
             }),
         })
     }
@@ -166,6 +173,57 @@ impl ConnectionTarget {
                 .expect("target lock")
                 .attempts_before_rollback = attempts;
         }
+    }
+
+    /// Records the largest random delay a redial may add, from
+    /// `OCPPCommCtrlr`/`RetryBackOffRandomRange` (A5). `0` disables jitter.
+    ///
+    /// Read from the **live** device model by [`run_network_profile_switching`] on every state
+    /// change, so unlike the rest of the backoff a CSMS write to this variable takes effect on the
+    /// connection that is already running. That asymmetry is not a design choice so much as a fact
+    /// about who owns which half: `initial_delay`/`max_delay` are fixed inside the transport when
+    /// it is built, while the random part is added here, by this crate, on every redial.
+    pub fn set_jitter_range(&self, seconds: u32) {
+        self.inner.lock().expect("target lock").jitter_range_secs = seconds;
+    }
+
+    /// How long the next redial waits before dialling, in seconds - a fresh draw from
+    /// `[0, RetryBackOffRandomRange]`, or `0` when jitter is switched off.
+    ///
+    /// This is OCPP's "random part of the back-off time", and it composes with rather than
+    /// replaces the transport's exponential backoff: `ocpp-client`'s read loop has already waited
+    /// out `ReconnectPolicy::delay_for` by the time it asks this target to dial.
+    ///
+    /// **What it is for.** A CSMS that goes down takes every charge point it serves down with it,
+    /// and they all notice within a second of each other. Without jitter they then retry in
+    /// lockstep - the same exponential curve, from the same instant - so the CSMS coming back up
+    /// meets its entire fleet arriving simultaneously and goes down again. Spreading the retries
+    /// costs a few seconds per station and is the difference between a recovery and a thundering
+    /// herd.
+    ///
+    /// It is deliberately applied to a profile switch too, which is also a redial: a CSMS that
+    /// rewrites the network profile of a whole fleet would otherwise point all of them at a new
+    /// endpoint at the same instant, which is the same stampede pointed somewhere fresh.
+    ///
+    /// A xorshift64* generator rather than a `rand` dependency: this needs to spread retries
+    /// across a fleet, not resist an adversary, and the crate compiles for bare metal where
+    /// pulling in an RNG stack for one number would be an odd trade. The *seed* is what matters
+    /// for spreading - see [`jitter_seed`].
+    fn next_jitter_secs(&self) -> u32 {
+        let mut inner = self.inner.lock().expect("target lock");
+        if inner.jitter_range_secs == 0 {
+            return 0;
+        }
+        // xorshift64*, whose state must never be zero.
+        let mut state = inner.jitter_state | 1;
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        inner.jitter_state = state;
+        let draw = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        // Inclusive of the range itself, which is what "maximum value for the random part" reads
+        // as - and one extra second at the top of a spread does no harm either way.
+        (draw >> 33) as u32 % (inner.jitter_range_secs + 1)
     }
 
     /// The address the next dial will use.
@@ -234,6 +292,16 @@ impl ConnectionTarget {
         &self,
     ) -> Result<(Box<dyn TransportSink>, Box<dyn TransportStream>), TransportError> {
         let (address, version) = self.dial_parameters()?;
+        // A5's random back-off, added on top of the exponential wait the transport has already
+        // done - see `next_jitter_secs` for why a charge point wants one at all.
+        let jitter = self.next_jitter_secs();
+        if jitter > 0 {
+            tracing::debug!(
+                seconds = jitter,
+                "waiting out the reconnect back-off jitter"
+            );
+            tokio::time::sleep(Duration::from_secs(u64::from(jitter))).await;
+        }
         let is_origin = address == self.origin;
         if !is_origin && self.username.is_some() {
             tracing::debug!(
@@ -266,6 +334,40 @@ impl ConnectionTarget {
             }
         }
     }
+}
+
+/// Seeds the jitter generator with something that differs between charge points.
+///
+/// The seed is the whole point: a generator every station in a fleet seeds identically produces
+/// identical "random" delays, which is no better than having none. Three ingredients, in
+/// increasing order of how much they help:
+///
+/// - the CSMS address, which distinguishes fleets but not stations within one;
+/// - the Basic-auth username, which in OCPP deployments is usually the charge point's own
+///   identity, and is therefore the ingredient that saves a fleet that all boots at once (a
+///   regional power cut) rather than merely all disconnecting at once;
+/// - the wall clock in nanoseconds, which decorrelates stations whose connections dropped at
+///   slightly different moments - the common case, and where a few milliseconds of difference is
+///   already enough.
+///
+/// None is sufficient alone, which is why all three are mixed. FNV-1a because it is four lines and
+/// this is a seed, not a checksum.
+fn jitter_seed(address: &str, username: Option<&str>) -> u64 {
+    fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+        let mut hash = seed;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    let mut seed = fnv1a(0xcbf2_9ce4_8422_2325, address.as_bytes());
+    seed = fnv1a(seed, username.unwrap_or_default().as_bytes());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    fnv1a(seed, &nanos.to_le_bytes())
 }
 
 /// Adapts [`ConnectionTarget`] to `ocpp-client`'s `Reconnector`.
@@ -330,6 +432,10 @@ pub async fn run_network_profile_switching<D: ConnectionCloser, B: crate::provis
         // write it at any time, and the value that matters is the one in force when a profile is
         // actually being tried.
         target.set_connection_attempts(connection_attempts(&state));
+        // Read live, like the attempt count above and for the same reason: this is the one part of
+        // the reconnect back-off this crate applies itself, so a CSMS write can reach the running
+        // connection rather than only the next one.
+        target.set_jitter_range(jitter_range(&state));
         let selected = selected_profile(&state).map(|(_, profile)| profile.csms_url.clone());
         drop(state);
 
@@ -345,16 +451,15 @@ pub async fn run_network_profile_switching<D: ConnectionCloser, B: crate::provis
     }
 }
 
-/// `OCPPCommCtrlr`/`NetworkProfileConnectionAttempts`, or this crate's registered default when it
-/// is absent or unparseable.
-fn connection_attempts(state: &crate::state::ChargePointState) -> u32 {
+/// Reads an integer `OCPPCommCtrlr` variable out of the live device model.
+fn ocpp_comm_ctrlr_u32(state: &crate::state::ChargePointState, variable: &str) -> Option<u32> {
     let component = crate::state::Component {
         name: "OCPPCommCtrlr".into(),
         instance: None,
         evse: None,
     };
     let variable = crate::state::Variable {
-        name: "NetworkProfileConnectionAttempts".into(),
+        name: variable.into(),
         instance: None,
     };
     state
@@ -362,6 +467,18 @@ fn connection_attempts(state: &crate::state::ChargePointState) -> u32 {
         .get(&component, &variable)
         .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
         .and_then(|attribute| attribute.value.parse().ok())
+}
+
+/// `OCPPCommCtrlr`/`RetryBackOffRandomRange`, or `0` (no jitter) when it is absent or
+/// unparseable - the same value this crate registers, so what a CSMS reads is what it gets.
+fn jitter_range(state: &crate::state::ChargePointState) -> u32 {
+    ocpp_comm_ctrlr_u32(state, "RetryBackOffRandomRange").unwrap_or(0)
+}
+
+/// `OCPPCommCtrlr`/`NetworkProfileConnectionAttempts`, or this crate's registered default when it
+/// is absent or unparseable.
+fn connection_attempts(state: &crate::state::ChargePointState) -> u32 {
+    ocpp_comm_ctrlr_u32(state, "NetworkProfileConnectionAttempts")
         .unwrap_or(DEFAULT_CONNECTION_ATTEMPTS)
 }
 
@@ -607,5 +724,131 @@ mod tests {
         assert_eq!(target.address(), "wss://origin");
         assert_eq!(*closes.lock().unwrap(), 0);
         switching.abort();
+    }
+
+    #[test]
+    fn no_jitter_is_added_until_the_csms_asks_for_some() {
+        let target = target("ws://csms.example/ocpp");
+
+        // This crate registers `RetryBackOffRandomRange` as 0, and a charge point that spread its
+        // retries without being told to would be reporting one thing and doing another.
+        assert_eq!(target.next_jitter_secs(), 0);
+    }
+
+    #[test]
+    fn jitter_stays_within_the_range_the_csms_set_and_can_reach_both_ends() {
+        let target = target("ws://csms.example/ocpp");
+        target.set_jitter_range(4);
+
+        let draws: Vec<u32> = (0..500).map(|_| target.next_jitter_secs()).collect();
+
+        assert!(
+            draws.iter().all(|draw| *draw <= 4),
+            "a delay past the range the CSMS set is a delay it did not agree to: {draws:?}"
+        );
+        // Inclusive of the range itself - "the maximum value for the random part" is a value the
+        // random part may take.
+        assert!(draws.contains(&0));
+        assert!(draws.contains(&4));
+    }
+
+    #[test]
+    fn a_range_of_one_still_spreads_rather_than_collapsing_to_a_constant() {
+        let target = target("ws://csms.example/ocpp");
+        target.set_jitter_range(1);
+
+        let draws: Vec<u32> = (0..200).map(|_| target.next_jitter_secs()).collect();
+
+        // The smallest range that means anything at all. An off-by-one in the modulus would make
+        // this always 0, which reads as working while spreading nothing.
+        assert!(draws.contains(&0) && draws.contains(&1));
+    }
+
+    #[test]
+    fn two_charge_points_do_not_draw_the_same_delays() {
+        // The whole point of jitter: a fleet that all seeded identically retries in lockstep, and
+        // is no better off than a fleet with no jitter at all.
+        let first = ConnectionTarget::new(
+            "ws://csms.example/ocpp",
+            &ConnectOptions {
+                username: Some("CP-0001"),
+                ..Default::default()
+            },
+        );
+        let second = ConnectionTarget::new(
+            "ws://csms.example/ocpp",
+            &ConnectOptions {
+                username: Some("CP-0002"),
+                ..Default::default()
+            },
+        );
+        first.set_jitter_range(60);
+        second.set_jitter_range(60);
+
+        let firsts: Vec<u32> = (0..20).map(|_| first.next_jitter_secs()).collect();
+        let seconds: Vec<u32> = (0..20).map(|_| second.next_jitter_secs()).collect();
+
+        assert_ne!(firsts, seconds);
+    }
+
+    #[test]
+    fn turning_jitter_off_again_stops_it_immediately() {
+        let target = target("ws://csms.example/ocpp");
+        target.set_jitter_range(30);
+        target.set_jitter_range(0);
+
+        assert_eq!(target.next_jitter_secs(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_csms_write_to_the_jitter_range_reaches_the_running_connection() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let target = target("ws://csms.example/ocpp");
+
+        let switching_target = target.clone();
+        let switching_actor = actor.clone();
+        tokio::spawn(async move {
+            run_network_profile_switching(
+                &switching_actor,
+                &switching_target,
+                &RecordingCloser {
+                    closes: Arc::new(Mutex::new(0)),
+                },
+                &TokioBackoff,
+            )
+            .await;
+        });
+
+        let _ = actor
+            .send(ChargePointEvent::DeviceModel(
+                crate::state::DeviceModelEvent::AttributeValueSet {
+                    component: crate::state::Component {
+                        name: "OCPPCommCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: crate::state::Variable {
+                        name: "RetryBackOffRandomRange".into(),
+                        instance: None,
+                    },
+                    attribute_type: crate::state::VariableAttributeType::Actual,
+                    value: "10".into(),
+                },
+            ))
+            .await;
+        for _ in 0..200 {
+            if target.inner.lock().expect("target lock").jitter_range_secs == 10 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Unlike `initial_delay`/`max_delay`, which are sealed into the transport when it is
+        // built, the random part is applied by this crate on every redial - so a CSMS write to it
+        // does not have to wait for the next connection.
+        assert_eq!(
+            target.inner.lock().expect("target lock").jitter_range_secs,
+            10
+        );
     }
 }

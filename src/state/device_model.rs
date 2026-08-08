@@ -707,8 +707,11 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         instance: None,
         data_type: VariableDataType::Integer,
         unit: Some("s"),
-        // `0`, honestly: the transport's reconnect policy has no jitter parameter at all, so any
-        // other value would be a number this charge point reports and does not apply.
+        // `0` - no jitter unless the CSMS asks for some. It *is* applied now (A5:
+        // `crate::network_switch::ConnectionTarget` adds the random part on every redial), so this
+        // is a default rather than a disclaimer; OCPP names no default of its own, and a charge
+        // point that spread its retries without being told to would be doing something its
+        // operator did not ask for. An operator running a fleet against one CSMS wants this set.
         value: "0",
         mutability: VariableMutability::ReadWrite,
         persistent: false,

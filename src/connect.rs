@@ -224,8 +224,9 @@ fn ocpp_comm_ctrlr_secs(model: &DeviceModel, variable: &str, default: u64) -> u6
         .unwrap_or(default)
 }
 
-/// Fills in the transport settings OCPP models as device-model variables - the reconnect backoff
-/// (`RetryBackOffWaitMinimum`/`RetryBackOffRepeatTimes`, A5) and the per-call timeout
+/// Fills in the transport settings OCPP models as device-model variables - the exponential part of
+/// the reconnect backoff (`RetryBackOffWaitMinimum`/`RetryBackOffRepeatTimes`, A5) and the per-call
+/// timeout
 /// (`MessageTimeout[Default]`, A6) - for a caller who did not supply its own
 /// [`ConnectOptions`].
 ///
@@ -233,16 +234,20 @@ fn ocpp_comm_ctrlr_secs(model: &DeviceModel, variable: &str, default: u64) -> u6
 /// [`DeviceModel`], i.e. this crate's registered defaults, because the connection has to exist
 /// before the actor that owns the live model does. So a CSMS *reading* these variables sees the
 /// values genuinely in force, and a CSMS *writing* them changes what the next connection uses -
-/// not the current one. Applying a change to the *live* connection is A5's remaining half and is
-/// not implemented: [`crate::network_switch`] can re-point where a connection goes, but the
-/// backoff and timeout are fixed in the transport when it is built.
+/// not the current one. That is not fixable from here for these two: [`crate::network_switch`] can
+/// re-point where a connection goes, but the exponential backoff and the timeout are sealed into
+/// the transport when it is built. `RetryBackOffRandomRange` is the exception - see below.
 ///
-/// Two honest gaps rather than approximations. `RetryBackOffRandomRange` (jitter) has **no**
-/// counterpart in the transport's reconnect policy, so it is registered as `0` and applied
-/// nowhere; reporting a jitter this charge point does not add would be worse than reporting none.
-/// And `RetryBackOffRepeatTimes` is a *doubling count* where the transport takes a maximum delay,
+/// `RetryBackOffRepeatTimes` is a *doubling count* where the transport takes a maximum delay,
 /// so it is converted (`minimum × 2^repeats`) rather than stored twice - the two express the same
 /// curve, and keeping both would let them disagree.
+///
+/// `RetryBackOffRandomRange` (jitter) is **not** here, because it is not the transport's to apply:
+/// this crate owns the reconnector ([`crate::network_switch::ConnectionTarget`]) and adds the
+/// random part itself on every redial, reading the range from the live device model. That makes it
+/// the one piece of the reconnect back-off a CSMS can change without waiting for the next
+/// connection - and it means a caller who supplies their own reconnector, rather than letting
+/// `connect_and_setup` install one, gets no jitter.
 ///
 /// An explicit `options` is left exactly as the caller wrote it: someone who reached for
 /// `ConnectOptions` is configuring the transport deliberately, and silently overriding their

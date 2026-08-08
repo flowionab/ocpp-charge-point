@@ -135,11 +135,44 @@ that can't reliably reconnect is worse than one missing a functional block.
 | **A2** | **Version negotiation** — **done.** The handshake already offered every compiled-in version; what was missing was running the result, which [A1](#3-workstream-a--transport-negotiation-connection-lifecycle) supplied. `UnsupportedNegotiatedVersion` is now only reachable for a version this build wasn't compiled with. An end-to-end test negotiates 1.6J and asserts the *1.6J* BootNotification shape on the wire, so it proves the right adapter set ran rather than that something connected. | ✅ |
 | **A3** | Configurable subprotocol preference order — **done** (`connect_and_setup`'s `versions`, which existed but was only meaningful once [A1](#3-workstream-a--transport-negotiation-connection-lifecycle) made non-2.1 outcomes usable). Tested: naming one version offers only that one, even against a CSMS that would speak another. | ✅ |
 | **A4** | WebSocket keepalive — **blocked upstream.** `ocpp-client` 0.2.1's `ConnectOptions` has no ping-interval field and its WebSocket transport only *replies* to pings; there is nothing to configure from here. `WebSocketPingInterval` is registered and readable, with a value of `0` (disabled), which is the honest reading of a cadence this charge point does not drive. Needs an `ocpp-client` change, the same shape as [D1](#61-d1--missing-action-wrappers)'s wrappers. | 🔒 |
-| **A5** | Reconnect backoff from the device model — **partly done, and the limit is structural.** All three variables are registered and readable; `RetryBackOffWaitMinimum`/`RetryBackOffRepeatTimes` are converted into the transport's `ReconnectPolicy` when the caller supplies no `ConnectOptions`, so what a CSMS reads is what the connection does. What a CSMS *writes* applies to the next connection, not the current one, and [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) does not change that: it re-points *where* a connection goes, while the backoff and timeout are fixed in the transport when it is built. `RetryBackOffRandomRange` (jitter) has **no** counterpart in the transport and is registered as `0` rather than reported as a value this crate does not apply. | 🚧 |
+| **A5** | Reconnect backoff from the device model — **done.** All three variables are registered, readable, and now applied. `RetryBackOffWaitMinimum`/`RetryBackOffRepeatTimes` become the transport's `ReconnectPolicy` when the caller supplies no `ConnectOptions`, so what a CSMS reads is what the connection does. `RetryBackOffRandomRange` — previously registered as `0` and applied nowhere, because `ocpp-client`'s `ReconnectPolicy` still has no jitter field — turns out **not to need one**: this crate already owns the reconnector (`network_switch::ConnectionTarget`, built for [A9](#3-workstream-a--transport-negotiation-connection-lifecycle)), so the random part is added here, on every redial, before dialling. See below for the seeding problem that is the whole difficulty, and for the split in what a CSMS write reaches. | ✅ |
 | **A6** | Per-message timeouts and retry — **done.** `MessageTimeout[Default]` becomes the transport's per-call timeout at connect time (same next-connection caveat as [A5](#3-workstream-a--transport-negotiation-connection-lifecycle)); `MessageAttempts[TransactionEvent]` now caps how many times a queued message is retried, which is **head-of-line unblocking**: without it a message the CSMS will never accept is retried forever at the front of the queue and blocks everything behind it. `MessageAttemptInterval` landed with [A7](#3-workstream-a--transport-negotiation-connection-lifecycle). | ✅ |
 | **A7** | `MessageAttemptInterval` / queue-depth limits — **done.** Queue depth is now configurable (`ChargePointBuilder::offline_queue_capacity`, previously hardcoded at the default); `MessageAttemptInterval[TransactionEvent]` drives a retry timer that sweeps every registered queue, re-read each cycle. Drop policy and the `MemoryExhaustion` event on overflow were already done ([G2.1](#92-g2--bounded-memory)) and are unchanged - including the security queue's deliberate exception, which must not report its own overflow through itself. | ✅ |
 | **A8** | `NotImplemented` CALLERROR — **done.** An integration test boots a real session over a WebSocket, has the mock CSMS call `GetLog` (a message this build has no handler for), and asserts a CALLERROR with `NotImplemented` comes back. The wait is bounded, because the failure it really guards is *silence*: a CSMS waiting on a response that never arrives is worse than one told no, and an unbounded wait would hang the suite instead of failing it. | ✅ |
 | **A9** | Network profile selection *and* application — **done.** `NetworkConfigurationPriority` is a live value (a stored slot joins the order, a vacated one leaves it, the operator's ordering is never rewritten), `network_profile::selected_profile` says which slot it picks, and `network_switch` moves the live connection there and rolls back after `NetworkProfileConnectionAttempts` failures. See below for the rules and the two limits. | ✅ |
+
+**A5's jitter, and why the seed is the whole problem.** A CSMS that goes down takes every charge
+point it serves with it, and they all notice within a second of each other. Without jitter they
+retry in lockstep — same exponential curve, same starting instant — so the CSMS coming back up
+meets its entire fleet at once and goes down again. The fix is a random delay per station, which
+means the interesting part is not the generator but its **seed**: a fleet that seeds identically
+draws identical "random" delays and is no better off than one with no jitter at all.
+
+Three ingredients are mixed (FNV-1a, then xorshift64\* — this spreads retries, it does not resist
+an adversary, and a `rand` dependency for one number on a bare-metal target would be an odd
+trade). The CSMS address distinguishes fleets but not stations within one. The Basic-auth
+username is, in most OCPP deployments, the charge point's own identity — it is what saves a fleet
+that all *boots* at once (a regional power cut), where uptime-derived entropy would correlate.
+Wall-clock nanoseconds decorrelate stations whose connections dropped at slightly different
+moments, which is the common case and where a few milliseconds is already plenty. None is
+sufficient alone.
+
+Jitter is deliberately applied to a profile switch too, which is also a redial: a CSMS that
+rewrites a whole fleet's network profile would otherwise point all of them at a new endpoint
+simultaneously — the same stampede, aimed somewhere fresh.
+
+**This also splits what a CSMS write reaches.** `initial_delay`/`max_delay` are sealed into the
+transport when it is built, so writing them still only affects the next connection.
+`RetryBackOffRandomRange` is read from the *live* device model by `run_network_profile_switching`
+on every state change (the same path that already re-reads `NetworkProfileConnectionAttempts`), so
+a write to it takes effect on the connection already running. Not a design choice so much as a
+fact about who owns which half. One consequence worth stating: a caller who supplies their own
+`reconnector` instead of letting `connect_and_setup` install one gets no jitter, because there is
+no longer anywhere for this crate to add it.
+
+The registered default stays `0`. OCPP names no default, and a charge point that spread its
+retries without being asked would be doing something its operator did not choose — but an operator
+running a fleet against one CSMS should set it.
 
 **How a switch works, and what it deliberately does not do.** The mechanism is the one the
 blocked-upstream note here used to describe: re-point the transport's reconnect target, then close
@@ -2332,6 +2365,18 @@ Three honest caveats, none of them a hole in the exit criteria:
 
 Smart charging is the block real deployments demand first.
 
+**All three exit conditions are met.** Every A-row is ✅ except
+[A4](#3-workstream-a--transport-negotiation-connection-lifecycle), which is 🔒 on an `ocpp-client`
+`ConnectOptions` that still has no ping-interval field in 0.2.2 (re-verified at the A5 commit, not
+carried over from the old note). That is a keepalive cadence this charge point does not drive, not
+a Core-profile message going unhandled, so it does not hold the milestone: `WebSocketPingInterval`
+reads `0`, which is the honest value.
+
+One caveat on "load management works end to end": it works for the *limits* this crate can
+project. 2.1's setpoints, discharge limits and per-phase asymmetries are parsed and dropped, because
+`hardware::Connector::set_current_limit` is a single import limit — see
+[B2.6](#b2--smart-charging-r11) and [B8.2](#b8--reservation-derv2x-battery-swap).
+
 ### M4 — Security and remote management
 
 [F1](#81-f1--security-profiles)–[F5](#85-f5--hardening) · [B3](#b3--firmware-management-r12) firmware · [B4](#b4--certificates-and-iso-15118-r1-r13) certificates · [B5](#b5--diagnostics-and-monitoring-r14) diagnostics
@@ -2454,5 +2499,5 @@ gap is entirely this crate's to close.
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 827 | `#[test]` + `#[tokio::test]`, re-counted at the B2.6 dynamic-schedule commit (803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 833 | `#[test]` + `#[tokio::test]`, re-counted at the A5 commit (827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |
