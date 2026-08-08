@@ -36,6 +36,18 @@ pub trait ReconnectHandler {
         FF: Future<Output = ()> + Send + 'static;
 }
 
+/// Forwards to the wrapped handler - see [`crate::availability::StatusNotifier`]'s `Arc` impl.
+#[async_trait::async_trait]
+impl<H: ReconnectHandler + Send + Sync> ReconnectHandler for alloc::sync::Arc<H> {
+    async fn register_reconnect_handler<F, FF>(&self, callback: F)
+    where
+        F: FnMut() -> FF + Send + Sync + 'static,
+        FF: core::future::Future<Output = ()> + Send + 'static,
+    {
+        (**self).register_reconnect_handler(callback).await;
+    }
+}
+
 /// Re-registers with the CSMS - a fresh BootNotification, retried until accepted (see
 /// [`register_until_accepted`]) - every time the connection to it is restored after being
 /// dropped. OCPP doesn't mandate this, but it's the conventional way for a charge point to

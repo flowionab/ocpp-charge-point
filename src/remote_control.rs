@@ -2200,6 +2200,22 @@ mod ocpp_1_6 {
         }
     }
 
+    /// Delegates to the wrapped client. `RemoteStopTransaction` addresses a transaction id, not a
+    /// connector, so 1.6J needs no topology for it - but
+    /// [`ChargePointBuilder::remote_control`](crate::builder::ChargePointBuilder::remote_control)
+    /// registers the three remote-control handlers together, so the wrapper implements this one
+    /// too rather than making a 1.6J caller pass two different types for one functional block.
+    #[async_trait::async_trait]
+    impl RequestStopTransactionHandler for Ocpp1_6RemoteControlHandler {
+        async fn register_request_stop_transaction_handler(&self, actor: ChargePointActor) {
+            RequestStopTransactionHandler::register_request_stop_transaction_handler(
+                &self.client,
+                actor,
+            )
+            .await;
+        }
+    }
+
     #[async_trait::async_trait]
     impl RequestStopTransactionHandler for OCPP1_6Client {
         async fn register_request_stop_transaction_handler(&self, actor: ChargePointActor) {

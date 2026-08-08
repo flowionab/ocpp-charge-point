@@ -727,6 +727,7 @@ mod ocpp_1_6 {
     /// Wraps an [`OCPP1_6Client`] with the connector topology its flat `connectorId` addressing
     /// needs, and the [`Clock`] that stamps each reading - the same pairing
     /// [`crate::transactions::Ocpp1_6TransactionNotifier`] uses.
+    #[derive(Clone)]
     pub struct Ocpp1_6MeterValuesNotifier<C> {
         client: OCPP1_6Client,
         connector_counts: Vec<usize>,

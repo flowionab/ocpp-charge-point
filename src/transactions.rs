@@ -31,6 +31,25 @@ pub trait TransactionNotifier {
     ) -> Result<(), Self::Error>;
 }
 
+/// Forwards to the wrapped notifier - see [`crate::availability::StatusNotifier`]'s `Arc` impl for
+/// why this exists.
+#[async_trait::async_trait]
+impl<N: TransactionNotifier + Send + Sync> TransactionNotifier for alloc::sync::Arc<N> {
+    type Error = N::Error;
+
+    async fn notify_transaction_event(
+        &self,
+        evse_id: usize,
+        connector_id: usize,
+        kind: crate::state::TransactionEventKind,
+        transaction: crate::state::Transaction,
+    ) -> Result<(), Self::Error> {
+        (**self)
+            .notify_transaction_event(evse_id, connector_id, kind, transaction)
+            .await
+    }
+}
+
 /// Forwards every transaction event received on `events` to the CSMS via `notifier`, forever.
 /// Errors are logged and do not stop the loop - the actor already applied the event to state;
 /// only the CSMS-facing report failed and is not retried. [`setup`](crate::setup) uses
@@ -1389,6 +1408,25 @@ pub(crate) mod ocpp_1_6 {
         use ocpp_client::ocpp_types::v16::{
             MeterValuesRequest, StartTransactionRequest, StopTransactionRequest,
         };
+
+        /// Delegates to the wrapped client: a reconnect is a property of the *connection*, and
+        /// this wrapper adds topology and an id cache on top of one rather than owning a
+        /// different one. Without this a 1.6J charge point could not use the offline queues at
+        /// all, since those flush on reconnect.
+        #[async_trait::async_trait]
+        impl<C: Clock + Send + Sync> crate::connection::ReconnectHandler for Ocpp1_6TransactionNotifier<C> {
+            async fn register_reconnect_handler<F, FF>(&self, callback: F)
+            where
+                F: FnMut() -> FF + Send + Sync + 'static,
+                FF: core::future::Future<Output = ()> + Send + 'static,
+            {
+                crate::connection::ReconnectHandler::register_reconnect_handler(
+                    &self.client,
+                    callback,
+                )
+                .await;
+            }
+        }
 
         #[async_trait::async_trait]
         impl<C: Clock + Send + Sync> TransactionNotifier for Ocpp1_6TransactionNotifier<C> {

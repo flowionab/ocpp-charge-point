@@ -131,9 +131,9 @@ that can't reliably reconnect is worse than one missing a functional block.
 
 | ID | Task | Status |
 |----|------|--------|
-| **A1** | `connect_and_setup` for 1.6J and 2.0.1. Today it's `ocpp_2_1`-gated only (`src/connect.rs`); 1.6J and 2.0.1 users must build a client by hand, which contradicts "integrators supply hardware bindings only". | ⬜ |
-| **A2** | **Version negotiation.** Offer `ocpp2.1, ocpp2.0.1, ocpp1.6` as WebSocket subprotocols, take what the CSMS picks, and run the matching adapter set. Depends on [C4](#54-c4--builder-refactor) — negotiation means picking an adapter set at runtime, which the current 20-bound monomorphised `setup()` can't express. | ⬜ |
-| **A3** | Configurable subprotocol preference order, so an operator can force a version. | ⬜ |
+| **A1** | `connect_and_setup` for 1.6J and 2.0.1 — **done.** All three versions run a session; the 1.6J and 2.0.1 paths register blocks through `ChargePointBuilder` (1.6J needs topology-aware wrappers, 2.0.1 lacks `SecurityEventNotification` upstream), which is exactly the limitation [C4](#54-c4--builder-refactor) removed. | ✅ |
+| **A2** | **Version negotiation** — **done.** The handshake already offered every compiled-in version; what was missing was running the result, which [A1](#3-workstream-a--transport-negotiation-connection-lifecycle) supplied. `UnsupportedNegotiatedVersion` is now only reachable for a version this build wasn't compiled with. An end-to-end test negotiates 1.6J and asserts the *1.6J* BootNotification shape on the wire, so it proves the right adapter set ran rather than that something connected. | ✅ |
+| **A3** | Configurable subprotocol preference order — **done** (`connect_and_setup`'s `versions`, which existed but was only meaningful once [A1](#3-workstream-a--transport-negotiation-connection-lifecycle) made non-2.1 outcomes usable). Tested: naming one version offers only that one, even against a CSMS that would speak another. | ✅ |
 | **A4** | WebSocket keepalive driven by the device model: `OCPPCommCtrlr.WebSocketPingInterval` (1.6J alias already exists) must actually configure ping cadence. | ⬜ |
 | **A5** | Reconnect backoff from the device model (`RetryBackOffWaitMinimum`, `RetryBackOffRepeatTimes`, `RetryBackOffRandomRange`) rather than the caller-supplied `Backoff` alone. | ⬜ |
 | **A6** | Per-message timeouts and retry: `MessageTimeout`, `TransactionMessageAttempts`, `TransactionMessageRetryInterval` (aliases exist, values inert). | ⬜ |

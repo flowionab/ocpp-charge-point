@@ -144,6 +144,26 @@ pub enum AvailabilityTarget {
     },
 }
 
+/// Forwards to the wrapped notifier, so a version adapter that owns a cache (and therefore cannot
+/// be `Clone`) can still be registered through [`crate::builder::ChargePointBuilder`], which
+/// clones what it is given. Mirrors the same impl on [`crate::hardware::Storage`].
+#[async_trait::async_trait]
+impl<N: StatusNotifier + Send + Sync> StatusNotifier for alloc::sync::Arc<N> {
+    type Error = N::Error;
+
+    async fn notify_status(
+        &self,
+        evse_id: usize,
+        connector_id: usize,
+        status: crate::state::ConnectorStatus,
+        connector_state: crate::state::ConnectorState,
+    ) -> Result<(), Self::Error> {
+        (**self)
+            .notify_status(evse_id, connector_id, status, connector_state)
+            .await
+    }
+}
+
 /// The outcome of a CSMS-initiated `ChangeAvailability` request, matching (a subset of) OCPP's
 /// `ChangeAvailabilityStatusEnum`. `Scheduled` - deferring the change until an in-progress
 /// transaction ends - isn't modeled: `SetUnavailable` takes effect immediately regardless of an
@@ -1398,6 +1418,21 @@ mod ocpp_1_6 {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),
             }
+        }
+    }
+
+    /// Delegates to the wrapped client: a reconnect is a property of the *connection*, and this
+    /// wrapper adds topology on top of one rather than owning a different one. Without this a
+    /// 1.6J charge point could not use the offline queues at all, since those flush on reconnect.
+    #[async_trait::async_trait]
+    impl crate::connection::ReconnectHandler for Ocpp1_6StatusNotifier {
+        async fn register_reconnect_handler<F, FF>(&self, callback: F)
+        where
+            F: FnMut() -> FF + Send + Sync + 'static,
+            FF: core::future::Future<Output = ()> + Send + 'static,
+        {
+            crate::connection::ReconnectHandler::register_reconnect_handler(&self.client, callback)
+                .await;
         }
     }
 

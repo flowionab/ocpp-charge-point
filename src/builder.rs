@@ -247,6 +247,23 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         })
     }
 
+    /// This charge point's connector topology - `connector_counts[evse_id]` is that EVSE's
+    /// connector count, in the shape this crate's 1.6J connector-address helpers take.
+    ///
+    /// Read back from the state the hardware binding established in [`Self::start`], so a caller
+    /// that handed its `ChargePoint` over can still build the version adapters that need it -
+    /// every 1.6J wrapper does, since 1.6J addresses connectors with a single flat id and has no
+    /// EVSE concept to derive one from.
+    pub fn connector_counts(&self) -> Vec<usize> {
+        self.runtime
+            .actor()
+            .state()
+            .evses
+            .iter()
+            .map(|evse| evse.connectors.len())
+            .collect()
+    }
+
     /// The capabilities the hardware declared via
     /// [`ChargePoint::capabilities`](crate::hardware::ChargePoint::capabilities), captured once in
     /// [`Self::start`]. The single source of truth callers (e.g. [`crate::setup::setup`]) consult
@@ -1190,13 +1207,27 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             + Sync
             + 'static,
     {
+        csms.register_get_base_report_handler(self.runtime.actor())
+            .await;
+        csms.register_get_report_handler(self.runtime.actor()).await;
+        self.configuration(csms).await
+    }
+
+    /// Registers the *reading and writing* half of the device model - `GetVariables`/
+    /// `SetVariables` on 2.x, or the `GetConfiguration`/`ChangeConfiguration` those project onto
+    /// under 1.6J - without the 2.x-only reporting half ([`Self::device_model`] registers both).
+    ///
+    /// Exists because 1.6J has no `GetBaseReport`/`GetReport` at all: its flat `GetConfiguration`
+    /// already returns everything a report would, so bundling the four handlers together would
+    /// make a 1.6J connection unable to register any of them.
+    pub async fn configuration<N>(self, csms: &N) -> Self
+    where
+        N: GetVariablesHandler + SetVariablesHandler + Send + Sync + 'static,
+    {
         csms.register_get_variables_handler(self.runtime.actor())
             .await;
         csms.register_set_variables_handler(self.runtime.actor())
             .await;
-        csms.register_get_base_report_handler(self.runtime.actor())
-            .await;
-        csms.register_get_report_handler(self.runtime.actor()).await;
 
         self
     }

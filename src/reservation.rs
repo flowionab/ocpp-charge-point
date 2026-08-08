@@ -996,6 +996,19 @@ mod ocpp_1_6 {
         }
     }
 
+    /// Delegates to the wrapped client. `CancelReservation` addresses a reservation id, not a
+    /// connector, so 1.6J needs no topology for it - but
+    /// [`ChargePointBuilder::reservation`](crate::builder::ChargePointBuilder::reservation)
+    /// registers both reservation handlers together, so the wrapper implements this one too
+    /// rather than making a 1.6J caller pass two types for one functional block.
+    #[async_trait::async_trait]
+    impl CancelReservationHandler for Ocpp1_6ReserveNowHandler {
+        async fn register_cancel_reservation_handler(&self, actor: ChargePointActor) {
+            CancelReservationHandler::register_cancel_reservation_handler(&self.client, actor)
+                .await;
+        }
+    }
+
     #[async_trait::async_trait]
     impl CancelReservationHandler for OCPP1_6Client {
         async fn register_cancel_reservation_handler(&self, actor: ChargePointActor) {
