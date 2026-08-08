@@ -163,6 +163,13 @@ macro entries. Until then an integrator driving its own connection can read
 `selected_profile(&runtime.state())` and redial, which is the supported interim path rather than
 poking at state fields.
 
+**Status:** the upstream change is written and tested, on the `connect-options-reconnector` branch
+of `ocpp-client` (unpushed, same as D1.1's was): `ConnectOptions::reconnector` takes an
+`Arc<dyn Reconnector>`, and a new public `websocket_transport(address, version, options)` opens the
+transport halves such a reconnector must return, so this crate can point a live connection at a
+different address without owning any WebSocket plumbing. A9 unblocks here as soon as that ships in
+a released `ocpp-client`.
+
 Closing A9 would also finish [A5](#3-workstream-a--transport-negotiation-connection-lifecycle):
 the same mechanism is what lets a CSMS's `RetryBackOff*` write apply to the live connection rather
 than only the next one.
