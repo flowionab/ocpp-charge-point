@@ -726,6 +726,210 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         mutability: VariableMutability::ReadWrite,
         persistent: false,
     },
+    // --- OCPP 2.x required variables (B1.7): recorded, and honest about it ---
+    //
+    // Every row below is marked Required in the vendored 2.1 appendix
+    // (`docs/OCPP-2.1/Appendices_CSV_v2.1/dm_components_vars.csv`) for a component whose
+    // functionality this crate always has. Required means a CSMS may read it and expects an
+    // answer; it does not mean this crate acts on it, and the ones it does act on are listed as
+    // live above.
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "FileTransferProtocols",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        // Empty, and truthfully so: file transfer arrives with firmware management and
+        // diagnostics (B3/B5), neither of which exists yet, so this charge point supports none.
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "MessageTimeout",
+        instance: Some("Default"),
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "30",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "NetworkConfigurationPriority",
+        instance: None,
+        data_type: VariableDataType::String,
+        unit: None,
+        // One network profile, slot 0 - this crate has no `SetNetworkProfile` yet (B1.8), so
+        // there is exactly one connection and it is the one the integrator dialled.
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "NetworkProfileConnectionAttempts",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "3",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "OCPPCommCtrlr",
+        variable: "OfflineThreshold",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "60",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "SampledDataCtrlr",
+        variable: "TxStartedMeasurands",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        value: "Energy.Active.Import.Register",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "TxCtrlr",
+        variable: "TxStartPoint",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        // What this crate's state machine actually does: a transaction starts when the presented
+        // token is authorized (see `advance_transaction`), not on plug-in or on energy flow.
+        value: "Authorized",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "TxCtrlr",
+        variable: "TxStopPoint",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        value: "EVConnected",
+        mutability: VariableMutability::ReadWrite,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "ClockCtrlr",
+        variable: "TimeSource",
+        instance: None,
+        data_type: VariableDataType::SequenceList,
+        unit: None,
+        // Heartbeat only: this crate learns the time from BootNotification/Heartbeat
+        // `currentTime` (G3.2) and has no other source. An integrator with an RTC or NTP supplies
+        // its own `Clock` but does not change where *this* crate's knowledge comes from.
+        value: "Heartbeat",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "SecurityCtrlr",
+        variable: "SecurityProfile",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: None,
+        // Profile 1 (basic auth over an unsecured connection) is what this crate can honestly
+        // claim: TLS and certificate handling are workstream F, unimplemented. Reporting 2 or 3
+        // would advertise security this charge point does not have.
+        value: "1",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "SecurityCtrlr",
+        variable: "OrganizationName",
+        instance: None,
+        data_type: VariableDataType::String,
+        unit: None,
+        // Empty until an integrator sets it - inventing an organization name would be worse than
+        // an obviously-unset one, and this is exactly the kind of value a deployment configures.
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+        persistent: true,
+    },
+    DefaultVariable {
+        component: "SecurityCtrlr",
+        variable: "CertificateEntries",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: None,
+        // No certificate store exists yet (B4.1), so it holds none.
+        value: "0",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "DeviceDataCtrlr",
+        variable: "ItemsPerMessage",
+        instance: Some("GetVariables"),
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "50",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "DeviceDataCtrlr",
+        variable: "ItemsPerMessage",
+        instance: Some("SetVariables"),
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "50",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "DeviceDataCtrlr",
+        variable: "ItemsPerMessage",
+        instance: Some("GetReport"),
+        data_type: VariableDataType::Integer,
+        unit: None,
+        // `crate::reporting::REPORT_CHUNK_SIZE` - the real figure this crate chunks
+        // `NotifyReport` at, not an aspiration.
+        value: "16",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "DeviceDataCtrlr",
+        variable: "BytesPerMessage",
+        instance: Some("GetVariables"),
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "8192",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "DeviceDataCtrlr",
+        variable: "BytesPerMessage",
+        instance: Some("SetVariables"),
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "8192",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "DeviceDataCtrlr",
+        variable: "BytesPerMessage",
+        instance: Some("GetReport"),
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "8192",
+        mutability: VariableMutability::ReadOnly,
+        persistent: false,
+    },
 ];
 
 #[cfg(test)]

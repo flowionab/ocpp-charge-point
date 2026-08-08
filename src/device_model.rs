@@ -29,7 +29,193 @@ use alloc::vec::Vec;
 /// [`crate::hardware::supported_feature_profiles_1_6`], and this device model both read
 /// [`CAPABILITY_GATES`] and `capabilities` directly, so a gate added to the table is picked up by
 /// all of them at once.
+/// One OCPP 2.x **required** variable that belongs to a capability-gated component - see
+/// [`CAPABILITY_GATED_VARIABLES`].
+struct CapabilityGatedVariable {
+    /// The `*Ctrlr` component, matching a [`CAPABILITY_GATES`] row's `ctrlr_component`.
+    component: &'static str,
+    /// The variable name.
+    variable: &'static str,
+    /// The variable's instance, where OCPP defines one.
+    instance: Option<&'static str>,
+    /// The variable's data type.
+    data_type: VariableDataType,
+    /// The value to register.
+    value: &'static str,
+    /// Whether a CSMS may write it.
+    mutability: VariableMutability,
+}
+
+/// The OCPP 2.x variables the vendored 2.1 appendix marks **Required** for components this crate
+/// only has when a capability is present (`docs/PRODUCTION-ROADMAP.md` B1.7).
+///
+/// Registered only when [`CAPABILITY_GATES`] says that capability is on, which is exactly C3's
+/// rule: *a build without Smart Charging owes no `SmartChargingCtrlr` variables*. A charge point
+/// that declares the capability answers every required variable for it; one that doesn't declares
+/// the component unavailable and registers nothing beyond that, rather than advertising
+/// configuration for a block it cannot run.
+///
+/// Components whose blocks do not exist here at all - `PaymentCtrlr`, `WebPaymentsCtrlr`,
+/// `DCDERCtrlr`/`ACDERCtrlr`, `V2XChargingCtrlr`, `ISO15118Ctrlr`, `NetworkConfiguration` - own
+/// 56 of the appendix's 122 required rows between them and appear nowhere here. That is the same
+/// rule applied consistently, not an omission: their capabilities are `false`, so nothing is owed.
+const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
+    CapabilityGatedVariable {
+        component: "LocalAuthListCtrlr",
+        variable: "Entries",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        // How many entries the list currently holds. Registered at 0 and updated by the list
+        // itself; see `crate::state::ChargePointState::apply`'s `LocalListUpdated` arm.
+        value: "0",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "LocalAuthListCtrlr",
+        variable: "ItemsPerMessage",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        value: "50",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "LocalAuthListCtrlr",
+        variable: "BytesPerMessage",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        value: "8192",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "SmartChargingCtrlr",
+        variable: "Entries",
+        instance: Some("ChargingProfiles"),
+        data_type: VariableDataType::Integer,
+        value: "0",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "SmartChargingCtrlr",
+        variable: "ProfileStackLevel",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        // The advisory figure the 1.6J adapter reports for `ChargeProfileMaxStackLevel`, kept in
+        // step: the profile store accepts any stack level, so both are guidance rather than a
+        // bound this crate enforces.
+        value: "8",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "SmartChargingCtrlr",
+        variable: "PeriodsPerSchedule",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        value: "24",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "SmartChargingCtrlr",
+        variable: "RateUnit",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        // Both, genuinely - `crate::smart_charging::compose` reads whichever unit a schedule is
+        // expressed in.
+        value: "A,W",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "SmartChargingCtrlr",
+        variable: "LimitChangeSignificance",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        // 0: this crate reports every composed limit change to hardware, however small, rather
+        // than filtering insignificant ones. Claiming a threshold it does not apply would be
+        // worse than admitting there isn't one.
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "TariffCostCtrlr",
+        variable: "Currency",
+        instance: None,
+        data_type: VariableDataType::String,
+        // Empty until configured: a CSMS-reported `CostUpdated` carries no currency, and
+        // inventing one (EUR? USD?) would put a unit on a number this crate never checks.
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "TariffCostCtrlr",
+        variable: "TariffFallbackMessage",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "TariffCostCtrlr",
+        variable: "TotalCostFallbackMessage",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+];
+
+/// Builds the `DeviceModelEvent::VariableRegistered` events that advertise every
+/// [`CAPABILITY_GATES`] entry's `*Ctrlr.Available` variable, reflecting `capabilities` (C3.2/C3.4,
+/// `docs/PRODUCTION-ROADMAP.md` §5.3) - registered for every gate regardless of whether the
+/// capability is present, so `GetBaseReport`/`GetVariables` can truthfully report `Available:
+/// false` rather than the component not existing at all (both 2.1 Part 2 and the 1.6J projection
+/// distinguish "not supported" from "unknown component"). Entries with no `ctrlr_component` (see
+/// that field's docs) contribute nothing - there's no standardized component to register.
+///
+/// This is the single place all four C3 propagation surfaces ultimately agree through: the
+/// handler-registration skip in [`crate::setup::setup`], the `SupportedFeatureProfiles` value from
+/// [`crate::hardware::supported_feature_profiles_1_6`], and this device model both read
+/// [`CAPABILITY_GATES`] and `capabilities` directly, so a gate added to the table is picked up by
+/// all of them at once.
+///
+/// Since B1.7 this also brings each gated component's **required** variables (see this module's
+/// `CAPABILITY_GATED_VARIABLES`), which is the same rule applied one level deeper: a capability
+/// that is off owes no configuration, only an honest `Available: false`.
 pub fn capability_gate_events(capabilities: &Capabilities) -> Vec<ChargePointEvent> {
+    let gated = CAPABILITY_GATES.iter().flat_map(|gate| {
+        let available = (gate.enabled)(capabilities);
+        CAPABILITY_GATED_VARIABLES
+            .iter()
+            .filter(move |variable| available && gate.ctrlr_component == Some(variable.component))
+            .map(|variable| {
+                ChargePointEvent::DeviceModel(DeviceModelEvent::VariableRegistered {
+                    component: Component {
+                        name: variable.component.to_string(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: Variable {
+                        name: variable.variable.to_string(),
+                        instance: variable.instance.map(ToString::to_string),
+                    },
+                    characteristics: VariableCharacteristics {
+                        data_type: variable.data_type,
+                        unit: None,
+                        min_limit: None,
+                        max_limit: None,
+                        values_list: None,
+                        supports_monitoring: false,
+                    },
+                    attributes: vec![VariableAttribute {
+                        attribute_type: VariableAttributeType::Actual,
+                        value: variable.value.to_string(),
+                        mutability: variable.mutability,
+                        persistent: false,
+                        constant: false,
+                        requires_reboot: false,
+                    }],
+                })
+            })
+    });
+
     CAPABILITY_GATES
         .iter()
         .filter_map(|gate| {
@@ -65,6 +251,7 @@ pub fn capability_gate_events(capabilities: &Capabilities) -> Vec<ChargePointEve
                 },
             ))
         })
+        .chain(gated)
         .collect()
 }
 
@@ -271,6 +458,83 @@ mod tests {
         ChargePointEvent, Component, DeviceModelEvent, Variable, VariableAttribute,
         VariableAttributeType, VariableCharacteristics, VariableDataType, VariableMutability,
     };
+
+    /// B1.7's rule, as a test rather than a claim: a capability that is *on* brings every required
+    /// variable its component owes, and one that is *off* brings none of them.
+    #[test]
+    fn required_variables_arrive_with_their_capability_and_only_with_it() {
+        use super::{CAPABILITY_GATED_VARIABLES, capability_gate_events};
+        use crate::hardware::Capabilities;
+        use crate::state::{ChargePointEvent, DeviceModelEvent};
+        let _ = CAPABILITY_GATED_VARIABLES;
+
+        let registered = |capabilities: &Capabilities| -> alloc::vec::Vec<(String, String)> {
+            capability_gate_events(capabilities)
+                .into_iter()
+                .filter_map(|event| match event {
+                    ChargePointEvent::DeviceModel(DeviceModelEvent::VariableRegistered {
+                        component,
+                        variable,
+                        ..
+                    }) => Some((component.name, variable.name)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Nothing declared: every `*Ctrlr.Available` still says so (that is C3.4's job), but no
+        // component's required configuration comes with it.
+        let none = registered(&Capabilities::default());
+        assert!(
+            none.iter().all(|(_, variable)| variable == "Available"),
+            "a charge point declaring no capabilities owes no capability-gated configuration"
+        );
+
+        // Smart charging declared: its five required variables arrive, and no other component's.
+        let smart = registered(&Capabilities {
+            smart_charging: true,
+            ..Capabilities::default()
+        });
+        for variable in [
+            "Entries",
+            "ProfileStackLevel",
+            "PeriodsPerSchedule",
+            "RateUnit",
+            "LimitChangeSignificance",
+        ] {
+            assert!(
+                smart
+                    .iter()
+                    .any(|(component, name)| component == "SmartChargingCtrlr" && name == variable),
+                "SmartChargingCtrlr.{variable} should arrive with the capability"
+            );
+        }
+        assert_eq!(
+            smart
+                .iter()
+                .filter(|(component, _)| component == "TariffCostCtrlr")
+                .count(),
+            1,
+            "only TariffCostCtrlr.Available - a build without tariff support owes no tariff \
+             configuration"
+        );
+    }
+
+    /// Every entry in `CAPABILITY_GATED_VARIABLES` must name a component some `CAPABILITY_GATES`
+    /// row actually gates - otherwise it is dead data that never registers, indistinguishable
+    /// from a typo.
+    #[test]
+    fn every_capability_gated_variable_belongs_to_a_real_gate() {
+        for variable in super::CAPABILITY_GATED_VARIABLES {
+            assert!(
+                crate::hardware::CAPABILITY_GATES
+                    .iter()
+                    .any(|gate| gate.ctrlr_component == Some(variable.component)),
+                "`{}` is not a component any capability gates",
+                variable.component
+            );
+        }
+    }
 
     fn component(name: &str) -> Component {
         Component {

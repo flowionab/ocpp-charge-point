@@ -5067,10 +5067,18 @@ mod tests {
         register_persistent_variable(&after).await;
         let recovered = restore_device_model(&after, &store).await;
 
-        assert_eq!(
-            recovered, 3,
-            "the test attribute plus this crate's own built-in persistent defaults"
-        );
+        // The test attribute plus every `persistent` built-in default - counted from the model
+        // itself rather than hard-coded, since the default set grows as functional blocks land.
+        let persistent_defaults = crate::state::DeviceModel::new()
+            .iter()
+            .filter(|(_, _, definition)| {
+                definition
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.persistent)
+            })
+            .count();
+        assert_eq!(recovered, persistent_defaults + 1);
         assert_eq!(
             after
                 .state()

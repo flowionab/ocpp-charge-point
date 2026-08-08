@@ -628,9 +628,19 @@ Boot, configuration, and the Component/Variable device model.
   integration surface. `VariableAttribute` carries one field OCPP's wire
   attribute doesn't have, `requires_reboot`, so `SetVariableStatusEnum`'s
   `RebootRequired` has something concrete to key off instead of being
-  permanently unreachable. The built-in default set is deliberately tiny
-  (`OCPPCommCtrlr`/`HeartbeatInterval`, `AuthCtrlr`/`AuthorizeRemoteStart`) -
-  integrators register what their hardware actually exposes.
+  permanently unreachable. The built-in default set covers OCPP's own
+  standardized variables - 45 always-on plus 11 that arrive with their
+  capability, between them every *required* row of the 2.1 appendix belonging
+  to a component this crate implements (B1.7), and every *required* 1.6J
+  configuration key (B1.6). Integrators register what their hardware exposes on
+  top of that. Required rows for blocks this crate does not have
+  (`PaymentCtrlr`, the DER controllers, ISO 15118, network configuration) are
+  deliberately absent: their capability is `false`, the component reports
+  `Available: false`, and a charge point that cannot run a block owes no
+  configuration for it. Per-EVSE and per-connector required rows
+  (`EVSE.Available`, `Connector.ConnectorType`, `SupplyPhases`) are still
+  missing, and want a derived-variable path rather than a stored copy that
+  would go stale.
 
   `device_model::handle_get_variables`/`handle_set_variables` resolve each
   item of a batch independently (a batch never fails outright), with adapters

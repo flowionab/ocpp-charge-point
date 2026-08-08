@@ -61,7 +61,7 @@ the charging profile store full.
 | Offline queue capacity (each of 3) | 25 | 100 | 200 |
 | Security log capacity | 25 | 50 | 200 |
 | `max_charging_profiles` | 16 | 16 | 16 |
-| Empty state (incl. built-in device model) | 17.3 KB | 17.6 KB | 19.7 KB |
+| Empty state (incl. built-in device model) | 23.7 KB | 24.0 KB | 26.1 KB |
 | Local authorization list, full | 3.1 KB | 10.9 KB | 52.5 KB |
 | Device model, full | 22.4 KB | 95.8 KB | 190.7 KB |
 | Busy connectors (transaction + reservation each) | 0.1 KB | 0.3 KB | 1.0 KB |
@@ -70,19 +70,25 @@ the charging profile store full.
 | Transaction queue, full | 6.0 KB | 23.8 KB | 47.6 KB |
 | Security queue, full | 5.1 KB | 20.5 KB | 41.1 KB |
 | Security log, full | 5.6 KB | 11.3 KB | 45.2 KB |
-| **Total retained** | **59.0 KB** | **178.5 KB** | **401.3 KB** |
+| **Total retained** | **59.5 KB** | **180.0 KB** | **400.8 KB** |
 
-Read that as: the crate's own defaults need roughly **179 KB of heap** in the
+Read that as: the crate's own defaults need roughly **180 KB of heap** in the
 worst case, and a deliberately tightened single-connector wallbox fits in
-roughly **59 KB**. Neither figure includes the exclusions above.
+roughly **60 KB**. Neither figure includes the exclusions above.
 
-The empty-state floor jumped from ~5 KB to ~17 KB when the crate started
-registering OCPP's standard configuration variables by default (B1.6: 26 of
-them, so that a 1.6J CSMS can read every *required* key without the hardware
-binding registering anything). That is the device model's per-variable cost
-below in action, and it is the price of protocol compliance rather than of
-topology — note how little it moves between a 1-connector and an 8-connector
-charge point.
+The empty-state floor went from ~5 KB to ~24 KB when the crate started
+registering OCPP's standard variables by default — B1.6's 1.6J required
+configuration keys, then B1.7's 2.x required variables, 45 in total. That is the
+device model's per-variable cost below in action, and it is the price of
+protocol compliance rather than of topology: note how little the floor moves
+between a 1-connector and an 8-connector charge point.
+
+The *totals* barely moved, which is worth understanding rather than glossing
+over: the device model is filled to `max_device_model_variables` either way, so
+built-in defaults displace filler rather than adding to it. What actually
+changed is the split — a charge point now spends more of its device-model budget
+on variables OCPP requires and less on whatever the hardware binding registers.
+A binding with many variables of its own should raise the bound accordingly.
 
 The charging profile store is the one row that does not scale with the
 configuration: `max_charging_profiles` defaults to 16 whatever the topology, so a

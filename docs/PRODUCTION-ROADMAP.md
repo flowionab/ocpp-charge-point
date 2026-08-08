@@ -102,7 +102,7 @@ close — mostly missing one version each.
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the authorization cache, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: certificates, network profiles. |
-| Test suite | 🚧 | 730 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
+| Test suite | 🚧 | 732 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
 
 ### 2.4 The structural blocker — resolved
@@ -376,11 +376,53 @@ version.
       by default lifts the empty-state floor from ~5 KB to ~17 KB, so retained-heap totals are now
       ~59 KB / ~179 KB / ~401 KB. `docs/MEMORY.md` and the README carry the new numbers; the
       existing ceilings still hold.
-- [ ] **B1.7** Register the 2.x required device-model variables. The
-      vendored appendix lists **122 required component/variable rows across
-      23 components**; the crate registers **2**. Scope per enabled feature
-      (a build without Smart Charging owes no `SmartChargingCtrlr`
-      variables) — see [C3](#53-c3--capability-propagation).
+- [x] **B1.7** 2.x required device-model variables — registered, scoped per capability, and
+      honest about which are inert.
+
+      Of the vendored 2.1 appendix's **122 required rows across 23 components**, this crate now
+      registers every one belonging to a component whose functionality it actually has: 45
+      always-on variables in `DEFAULT_VARIABLES` (`OCPPCommCtrlr`, `TxCtrlr`, `SampledDataCtrlr`,
+      `AlignedDataCtrlr`, `AuthCtrlr`, `ClockCtrlr`, `SecurityCtrlr`, `DeviceDataCtrlr` …) plus 11
+      in `CAPABILITY_GATED_VARIABLES` that arrive only with their capability.
+
+      **56 of the 122 belong to blocks that do not exist here** — `PaymentCtrlr` (22),
+      `DCDERCtrlr` (16), `NetworkConfiguration` (9), `WebPaymentsCtrlr` (5), `V2XChargingCtrlr`
+      (3), `ISO15118Ctrlr`, `ACDERCtrlr` — and are registered nowhere. That is
+      [C3](#53-c3--capability-propagation)'s rule applied consistently rather than an omission:
+      those capabilities are `false`, the component reports `Available: false`, and a charge point
+      that cannot run a block owes no configuration for it. Two tests hold the line: a capability
+      that is on brings every required variable its component owes and a capability that is off
+      brings none, and every `CAPABILITY_GATED_VARIABLES` entry names a component some
+      `CAPABILITY_GATES` row really gates (dead data there would be indistinguishable from a typo).
+
+      **Every value is one this crate can defend**, which is where most of the work went.
+      `SecurityCtrlr.SecurityProfile` is `1`, because TLS and certificates are workstream F and
+      claiming 2 or 3 would advertise security this charge point does not have.
+      `OCPPCommCtrlr.FileTransferProtocols` is empty, because file transfer arrives with B3/B5.
+      `TxCtrlr.TxStartPoint` is `Authorized`, because that is when `advance_transaction` actually
+      starts a transaction. `SmartChargingCtrlr.LimitChangeSignificance` is `0`, because the
+      projection reports every composed change however small. `SecurityCtrlr.OrganizationName` and
+      `TariffCostCtrlr.Currency` are empty rather than invented. `DeviceDataCtrlr.ItemsPerMessage
+      [GetReport]` is `16` — `reporting::REPORT_CHUNK_SIZE`, the real figure, not an aspiration.
+
+      Registration makes a variable readable and writable; it does not make it *live*. The five
+      live variables are unchanged from B1.6, and `DEFAULT_VARIABLES`' docs keep carrying that
+      split rather than letting a full device model imply a fully-implemented charge point.
+
+      **Not done, and worth naming**: the per-EVSE and per-connector required rows (`EVSE.Available`,
+      `EVSE.AvailabilityState`, `Connector.Available`, `Connector.ConnectorType`, the `SupplyPhases`
+      trio) are *not* registered. Their values live in the connector state machine or in hardware
+      the crate cannot see, and a stored copy would be a second source of truth that goes stale the
+      moment a connector changes state — the exact failure the 1.6J adapter's derived keys were
+      built to avoid. They want the same treatment: a derived-variable path shared by
+      `handle_get_variables` and `crate::reporting`, which is a contained follow-up rather than
+      something to fake now.
+
+      Memory moved again and was re-measured: the empty-state floor is ~24 KB (from ~17 KB after
+      B1.6, ~5 KB before both). Totals barely moved — the device model is filled to
+      `max_device_model_variables` either way, so defaults displace filler rather than adding to
+      it; what changed is that more of that budget now goes to variables OCPP requires.
+      `docs/MEMORY.md` explains that, and the ceilings still hold.
 - [ ] **B1.8** `SetNetworkProfile` handler (R§2), paired with [A9](#3-workstream-a--transport-negotiation-connection-lifecycle).
 
 ### B2 — Smart charging (R§11)
@@ -2175,10 +2217,10 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 |--------|-------|--------|
 | Device-model rows in the 2.1 appendix | 438 | `docs/OCPP-2.1/Appendices_CSV_v2.1/dm_components_vars.csv` |
 | …marked Required | 122, across 23 components | same |
-| …registered by this crate | 26 (`DEFAULT_VARIABLES`) | `src/state/device_model.rs` |
+| …registered by this crate | 45 always-on (`DEFAULT_VARIABLES`) + 11 capability-gated (`CAPABILITY_GATED_VARIABLES`); the 56 rows belonging to unimplemented blocks are deliberately absent | `src/state/device_model.rs`, `src/device_model.rs` |
 | 1.6J standard config keys aliased | 23, plus 10 answered from live state | `src/device_model.rs` |
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 27 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 730 | `#[test]` + `#[tokio::test]`, re-counted at the B1.6 commit (725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 732 | `#[test]` + `#[tokio::test]`, re-counted at the B1.7 commit (730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

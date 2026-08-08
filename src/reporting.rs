@@ -435,9 +435,21 @@ mod tests {
 
         let entries = report_base_entries(&model, ReportBase::ConfigurationInventory);
 
-        // Every built-in default is ReadWrite, so they're all included; the freshly registered
-        // ReadOnly-only variable is not.
-        assert_eq!(entries.len(), model.len() - 1);
+        // The freshly registered ReadOnly-only variable is excluded, and so is every built-in
+        // default that is itself ReadOnly (B1.7 registered several: values this crate reports but
+        // a CSMS cannot change).
+        let read_only_defaults = model
+            .iter()
+            .filter(|(_, _, definition)| {
+                definition
+                    .attribute(VariableAttributeType::Actual)
+                    .is_some_and(|attribute| attribute.mutability == VariableMutability::ReadOnly)
+            })
+            .count();
+        // `read_only_defaults` already counts the freshly registered ReadOnly-only variable,
+        // since it is in the model too.
+        assert_eq!(entries.len(), model.len() - read_only_defaults);
+        assert!(entries.len() < model.len());
         assert!(
             entries
                 .iter()
