@@ -775,8 +775,8 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 
 | Message | 1.6J | 2.0.1 | 2.1 |
 |---------|:----:|:-----:|:---:|
-| UpdateFirmware | ⬜ | ⬜ | ⬜ |
-| FirmwareStatusNotification | ⬜ | ⬜ | ⬜ |
+| UpdateFirmware | ✅ | ✅ | ✅ |
+| FirmwareStatusNotification | ✅ | ✅ | ✅ |
 | PublishFirmware / UnpublishFirmware / PublishFirmwareStatusNotification | — | ⬜ | ⬜ |
 
 - [x] **B3.1** File-transfer abstraction in `crate::hardware` — `FileTransfer`, with
@@ -819,9 +819,69 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
       A streaming implementor in the tests exercises the shape end to end (chunked reads, an await
       between chunks, progress out, content retained) so the ergonomics are proven rather than
       assumed.
-- [ ] **B3.2** Firmware state machine: Downloading → Downloaded →
-      Installing → Installed / failure states, each mapped to
-      `FirmwareStatusNotification` on all three versions.
+- [x] **B3.2** Firmware state machine, on all three versions, implemented against the vendored
+      spec's L01/L02 requirements rather than from the message list.
+
+      `UpdateFirmware` is answered immediately and the update runs on a worker, for the reason
+      [B5.1](#b5--diagnostics-and-monitoring-r14) does the same: an update takes minutes and the
+      response has to go out first. Every state change is reported (L01.FR.01), all carrying the
+      request id that started it (L01.FR.10).
+
+      **Both scheduling points are honoured and announced.** A `retrieveDateTime` in the future
+      reports `DownloadScheduled` (L01.FR.13) — a CSMS that heard nothing could not tell a
+      scheduled update from a lost one — and an `installDateTime` in the future reports
+      `InstallScheduled` *after* the download completes (L01.FR.16), so a late install does not
+      hold back the fetch. **An unsynchronized clock treats every schedule as due now**: a charge
+      point that cannot know the instant arrived would otherwise never start, and an update that
+      never happens is worse than one that happens early — the CSMS asked for it either way.
+
+      **The transaction wait changes availability, and that is L01.FR.07 rather than a
+      flourish.** Installation waits for running transactions to end (L01.FR.06), and while
+      waiting every EVSE is held `Unavailable` unless the CSMS set
+      `AllowNewSessionsPendingFirmwareUpdate` — otherwise a charge point about to reboot keeps
+      accepting drivers it is about to cut off. Availability is restored if the install *fails*,
+      so a failed update does not leave a station silently out of service, and deliberately **not**
+      restored before a reboot, where re-opening for a session the restart would kill is worse
+      than coming back up unavailable.
+
+      `InstallRebooting` is reported *before* the reboot (L01.FR.15), because afterwards there is
+      no process left to report anything, and the reboot goes through the existing `Reset` path
+      rather than a parallel one — that path already drives every connector through the fail-safe
+      stop, and `Immediate` is safe there precisely because the transaction wait established there
+      is nothing running.
+
+      A second `UpdateFirmware` supersedes the first and answers `AcceptedCanceled` (L01.FR.24),
+      with the same monotonic-ticket reasoning as B5.1. `FirmwareUpdateState::triggered_status`
+      answers a `TriggerMessage`: `Idle` once the last update installed (L01.FR.25), the last
+      status otherwise (L01.FR.26), and `Idle` is the one status sent without a request id
+      (L01.FR.20).
+
+      **New hardware surface:** `hardware::FirmwareInstaller`, separate from `FileTransfer`
+      because installing is not transferring — a charge point may be able to fetch a file and
+      unable to flash one, and the two live in different parts of an integrator's stack. Its
+      `RebootRequired` outcome is what lets this crate report `InstallRebooting` before issuing
+      the reboot; an implementor must not reboot inside `install`.
+
+      **1.6J is genuinely poorer, and every projection picks the status that is *true* rather than
+      convenient.** Its response is `{}` — no status field at all, so acceptance is invisible and a
+      refusal shows up only as the notifications that do not follow. It has no request id, no
+      `installDate`, and seven statuses rather than fourteen: `DownloadScheduled` → `Idle`
+      (nothing has started; `Downloading` would claim a transfer that has not begun),
+      `InstallScheduled` → `Downloaded` (exactly the state it is in), `InstallRebooting` →
+      `Installing` (`Installed` would have a CSMS record a version this charge point is not
+      running). 1.6J's plain `UpdateFirmware` is also unsigned by construction — signing arrives
+      with the Security Whitepaper's `SignedUpdateFirmware`, which `ocpp-types` does not generate
+      ([D2.2](#62-d2--type-completeness-audit)).
+
+      **Still open, and honestly so:** signature/certificate verification is
+      [B3.3](#b3--firmware-management-r12) — it needs crypto and a trust store this crate has no
+      hook for, so `signature`/`signingCertificate` are carried through to the integrator untouched
+      and `InvalidCertificate` is never returned, since answering it without having checked would
+      be a lie in the dangerous direction. Reporting `Installed` *after* a reboot needs a marker
+      that survives the restart, the same shape as `BootReasonStore`.
+
+      Registered through `ChargePointBuilder::firmware_updates` only — it needs both halves of the
+      firmware hardware surface, which `setup()` has no way to receive.
 - [ ] **B3.3** Signed firmware verification (2.x `signingCertificate` /
       `signature`; 1.6J security whitepaper `SignedUpdateFirmware`), driving
       the `InvalidFirmwareSignature` / `InvalidFirmwareSigningCertificate`
@@ -2547,7 +2607,10 @@ Method: every `.on_*(` / `.send_*(` call inside a `mod ocpp_1_6` /
 `ocpp-client` 0.2.0 generates per version. Re-run it after any coverage
 work; it's the honest number.
 
-### A.1 OCPP 1.6J — 25 of 28 wired
+### A.1 OCPP 1.6J — 28 of 28 wired
+
+**Complete.** Every message OCPP 1.6J's core profile defines is handled. The old "25 of 28"
+heading here also disagreed with its own list, which had 24 entries; both are now moot.
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ChangeConfiguration, ClearCache, DataTransfer, GetConfiguration,
@@ -2555,11 +2618,11 @@ ClearChargingProfile, GetCompositeSchedule, GetLocalListVersion, Heartbeat,
 MeterValues, RemoteStartTransaction, RemoteStopTransaction, ReserveNow, Reset,
 DiagnosticsStatusNotification, GetDiagnostics, SendLocalList, SetChargingProfile,
 StartTransaction, StatusNotification, StopTransaction, TriggerMessage,
-UnlockConnector
+FirmwareStatusNotification, UnlockConnector, UpdateFirmware
 
-**Missing:** FirmwareStatusNotification, UpdateFirmware
+**Missing:** none — 1.6J's core profile is complete.
 
-### A.2 OCPP 2.0.1 — 34 of 64 wired
+### A.2 OCPP 2.0.1 — 36 of 64 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
@@ -2586,7 +2649,7 @@ SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 2.0.1 spec and in `ocpp-types` v201 but ungenerated by `ocpp-client` 0.2.0. D1
 fixed that upstream; 0.2.2 generates all 64 actions, and F4.4 wired this one.
 
-### A.3 OCPP 2.1 — 38 of 91 wired
+### A.3 OCPP 2.1 — 40 of 91 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
@@ -2640,5 +2703,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 873 | `#[test]` + `#[tokio::test]`, re-counted at the B5.1 commit (848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 895 | `#[test]` + `#[tokio::test]`, re-counted at the B3.2 commit (873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

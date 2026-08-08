@@ -1,0 +1,270 @@
+//! OCPP 2.0.1 wire adapter for the Firmware Management block (B3.2).
+
+use alloc::boxed::Box;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use chrono::{DateTime, Utc};
+
+use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
+use ocpp_client::ocpp_types::v201::common::{FirmwareStatusEnum, UpdateFirmwareStatusEnum};
+use ocpp_client::ocpp_types::v201::{
+    FirmwareStatusNotificationRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
+};
+
+use crate::actor::ChargePointActor;
+use crate::firmware::{
+    FirmwareStatus, FirmwareStatusNotifier, FirmwareUpdateQueue, FirmwareUpdateRequest,
+    FirmwareUpdateState, UpdateFirmwareHandler, UpdateFirmwareOutcome, handle_update_firmware,
+};
+
+fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
+
+fn map_request(request: &UpdateFirmwareRequest) -> FirmwareUpdateRequest {
+    let firmware = &request.firmware;
+    FirmwareUpdateRequest {
+        request_id: Some(request.request_id),
+        location: firmware.location.to_string(),
+        // `retrieveDateTime` is required on the wire; an unparseable one becomes "now", which
+        // starts the update the CSMS asked for rather than stalling it on a formatting problem.
+        retrieve_at: parse_time(&firmware.retrieve_date_time),
+        install_at: firmware.install_date_time.as_deref().and_then(parse_time),
+        signature: firmware.signature.as_deref().map(Into::into),
+        signing_certificate: firmware.signing_certificate.as_deref().map(Into::into),
+        retries: request
+            .retries
+            .and_then(|retries| u32::try_from(retries).ok())
+            .unwrap_or(crate::firmware::DEFAULT_RETRIES),
+        retry_interval_secs: request
+            .retry_interval
+            .and_then(|interval| u32::try_from(interval).ok())
+            .filter(|interval| *interval > 0)
+            .unwrap_or(crate::firmware::DEFAULT_RETRY_INTERVAL_SECS),
+    }
+}
+
+fn update_response(outcome: UpdateFirmwareOutcome) -> UpdateFirmwareResponse {
+    UpdateFirmwareResponse {
+        custom_data: None,
+        status: match outcome {
+            UpdateFirmwareOutcome::Accepted => UpdateFirmwareStatusEnum::Accepted,
+            UpdateFirmwareOutcome::AcceptedCanceled => UpdateFirmwareStatusEnum::AcceptedCanceled,
+            UpdateFirmwareOutcome::Rejected => UpdateFirmwareStatusEnum::Rejected,
+        },
+        // `InvalidCertificate`/`RevokedCertificate` are never returned: verifying the signing
+        // certificate is B3.3, and answering `InvalidCertificate` without having checked would be
+        // a lie in the more dangerous direction.
+        status_info: None,
+    }
+}
+
+pub(super) fn wire_status(status: FirmwareStatus) -> FirmwareStatusEnum {
+    match status {
+        FirmwareStatus::Idle => FirmwareStatusEnum::Idle,
+        FirmwareStatus::DownloadScheduled => FirmwareStatusEnum::DownloadScheduled,
+        FirmwareStatus::Downloading => FirmwareStatusEnum::Downloading,
+        FirmwareStatus::Downloaded => FirmwareStatusEnum::Downloaded,
+        FirmwareStatus::DownloadFailed => FirmwareStatusEnum::DownloadFailed,
+        FirmwareStatus::InstallScheduled => FirmwareStatusEnum::InstallScheduled,
+        FirmwareStatus::Installing => FirmwareStatusEnum::Installing,
+        FirmwareStatus::Installed => FirmwareStatusEnum::Installed,
+        FirmwareStatus::InstallationFailed => FirmwareStatusEnum::InstallationFailed,
+        FirmwareStatus::InstallRebooting => FirmwareStatusEnum::InstallRebooting,
+    }
+}
+
+/// Handles 2.1's `UpdateFirmware` and sends its `FirmwareStatusNotification`s.
+pub struct Ocpp2_0_1FirmwareHandler {
+    client: OCPP2_0_1Client,
+}
+
+impl Ocpp2_0_1FirmwareHandler {
+    /// Wraps `client`.
+    pub fn new(client: OCPP2_0_1Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl UpdateFirmwareHandler for Ocpp2_0_1FirmwareHandler {
+    async fn register_update_firmware_handler(
+        &self,
+        actor: ChargePointActor,
+        updates: FirmwareUpdateQueue,
+        state: Arc<FirmwareUpdateState>,
+    ) {
+        self.client
+            .on_update_firmware(move |request: UpdateFirmwareRequest, _client| {
+                let actor = actor.clone();
+                let updates = updates.clone();
+                let state = state.clone();
+                async move {
+                    let outcome =
+                        handle_update_firmware(&actor, &updates, &state, map_request(&request))
+                            .await;
+                    Ok(update_response(outcome))
+                }
+            })
+            .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl FirmwareStatusNotifier for Ocpp2_0_1FirmwareHandler {
+    type Error = ocpp_client::ClientError<ocpp_client::ocpp_2_0_1::OCPP2_0_1Error>;
+
+    async fn notify_firmware_status(
+        &self,
+        request_id: Option<i64>,
+        status: FirmwareStatus,
+    ) -> Result<(), Self::Error> {
+        self.client
+            .send_firmware_status_notification(FirmwareStatusNotificationRequest {
+                custom_data: None,
+                // L01.FR.20: mandatory unless the status is `Idle`, which is the one state with
+                // no update to correlate to.
+                request_id: match status {
+                    FirmwareStatus::Idle => None,
+                    _ => request_id,
+                },
+                status: wire_status(status),
+                // 2.0.1's `FirmwareStatusNotificationRequest` has no `statusInfo`; 2.1 added it.
+            })
+            .await
+            .map(|_| ())
+    }
+}
+
+/// The `std` convenience: a bare [`OCPP2_0_1Client`] handles this block directly.
+#[cfg(feature = "std")]
+mod std_impls {
+    use super::*;
+
+    #[async_trait::async_trait]
+    impl UpdateFirmwareHandler for OCPP2_0_1Client {
+        async fn register_update_firmware_handler(
+            &self,
+            actor: ChargePointActor,
+            updates: FirmwareUpdateQueue,
+            state: Arc<FirmwareUpdateState>,
+        ) {
+            Ocpp2_0_1FirmwareHandler::new(self.clone())
+                .register_update_firmware_handler(actor, updates, state)
+                .await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FirmwareStatusNotifier for OCPP2_0_1Client {
+        type Error = ocpp_client::ClientError<ocpp_client::ocpp_2_0_1::OCPP2_0_1Error>;
+
+        async fn notify_firmware_status(
+            &self,
+            request_id: Option<i64>,
+            status: FirmwareStatus,
+        ) -> Result<(), Self::Error> {
+            Ocpp2_0_1FirmwareHandler::new(self.clone())
+                .notify_firmware_status(request_id, status)
+                .await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ocpp_client::ocpp_types::v201::common::Firmware;
+
+    fn wire_request() -> UpdateFirmwareRequest {
+        UpdateFirmwareRequest {
+            custom_data: None,
+            firmware: Firmware {
+                custom_data: None,
+                install_date_time: Some("2026-03-04T06:00:00Z".into()),
+                location: heapless::String::try_from("https://fw.example/image.bin").unwrap(),
+                retrieve_date_time: "2026-03-04T05:00:00Z".into(),
+                signature: Some(heapless::String::try_from("c2ln").unwrap()),
+                signing_certificate: Some(heapless::String::try_from("Y2VydA==").unwrap()),
+            },
+            request_id: 77,
+            retries: Some(2),
+            retry_interval: Some(30),
+        }
+    }
+
+    #[test]
+    fn the_schedule_signature_and_retry_policy_all_come_across() {
+        let mapped = map_request(&wire_request());
+
+        assert_eq!(mapped.request_id, Some(77));
+        assert_eq!(mapped.location, "https://fw.example/image.bin");
+        assert!(mapped.retrieve_at.is_some());
+        assert!(mapped.install_at.is_some());
+        assert_eq!(mapped.retries, 2);
+        assert_eq!(mapped.retry_interval_secs, 30);
+        // Carried untouched for B3.3 rather than dropped, so verification can land there without
+        // another breaking change to this shape.
+        assert_eq!(mapped.signature.as_deref(), Some("c2ln"));
+        assert_eq!(mapped.signing_certificate.as_deref(), Some("Y2VydA=="));
+    }
+
+    #[test]
+    fn an_unparseable_retrieve_time_starts_the_update_rather_than_stalling_it() {
+        let mut request = wire_request();
+        request.firmware.retrieve_date_time = "not a timestamp".into();
+
+        // `None` means "now" downstream - the CSMS asked for an update, and refusing it over a
+        // formatting problem in a field whose whole job is "when" would serve nobody.
+        assert_eq!(map_request(&request).retrieve_at, None);
+    }
+
+    #[test]
+    fn every_internal_status_has_its_own_2_1_value() {
+        // 2.1's enum is the superset this crate models, so nothing collapses here - unlike 1.6J.
+        let all = [
+            (FirmwareStatus::Idle, FirmwareStatusEnum::Idle),
+            (
+                FirmwareStatus::DownloadScheduled,
+                FirmwareStatusEnum::DownloadScheduled,
+            ),
+            (FirmwareStatus::Downloading, FirmwareStatusEnum::Downloading),
+            (FirmwareStatus::Downloaded, FirmwareStatusEnum::Downloaded),
+            (
+                FirmwareStatus::DownloadFailed,
+                FirmwareStatusEnum::DownloadFailed,
+            ),
+            (
+                FirmwareStatus::InstallScheduled,
+                FirmwareStatusEnum::InstallScheduled,
+            ),
+            (FirmwareStatus::Installing, FirmwareStatusEnum::Installing),
+            (FirmwareStatus::Installed, FirmwareStatusEnum::Installed),
+            (
+                FirmwareStatus::InstallationFailed,
+                FirmwareStatusEnum::InstallationFailed,
+            ),
+            (
+                FirmwareStatus::InstallRebooting,
+                FirmwareStatusEnum::InstallRebooting,
+            ),
+        ];
+        for (internal, wire) in all {
+            assert_eq!(wire_status(internal), wire);
+        }
+    }
+
+    #[test]
+    fn a_supersede_is_reported_as_accepted_canceled() {
+        assert_eq!(
+            update_response(UpdateFirmwareOutcome::AcceptedCanceled).status,
+            UpdateFirmwareStatusEnum::AcceptedCanceled
+        );
+        assert_eq!(
+            update_response(UpdateFirmwareOutcome::Rejected).status,
+            UpdateFirmwareStatusEnum::Rejected
+        );
+    }
+}

@@ -1771,6 +1771,49 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers the Firmware Management block (`docs/PRODUCTION-ROADMAP.md` B3.2): inbound
+    /// `UpdateFirmware`, and the worker that downloads, waits, installs and reports every state
+    /// change to `csms`.
+    ///
+    /// Needs both halves of the firmware hardware surface - `transfer` to fetch the image,
+    /// `installer` to flash it - which is why, like [`Self::log_uploads`], this is builder-only:
+    /// `setup()` has no way to receive either.
+    pub async fn firmware_updates<N, F, I, K, B>(
+        self,
+        csms: &N,
+        transfer: F,
+        installer: I,
+        clock: K,
+        backoff: B,
+    ) -> Self
+    where
+        N: crate::firmware::UpdateFirmwareHandler
+            + crate::firmware::FirmwareStatusNotifier
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        F: crate::hardware::FileTransfer + Send + Sync + 'static,
+        I: crate::hardware::FirmwareInstaller + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+    {
+        let updates = crate::firmware::FirmwareUpdateQueue::new();
+        let state = Arc::new(crate::firmware::FirmwareUpdateState::new());
+        csms.register_update_firmware_handler(self.runtime.actor(), updates.clone(), state.clone())
+            .await;
+
+        let actor = self.runtime.actor();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::firmware::run_firmware_updates(
+                &actor, updates, &state, &transfer, &installer, &notifier, &clock, &backoff,
+            )
+            .await;
+        }));
+        self
+    }
+
     /// Finishes building, handing back the [`ChargePointRuntime`] every registered block is now
     /// wired to.
     pub fn build(self) -> ChargePointRuntime<T> {

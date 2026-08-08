@@ -14,6 +14,7 @@ mod connector;
 mod event_sender;
 mod evse;
 mod file_transfer;
+mod firmware;
 mod storage;
 
 pub use self::capabilities::{
@@ -29,6 +30,9 @@ pub use self::evse::Evse;
 pub use self::file_transfer::{
     FileTransfer, LogKind, NoFileTransfer, NoFileTransferError, TransferProgress, TransferReport,
     UploadSource,
+};
+pub use self::firmware::{
+    FirmwareInstallOutcome, FirmwareInstaller, NoFirmwareInstaller, NoFirmwareInstallerError,
 };
 pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]

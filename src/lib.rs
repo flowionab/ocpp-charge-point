@@ -38,6 +38,7 @@ pub mod data_transfer;
 pub mod device_model;
 pub mod diagnostics;
 pub mod executor;
+pub mod firmware;
 pub mod hardware;
 #[cfg(feature = "ocpp_1_6")]
 mod id_tag;

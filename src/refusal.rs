@@ -135,6 +135,11 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         shape: RefusalShape::CallResultStatus,
     },
     RefusalGate {
+        message: "UpdateFirmware",
+        capability: |c| c.firmware_management,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
         message: "GetLog",
         capability: |c| c.diagnostics,
         shape: RefusalShape::CallResultStatus,

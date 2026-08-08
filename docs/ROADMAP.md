@@ -1344,17 +1344,36 @@ Over-the-air firmware updates.
 - Internal state needed: firmware update state machine
   (Downloading/Downloaded/Installing/Installed/Failed), signature
   verification hook.
-- Status: 🚧 the shared foundation is in. `crate::hardware::FileTransfer` (B3.1)
-  is the hardware trait both this block and §14 need: fetch a URL, or send a log
-  to one, with optional progress. It is deliberately general rather than
-  firmware-shaped, and deliberately never carries downloaded content back into
-  this crate - a firmware image is megabytes against an MCU's kilobytes, and the
-  only thing the crate would do with it is hand it straight back to be flashed.
-  Retries stay with the caller (OCPP puts `retries`/`retryInterval` on the
-  request), and an implementation must be safe to cancel mid-transfer without
-  leaving a half-written image behind. Nothing drives it yet: the firmware state
-  machine (Downloading → Downloaded → Installing → Installed) and the
-  `FirmwareStatusNotification` mapping are still to come.
+- Status: 🚧 partial - **the update flow is wired end to end on all three
+  versions** (B3.2). `UpdateFirmware` is answered immediately and the update runs
+  on a worker: download, wait, install, reporting every state change as a
+  `FirmwareStatusNotification` with the request id that started it.
+
+  Both of OCPP's scheduling points are honoured *and announced* -
+  `DownloadScheduled` for a future `retrieveDateTime`, `InstallScheduled` for a
+  future `installDateTime` - because a CSMS that heard nothing could not tell a
+  scheduled update from a lost one. An unsynchronized clock treats every schedule
+  as due now: a charge point that cannot know the instant arrived would otherwise
+  never start, and an update that never happens is worse than one that happens
+  early.
+
+  Installation waits for running transactions, and while waiting every EVSE is
+  held unavailable unless the CSMS allows new sessions - a charge point about to
+  reboot should not keep taking drivers it is about to cut off. Availability is
+  restored if the install fails, and deliberately not before a reboot.
+  `InstallRebooting` is reported before the reboot, which then goes through the
+  existing `Reset` path rather than a parallel one, so the fail-safe stop still
+  applies.
+
+  Two hardware traits carry this: `FileTransfer` (§12/§14's shared abstraction)
+  fetches the image and `FirmwareInstaller` flashes it, kept separate because a
+  charge point may be able to do one and not the other. Its `RebootRequired`
+  outcome is what lets the crate announce the restart before causing it.
+
+  Still missing: signature and certificate verification (needs crypto and a trust
+  store this crate has no hook for - the fields are carried through to the
+  integrator untouched), reporting `Installed` after the reboot (needs a marker
+  that survives it), and 2.x's local-controller firmware publishing.
 - Version notes: 1.6J's `FirmwareStatusNotification` status enum is a
   subset of 2.x's.
 
