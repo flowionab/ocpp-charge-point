@@ -70,7 +70,8 @@ use crate::tariff::{
 };
 use crate::transactions::TransactionNotifier;
 use crate::variable_monitoring::{
-    ClearVariableMonitoringHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
+    ClearVariableMonitoringHandler, GetMonitoringReportHandler, SetMonitoringBaseHandler,
+    SetMonitoringLevelHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
 };
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -464,8 +465,14 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     {
         let events = self.runtime.actor().subscribe_variable_monitor_events();
         let notifier = csms.clone();
+        let events_actor = self.runtime.actor();
         self.executor.spawn(Box::pin(async move {
-            crate::variable_monitoring::run_variable_monitor_events(events, &notifier).await;
+            crate::variable_monitoring::run_variable_monitor_events(
+                events,
+                &notifier,
+                &events_actor,
+            )
+            .await;
         }));
 
         let actor = self.runtime.actor();
@@ -1655,6 +1662,34 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         csms.register_set_variable_monitoring_handler(self.runtime.actor())
             .await;
         csms.register_clear_variable_monitoring_handler(self.runtime.actor())
+            .await;
+
+        self
+    }
+
+    /// Registers the variable monitoring engine's *reporting* surface: `SetMonitoringBase`,
+    /// `SetMonitoringLevel`, and `GetMonitoringReport` (answered via one or more
+    /// `NotifyMonitoringReport`s) all feed into the runtime's actor
+    /// (`docs/PRODUCTION-ROADMAP.md` §B5, B5.3) - the read/bulk-control counterpart to
+    /// [`Self::variable_monitoring`]'s install/clear surface, kept as a separate call so a CSMS
+    /// client implementing only one half doesn't need the other (mirrors [`Self::device_model`]/
+    /// [`Self::configuration`]'s same split).
+    ///
+    /// **2.x only** - see [`Self::variable_monitoring`]'s docs; 1.6J has no such messages.
+    pub async fn monitoring_reports<N>(self, csms: &N) -> Self
+    where
+        N: SetMonitoringBaseHandler
+            + SetMonitoringLevelHandler
+            + GetMonitoringReportHandler
+            + Send
+            + Sync
+            + 'static,
+    {
+        csms.register_set_monitoring_base_handler(self.runtime.actor())
+            .await;
+        csms.register_set_monitoring_level_handler(self.runtime.actor())
+            .await;
+        csms.register_get_monitoring_report_handler(self.runtime.actor())
             .await;
 
         self

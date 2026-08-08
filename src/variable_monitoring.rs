@@ -1,28 +1,42 @@
-//! Variable monitoring functional block: `SetVariableMonitoring`/`ClearVariableMonitoring`
-//! inbound, `NotifyEvent` outbound. See `docs/ROADMAP.md` §2/§14 and
-//! `docs/PRODUCTION-ROADMAP.md` §B5 (B5.2).
+//! Variable monitoring functional block: `SetVariableMonitoring`/`ClearVariableMonitoring`/
+//! `SetMonitoringBase`/`SetMonitoringLevel` inbound, `NotifyEvent`/`NotifyMonitoringReport`
+//! outbound, and `GetMonitoringReport` inbound. See `docs/ROADMAP.md` §2/§14 and
+//! `docs/PRODUCTION-ROADMAP.md` §B5 (B5.2/B5.3).
 //!
-//! **2.x only.** OCPP 1.6J has no variable monitoring messages and no `NotifyEvent` at all, so -
-//! unlike almost every other functional block in this crate - there is no `ocpp_1_6` submodule
-//! here to even honestly say "unsupported" from: the messages simply don't exist on that wire.
+//! **2.x only.** OCPP 1.6J has no variable monitoring messages and no `NotifyEvent`/
+//! `NotifyMonitoringReport` at all - unlike almost every other functional block in this crate,
+//! there is no `ocpp_1_6` submodule here to even honestly say "unsupported" from: the messages
+//! simply don't exist on that wire.
 //!
-//! Monitoring **report generation** (`GetMonitoringReport`/`NotifyMonitoringReport`, B5.3) is a
-//! separate, still-open concern - this module only sets up, clears, evaluates, and reports
-//! monitors; nothing here answers "what monitors are installed" back to the CSMS as a report.
+//! **Monitoring report generation** (`GetMonitoringReport`/`NotifyMonitoringReport`, B5.3) is the
+//! read side of this same engine: [`handle_get_monitoring_report`] answers "what monitors are
+//! installed" by filtering [`crate::state::VariableMonitorStore::installed`] and
+//! [`chunk_monitoring_report`] splits the answer across one or more `NotifyMonitoringReport`s -
+//! chunked exactly the way [`crate::reporting::chunk_report`] already chunks `NotifyReport`
+//! (same [`crate::reporting::REPORT_CHUNK_SIZE`], same `seqNo`/`tbc`/`requestId` correlation
+//! scheme). [`handle_set_monitoring_base`]/[`handle_set_monitoring_level`] are the bulk
+//! severity/activation controls (`SetMonitoringBase`/`SetMonitoringLevel`) - see their docs for
+//! what each actually does to [`crate::state::VariableMonitorStore`], not just the status they
+//! report back.
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::provisioning::Backoff;
+use crate::reporting::{REPORT_CHUNK_SIZE, ReportComponentVariable};
 use crate::state::{
-    ChargePointEvent, Component, EventTrigger, MonitorType, SetMonitorRejection, TriggeredMonitor,
-    Variable, VariableAttributeType, VariableMonitorId, VariableMonitoringEvent,
+    ChargePointEvent, Component, EventTrigger, MonitorType, MonitoringBase, SetMonitorRejection,
+    TriggeredMonitor, Variable, VariableAttributeType, VariableMonitorId, VariableMonitoringEvent,
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 #[cfg(feature = "ocpp_2_0_1")]
+pub use self::ocpp_2_0_1::Ocpp2_0_1MonitoringReportHandler;
+#[cfg(feature = "ocpp_2_0_1")]
 pub use self::ocpp_2_0_1::Ocpp2_0_1VariableMonitorEventNotifier;
+#[cfg(feature = "ocpp_2_1")]
+pub use self::ocpp_2_1::Ocpp2_1MonitoringReportHandler;
 #[cfg(feature = "ocpp_2_1")]
 pub use self::ocpp_2_1::Ocpp2_1VariableMonitorEventNotifier;
 
@@ -198,6 +212,257 @@ pub async fn handle_clear_variable_monitoring(
     outcomes
 }
 
+/// Handles a CSMS-initiated `SetMonitoringBase` request against `actor` - always accepted (this
+/// crate's [`MonitoringBase`] already covers all 3 values OCPP defines, and applying one can't
+/// fail), mirroring [`crate::reporting::handle_get_base_report`]'s same "every value this crate
+/// models is unconditionally supported" stance. See [`crate::state::VariableMonitorStore::set_base`]
+/// for what this actually does to the installed monitor set - critically, `FactoryDefault`/
+/// `HardWiredOnly` clear every CSMS-installed monitor rather than leaving them running under a new
+/// name.
+pub async fn handle_set_monitoring_base(actor: &ChargePointActor, base: MonitoringBase) {
+    let _ = actor
+        .send(ChargePointEvent::VariableMonitoring(
+            VariableMonitoringEvent::BaseSet { base },
+        ))
+        .await;
+}
+
+/// The outcome of a `SetMonitoringLevel` request, matching OCPP's `GenericStatusEnum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetMonitoringLevelOutcome {
+    /// `severity` was in OCPP's `0..=9` range and is now [`crate::state::VariableMonitorStore::level`].
+    Accepted,
+    /// `severity` was outside OCPP's `0..=9` range.
+    Rejected,
+}
+
+/// Handles a CSMS-initiated `SetMonitoringLevel` request against `actor`: `severity` must be in
+/// OCPP's `0..=9` range (mirroring [`resolve_and_apply_set`]'s own severity validation for
+/// `SetVariableMonitoring`) or the request is `Rejected` without touching the store at all. An
+/// accepted level is not just remembered - see [`crate::state::VariableMonitorStore::is_reportable`],
+/// consulted by [`run_variable_monitor_events`]/[`run_periodic_variable_monitors`] before every
+/// report, so tightening it actually suppresses lower-urgency reports rather than being a value
+/// this crate stores but never acts on.
+pub async fn handle_set_monitoring_level(
+    actor: &ChargePointActor,
+    severity: i64,
+) -> SetMonitoringLevelOutcome {
+    let Ok(severity) = u8::try_from(severity) else {
+        return SetMonitoringLevelOutcome::Rejected;
+    };
+    if severity > 9 {
+        return SetMonitoringLevelOutcome::Rejected;
+    }
+    let _ = actor
+        .send(ChargePointEvent::VariableMonitoring(
+            VariableMonitoringEvent::LevelSet { severity },
+        ))
+        .await;
+    SetMonitoringLevelOutcome::Accepted
+}
+
+/// Which of OCPP's three `MonitoringCriterionEnum` values a `GetMonitoringReport` filter names.
+/// See [`Self::matches`] for how each maps onto this crate's [`MonitorType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitoringCriterion {
+    /// Matches [`MonitorType::UpperThreshold`]/[`MonitorType::LowerThreshold`] monitors - OCPP
+    /// `ThresholdMonitoring`.
+    Threshold,
+    /// Matches [`MonitorType::Delta`] monitors - OCPP `DeltaMonitoring`.
+    Delta,
+    /// Matches [`MonitorType::Periodic`] monitors - OCPP `PeriodicMonitoring`.
+    Periodic,
+}
+
+impl MonitoringCriterion {
+    /// Whether `monitor_type` falls under this criterion.
+    fn matches(self, monitor_type: MonitorType) -> bool {
+        matches!(
+            (self, monitor_type),
+            (
+                Self::Threshold,
+                MonitorType::UpperThreshold | MonitorType::LowerThreshold
+            ) | (Self::Delta, MonitorType::Delta)
+                | (Self::Periodic, MonitorType::Periodic)
+        )
+    }
+}
+
+/// One installed monitor as reported in a `GetMonitoringReport` answer - a single wire
+/// `VariableMonitoring` item, minus the `(component, variable)` it's grouped under (see
+/// [`MonitoringReportEntry`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonitoringReportMonitor {
+    /// The monitor's id.
+    pub id: VariableMonitorId,
+    /// What kind of monitor this is.
+    pub monitor_type: MonitorType,
+    /// The threshold, delta amount, or interval in seconds.
+    pub value: f64,
+    /// The severity a firing of this monitor is reported at.
+    pub severity: u8,
+}
+
+/// Every monitor installed on one `(component, variable)` pair, as one `NotifyMonitoringReport`
+/// entry (OCPP `MonitoringData`, which itself groups a component/variable's monitors the same
+/// way).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonitoringReportEntry {
+    /// The component the monitored variable belongs to.
+    pub component: Component,
+    /// The monitored variable.
+    pub variable: Variable,
+    /// Every monitor installed on this `(component, variable)` pair that matched the request's
+    /// filter - never empty (see [`filter_monitoring_entries`]).
+    pub monitors: Vec<MonitoringReportMonitor>,
+}
+
+/// The outcome of a `GetMonitoringReport` request, matching the subset of OCPP's
+/// `GenericDeviceModelStatusEnum` this crate can actually produce - mirrors
+/// [`crate::reporting::ReportOutcome`]'s same shape and the same reasoning for omitting
+/// `Rejected`/`NotSupported` (this crate's filtering can't fail, and every `MonitoringCriterion`
+/// OCPP defines is modeled).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MonitoringReportOutcome {
+    /// The request was understood; the enclosed entries follow in one or more
+    /// `NotifyMonitoringReport`s (via [`chunk_monitoring_report`]). Never empty - see
+    /// [`Self::EmptyResultSet`] for that case.
+    Accepted(Vec<MonitoringReportEntry>),
+    /// The filter (criteria and/or component/variable list) matched no installed monitor at all -
+    /// including the degenerate case of no filter at all against an empty store.
+    EmptyResultSet,
+}
+
+/// Whether monitor `component`/`variable`/`monitor_type` matches `criteria`/`component_variable` -
+/// OCPP's `GetMonitoringReport` OR semantics, mirroring
+/// [`crate::reporting::filter_report_entries`]'s identical shape for `GetReport`.
+fn monitor_matches_filter(
+    component: &Component,
+    variable: &Variable,
+    monitor_type: MonitorType,
+    criteria: &[MonitoringCriterion],
+    component_variable: &[ReportComponentVariable],
+) -> bool {
+    let matches_criteria = criteria
+        .iter()
+        .any(|criterion| criterion.matches(monitor_type));
+    let matches_component_variable = component_variable.iter().any(|entry| {
+        &entry.component == component
+            && match &entry.variable {
+                Some(wanted) => wanted == variable,
+                None => true,
+            }
+    });
+    matches_criteria || matches_component_variable
+}
+
+/// Filters `store`'s installed monitors per `GetMonitoringReport`'s `monitoringCriteria`/
+/// `componentVariable` semantics (a logical OR, exactly like
+/// [`crate::reporting::filter_report_entries`]), grouping matches by `(component, variable)` into
+/// [`MonitoringReportEntry`] items - one per pair, however many monitors it has installed on it.
+/// If both `criteria` and `component_variable` are empty there's nothing to filter by, so every
+/// installed monitor matches (same "report everything" default `filter_report_entries` uses).
+/// Entries are returned in `(component, variable)` order for determinism, not installation order.
+fn filter_monitoring_entries(
+    store: &crate::state::VariableMonitorStore,
+    criteria: &[MonitoringCriterion],
+    component_variable: &[ReportComponentVariable],
+) -> Vec<MonitoringReportEntry> {
+    let report_everything = criteria.is_empty() && component_variable.is_empty();
+    let mut grouped: BTreeMap<(Component, Variable), Vec<MonitoringReportMonitor>> =
+        BTreeMap::new();
+    for monitor in store.installed() {
+        let matches = report_everything
+            || monitor_matches_filter(
+                &monitor.component,
+                &monitor.variable,
+                monitor.monitor_type,
+                criteria,
+                component_variable,
+            );
+        if !matches {
+            continue;
+        }
+        grouped
+            .entry((monitor.component.clone(), monitor.variable.clone()))
+            .or_default()
+            .push(MonitoringReportMonitor {
+                id: monitor.id,
+                monitor_type: monitor.monitor_type,
+                value: monitor.value,
+                severity: monitor.severity,
+            });
+    }
+    grouped
+        .into_iter()
+        .map(|((component, variable), monitors)| MonitoringReportEntry {
+            component,
+            variable,
+            monitors,
+        })
+        .collect()
+}
+
+/// Handles a CSMS-initiated `GetMonitoringReport` request against `actor`'s currently installed
+/// monitors, applying `criteria`/`component_variable` with OR semantics - the read side of this
+/// functional block, mirroring [`crate::reporting::handle_get_report`]'s shape exactly.
+/// `EmptyResultSet` if nothing matches (including an unfiltered request against an empty store).
+pub fn handle_get_monitoring_report(
+    actor: &ChargePointActor,
+    criteria: &[MonitoringCriterion],
+    component_variable: &[ReportComponentVariable],
+) -> MonitoringReportOutcome {
+    let state = actor.state();
+    let entries = filter_monitoring_entries(&state.variable_monitors, criteria, component_variable);
+    if entries.is_empty() {
+        MonitoringReportOutcome::EmptyResultSet
+    } else {
+        MonitoringReportOutcome::Accepted(entries)
+    }
+}
+
+/// One `NotifyMonitoringReport` message's worth of a chunked report - the `MonitoringData`
+/// analogue of [`crate::reporting::ReportChunk`]. See [`chunk_monitoring_report`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonitoringReportChunk {
+    /// This chunk's sequence number - `0` for the first chunk, incrementing by one per chunk.
+    pub seq_no: i64,
+    /// Whether another chunk follows this one.
+    pub tbc: bool,
+    /// This chunk's entries (at most [`REPORT_CHUNK_SIZE`]).
+    pub entries: Vec<MonitoringReportEntry>,
+}
+
+/// Splits `entries` into an ordered sequence of [`MonitoringReportChunk`]s of at most
+/// [`REPORT_CHUNK_SIZE`] items each, with correctly incrementing `seq_no`/`tbc` - the exact same
+/// mechanism [`crate::reporting::chunk_report`] uses for `NotifyReport`, reused here (via the
+/// shared [`REPORT_CHUNK_SIZE`] constant) rather than invented separately, per this block's own
+/// docs. As with `chunk_report`, an empty `entries` still produces exactly one (empty, `tbc:
+/// false`) chunk rather than zero - `seqNo` must start at `0`, which only makes sense once at
+/// least one `NotifyMonitoringReport` is actually sent; in practice this crate's own
+/// [`handle_get_monitoring_report`] never calls this with an empty slice (it reports
+/// `EmptyResultSet` instead, and sends no `NotifyMonitoringReport` at all - see the `ocpp_2_1`/
+/// `ocpp_2_0_1` adapters), so this case only matters for a caller supplying entries itself.
+pub fn chunk_monitoring_report(entries: &[MonitoringReportEntry]) -> Vec<MonitoringReportChunk> {
+    if entries.is_empty() {
+        return alloc::vec![MonitoringReportChunk {
+            seq_no: 0,
+            tbc: false,
+            entries: Vec::new(),
+        }];
+    }
+    let total = entries.chunks(REPORT_CHUNK_SIZE).count();
+    entries
+        .chunks(REPORT_CHUNK_SIZE)
+        .enumerate()
+        .map(|(index, chunk)| MonitoringReportChunk {
+            seq_no: index as i64,
+            tbc: index + 1 < total,
+            entries: chunk.to_vec(),
+        })
+        .collect()
+}
+
 /// Registers this charge point's inbound `SetVariableMonitoring` handling with the CSMS
 /// connection. Implemented per protocol version (see the `ocpp_2_1` module). **2.x only** - see
 /// this module's docs.
@@ -217,6 +482,36 @@ pub trait ClearVariableMonitoringHandler {
     async fn register_clear_variable_monitoring_handler(&self, actor: ChargePointActor);
 }
 
+/// Registers this charge point's inbound `SetMonitoringBase` handling with the CSMS connection.
+/// Implemented per protocol version (see the `ocpp_2_1` module). **2.x only** - see this module's
+/// docs.
+#[async_trait::async_trait]
+pub trait SetMonitoringBaseHandler {
+    /// Registers a `SetMonitoringBase` handler with the CSMS connection that dispatches incoming
+    /// requests to [`handle_set_monitoring_base`] against `actor`.
+    async fn register_set_monitoring_base_handler(&self, actor: ChargePointActor);
+}
+
+/// Registers this charge point's inbound `SetMonitoringLevel` handling with the CSMS connection.
+/// Implemented per protocol version (see the `ocpp_2_1` module). **2.x only**.
+#[async_trait::async_trait]
+pub trait SetMonitoringLevelHandler {
+    /// Registers a `SetMonitoringLevel` handler with the CSMS connection that dispatches incoming
+    /// requests to [`handle_set_monitoring_level`] against `actor`.
+    async fn register_set_monitoring_level_handler(&self, actor: ChargePointActor);
+}
+
+/// Registers this charge point's inbound `GetMonitoringReport` handling with the CSMS connection,
+/// answering with one or more `NotifyMonitoringReport`s. Implemented per protocol version (see the
+/// `ocpp_2_1` module). **2.x only**.
+#[async_trait::async_trait]
+pub trait GetMonitoringReportHandler {
+    /// Registers a `GetMonitoringReport` handler with the CSMS connection that answers with
+    /// [`handle_get_monitoring_report`]'s outcome, then sends the resulting entries (if any) as
+    /// one or more `NotifyMonitoringReport`s (via [`chunk_monitoring_report`]).
+    async fn register_get_monitoring_report_handler(&self, actor: ChargePointActor);
+}
+
 /// Reports one fired variable monitor to the CSMS via `NotifyEvent`. Implemented per protocol
 /// version (see the `ocpp_2_1` module), mirroring [`crate::security::SecurityEventNotifier`].
 #[async_trait::async_trait]
@@ -232,8 +527,12 @@ pub trait VariableMonitorEventNotifier {
 }
 
 /// Forwards every threshold/delta monitor firing received on `events` to the CSMS via `notifier`,
-/// forever. A periodic monitor never appears on `events` - see
-/// [`run_periodic_variable_monitors`], which reports those separately, on its own clock.
+/// forever - except one whose severity is coarser (numerically greater) than `actor`'s currently
+/// configured [`crate::state::VariableMonitorStore::level`] (OCPP `SetMonitoringLevel`), which is
+/// dropped without ever reaching `notifier` (logged at `debug`, not `warn` - this is the level
+/// working as configured, not a failure). A periodic monitor never appears on `events` - see
+/// [`run_periodic_variable_monitors`], which reports those separately, on its own clock, and
+/// applies the same level check.
 ///
 /// Errors are logged and do not stop the loop - the actor already recorded the trigger; only the
 /// CSMS-facing report failed and is not retried here. [`crate::builder::ChargePointBuilder`]
@@ -242,8 +541,21 @@ pub trait VariableMonitorEventNotifier {
 pub async fn run_variable_monitor_events<N: VariableMonitorEventNotifier>(
     mut events: crate::sync::BroadcastReceiver<TriggeredMonitor>,
     notifier: &N,
+    actor: &ChargePointActor,
 ) {
     while let Ok(event) = events.recv().await {
+        if !actor
+            .state()
+            .variable_monitors
+            .is_reportable(event.severity)
+        {
+            tracing::debug!(
+                monitor_id = event.monitor_id.0,
+                severity = event.severity,
+                "suppressing a variable monitor event below the configured monitoring level"
+            );
+            continue;
+        }
         if let Err(err) = notifier.notify_variable_monitor_event(&event).await {
             tracing::warn!(
                 error = %err,
@@ -298,6 +610,22 @@ pub async fn run_periodic_variable_monitors<
         }
         for event in due_periodic_events(&actor.state(), now, &last_reported) {
             let monitor_id = event.monitor_id;
+            if !actor
+                .state()
+                .variable_monitors
+                .is_reportable(event.severity)
+            {
+                tracing::debug!(
+                    monitor_id = monitor_id.0,
+                    severity = event.severity,
+                    "suppressing a periodic variable monitor event below the configured monitoring level"
+                );
+                // Still counts as "reported" for due-tracking purposes - the level, not the
+                // clock, is why this one didn't go out, and it will fire again next interval
+                // regardless of whether the level changes back before then.
+                last_reported.insert(monitor_id, now);
+                continue;
+            }
             if let Err(err) = notifier.notify_variable_monitor_event(&event).await {
                 tracing::warn!(
                     error = %err,
@@ -780,26 +1108,333 @@ mod tests {
 
         assert_eq!(due.len(), 1);
     }
+
+    #[tokio::test]
+    async fn set_monitoring_base_all_leaves_installed_monitors_running() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        register_monitorable_variable(&actor, "EVSE", "Temperature").await;
+        handle_set_variable_monitoring(
+            &actor,
+            alloc::vec![SetMonitorRequest {
+                id: None,
+                component: component("EVSE"),
+                variable: variable("Temperature"),
+                monitor_type: Some(MonitorType::UpperThreshold),
+                value: 60.0,
+                severity: 2,
+            }],
+        )
+        .await;
+
+        handle_set_monitoring_base(&actor, MonitoringBase::All).await;
+
+        assert_eq!(actor.state().variable_monitors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_monitoring_base_factory_default_clears_installed_monitors() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        register_monitorable_variable(&actor, "EVSE", "Temperature").await;
+        handle_set_variable_monitoring(
+            &actor,
+            alloc::vec![SetMonitorRequest {
+                id: None,
+                component: component("EVSE"),
+                variable: variable("Temperature"),
+                monitor_type: Some(MonitorType::UpperThreshold),
+                value: 60.0,
+                severity: 2,
+            }],
+        )
+        .await;
+
+        handle_set_monitoring_base(&actor, MonitoringBase::FactoryDefault).await;
+
+        assert!(actor.state().variable_monitors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_monitoring_base_hard_wired_only_also_clears_installed_monitors() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        register_monitorable_variable(&actor, "EVSE", "Temperature").await;
+        handle_set_variable_monitoring(
+            &actor,
+            alloc::vec![SetMonitorRequest {
+                id: None,
+                component: component("EVSE"),
+                variable: variable("Temperature"),
+                monitor_type: Some(MonitorType::UpperThreshold),
+                value: 60.0,
+                severity: 2,
+            }],
+        )
+        .await;
+
+        handle_set_monitoring_base(&actor, MonitoringBase::HardWiredOnly).await;
+
+        assert!(actor.state().variable_monitors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_monitoring_level_in_range_is_accepted_and_applied() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_set_monitoring_level(&actor, 3).await;
+
+        assert_eq!(outcome, SetMonitoringLevelOutcome::Accepted);
+        assert_eq!(actor.state().variable_monitors.level(), 3);
+    }
+
+    #[tokio::test]
+    async fn set_monitoring_level_out_of_range_is_rejected_and_leaves_the_level_alone() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_set_monitoring_level(&actor, 42).await;
+
+        assert_eq!(outcome, SetMonitoringLevelOutcome::Rejected);
+        assert_eq!(actor.state().variable_monitors.level(), 9);
+    }
+
+    #[tokio::test]
+    async fn set_monitoring_level_negative_is_rejected() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_set_monitoring_level(&actor, -1).await;
+
+        assert_eq!(outcome, SetMonitoringLevelOutcome::Rejected);
+    }
+
+    #[test]
+    fn a_severity_criterion_matches_the_right_monitor_types() {
+        assert!(MonitoringCriterion::Threshold.matches(MonitorType::UpperThreshold));
+        assert!(MonitoringCriterion::Threshold.matches(MonitorType::LowerThreshold));
+        assert!(!MonitoringCriterion::Threshold.matches(MonitorType::Delta));
+        assert!(MonitoringCriterion::Delta.matches(MonitorType::Delta));
+        assert!(!MonitoringCriterion::Delta.matches(MonitorType::Periodic));
+        assert!(MonitoringCriterion::Periodic.matches(MonitorType::Periodic));
+        assert!(!MonitoringCriterion::Periodic.matches(MonitorType::UpperThreshold));
+    }
+
+    #[tokio::test]
+    async fn get_monitoring_report_with_no_filter_reports_every_installed_monitor() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        register_monitorable_variable(&actor, "EVSE", "Temperature").await;
+        handle_set_variable_monitoring(
+            &actor,
+            alloc::vec![SetMonitorRequest {
+                id: None,
+                component: component("EVSE"),
+                variable: variable("Temperature"),
+                monitor_type: Some(MonitorType::UpperThreshold),
+                value: 60.0,
+                severity: 2,
+            }],
+        )
+        .await;
+
+        let outcome = handle_get_monitoring_report(&actor, &[], &[]);
+
+        let MonitoringReportOutcome::Accepted(entries) = outcome else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].monitors.len(), 1);
+        assert_eq!(entries[0].component.name, "EVSE");
+        assert_eq!(entries[0].variable.name, "Temperature");
+    }
+
+    #[tokio::test]
+    async fn get_monitoring_report_groups_multiple_monitors_on_the_same_variable() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        register_monitorable_variable(&actor, "EVSE", "Temperature").await;
+        handle_set_variable_monitoring(
+            &actor,
+            alloc::vec![
+                SetMonitorRequest {
+                    id: None,
+                    component: component("EVSE"),
+                    variable: variable("Temperature"),
+                    monitor_type: Some(MonitorType::UpperThreshold),
+                    value: 60.0,
+                    severity: 2,
+                },
+                SetMonitorRequest {
+                    id: None,
+                    component: component("EVSE"),
+                    variable: variable("Temperature"),
+                    monitor_type: Some(MonitorType::LowerThreshold),
+                    value: 10.0,
+                    severity: 4,
+                },
+            ],
+        )
+        .await;
+
+        let outcome = handle_get_monitoring_report(&actor, &[], &[]);
+
+        let MonitoringReportOutcome::Accepted(entries) = outcome else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].monitors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_monitoring_report_filters_by_criterion() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        register_monitorable_variable(&actor, "EVSE", "Temperature").await;
+        handle_set_variable_monitoring(
+            &actor,
+            alloc::vec![
+                SetMonitorRequest {
+                    id: None,
+                    component: component("EVSE"),
+                    variable: variable("Temperature"),
+                    monitor_type: Some(MonitorType::UpperThreshold),
+                    value: 60.0,
+                    severity: 2,
+                },
+                SetMonitorRequest {
+                    id: None,
+                    component: component("EVSE"),
+                    variable: variable("Temperature"),
+                    monitor_type: Some(MonitorType::Periodic),
+                    value: 30.0,
+                    severity: 4,
+                },
+            ],
+        )
+        .await;
+
+        let outcome = handle_get_monitoring_report(&actor, &[MonitoringCriterion::Periodic], &[]);
+
+        let MonitoringReportOutcome::Accepted(entries) = outcome else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].monitors.len(), 1);
+        assert_eq!(entries[0].monitors[0].monitor_type, MonitorType::Periodic);
+    }
+
+    #[tokio::test]
+    async fn get_monitoring_report_filters_by_component_variable() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        register_monitorable_variable(&actor, "EVSE", "Temperature").await;
+        register_monitorable_variable(&actor, "EVSE", "Voltage").await;
+        handle_set_variable_monitoring(
+            &actor,
+            alloc::vec![
+                SetMonitorRequest {
+                    id: None,
+                    component: component("EVSE"),
+                    variable: variable("Temperature"),
+                    monitor_type: Some(MonitorType::UpperThreshold),
+                    value: 60.0,
+                    severity: 2,
+                },
+                SetMonitorRequest {
+                    id: None,
+                    component: component("EVSE"),
+                    variable: variable("Voltage"),
+                    monitor_type: Some(MonitorType::UpperThreshold),
+                    value: 250.0,
+                    severity: 2,
+                },
+            ],
+        )
+        .await;
+
+        let outcome = handle_get_monitoring_report(
+            &actor,
+            &[],
+            &[ReportComponentVariable {
+                component: component("EVSE"),
+                variable: Some(variable("Temperature")),
+            }],
+        );
+
+        let MonitoringReportOutcome::Accepted(entries) = outcome else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].variable.name, "Temperature");
+    }
+
+    #[tokio::test]
+    async fn get_monitoring_report_matching_nothing_is_an_empty_result_set() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcome = handle_get_monitoring_report(&actor, &[], &[]);
+
+        assert_eq!(outcome, MonitoringReportOutcome::EmptyResultSet);
+    }
+
+    #[test]
+    fn chunking_monitoring_report_splits_at_the_configured_size_with_correct_seq_no_and_tbc() {
+        let entries: Vec<MonitoringReportEntry> = (0..(REPORT_CHUNK_SIZE * 2 + 1))
+            .map(|i| MonitoringReportEntry {
+                component: component("EVSE"),
+                variable: Variable {
+                    name: alloc::format!("V{i}"),
+                    instance: None,
+                },
+                monitors: alloc::vec![MonitoringReportMonitor {
+                    id: VariableMonitorId(i as i64),
+                    monitor_type: MonitorType::UpperThreshold,
+                    value: 1.0,
+                    severity: 5,
+                }],
+            })
+            .collect();
+
+        let chunks = chunk_monitoring_report(&entries);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].seq_no, 0);
+        assert!(chunks[0].tbc);
+        assert_eq!(chunks[0].entries.len(), REPORT_CHUNK_SIZE);
+        assert_eq!(chunks[2].seq_no, 2);
+        assert!(!chunks[2].tbc);
+        assert_eq!(chunks[2].entries.len(), 1);
+    }
+
+    #[test]
+    fn chunking_an_empty_monitoring_report_still_produces_one_chunk() {
+        let chunks = chunk_monitoring_report(&[]);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].seq_no, 0);
+        assert!(!chunks[0].tbc);
+        assert!(chunks[0].entries.is_empty());
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
     use super::{
-        ClearMonitorOutcome, ClearVariableMonitoringHandler, EventTrigger, MonitorType,
-        SetMonitorOutcome, SetMonitorRequest, SetVariableMonitoringHandler, TriggeredMonitor,
-        VariableMonitorEventNotifier, VariableMonitorId, handle_clear_variable_monitoring,
-        handle_set_variable_monitoring,
+        ClearMonitorOutcome, ClearVariableMonitoringHandler, EventTrigger,
+        GetMonitoringReportHandler, MonitorType, MonitoringBase, MonitoringCriterion,
+        MonitoringReportEntry, MonitoringReportMonitor, MonitoringReportOutcome,
+        ReportComponentVariable, SetMonitorOutcome, SetMonitorRequest, SetMonitoringBaseHandler,
+        SetMonitoringLevelHandler, SetMonitoringLevelOutcome, SetVariableMonitoringHandler,
+        TriggeredMonitor, VariableMonitorEventNotifier, VariableMonitorId, chunk_monitoring_report,
+        handle_clear_variable_monitoring, handle_get_monitoring_report, handle_set_monitoring_base,
+        handle_set_monitoring_level, handle_set_variable_monitoring,
     };
     use crate::actor::ChargePointActor;
     use crate::clock::Clock;
     use crate::state::{Component, Variable};
     use crate::wire::v21::common::{
-        ClearMonitoringResult, ClearMonitoringStatusEnum, EVSE, EventData, EventNotificationEnum,
-        EventTriggerEnum, MonitorEnum, SetMonitoringData, SetMonitoringResult,
-        SetMonitoringStatusEnum,
+        ClearMonitoringResult, ClearMonitoringStatusEnum,
+        ComponentVariable as WireComponentVariable, EVSE, EventData, EventNotificationEnum,
+        EventTriggerEnum, GenericDeviceModelStatusEnum, GenericStatusEnum, MonitorEnum,
+        MonitoringBaseEnum, MonitoringCriterionEnum, MonitoringData, SetMonitoringData,
+        SetMonitoringResult, SetMonitoringStatusEnum, VariableMonitoring,
     };
     use crate::wire::v21::{
-        ClearVariableMonitoringResponse, NotifyEventRequest, SetVariableMonitoringResponse,
+        ClearVariableMonitoringResponse, GetMonitoringReportResponse, NotifyEventRequest,
+        NotifyMonitoringReportRequest, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
+        SetVariableMonitoringResponse,
     };
     use alloc::boxed::Box;
     use alloc::string::ToString;
@@ -896,10 +1531,10 @@ mod ocpp_2_1 {
         }
     }
 
-    /// The inverse of [`map_monitor_type`] - only ever needed to build a wire request in this
-    /// module's own round-trip tests (production code never re-emits a monitor type it received;
-    /// it only ever reports `severity`/`id`/`status` back, via `build_set_monitoring_result`).
-    #[cfg(test)]
+    /// The inverse of [`map_monitor_type`]. `SetVariableMonitoring`/`ClearVariableMonitoring`
+    /// production code never needs this (it only ever reports `severity`/`id`/`status` back, via
+    /// `build_set_monitoring_result`) - but `GetMonitoringReport`'s answer does need to re-emit
+    /// the type of every installed monitor it reports, via `build_variable_monitoring`.
     fn wire_monitor_type(kind: MonitorType) -> MonitorEnum {
         match kind {
             MonitorType::UpperThreshold => MonitorEnum::UpperThreshold,
@@ -1056,6 +1691,262 @@ mod ocpp_2_1 {
                         clear_monitoring_result,
                         custom_data: None,
                     })
+                }
+            })
+            .await;
+        }
+    }
+
+    fn map_monitoring_base(base: &MonitoringBaseEnum) -> MonitoringBase {
+        match base {
+            MonitoringBaseEnum::All => MonitoringBase::All,
+            MonitoringBaseEnum::FactoryDefault => MonitoringBase::FactoryDefault,
+            MonitoringBaseEnum::HardWiredOnly => MonitoringBase::HardWiredOnly,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SetMonitoringBaseHandler for OCPP2_1Client {
+        async fn register_set_monitoring_base_handler(&self, actor: ChargePointActor) {
+            self.on_set_monitoring_base(move |request, _client| {
+                let actor = actor.clone();
+                async move {
+                    handle_set_monitoring_base(
+                        &actor,
+                        map_monitoring_base(&request.monitoring_base),
+                    )
+                    .await;
+                    Ok(SetMonitoringBaseResponse {
+                        custom_data: None,
+                        status: GenericDeviceModelStatusEnum::Accepted,
+                        status_info: None,
+                    })
+                }
+            })
+            .await;
+        }
+    }
+
+    fn map_set_monitoring_level_status(outcome: SetMonitoringLevelOutcome) -> GenericStatusEnum {
+        match outcome {
+            SetMonitoringLevelOutcome::Accepted => GenericStatusEnum::Accepted,
+            SetMonitoringLevelOutcome::Rejected => GenericStatusEnum::Rejected,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SetMonitoringLevelHandler for OCPP2_1Client {
+        async fn register_set_monitoring_level_handler(&self, actor: ChargePointActor) {
+            self.on_set_monitoring_level(move |request, _client| {
+                let actor = actor.clone();
+                async move {
+                    let outcome = handle_set_monitoring_level(&actor, request.severity).await;
+                    Ok(SetMonitoringLevelResponse {
+                        custom_data: None,
+                        status: map_set_monitoring_level_status(outcome),
+                        status_info: None,
+                    })
+                }
+            })
+            .await;
+        }
+    }
+
+    fn map_monitoring_criterion(criterion: &MonitoringCriterionEnum) -> MonitoringCriterion {
+        match criterion {
+            MonitoringCriterionEnum::ThresholdMonitoring => MonitoringCriterion::Threshold,
+            MonitoringCriterionEnum::DeltaMonitoring => MonitoringCriterion::Delta,
+            MonitoringCriterionEnum::PeriodicMonitoring => MonitoringCriterion::Periodic,
+        }
+    }
+
+    /// Mirrors `crate::reporting::ocpp_2_1::map_component_variable` - duplicated rather than
+    /// shared, the same small-helper-duplication convention this crate's functional blocks
+    /// already use for one another (see e.g. this module's own `bounded_string`).
+    fn map_component_variable(item: &WireComponentVariable) -> ReportComponentVariable {
+        ReportComponentVariable {
+            component: map_component(&item.component),
+            variable: item.variable.as_ref().map(map_variable),
+        }
+    }
+
+    fn map_monitoring_report_status(
+        outcome: &MonitoringReportOutcome,
+    ) -> GenericDeviceModelStatusEnum {
+        match outcome {
+            MonitoringReportOutcome::Accepted(_) => GenericDeviceModelStatusEnum::Accepted,
+            MonitoringReportOutcome::EmptyResultSet => GenericDeviceModelStatusEnum::EmptyResultSet,
+        }
+    }
+
+    fn build_variable_monitoring(monitor: &MonitoringReportMonitor) -> VariableMonitoring {
+        VariableMonitoring {
+            custom_data: None,
+            event_notification_type: EventNotificationEnum::CustomMonitor,
+            id: monitor.id.0,
+            severity: i64::from(monitor.severity),
+            transaction: false,
+            r#type: wire_monitor_type(monitor.monitor_type),
+            value: monitor.value,
+        }
+    }
+
+    fn build_monitoring_data(entry: &MonitoringReportEntry) -> MonitoringData {
+        MonitoringData {
+            component: build_component(&entry.component),
+            custom_data: None,
+            variable: build_variable(&entry.variable),
+            variable_monitoring: entry
+                .monitors
+                .iter()
+                .map(build_variable_monitoring)
+                .collect(),
+        }
+    }
+
+    /// Sends `entries` (already decided `Accepted` by the caller) to the CSMS as one or more
+    /// `NotifyMonitoringReport`s, chunked via [`chunk_monitoring_report`], all sharing one
+    /// `generatedAt` timestamp from `clock.now()` - mirrors
+    /// `crate::reporting::ocpp_2_1::with_clock::send_report_chunks` exactly, one level down (a
+    /// `MonitoringData` item per chunk entry rather than a `ReportData` one).
+    async fn send_monitoring_report_chunks<C: Clock>(
+        client: &OCPP2_1Client,
+        clock: &C,
+        request_id: i64,
+        entries: Vec<MonitoringReportEntry>,
+    ) {
+        let now = clock.now();
+        if !crate::clock::is_synchronized(&now) {
+            tracing::warn!(
+                timestamp = %now,
+                "NotifyMonitoringReport generatedAt sourced from an unsynchronized clock"
+            );
+        }
+        let generated_at = crate::wire::OcppTimestamp::from(now);
+        for chunk in chunk_monitoring_report(&entries) {
+            let monitor: Vec<_> = chunk.entries.iter().map(build_monitoring_data).collect();
+            let request = NotifyMonitoringReportRequest {
+                custom_data: None,
+                generated_at,
+                monitor: (!monitor.is_empty()).then_some(monitor),
+                request_id,
+                seq_no: chunk.seq_no,
+                tbc: Some(chunk.tbc),
+            };
+            if let Err(err) = client.send_notify_monitoring_report(request).await {
+                tracing::warn!(error = %err, "failed to send a NotifyMonitoringReport chunk");
+            }
+        }
+    }
+
+    /// Wraps an [`OCPP2_1Client`] with a caller-supplied [`Clock`] for
+    /// `NotifyMonitoringReport`'s `generatedAt` timestamp - the no_std-reachable counterpart to
+    /// this module's `std`-only `OCPP2_1Client` impl below, mirroring
+    /// `crate::reporting::ocpp_2_1::with_clock::Ocpp2_1ReportHandler` exactly.
+    pub struct Ocpp2_1MonitoringReportHandler<C> {
+        client: OCPP2_1Client,
+        clock: C,
+    }
+
+    impl<C: Clock> Ocpp2_1MonitoringReportHandler<C> {
+        /// Wraps `client`, sourcing every `NotifyMonitoringReport`'s `generatedAt` from `clock`.
+        pub fn with_clock(client: OCPP2_1Client, clock: C) -> Self {
+            Self { client, clock }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl Ocpp2_1MonitoringReportHandler<crate::clock::SystemClock> {
+        /// Wraps `client`, sourcing every `NotifyMonitoringReport`'s `generatedAt` from
+        /// [`crate::clock::SystemClock`].
+        pub fn new(client: OCPP2_1Client) -> Self {
+            Self::with_clock(client, crate::clock::SystemClock)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<C: Clock + Clone + Send + Sync + 'static> GetMonitoringReportHandler
+        for Ocpp2_1MonitoringReportHandler<C>
+    {
+        async fn register_get_monitoring_report_handler(&self, actor: ChargePointActor) {
+            let clock = self.clock.clone();
+            self.client
+                .on_get_monitoring_report(move |request, client| {
+                    let actor = actor.clone();
+                    let clock = clock.clone();
+                    async move {
+                        let criteria: Vec<_> = request
+                            .monitoring_criteria
+                            .as_ref()
+                            .map(|list| list.iter().map(map_monitoring_criterion).collect())
+                            .unwrap_or_default();
+                        let component_variable: Vec<_> = request
+                            .component_variable
+                            .as_ref()
+                            .map(|list| list.iter().map(map_component_variable).collect())
+                            .unwrap_or_default();
+                        let outcome =
+                            handle_get_monitoring_report(&actor, &criteria, &component_variable);
+                        let response = GetMonitoringReportResponse {
+                            custom_data: None,
+                            status: map_monitoring_report_status(&outcome),
+                            status_info: None,
+                        };
+                        if let MonitoringReportOutcome::Accepted(entries) = outcome {
+                            send_monitoring_report_chunks(
+                                &client,
+                                &clock,
+                                request.request_id,
+                                entries,
+                            )
+                            .await;
+                        }
+                        Ok(response)
+                    }
+                })
+                .await;
+        }
+    }
+
+    /// The `std` convenience: `OCPP2_1Client` itself implements `GetMonitoringReportHandler`
+    /// (sourcing `generatedAt` from [`crate::clock::SystemClock`]) so existing callers that pass
+    /// a bare client need no source change - mirrors
+    /// `crate::reporting::ocpp_2_1::with_clock`'s same convenience `impl` for `GetBaseReport`/
+    /// `GetReport`.
+    #[cfg(feature = "std")]
+    #[async_trait::async_trait]
+    impl GetMonitoringReportHandler for OCPP2_1Client {
+        async fn register_get_monitoring_report_handler(&self, actor: ChargePointActor) {
+            self.on_get_monitoring_report(move |request, client| {
+                let actor = actor.clone();
+                async move {
+                    let criteria: Vec<_> = request
+                        .monitoring_criteria
+                        .as_ref()
+                        .map(|list| list.iter().map(map_monitoring_criterion).collect())
+                        .unwrap_or_default();
+                    let component_variable: Vec<_> = request
+                        .component_variable
+                        .as_ref()
+                        .map(|list| list.iter().map(map_component_variable).collect())
+                        .unwrap_or_default();
+                    let outcome =
+                        handle_get_monitoring_report(&actor, &criteria, &component_variable);
+                    let response = GetMonitoringReportResponse {
+                        custom_data: None,
+                        status: map_monitoring_report_status(&outcome),
+                        status_info: None,
+                    };
+                    if let MonitoringReportOutcome::Accepted(entries) = outcome {
+                        send_monitoring_report_chunks(
+                            &client,
+                            &crate::clock::SystemClock,
+                            request.request_id,
+                            entries,
+                        )
+                        .await;
+                    }
+                    Ok(response)
                 }
             })
             .await;
@@ -1274,21 +2165,29 @@ mod ocpp_2_1 {
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
     use super::{
-        ClearMonitorOutcome, ClearVariableMonitoringHandler, EventTrigger, MonitorType,
-        SetMonitorOutcome, SetMonitorRequest, SetVariableMonitoringHandler, TriggeredMonitor,
-        VariableMonitorEventNotifier, VariableMonitorId, handle_clear_variable_monitoring,
-        handle_set_variable_monitoring,
+        ClearMonitorOutcome, ClearVariableMonitoringHandler, EventTrigger,
+        GetMonitoringReportHandler, MonitorType, MonitoringBase, MonitoringCriterion,
+        MonitoringReportEntry, MonitoringReportMonitor, MonitoringReportOutcome,
+        ReportComponentVariable, SetMonitorOutcome, SetMonitorRequest, SetMonitoringBaseHandler,
+        SetMonitoringLevelHandler, SetMonitoringLevelOutcome, SetVariableMonitoringHandler,
+        TriggeredMonitor, VariableMonitorEventNotifier, VariableMonitorId, chunk_monitoring_report,
+        handle_clear_variable_monitoring, handle_get_monitoring_report, handle_set_monitoring_base,
+        handle_set_monitoring_level, handle_set_variable_monitoring,
     };
     use crate::actor::ChargePointActor;
     use crate::clock::Clock;
     use crate::state::{Component, Variable};
     use crate::wire::v201::common::{
-        ClearMonitoringResult, ClearMonitoringStatusEnum, EVSE, EventData, EventNotificationEnum,
-        EventTriggerEnum, MonitorEnum, SetMonitoringData, SetMonitoringResult,
-        SetMonitoringStatusEnum,
+        ClearMonitoringResult, ClearMonitoringStatusEnum,
+        ComponentVariable as WireComponentVariable, EVSE, EventData, EventNotificationEnum,
+        EventTriggerEnum, GenericDeviceModelStatusEnum, GenericStatusEnum, MonitorEnum,
+        MonitoringBaseEnum, MonitoringCriterionEnum, MonitoringData, SetMonitoringData,
+        SetMonitoringResult, SetMonitoringStatusEnum, VariableMonitoring,
     };
     use crate::wire::v201::{
-        ClearVariableMonitoringResponse, NotifyEventRequest, SetVariableMonitoringResponse,
+        ClearVariableMonitoringResponse, GetMonitoringReportResponse, NotifyEventRequest,
+        NotifyMonitoringReportRequest, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
+        SetVariableMonitoringResponse,
     };
     use alloc::boxed::Box;
     use alloc::string::ToString;
@@ -1380,10 +2279,10 @@ mod ocpp_2_0_1 {
         }
     }
 
-    /// The inverse of [`map_monitor_type`] - only ever needed to build a wire request in this
-    /// module's own round-trip tests (production code never re-emits a monitor type it received;
-    /// it only ever reports `severity`/`id`/`status` back, via `build_set_monitoring_result`).
-    #[cfg(test)]
+    /// The inverse of [`map_monitor_type`]. `SetVariableMonitoring`/`ClearVariableMonitoring`
+    /// production code never needs this (it only ever reports `severity`/`id`/`status` back, via
+    /// `build_set_monitoring_result`) - but `GetMonitoringReport`'s answer does need to re-emit
+    /// the type of every installed monitor it reports, via `build_variable_monitoring`.
     fn wire_monitor_type(kind: MonitorType) -> MonitorEnum {
         match kind {
             MonitorType::UpperThreshold => MonitorEnum::UpperThreshold,
@@ -1533,6 +2432,256 @@ mod ocpp_2_0_1 {
                         clear_monitoring_result,
                         custom_data: None,
                     })
+                }
+            })
+            .await;
+        }
+    }
+
+    fn map_monitoring_base(base: &MonitoringBaseEnum) -> MonitoringBase {
+        match base {
+            MonitoringBaseEnum::All => MonitoringBase::All,
+            MonitoringBaseEnum::FactoryDefault => MonitoringBase::FactoryDefault,
+            MonitoringBaseEnum::HardWiredOnly => MonitoringBase::HardWiredOnly,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SetMonitoringBaseHandler for OCPP2_0_1Client {
+        async fn register_set_monitoring_base_handler(&self, actor: ChargePointActor) {
+            self.on_set_monitoring_base(move |request, _client| {
+                let actor = actor.clone();
+                async move {
+                    handle_set_monitoring_base(
+                        &actor,
+                        map_monitoring_base(&request.monitoring_base),
+                    )
+                    .await;
+                    Ok(SetMonitoringBaseResponse {
+                        custom_data: None,
+                        status: GenericDeviceModelStatusEnum::Accepted,
+                        status_info: None,
+                    })
+                }
+            })
+            .await;
+        }
+    }
+
+    fn map_set_monitoring_level_status(outcome: SetMonitoringLevelOutcome) -> GenericStatusEnum {
+        match outcome {
+            SetMonitoringLevelOutcome::Accepted => GenericStatusEnum::Accepted,
+            SetMonitoringLevelOutcome::Rejected => GenericStatusEnum::Rejected,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SetMonitoringLevelHandler for OCPP2_0_1Client {
+        async fn register_set_monitoring_level_handler(&self, actor: ChargePointActor) {
+            self.on_set_monitoring_level(move |request, _client| {
+                let actor = actor.clone();
+                async move {
+                    let outcome = handle_set_monitoring_level(&actor, request.severity).await;
+                    Ok(SetMonitoringLevelResponse {
+                        custom_data: None,
+                        status: map_set_monitoring_level_status(outcome),
+                        status_info: None,
+                    })
+                }
+            })
+            .await;
+        }
+    }
+
+    fn map_monitoring_criterion(criterion: &MonitoringCriterionEnum) -> MonitoringCriterion {
+        match criterion {
+            MonitoringCriterionEnum::ThresholdMonitoring => MonitoringCriterion::Threshold,
+            MonitoringCriterionEnum::DeltaMonitoring => MonitoringCriterion::Delta,
+            MonitoringCriterionEnum::PeriodicMonitoring => MonitoringCriterion::Periodic,
+        }
+    }
+
+    /// Mirrors `crate::reporting::ocpp_2_0_1::map_component_variable` - duplicated rather than
+    /// shared, the same small-helper-duplication convention this crate's functional blocks
+    /// already use for one another.
+    fn map_component_variable(item: &WireComponentVariable) -> ReportComponentVariable {
+        ReportComponentVariable {
+            component: map_component(&item.component),
+            variable: item.variable.as_ref().map(map_variable),
+        }
+    }
+
+    fn map_monitoring_report_status(
+        outcome: &MonitoringReportOutcome,
+    ) -> GenericDeviceModelStatusEnum {
+        match outcome {
+            MonitoringReportOutcome::Accepted(_) => GenericDeviceModelStatusEnum::Accepted,
+            MonitoringReportOutcome::EmptyResultSet => GenericDeviceModelStatusEnum::EmptyResultSet,
+        }
+    }
+
+    /// Unlike 2.1's `VariableMonitoring`, 2.0.1's has no `eventNotificationType` field - see this
+    /// module's top-level docs on that difference.
+    fn build_variable_monitoring(monitor: &MonitoringReportMonitor) -> VariableMonitoring {
+        VariableMonitoring {
+            custom_data: None,
+            id: monitor.id.0,
+            severity: i64::from(monitor.severity),
+            transaction: false,
+            r#type: wire_monitor_type(monitor.monitor_type),
+            value: monitor.value,
+        }
+    }
+
+    fn build_monitoring_data(entry: &MonitoringReportEntry) -> MonitoringData {
+        MonitoringData {
+            component: build_component(&entry.component),
+            custom_data: None,
+            variable: build_variable(&entry.variable),
+            variable_monitoring: entry
+                .monitors
+                .iter()
+                .map(build_variable_monitoring)
+                .collect(),
+        }
+    }
+
+    /// Sends `entries` (already decided `Accepted` by the caller) to the CSMS as one or more
+    /// `NotifyMonitoringReport`s, chunked via [`chunk_monitoring_report`], all sharing one
+    /// `generatedAt` timestamp from `clock.now()` - mirrors
+    /// `super::ocpp_2_1::send_monitoring_report_chunks` exactly, for a 2.0.1 client.
+    async fn send_monitoring_report_chunks<C: Clock>(
+        client: &OCPP2_0_1Client,
+        clock: &C,
+        request_id: i64,
+        entries: Vec<MonitoringReportEntry>,
+    ) {
+        let now = clock.now();
+        if !crate::clock::is_synchronized(&now) {
+            tracing::warn!(
+                timestamp = %now,
+                "NotifyMonitoringReport generatedAt sourced from an unsynchronized clock"
+            );
+        }
+        let generated_at = crate::wire::OcppTimestamp::from(now);
+        for chunk in chunk_monitoring_report(&entries) {
+            let monitor: Vec<_> = chunk.entries.iter().map(build_monitoring_data).collect();
+            let request = NotifyMonitoringReportRequest {
+                custom_data: None,
+                generated_at,
+                monitor: (!monitor.is_empty()).then_some(monitor),
+                request_id,
+                seq_no: chunk.seq_no,
+                tbc: Some(chunk.tbc),
+            };
+            if let Err(err) = client.send_notify_monitoring_report(request).await {
+                tracing::warn!(error = %err, "failed to send a NotifyMonitoringReport chunk");
+            }
+        }
+    }
+
+    /// Mirrors `super::ocpp_2_1::Ocpp2_1MonitoringReportHandler` for a 2.0.1 client.
+    pub struct Ocpp2_0_1MonitoringReportHandler<C> {
+        client: OCPP2_0_1Client,
+        clock: C,
+    }
+
+    impl<C: Clock> Ocpp2_0_1MonitoringReportHandler<C> {
+        /// Wraps `client`, sourcing every `NotifyMonitoringReport`'s `generatedAt` from `clock`.
+        pub fn with_clock(client: OCPP2_0_1Client, clock: C) -> Self {
+            Self { client, clock }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl Ocpp2_0_1MonitoringReportHandler<crate::clock::SystemClock> {
+        /// Wraps `client`, sourcing every `NotifyMonitoringReport`'s `generatedAt` from
+        /// [`crate::clock::SystemClock`].
+        pub fn new(client: OCPP2_0_1Client) -> Self {
+            Self::with_clock(client, crate::clock::SystemClock)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<C: Clock + Clone + Send + Sync + 'static> GetMonitoringReportHandler
+        for Ocpp2_0_1MonitoringReportHandler<C>
+    {
+        async fn register_get_monitoring_report_handler(&self, actor: ChargePointActor) {
+            let clock = self.clock.clone();
+            self.client
+                .on_get_monitoring_report(move |request, client| {
+                    let actor = actor.clone();
+                    let clock = clock.clone();
+                    async move {
+                        let criteria: Vec<_> = request
+                            .monitoring_criteria
+                            .as_ref()
+                            .map(|list| list.iter().map(map_monitoring_criterion).collect())
+                            .unwrap_or_default();
+                        let component_variable: Vec<_> = request
+                            .component_variable
+                            .as_ref()
+                            .map(|list| list.iter().map(map_component_variable).collect())
+                            .unwrap_or_default();
+                        let outcome =
+                            handle_get_monitoring_report(&actor, &criteria, &component_variable);
+                        let response = GetMonitoringReportResponse {
+                            custom_data: None,
+                            status: map_monitoring_report_status(&outcome),
+                            status_info: None,
+                        };
+                        if let MonitoringReportOutcome::Accepted(entries) = outcome {
+                            send_monitoring_report_chunks(
+                                &client,
+                                &clock,
+                                request.request_id,
+                                entries,
+                            )
+                            .await;
+                        }
+                        Ok(response)
+                    }
+                })
+                .await;
+        }
+    }
+
+    /// The `std` convenience: `OCPP2_0_1Client` itself implements `GetMonitoringReportHandler`
+    /// (sourcing `generatedAt` from [`crate::clock::SystemClock`]).
+    #[cfg(feature = "std")]
+    #[async_trait::async_trait]
+    impl GetMonitoringReportHandler for OCPP2_0_1Client {
+        async fn register_get_monitoring_report_handler(&self, actor: ChargePointActor) {
+            self.on_get_monitoring_report(move |request, client| {
+                let actor = actor.clone();
+                async move {
+                    let criteria: Vec<_> = request
+                        .monitoring_criteria
+                        .as_ref()
+                        .map(|list| list.iter().map(map_monitoring_criterion).collect())
+                        .unwrap_or_default();
+                    let component_variable: Vec<_> = request
+                        .component_variable
+                        .as_ref()
+                        .map(|list| list.iter().map(map_component_variable).collect())
+                        .unwrap_or_default();
+                    let outcome =
+                        handle_get_monitoring_report(&actor, &criteria, &component_variable);
+                    let response = GetMonitoringReportResponse {
+                        custom_data: None,
+                        status: map_monitoring_report_status(&outcome),
+                        status_info: None,
+                    };
+                    if let MonitoringReportOutcome::Accepted(entries) = outcome {
+                        send_monitoring_report_chunks(
+                            &client,
+                            &crate::clock::SystemClock,
+                            request.request_id,
+                            entries,
+                        )
+                        .await;
+                    }
+                    Ok(response)
                 }
             })
             .await;

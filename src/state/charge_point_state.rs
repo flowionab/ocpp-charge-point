@@ -608,6 +608,10 @@ impl ChargePointState {
                     severity,
                 ),
                 VariableMonitoringEvent::MonitorCleared { id } => self.variable_monitors.clear(id),
+                VariableMonitoringEvent::BaseSet { base } => self.variable_monitors.set_base(base),
+                VariableMonitoringEvent::LevelSet { severity } => {
+                    self.variable_monitors.set_level(severity)
+                }
             },
         };
 

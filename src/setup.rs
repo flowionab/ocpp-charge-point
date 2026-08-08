@@ -28,7 +28,8 @@ use crate::tariff::{
 };
 use crate::transactions::TransactionNotifier;
 use crate::variable_monitoring::{
-    ClearVariableMonitoringHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
+    ClearVariableMonitoringHandler, GetMonitoringReportHandler, SetMonitoringBaseHandler,
+    SetMonitoringLevelHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
 };
 
 /// Starts the hardware, then runs the Provisioning functional block's BootNotification
@@ -102,6 +103,9 @@ where
         + SetVariableMonitoringHandler
         + ClearVariableMonitoringHandler
         + VariableMonitorEventNotifier
+        + SetMonitoringBaseHandler
+        + SetMonitoringLevelHandler
+        + GetMonitoringReportHandler
         + ReconnectHandler
         + Clone
         + Send
@@ -141,6 +145,8 @@ where
         .meter_values(&csms, backoff.clone(), clock.clone())
         .await
         .variable_monitoring(&csms)
+        .await
+        .monitoring_reports(&csms)
         .await
         // B5.2: 60 s between periodic-monitor sweeps - fine-grained enough against monitors
         // configured in the tens of seconds and up (see `run_periodic_variable_monitors`'s docs),
@@ -472,6 +478,33 @@ mod tests {
             _event: &crate::state::TriggeredMonitor,
         ) -> Result<(), Self::Error> {
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::SetMonitoringBaseHandler for RecordingCsms {
+        async fn register_set_monitoring_base_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::SetMonitoringLevelHandler for RecordingCsms {
+        async fn register_set_monitoring_level_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::GetMonitoringReportHandler for RecordingCsms {
+        async fn register_get_monitoring_report_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
         }
     }
 
