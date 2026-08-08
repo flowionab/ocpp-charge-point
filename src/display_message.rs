@@ -267,8 +267,8 @@ pub fn chunk_display_messages(messages: &[DisplayedMessage]) -> Vec<DisplayMessa
 /// Derives the [`MessageState`] that best describes `state` right now, used by [`current_message`]
 /// to decide which stored messages currently apply.
 ///
-/// Priority order - most informative wins, mirroring
-/// [`crate::reservation::unavailable_outcome`]'s "which rejection reason to report" ordering:
+/// Priority order - most informative wins, mirroring `crate::reservation`'s own
+/// `unavailable_outcome` "which rejection reason to report" ordering:
 /// [`MessageState::Faulted`] (any fault, charge-point-wide/EVSE-wide/connector-wide) beats
 /// [`MessageState::Charging`] (any connector actively charging) beats
 /// [`MessageState::Unavailable`] (made unavailable, charge-point-wide/EVSE-wide/connector-wide)

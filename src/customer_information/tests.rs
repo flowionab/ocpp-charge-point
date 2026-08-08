@@ -42,9 +42,12 @@ fn at(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
 }
 
+/// One recorded `NotifyCustomerInformation`: `(request_id, seq_no, tbc, generated_at, data)`.
+type RecordedNotification = (i64, i64, bool, String, String);
+
 #[derive(Default)]
 struct RecordingNotifier {
-    seen: StdMutex<Vec<(i64, i64, bool, String, String)>>,
+    seen: StdMutex<Vec<RecordedNotification>>,
 }
 
 #[async_trait::async_trait]
