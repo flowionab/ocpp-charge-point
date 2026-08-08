@@ -118,11 +118,46 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-features --all-targets
 
-  # H1.6: coverage. Reported, not yet gated - the roadmap asks for a floor on
-  # the protocol adapters specifically, and setting one before a baseline
-  # exists would either be trivially passable or block work arbitrarily. The
-  # first green run on `main` supplies the number; the floor goes in as
-  # `--fail-under-lines` once it does, and H1.6 stays open until then.
+  # H1.6: coverage, gated with a floor on the protocol adapters.
+  #
+  # Whole-crate coverage stays informational (`--summary-only`, no
+  # `--fail-under-lines`): most of the low-coverage surface in that report is
+  # error-path plumbing (hardware failure branches, `builder.rs` generic
+  # wiring) where the missing tests are expensive relative to what they'd
+  # catch, and gating on the crate-wide number would either sit slack forever
+  # or start blocking unrelated work the day someone touches a big, hard file.
+  #
+  # The `ocpp_1_6.rs` / `ocpp_2_0_1.rs` / `ocpp_2_1.rs` files (one per
+  # functional block: certificates, diagnostics, firmware, smart_charging)
+  # are the version *adapters* CLAUDE.md calls out - they translate the
+  # protocol-agnostic internal state to/from each wire format, so a silent
+  # field-mapping bug there ships straight to a CSMS, and a test for one is
+  # cheap (construct a state, assert the wire shape). That is what actually
+  # gets gated below.
+  #
+  # cargo-llvm-cov has no "only report these files" flag, only
+  # `--ignore-filename-regex` to exclude, so scoping to the adapters is done
+  # by exporting full JSON (`cargo llvm-cov report --json`) once and
+  # aggregating the matching files' line counts with `jq` - both reports come
+  # from one instrumented test run (`--no-report` first, then `report` twice)
+  # rather than paying for the run twice.
+  #
+  # Floor is 70%, chosen below the measured baseline of ~75.8% (2250/2969
+  # lines across the 11 adapter files, all-features, on the commit this gate
+  # was added) so the gate protects against regression rather than failing on
+  # day one; it is not a target to stop at. Ratchet it up as adapter tests
+  # are added rather than treating 70 as good enough.
+  #
+  # What this floor does *not* protect: it is a line-coverage percentage, so
+  # it can be satisfied by exercising the easy/common branches of the 11
+  # files repeatedly while leaving specific error-mapping arms untested, and
+  # it says nothing about the many other `ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1`
+  # adapter *modules* that live inline inside larger files (e.g.
+  # `authorization.rs`, `transactions.rs`) rather than as their own file -
+  # llvm-cov reports at file granularity, so those aren't separable from the
+  # rest of their file's coverage without deeper per-region tooling this gate
+  # doesn't attempt. A green gate here is evidence the dedicated adapter
+  # files didn't regress, not proof every adapter path is tested.
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -132,7 +167,25 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      - run: cargo llvm-cov --all-features --summary-only
+      - run: cargo llvm-cov --all-features --no-report
+      - run: cargo llvm-cov report --summary-only
+      - name: Protocol adapter coverage floor
+        env:
+          FLOOR: "70.0"
+        run: |
+          cargo llvm-cov report --json --output-path /tmp/llvm-cov.json
+          read -r covered total <<< "$(jq -r '
+            .data[0].files
+            | map(select(.filename | test("/(ocpp_1_6|ocpp_2_0_1|ocpp_2_1)\\.rs$")))
+            | "\(map(.summary.lines.covered) | add) \(map(.summary.lines.count) | add)"
+          ' /tmp/llvm-cov.json)"
+          pct=$(awk -v c="$covered" -v t="$total" 'BEGIN { printf "%.2f", 100.0 * c / t }')
+          echo "Protocol adapter (ocpp_1_6/ocpp_2_0_1/ocpp_2_1) line coverage: $covered/$total = $pct% (floor $FLOOR%)"
+          awk -v p="$pct" -v f="$FLOOR" 'BEGIN { exit !(p < f) }' && {
+            echo "::error::Protocol adapter line coverage $pct% is below the $FLOOR% floor (H1.6)"
+            exit 1
+          }
+          true
 
   # H1.5 / D3.3: licences and advisories, configured in deny.toml.
   deny:

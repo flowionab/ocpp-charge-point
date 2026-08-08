@@ -103,7 +103,7 @@ close — mostly missing one version each.
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the authorization cache, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: certificates, network profiles. |
 | Test suite | 🚧 | 757 test functions in `src/`, three integration tests (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`). Strong unit coverage; end-to-end is no longer zero but is still missing a mock CSMS over a real socket ([H2.1](#102-h2--integration-testing)). |
-| CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too. Coverage reported but not gated ([H1.6](#101-h1--ci-hardening)). |
+| CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too, plus a coverage floor on the protocol adapter files ([H1.6](#101-h1--ci-hardening)). Whole-crate coverage stays informational. |
 
 ### 2.4 The structural blocker — resolved
 
@@ -2480,11 +2480,21 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
       licenses ok, sources ok`. Permissive-only allow-list, every entry taken
       from a licence actually in the tree; `ignore = []` with a note that
       exceptions get a reason, never silence. This closes D3.3 as well.
-- [ ] **H1.6** Coverage reporting, with a floor on the protocol adapters.
-      *Partial* — `cargo llvm-cov` runs and reports, but nothing is gated. A
-      floor set before a baseline exists is either trivially passable or
-      arbitrary; the first green `main` run supplies the number, and this
-      stays open until `--fail-under-lines` is in.
+- [x] **H1.6** Coverage reporting, with a floor on the protocol adapters.
+      Whole-crate coverage (`cargo llvm-cov --all-features`) stays
+      informational, matching the reasoning for not gating the crate-wide
+      number in the CI comment. The gate targets the 11 dedicated adapter
+      files (`ocpp_1_6.rs` / `ocpp_2_0_1.rs` / `ocpp_2_1.rs` under
+      `certificates/`, `diagnostics/`, `firmware/`, `smart_charging/`) —
+      llvm-cov has no positive file filter, so the `coverage` job exports
+      JSON and aggregates those files' line counts with `jq`. Measured
+      baseline on the commit this landed: 2250/2969 lines = 75.78%; floor set
+      to 70% to leave headroom rather than pin the exact number. Does *not*
+      cover the many other `ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1` adapter
+      *modules* that live inline inside larger files (e.g.
+      `authorization.rs`) — llvm-cov reports at file granularity, so those
+      aren't separable from the rest of their file without per-region
+      tooling this doesn't attempt.
 - [x] **H1.7** Run on PRs, not just `push`.
 - [ ] **H1.8** **Make a red gate visible.** `feature-matrix` was failing on
       `main` for at least three consecutive commits before anyone looked; the
