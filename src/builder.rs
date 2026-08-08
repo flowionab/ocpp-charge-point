@@ -1913,6 +1913,43 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers the Customer Information block (`docs/PRODUCTION-ROADMAP.md` B5.5): inbound
+    /// `CustomerInformation`, and the worker that gathers and sends every accepted `report` and
+    /// applies every accepted `clear` - see [`crate::customer_information`].
+    ///
+    /// **2.x only** - see that module's docs for why 1.6J has no such message.
+    ///
+    /// Needs nothing but this charge point's own in-memory state and `clock` (for
+    /// `NotifyCustomerInformation`'s `generatedAt`), unlike [`Self::log_uploads`]/
+    /// [`Self::firmware_updates`] - but is still builder-only rather than folded into
+    /// [`crate::setup::setup`]'s response-then-work worker, so that a future
+    /// [`crate::hardware`]-backed customer store can slot in here without changing `setup()`'s
+    /// signature.
+    pub async fn customer_information<N, K>(self, csms: &N, clock: K) -> Self
+    where
+        N: crate::customer_information::CustomerInformationHandler
+            + crate::customer_information::CustomerInformationNotifier
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+    {
+        let queue = crate::customer_information::CustomerInformationQueue::new();
+        csms.register_customer_information_handler(self.runtime.actor(), queue.clone())
+            .await;
+
+        let actor = self.runtime.actor();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::customer_information::run_customer_information_requests(
+                &actor, queue, &notifier, &clock,
+            )
+            .await;
+        }));
+        self
+    }
+
     /// Finishes building, handing back the [`ChargePointRuntime`] every registered block is now
     /// wired to.
     pub fn build(self) -> ChargePointRuntime<T> {

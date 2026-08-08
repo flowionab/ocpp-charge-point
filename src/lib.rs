@@ -44,6 +44,7 @@ mod connect;
 pub mod connection;
 #[cfg(feature = "tariff-cost")]
 pub mod cost;
+pub mod customer_information;
 pub mod data_transfer;
 pub mod device_model;
 pub mod diagnostics;

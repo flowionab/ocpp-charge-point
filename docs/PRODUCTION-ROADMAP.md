@@ -989,7 +989,7 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 | SetMonitoringBase / SetMonitoringLevel | — | ⬜ | ⬜ |
 | GetMonitoringReport / NotifyMonitoringReport | — | ⬜ | ⬜ |
 | NotifyEvent | — | ⬜ | ⬜ |
-| CustomerInformation / NotifyCustomerInformation | — | ⬜ | ⬜ |
+| CustomerInformation / NotifyCustomerInformation | — | ✅ | ✅ |
 | GetTransactionStatus | — | ⬜ | ⬜ |
 | Open/Close/Adjust/Get PeriodicEventStream, NotifyPeriodicEventStream | — | — | ⬜ |
 
@@ -1082,7 +1082,77 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
       `get_transaction_status` without either of those first still answers
       correctly — `false`, because nothing is ever queued through a queue
       that doesn't exist — just less usefully.
-- [ ] **B5.5** Customer information / GDPR erasure.
+- [x] **B5.5** Customer information / GDPR erasure - `CustomerInformation`
+      (2.x only; 1.6J has no such message) and the `NotifyCustomerInformation`
+      report(s) it triggers.
+
+      **Two independent jobs, honoured against real state.** `report` and
+      `clear` may both be set, and each is decided against the places a
+      customer's identity actually lives in this crate - the authorization
+      cache (`state::AuthorizationCache`), the local authorization list
+      (`state::LocalAuthorizationList`), and any transaction currently in
+      progress under that identity - never a fabricated store built to answer
+      this one message. `crate::customer_information::gather`/`render` read
+      all three and produce one human-readable text blob (OCPP prescribes no
+      format for `data`, same stance B5.1 takes for the security log), and
+      `crate::customer_information::chunk_customer_information` splits it into
+      `NotifyCustomerInformation` chunks with correctly incrementing
+      `seqNo`/`tbc` - the same shape `reporting::chunk_report` uses for
+      `NotifyReport`, just splitting one bounded string by byte length rather
+      than a list of entries by count, since a single
+      `NotifyCustomerInformation` carries one `heapless::String<512>` rather
+      than a list. An empty report still produces one chunk, for the same
+      "`seqNo` must start at `0`" reason `chunk_report` does.
+
+      **Only an `idToken` is actually resolvable.** OCPP names three ways to
+      identify the customer - `customerIdentifier`, `idToken`,
+      `customerCertificate` - but this crate's state has no notion of a
+      vendor-specific `customerIdentifier` distinct from an `IdToken`, and
+      matching a `customerCertificate` needs certificate-chain cryptography
+      this crate does not have (B4's certificate store gap). Both are
+      honestly answered `Invalid` rather than pretended at; only a request
+      naming an `idToken` is `Accepted`, regardless of whether anything is
+      actually found for it - finding nothing is itself an honest answer to
+      `report`, and a no-op for `clear`.
+
+      **Erasure is a real state mutation, not a fabricated success.**
+      `ChargePointEvent::CustomerInformationErased` removes the matching
+      `AuthorizationCacheEntry` (`AuthorizationCache::forget`, added
+      alongside the existing `clear`) and the matching `LocalListEntry`
+      (`LocalAuthorizationList::forget`). The local list's `version` is
+      bumped when an entry is actually removed - the same reasoning
+      `LocalAuthorizationList::replace`'s docs already give for always
+      adopting the version it's told, just in the other direction: a CSMS
+      whose next differential `SendLocalList` assumes the old version must be
+      made to notice (via `GetLocalListVersion`) rather than silently apply on
+      top of a list that moved out from under it. Both stores already have a
+      persistence task (`run_authorization_cache_persistence`,
+      `run_local_authorization_list_persistence`, E2.4/E2.5) that re-saves on
+      any observed state change, so this needed no new persistence code to
+      survive a reboot - it reuses the stores that were already durable.
+      Deliberately **not** erased: a transaction currently in progress under
+      the erased token. The CSMS still needs to bill and reconcile a session
+      that's already running, and this crate keeps no separate transaction
+      history to erase from once one ends (the same "a finished transaction
+      and one this charge point never had are indistinguishable" reasoning
+      B5.4's `transaction_status` module documents) - an operator who needs a
+      live session's identity gone has to stop it first. The report still
+      names any such transaction, so the CSMS at least knows one exists.
+
+      **Answer first, then act**, matching B5.1's `GetLog` shape:
+      `handle_customer_information` is synchronous and only decides and
+      queues; `run_customer_information_requests` - a worker
+      `ChargePointBuilder::customer_information` spawns - gathers and sends
+      the report *before* applying the erasure, so a request with both flags
+      set describes what was held right before `clear` deleted it, not data
+      `clear` had already removed. Unlike `GetLog`, this needed no
+      hardware-fallibility handling to justify the split (gathering and
+      erasing are both plain in-memory state) - the split is kept anyway for
+      the same reason B5.1 gives: the response the CSMS is waiting on must
+      never be held behind follow-up work, even work that happens to be cheap
+      today. Builder-only rather than folded into `setup()`, matching B5.4's
+      `get_transaction_status` - so a future slower customer-data source can
+      still slot in here without changing `setup()`'s signature.
 - [ ] **B5.6** 2.1 periodic event streams.
 
 ### B6 — Display message (R§15)

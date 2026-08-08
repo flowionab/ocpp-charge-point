@@ -152,6 +152,20 @@ impl AuthorizationCache {
         discarded
     }
 
+    /// Forgets the cached decision for `id_token`, if one is held - the erasure half of GDPR
+    /// customer information handling (`crate::customer_information`,
+    /// `docs/PRODUCTION-ROADMAP.md` B5.5). Unlike [`Self::lookup`], this removes the entry
+    /// outright regardless of whether it has expired: an expired entry is still data this charge
+    /// point holds about the customer until something actually deletes it.
+    ///
+    /// Returns whether an entry was actually held (and so removed).
+    pub fn forget(&mut self, id_token: &IdToken) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| !same_token(&entry.id_token, id_token));
+        self.entries.len() != before
+    }
+
     /// Replaces the cache's contents (used by recovery from durable storage), respecting the
     /// bound. Returns how many entries the bound dropped.
     pub fn replace(&mut self, entries: Vec<AuthorizationCacheEntry>) -> usize {
@@ -320,6 +334,22 @@ mod tests {
         cache.remember(token("A"), AuthorizationStatus::Accepted, at(0));
 
         assert!(cache.lookup(&token("A"), None, Some(60)).is_some());
+    }
+
+    #[test]
+    fn forgetting_removes_only_the_named_token_regardless_of_expiry() {
+        let mut cache = AuthorizationCache::with_max_entries(10);
+        cache.remember(token("A"), AuthorizationStatus::Accepted, at(0));
+        cache.remember(token("B"), AuthorizationStatus::Accepted, at(0));
+
+        // Expired, but still held - and `forget` must still find and remove it.
+        assert!(cache.lookup(&token("A"), at(1_000_000), Some(60)).is_none());
+        assert!(cache.forget(&token("A")));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.lookup(&token("B"), at(1), None).is_some());
+
+        // Forgetting a token never held is a no-op that reports honestly.
+        assert!(!cache.forget(&token("A")));
     }
 
     #[test]

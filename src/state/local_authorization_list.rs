@@ -78,6 +78,28 @@ impl LocalAuthorizationList {
         self.entries = entries;
         dropped
     }
+
+    /// Forgets the entry for `id_token`, if this list holds one - the erasure half of GDPR
+    /// customer information handling (`crate::customer_information`,
+    /// `docs/PRODUCTION-ROADMAP.md` B5.5).
+    ///
+    /// Bumps [`Self::version`] when an entry was actually removed: the list now on this charge
+    /// point no longer matches what the CSMS believes it last sent, the same reasoning
+    /// [`Self::replace`]'s docs give for always adopting the version it's told, just in the other
+    /// direction here - a CSMS whose next differential `SendLocalList` assumes the old version
+    /// must be made to notice (via `GetLocalListVersion`) rather than silently apply on top of a
+    /// list that has moved out from under it.
+    ///
+    /// Returns whether an entry was actually held (and so removed).
+    pub fn forget(&mut self, id_token: &IdToken) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.id_token.value != id_token.value);
+        let changed = self.entries.len() != before;
+        if changed {
+            self.version += 1;
+        }
+        changed
+    }
 }
 
 impl Default for LocalAuthorizationList {
@@ -143,6 +165,22 @@ mod tests {
         // that was sent, and claiming an older version would make the next differential update
         // apply on top of a list this charge point doesn't actually hold either.
         assert_eq!(list.version, 1);
+    }
+
+    #[test]
+    fn forgetting_an_entry_removes_it_and_bumps_the_version() {
+        let mut list = LocalAuthorizationList::with_max_entries(4);
+        list.replace(1, entries(2));
+
+        let removed_token = entries(2)[0].id_token.clone();
+        assert!(list.forget(&removed_token));
+        assert_eq!(list.entries.len(), 1);
+        assert_eq!(list.version, 2);
+
+        // Forgetting a token never held is a no-op that reports honestly and leaves the version
+        // alone.
+        assert!(!list.forget(&removed_token));
+        assert_eq!(list.version, 2);
     }
 
     #[test]
