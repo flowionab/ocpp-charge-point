@@ -15,17 +15,19 @@ use core::cell::RefCell;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
+#[cfg(feature = "ocpp_2_0_1")]
+pub use self::ocpp_2_0_1::Ocpp2_0_1SecurityEventNotifier;
 #[cfg(feature = "ocpp_2_1")]
 pub use self::ocpp_2_1::Ocpp2_1SecurityEventNotifier;
 
 /// The OCPP wire `type` string for `event_type` - the standardized values, or the raw
-/// vendor-specific string for `Other`. Only 2.1 has an adapter to use this today - `ocpp-client`
-/// 0.2.0 doesn't implement `SecurityEventNotification` for 2.0.1 at all (see the `ocpp_2_0_1`
-/// note below) - but it's defined at this module's top level, not inside `ocpp_2_1`, since the
-/// wire shape itself (a free-form string, unlike e.g. `IdToken.type`, which 2.0.1 keeps as a
-/// closed enum) is not actually 2.1-specific, and a 2.0.1 adapter should reuse this the moment
-/// upstream support exists rather than needing its own copy written from scratch.
-#[cfg(feature = "ocpp_2_1")]
+/// vendor-specific string for `Other`.
+///
+/// Shared by the 2.1 and 2.0.1 adapters, which is exactly what it was placed at this module's top
+/// level for: the wire shape is a free-form string (unlike e.g. `IdToken.type`, which 2.0.1 keeps
+/// as a closed enum), so it was never 2.1-specific. When `ocpp-client` gained the 2.0.1 action
+/// (D1), the adapter below reused this rather than needing a second copy.
+#[cfg(any(feature = "ocpp_2_1", feature = "ocpp_2_0_1"))]
 fn wire_type(event_type: &SecurityEventType) -> alloc::string::String {
     use alloc::string::ToString;
     match event_type {
@@ -51,8 +53,13 @@ fn wire_type(event_type: &SecurityEventType) -> alloc::string::String {
         SecurityEventType::InvalidChargingStationCertificate => {
             "InvalidChargingStationCertificate".to_string()
         }
+        SecurityEventType::DiscardedRenewedClientCertificate => {
+            "DiscardedRenewedClientCertificate".to_string()
+        }
         SecurityEventType::InvalidTlsVersion => "InvalidTLSVersion".to_string(),
         SecurityEventType::InvalidTlsCipherSuite => "InvalidTLSCipherSuite".to_string(),
+        SecurityEventType::MaintenanceLoginAccepted => "MaintenanceLoginAccepted".to_string(),
+        SecurityEventType::MaintenanceLoginFailed => "MaintenanceLoginFailed".to_string(),
         SecurityEventType::Other(value) => value.clone(),
     }
 }
@@ -117,8 +124,11 @@ mod wire_type_tests {
             SecurityEventType::InvalidFirmwareSigningCertificate,
             SecurityEventType::InvalidCsmsCertificate,
             SecurityEventType::InvalidChargingStationCertificate,
+            SecurityEventType::DiscardedRenewedClientCertificate,
             SecurityEventType::InvalidTlsVersion,
             SecurityEventType::InvalidTlsCipherSuite,
+            SecurityEventType::MaintenanceLoginAccepted,
+            SecurityEventType::MaintenanceLoginFailed,
         ];
         for event_type in all {
             assert!(wire_type(&event_type).len() <= 50);
@@ -306,17 +316,26 @@ pub async fn report_security_event(actor: &ChargePointActor, event: SecurityEven
         .await;
 }
 
-/// Forwards every security event received on `events` to the CSMS via `notifier`, forever.
+/// Forwards every **critical** security event received on `events` to the CSMS via `notifier`,
+/// forever.
+///
+/// Non-critical events are skipped, per OCPP A04.FR.01 - they belong in the security log
+/// (A04.FR.04), which subscribes separately and keeps everything. See
+/// [`SecurityEventType::is_critical`].
+///
 /// Errors are logged and do not stop the loop - the actor already recorded the event; only the
 /// CSMS-facing report failed and is not retried. [`setup`](crate::setup) uses
-/// [`crate::offline_queue::run_with_offline_queue`] instead, which queues and retries a failed
-/// report rather than just logging it; this simpler fire-and-forget version remains for callers
-/// who don't need retry.
+/// [`crate::offline_queue::run_with_offline_queue_where`] instead, which queues and retries a
+/// failed report rather than just logging it; this simpler fire-and-forget version remains for
+/// callers who don't need retry.
 pub async fn run_security_events<N: SecurityEventNotifier>(
     mut events: BroadcastReceiver<SecurityEvent>,
     notifier: &N,
 ) {
     while let Ok(event) = events.recv().await {
+        if !event.event_type.is_critical() {
+            continue;
+        }
         if let Err(err) = notifier
             .notify_security_event(&event.event_type, event.tech_info.as_deref())
             .await
@@ -353,6 +372,39 @@ mod tests {
                 .send_modify(|seen| seen.push((event_type.clone(), tech_info.map(Into::into))));
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn a_non_critical_event_is_not_reported_to_the_csms() {
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        let (seen_tx, seen_rx) = watch::channel(Vec::new());
+        let notifier = RecordingSecurityEventNotifier { seen: seen_tx };
+
+        let forwarder = tokio::spawn(async move {
+            run_security_events(receiver, &notifier).await;
+        });
+
+        // A04.FR.01 asks for critical events only. `InvalidMessages` is one an attacker can
+        // generate at will, and it still reaches the security log (A04.FR.04) through that log's
+        // own separate subscription - it just does not consume a CSMS report.
+        sender.send(SecurityEvent {
+            event_type: SecurityEventType::InvalidMessages,
+            tech_info: Some("malformed frame".into()),
+        });
+        sender.send(SecurityEvent {
+            event_type: SecurityEventType::TamperDetectionActivated,
+            tech_info: None,
+        });
+
+        drop(sender);
+        forwarder.await.unwrap();
+
+        assert_eq!(
+            *seen_rx.borrow(),
+            alloc::vec![(SecurityEventType::TamperDetectionActivated, None)],
+            "the non-critical event should not have been reported"
+        );
     }
 
     #[tokio::test]
@@ -662,12 +714,144 @@ mod ocpp_2_1 {
     }
 }
 
-// No `ocpp_2_0_1` module here (unlike every other functional block ported to 2.0.1 so far):
-// `ocpp-client` 0.2.0 simply doesn't implement `SecurityEventNotification` for
-// `OCPP2_0_1Client` at all - verified directly against the pinned dependency (grepped its full
-// `ocpp_2_0_1::actions` list: 66 actions covering every other 2.0.1 message including all of
-// Provisioning/Availability/Transactions/Remote control/Reservation/Local auth list, but no
-// `SecurityEventNotification`), not assumed from the absence of a `send_security_event_
-// notification` method alone. This is a real upstream gap this crate can't work around per
-// `CLAUDE.md`'s "delegate wire-protocol concerns to `ocpp-client`" - there is no `Action` type or
-// `send_*`/`on_*` method to call. See `docs/ROADMAP.md` §1.
+/// OCPP 2.0.1 adapter for SecurityEventNotification (F4.4).
+///
+/// This module used to be a comment explaining its own absence: `ocpp-client` 0.2.0 generated no
+/// 2.0.1 action for `SecurityEventNotification`, even though the message is in the 2.0.1 spec and
+/// its types are in `ocpp-types` v201. D1 fixed that upstream and the pinned 0.2.2 generates it,
+/// so a 2.0.1 connection now reports security events like a 2.1 one - and the wire request is
+/// field-for-field identical, so only the client type differs.
+#[cfg(feature = "ocpp_2_0_1")]
+mod ocpp_2_0_1 {
+    use super::{SecurityEventNotifier, SecurityEventType, wire_type};
+    use crate::clock::{Clock, is_synchronized};
+    use alloc::boxed::Box;
+    use ocpp_client::ClientError;
+    use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
+    use ocpp_client::ocpp_types::v201::SecurityEventNotificationRequest;
+
+    /// The 2.0.1 counterpart of the 2.1 builder - same fields, same bounds, same fallbacks. Kept
+    /// as its own function rather than made generic over the two request types: they are distinct
+    /// generated structs with no shared trait, and a macro to unify four field assignments would
+    /// cost more to read than it saves.
+    fn build_security_event_notification_request<C: Clock>(
+        clock: &C,
+        event_type: &SecurityEventType,
+        tech_info: Option<&str>,
+    ) -> SecurityEventNotificationRequest {
+        let now = clock.now();
+        if !is_synchronized(&now) {
+            tracing::warn!(
+                timestamp = %now,
+                "SecurityEventNotification timestamp sourced from an unsynchronized clock"
+            );
+        }
+        SecurityEventNotificationRequest {
+            custom_data: None,
+            tech_info: tech_info.and_then(|info| heapless::String::try_from(info).ok()),
+            timestamp: now.to_rfc3339(),
+            r#type: heapless::String::try_from(wire_type(event_type).as_str())
+                .unwrap_or_else(|_| heapless::String::try_from("Other").unwrap()),
+        }
+    }
+
+    /// Wraps an `OCPP2_0_1Client` with a caller-supplied [`Clock`], mirroring
+    /// [`super::Ocpp2_1SecurityEventNotifier`].
+    pub struct Ocpp2_0_1SecurityEventNotifier<C> {
+        client: OCPP2_0_1Client,
+        clock: C,
+    }
+
+    impl<C: Clock> Ocpp2_0_1SecurityEventNotifier<C> {
+        /// Wraps `client`, sourcing every SecurityEventNotification timestamp from `clock`.
+        pub fn with_clock(client: OCPP2_0_1Client, clock: C) -> Self {
+            Self { client, clock }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl Ocpp2_0_1SecurityEventNotifier<crate::clock::SystemClock> {
+        /// Wraps `client`, sourcing every timestamp from [`crate::clock::SystemClock`].
+        pub fn new(client: OCPP2_0_1Client) -> Self {
+            Self::with_clock(client, crate::clock::SystemClock)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<C: Clock + Send + Sync> SecurityEventNotifier for Ocpp2_0_1SecurityEventNotifier<C> {
+        type Error = ClientError<OCPP2_0_1Error>;
+
+        async fn notify_security_event(
+            &self,
+            event_type: &SecurityEventType,
+            tech_info: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            let request =
+                build_security_event_notification_request(&self.clock, event_type, tech_info);
+            self.client
+                .send_security_event_notification(request)
+                .await?;
+            Ok(())
+        }
+    }
+
+    /// The `std` convenience, matching the 2.1 side: a bare `OCPP2_0_1Client` reports directly.
+    #[cfg(feature = "std")]
+    #[async_trait::async_trait]
+    impl SecurityEventNotifier for OCPP2_0_1Client {
+        type Error = ClientError<OCPP2_0_1Error>;
+
+        async fn notify_security_event(
+            &self,
+            event_type: &SecurityEventType,
+            tech_info: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            let request = build_security_event_notification_request(
+                &crate::clock::SystemClock,
+                event_type,
+                tech_info,
+            );
+            self.send_security_event_notification(request).await?;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use chrono::{DateTime, Utc};
+
+        struct FixedClock(DateTime<Utc>);
+
+        impl Clock for FixedClock {
+            fn now(&self) -> DateTime<Utc> {
+                self.0
+            }
+        }
+
+        #[test]
+        fn a_2_0_1_request_carries_the_same_type_string_as_2_1() {
+            let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+            let request = build_security_event_notification_request(
+                &FixedClock(fixed),
+                &SecurityEventType::InvalidCsmsCertificate,
+                Some("chain does not verify"),
+            );
+
+            // The same `wire_type` both versions share - including OCPP's capitalisation, which
+            // is `InvalidCSMSCertificate` rather than the Rust variant's spelling.
+            assert_eq!(request.r#type, "InvalidCSMSCertificate");
+            assert_eq!(request.tech_info.as_deref(), Some("chain does not verify"));
+            assert_eq!(request.timestamp, fixed.to_rfc3339());
+        }
+    }
+}
+
+// 1.6J has no `SecurityEventNotification` in the core specification at all - it arrives only with
+// the OCPP 1.6 Security Whitepaper, whose message set `ocpp-types` does not generate (D2.2). So a
+// 1.6J connection records security events in the durable log and reports none of them, which is a
+// version difference rather than a gap here. Closing it means contributing the whitepaper types
+// upstream first; see `docs/PRODUCTION-ROADMAP.md` D2.2, where that decision is still open.

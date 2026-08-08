@@ -539,7 +539,7 @@ Secures the OCPP connection and reports security-relevant events.
 - Internal state needed: certificate store abstraction, security event log,
   security profile (1/2/3) configuration.
 - Status: 🚧 partial — `SecurityEventNotification` (outbound only) is
-  implemented; the certificate messages (`SignCertificate`,
+  implemented on **both 2.1 and 2.0.1**; the certificate messages (`SignCertificate`,
   `CertificateSigned`, `Get15118EVCertificate`, `GetCertificateStatus`,
   `DeleteCertificate`, `InstallCertificate`, `GetInstalledCertificateIds`)
   are not - no certificate store abstraction exists, and several need real
@@ -547,18 +547,34 @@ Secures the OCPP connection and reports security-relevant events.
   `SecurityEvent` (`event_type: SecurityEventType`, `tech_info: Option<
   String>`) is reported via a new `src/security.rs` module, wired the same
   way as every other outbound report: a protocol-agnostic
-  `SecurityEventNotifier` trait, implemented for `ocpp-client`'s OCPP 2.1
-  client, forwarded by `run_security_events` (spawned from `setup()`) over a
+  `SecurityEventNotifier` trait, implemented for `ocpp-client`'s OCPP 2.1 and
+  2.0.1 clients, forwarded by `run_security_events` (spawned from `setup()`) over a
   new dedicated broadcast channel on the actor
   (`ChargePointActor::subscribe_security_events`). `SecurityEventType`
-  covers OCPP's standardized "Security events" list (18 values, e.g.
+  covers OCPP's standardized "Security events" list (all 21 values, e.g.
   `TamperDetectionActivated`, `InvalidCsmsCertificate`,
   `MemoryExhaustion`) plus `Other(String)` for vendor-specific/uncovered
   ones - mirroring `StopReason`'s "subset of the full spec enum" pattern.
-  Critically, **nothing in this crate raises one of these on its own yet**:
-  there's no certificate handling (the rest of this block), no firmware
-  update flow (§12), and no TLS-layer visibility (that lives in
-  `ocpp-client`, not here). A durable, size-bounded **security log** now sits alongside
+
+  **Criticality decides where an event goes**, per OCPP A04:
+  `SecurityEventType::is_critical` (transcribed from the spec appendix's own
+  `Critical` column) gates entry to the CSMS notification queue, while the log
+  keeps everything. That is a security property, not tidiness - the queue is
+  bounded and evicts its oldest entry, and `InvalidMessages` /
+  `AttemptedReplayAttacks` are precisely what a remote party can generate at
+  will, so sharing the queue let a flood push a queued
+  `TamperDetectionActivated` out before the CSMS saw it.
+
+  Six events are now raised by this crate itself: `StartupOfTheDevice`,
+  `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`,
+  `SecurityLogWasCleared` and `ReconfigurationOfSecurityParameters` (on an
+  accepted `SetNetworkProfile`). The rest still cannot be: there's no
+  certificate handling (the rest of this block), no firmware update flow (§12),
+  and no TLS-layer visibility (that lives in `ocpp-client`, not here); the
+  tamper and maintenance-login events are the integrator's to raise, since only
+  the hardware knows a case was opened or who logged in. **1.6J reports none of
+  them** - `SecurityEventNotification` is a Security Whitepaper message, not a
+  core 1.6J one, and `ocpp-types` does not generate that message set. A durable, size-bounded **security log** now sits alongside
   the reporting pipeline (`security::SecurityEventLog` plus
   `persistence::SecurityLogStore`, wired via
   `ChargePointBuilder::security_log_persisted`): every raised event is recorded

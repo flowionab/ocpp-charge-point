@@ -64,7 +64,7 @@ generates for that version:
 | Version | Wired | Available in `ocpp-client` | Spec messages (approx.) |
 |---------|-------|---------------------------|-------------------------|
 | **1.6J** | **19** | 28 | 28 core + security-whitepaper extensions |
-| **2.0.1** | **21** | 63 | 64 (`ocpp-types` has 64 request types) |
+| **2.0.1** | **21** | 64 (0.2.2; the 63 here was 0.2.0) | 64 (`ocpp-types` has 64 request types) |
 | **2.1** | **22** | 91 (0.2.2; the 86 here was 0.2.0) | 90+ (`ocpp-types` has 90 request types) |
 
 Two things this table hides, both good news:
@@ -1723,20 +1723,66 @@ security whitepaper to whatever extent [D2.2](#62-d2--type-completeness-audit) c
 
 ### 8.4 F4 — Security events
 
-18 of the 21 event types in the vendored appendix are modelled in
-`SecurityEventType`.
+All 21 event types in the vendored appendix are modelled, and OCPP's
+**criticality** distinction is now honoured rather than ignored.
 
-- [ ] **F4.1** Add the missing three: `DiscardedRenewedClientCertificate`,
-      `MaintenanceLoginAccepted`, `MaintenanceLoginFailed`.
-- [ ] **F4.2** Actually *raise* each event from the code path that detects
-      it — most are declared but never emitted.
+- [x] **F4.1** Added the missing three: `DiscardedRenewedClientCertificate`,
+      `MaintenanceLoginAccepted`, `MaintenanceLoginFailed`. A test asserts the modelled set is the
+      same size as the appendix's, so the next spec revision fails a test rather than going
+      unnoticed.
+- [x] **F4.2** Raised from the code paths that detect them, and **criticality now decides where an
+      event goes** — which turned out to be the substance of this row.
+
+      **The defect.** OCPP A04 splits a security event's two destinations: A04.FR.01 sends
+      *critical* events to the CSMS, A04.FR.04 stores *every* event (also non-critical) in the
+      security log. This crate sent everything to the CSMS. That is not merely over-reporting: the
+      notification queue is bounded and drops its **oldest** entry on overflow (G2.2), and two of
+      the non-critical types — `InvalidMessages` and `AttemptedReplayAttacks` — are exactly what a
+      remote party can generate at will by throwing malformed frames at the charge point. Sharing
+      the queue meant an attacker could flood it and evict a queued `TamperDetectionActivated`
+      before the CSMS ever saw it: **silencing the report of their own physical intrusion.**
+
+      `SecurityEventType::is_critical` (transcribed from the appendix's `Critical` column, and
+      test-asserted against it row by row) now gates entry to the queue — *before* the push, not
+      before the send, because anything allowed into a bounded queue can displace something else.
+      `Other` is treated as critical: a vendor event this crate has never heard of is not
+      something to quietly downgrade. The regression test was validated by injecting the old
+      behaviour, which fails it with the tamper report fully evicted and only `InvalidMessages`
+      delivered.
+
+      **Now actually raised:** `StartupOfTheDevice` (after the hardware binding starts — a charge
+      point that failed to start has not started), `ResetOrReboot` (before the event that may
+      reboot immediately, since afterwards there may be no process left to raise anything), and
+      `ReconfigurationOfSecurityParameters` on an accepted `SetNetworkProfile`, which carries the
+      security profile and the endpoint this charge point authenticates to. Together with the
+      three already raised — `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared` —
+      that is six of 21.
+
+      **Still not raised, and honestly so:** the certificate, firmware, TLS and authentication
+      types need blocks that do not exist ([B3](#b3--firmware-management-r12),
+      [B4](#b4--certificates-and-iso-15118-r1-r13), [F1](#81-f1--security-profiles),
+      [F2](#82-f2--tls)). `InvalidMessages` and `AttemptedReplayAttacks` need a transport-level
+      hook `ocpp-client` does not expose. `TamperDetectionActivated` and the two
+      `MaintenanceLogin*` types are the integrator's to raise — only the hardware knows a case was
+      opened or who logged in, and OCPP's recommended `techInfo` format for a login
+      (`{'user': ..., 'origin': ...}`) is theirs to fill in.
 - [ ] **F4.3** Durable, size-bounded security log ([E2](#72-e2--what-must-survive)), readable via
       `GetLog`. *Partial* - the log itself is done ([E2.10](#72-e2--what-must-survive)): bounded,
       durable, restored at boot, and clearable with a `SecurityLogWasCleared` report. What's left
       is the `GetLog` reader that uploads it, which needs [B5.1](#b5--diagnostics-and-monitoring-r14)'s
-      file-transfer abstraction.
-- [ ] **F4.4** `SecurityEventNotification` for 2.0.1 (after [D1](#61-d1--missing-action-wrappers)) and a
-      decision on 1.6J.
+      file-transfer abstraction. Non-critical events make this more valuable than it was: they are
+      now *only* in the log, so the log is the only way a CSMS ever learns of them.
+- [x] **F4.4** `SecurityEventNotification` for 2.0.1 — **done**, and the "after D1" caveat was
+      stale: D1 landed and the pinned `ocpp-client` 0.2.2 generates the 2.0.1 action. The wire
+      request is field-for-field identical to 2.1's, so the adapter shares `wire_type` exactly as
+      that function's docs anticipated, and `connect_and_setup`'s 2.0.1 path registers the block.
+
+      **1.6J: decided, and the answer is no.** 1.6J has no `SecurityEventNotification` in the core
+      specification — it arrives only with the OCPP 1.6 Security Whitepaper, whose message set
+      `ocpp-types` does not generate ([D2.2](#62-d2--type-completeness-audit)). A 1.6J connection
+      records events in the durable log and reports none. That is a version difference, not a gap
+      here; closing it means contributing the whitepaper types upstream first, which is D2.2's
+      still-open decision.
 
 ### 8.5 F5 — Hardening
 
@@ -2419,16 +2465,16 @@ StopTransaction, TriggerMessage, UnlockConnector
 **Missing:** DiagnosticsStatusNotification,
 FirmwareStatusNotification, GetDiagnostics, UpdateFirmware
 
-### A.2 OCPP 2.0.1 — 31 of 63 wired
+### A.2 OCPP 2.0.1 — 32 of 64 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
 GetReport, GetVariables, Heartbeat, NotifyReport, ReportChargingProfiles,
 ReservationStatusUpdate, RequestStartTransaction,
-MeterValues, RequestStopTransaction, ReserveNow, Reset, SendLocalList,
-SetChargingProfile, SetNetworkProfile, SetVariables, StatusNotification,
-TransactionEvent, TriggerMessage, UnlockConnector
+MeterValues, RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
+SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
+StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
 
 **Missing:** CertificateSigned,
 ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
@@ -2443,9 +2489,9 @@ PublishFirmware, PublishFirmwareStatusNotification, SetDisplayMessage,
 SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 
-**Also:** `SecurityEventNotification` is in the 2.0.1 spec and in
-`ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
-[D1](#61-d1--missing-action-wrappers).
+**Note:** `SecurityEventNotification` used to be listed here as present in the
+2.0.1 spec and in `ocpp-types` v201 but ungenerated by `ocpp-client` 0.2.0. D1
+fixed that upstream; 0.2.2 generates all 64 actions, and F4.4 wired this one.
 
 ### A.3 OCPP 2.1 — 36 of 91 wired
 
@@ -2497,7 +2543,8 @@ gap is entirely this crate's to close.
 | …registered by this crate | 48 always-on (`DEFAULT_VARIABLES`) + 11 capability-gated (`CAPABILITY_GATED_VARIABLES`); the 56 rows belonging to unimplemented blocks are deliberately absent | `src/state/device_model.rs`, `src/device_model.rs` |
 | 1.6J standard config keys aliased | 23, plus 10 answered from live state | `src/device_model.rs` |
 | Security event types in the appendix | 21 | `…/security_events.csv` |
-| …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
+| …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
+| …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 833 | `#[test]` + `#[tokio::test]`, re-counted at the A5 commit (827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 840 | `#[test]` + `#[tokio::test]`, re-counted at the F4 commit (833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

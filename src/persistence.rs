@@ -803,11 +803,11 @@ async fn persist_queue_change<M, P, S>(
 /// already in place (and already counted in the length this function starts tracking from) rather
 /// than being overwritten by an empty starting state.
 pub async fn run_persisted_offline_queue<M, P, S, F, Fut, E, H, HFut>(
-    mut events: BroadcastReceiver<M>,
+    events: BroadcastReceiver<M>,
     queue: &OfflineQueue<M>,
     store: &QueueStore<S>,
-    mut send: F,
-    mut on_overflow: H,
+    send: F,
+    on_overflow: H,
 ) where
     M: Clone,
     P: From<M> + serde::Serialize + Send + Sync,
@@ -818,9 +818,45 @@ pub async fn run_persisted_offline_queue<M, P, S, F, Fut, E, H, HFut>(
     H: FnMut(M) -> HFut,
     HFut: Future<Output = ()>,
 {
+    run_persisted_offline_queue_where::<M, P, S, _, F, Fut, E, H, HFut>(
+        events,
+        queue,
+        store,
+        |_| true,
+        send,
+        on_overflow,
+    )
+    .await
+}
+
+/// [`run_persisted_offline_queue`], but only messages `should_send` accepts are queued, persisted
+/// and sent - see [`crate::offline_queue::run_with_offline_queue_where`] for why the filter has to
+/// sit before the queue rather than before the wire.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_persisted_offline_queue_where<M, P, S, Pred, F, Fut, E, H, HFut>(
+    mut events: BroadcastReceiver<M>,
+    queue: &OfflineQueue<M>,
+    store: &QueueStore<S>,
+    mut should_send: Pred,
+    mut send: F,
+    mut on_overflow: H,
+) where
+    M: Clone,
+    P: From<M> + serde::Serialize + Send + Sync,
+    S: Storage,
+    Pred: FnMut(&M) -> bool,
+    F: FnMut(M) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+    H: FnMut(M) -> HFut,
+    HFut: Future<Output = ()>,
+{
     let mut previous_len = queue.len();
     let mut mutations_since_write: usize = 0;
     while let Ok(message) = events.recv().await {
+        if !should_send(&message) {
+            continue;
+        }
         if let Some(dropped) = queue.push(message) {
             on_overflow(dropped).await;
         }
@@ -1238,8 +1274,11 @@ enum PersistedSecurityEventType {
     InvalidFirmwareSigningCertificate,
     InvalidCsmsCertificate,
     InvalidChargingStationCertificate,
+    DiscardedRenewedClientCertificate,
     InvalidTlsVersion,
     InvalidTlsCipherSuite,
+    MaintenanceLoginAccepted,
+    MaintenanceLoginFailed,
     Other(String),
 }
 
@@ -1268,8 +1307,13 @@ impl From<SecurityEventType> for PersistedSecurityEventType {
             SecurityEventType::InvalidChargingStationCertificate => {
                 Self::InvalidChargingStationCertificate
             }
+            SecurityEventType::DiscardedRenewedClientCertificate => {
+                Self::DiscardedRenewedClientCertificate
+            }
             SecurityEventType::InvalidTlsVersion => Self::InvalidTlsVersion,
             SecurityEventType::InvalidTlsCipherSuite => Self::InvalidTlsCipherSuite,
+            SecurityEventType::MaintenanceLoginAccepted => Self::MaintenanceLoginAccepted,
+            SecurityEventType::MaintenanceLoginFailed => Self::MaintenanceLoginFailed,
             SecurityEventType::Other(value) => Self::Other(value),
         }
     }
@@ -1302,8 +1346,13 @@ impl From<PersistedSecurityEventType> for SecurityEventType {
             PersistedSecurityEventType::InvalidChargingStationCertificate => {
                 Self::InvalidChargingStationCertificate
             }
+            PersistedSecurityEventType::DiscardedRenewedClientCertificate => {
+                Self::DiscardedRenewedClientCertificate
+            }
             PersistedSecurityEventType::InvalidTlsVersion => Self::InvalidTlsVersion,
             PersistedSecurityEventType::InvalidTlsCipherSuite => Self::InvalidTlsCipherSuite,
+            PersistedSecurityEventType::MaintenanceLoginAccepted => Self::MaintenanceLoginAccepted,
+            PersistedSecurityEventType::MaintenanceLoginFailed => Self::MaintenanceLoginFailed,
             PersistedSecurityEventType::Other(value) => Self::Other(value),
         }
     }
@@ -1363,8 +1412,27 @@ pub async fn run_persisted_security_event_queue<S, F, Fut, E, H, HFut>(
     H: FnMut(SecurityEvent) -> HFut,
     HFut: Future<Output = ()>,
 {
-    run_persisted_offline_queue::<SecurityEvent, PersistedQueuedSecurityEvent, S, F, Fut, E, H, HFut>(
-        events, queue, store, send, on_overflow,
+    run_persisted_offline_queue_where::<
+        SecurityEvent,
+        PersistedQueuedSecurityEvent,
+        S,
+        _,
+        F,
+        Fut,
+        E,
+        H,
+        HFut,
+    >(
+        events,
+        queue,
+        store,
+        // A04.FR.01, exactly as the non-persisted path applies it - and it matters more here,
+        // because this queue survives a reboot: a flood of non-critical events would otherwise
+        // evict critical ones out of *durable* storage, not just RAM. See
+        // [`crate::state::SecurityEventType::is_critical`].
+        |event: &SecurityEvent| event.event_type.is_critical(),
+        send,
+        on_overflow,
     )
     .await
 }

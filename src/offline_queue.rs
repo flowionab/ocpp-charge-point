@@ -413,10 +413,10 @@ pub async fn run_offline_queue_retries<M, B, F, Fut, E>(
 /// wired to raise a `MemoryExhaustion` security event. Pass `|_dropped| async {}` to ignore
 /// overflow entirely.
 pub async fn run_with_offline_queue<M, F, Fut, E, H, HFut>(
-    mut events: BroadcastReceiver<M>,
+    events: BroadcastReceiver<M>,
     queue: &OfflineQueue<M>,
-    mut send: F,
-    mut on_overflow: H,
+    send: F,
+    on_overflow: H,
 ) where
     M: Clone,
     F: FnMut(M) -> Fut,
@@ -425,7 +425,39 @@ pub async fn run_with_offline_queue<M, F, Fut, E, H, HFut>(
     H: FnMut(M) -> HFut,
     HFut: Future<Output = ()>,
 {
+    run_with_offline_queue_where(events, queue, |_| true, send, on_overflow).await;
+}
+
+/// [`run_with_offline_queue`], but only messages `should_send` accepts are queued and sent.
+///
+/// The rejected ones are dropped *before* the queue rather than filtered at the send, which is the
+/// whole point: the queue is bounded and evicts its oldest entry on overflow, so anything allowed
+/// into it can push something else out. A message class that must never be able to displace
+/// another has to be kept out of the queue entirely, not merely skipped on the way to the wire.
+///
+/// The Security block is what needs this - see
+/// [`SecurityEventType::is_critical`](crate::state::SecurityEventType::is_critical), where the
+/// distinction stops an attacker flooding remotely-triggerable non-critical events to evict a
+/// queued tamper report.
+pub async fn run_with_offline_queue_where<M, P, F, Fut, E, H, HFut>(
+    mut events: BroadcastReceiver<M>,
+    queue: &OfflineQueue<M>,
+    mut should_send: P,
+    mut send: F,
+    mut on_overflow: H,
+) where
+    M: Clone,
+    P: FnMut(&M) -> bool,
+    F: FnMut(M) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+    H: FnMut(M) -> HFut,
+    HFut: Future<Output = ()>,
+{
     while let Ok(message) = events.recv().await {
+        if !should_send(&message) {
+            continue;
+        }
         if let Some(dropped) = queue.push(message) {
             on_overflow(dropped).await;
         }

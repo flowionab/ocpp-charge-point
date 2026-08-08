@@ -31,7 +31,9 @@ use crate::hardware::Evse;
 use crate::hardware::{Capabilities, warn_on_feature_mismatches};
 #[cfg(feature = "local-auth-list")]
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
-use crate::offline_queue::{OfflineQueue, OverflowPolicy, run_with_offline_queue};
+use crate::offline_queue::{
+    OfflineQueue, OverflowPolicy, run_with_offline_queue, run_with_offline_queue_where,
+};
 use crate::persistence::{
     AuthorizationCacheStore, BootReasonStore, ChargingProfileSnapshotStore, DeviceModelStore,
     LocalAuthorizationListStore, QueueStore, ReservationStore, TransactionStore,
@@ -244,6 +246,23 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             .hardware()
             .start(runtime.hardware_events(), runtime.hardware_commands())
             .await?;
+
+        // F4.2: OCPP's `StartupOfTheDevice`, a critical security event. Raised after the hardware
+        // binding has started - a charge point that failed to start has not started, and reporting
+        // a boot that then errored out would be reporting something that did not happen.
+        //
+        // It is *raised* here, not delivered: the subscriptions above are already buffering, so it
+        // sits in the queue until a Security block is registered and the CSMS connection is up.
+        // That ordering is what makes it useful at all - a boot event that needed a live
+        // connection to be raised could never report the boot that follows a power cut.
+        report_security_event(
+            &runtime.actor(),
+            SecurityEvent {
+                event_type: SecurityEventType::StartupOfTheDevice,
+                tech_info: Some(alloc::format!("{vendor_name} {model_name}")),
+            },
+        )
+        .await;
 
         Ok(Self {
             runtime,
@@ -1218,9 +1237,14 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let forwarder_queue = security_queue.clone();
         let forwarder_csms = csms.clone();
         self.executor.spawn(Box::pin(async move {
-            run_with_offline_queue(
+            run_with_offline_queue_where(
                 security_events,
                 &forwarder_queue,
+                // A04.FR.01: only *critical* events are reported to the CSMS. The non-critical
+                // ones still reach the security log (A04.FR.04), which subscribes separately -
+                // see `SecurityEventType::is_critical` for why sharing this bounded queue with
+                // them is a security problem rather than a tidiness one.
+                |event: &SecurityEvent| event.event_type.is_critical(),
                 move |event| {
                     let notifier = forwarder_csms.clone();
                     async move {
@@ -2691,6 +2715,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_flood_of_non_critical_events_cannot_evict_a_queued_critical_one() {
+        // The attack this closes: `InvalidMessages` and `AttemptedReplayAttacks` are the two
+        // security events a remote party can generate at will, simply by throwing malformed
+        // frames at the charge point. The notification queue is bounded and drops its *oldest*
+        // entry on overflow (G2.2), so if those shared it with critical events, an attacker could
+        // flush a queued `TamperDetectionActivated` out of it before the CSMS ever saw it - and
+        // silence the report of their own physical intrusion.
+        let charge_point = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms = FlakySecurityCsms {
+            // Offline, so everything raised below has to sit in the queue rather than going out.
+            should_fail: Arc::new(AtomicBool::new(true)),
+            ..Default::default()
+        };
+        let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            // A queue small enough that the flood below would certainly overflow it.
+            .offline_queue_capacity(4)
+            .security_events(&csms)
+            .await;
+
+        report_security_event(
+            &builder.runtime.actor(),
+            SecurityEvent {
+                event_type: crate::state::SecurityEventType::TamperDetectionActivated,
+                tech_info: Some("door switch tripped".into()),
+            },
+        )
+        .await;
+        for index in 0..50 {
+            report_security_event(
+                &builder.runtime.actor(),
+                SecurityEvent {
+                    event_type: crate::state::SecurityEventType::InvalidMessages,
+                    tech_info: Some(alloc::format!("malformed frame {index}")),
+                },
+            )
+            .await;
+        }
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        // The connection comes back: whatever is still queued goes out.
+        csms.should_fail.store(false, Ordering::SeqCst);
+        csms.fire_reconnect().await;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        let delivered = csms.delivered.lock().unwrap().clone();
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|event| event.event_type.clone())
+                .collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![
+                crate::state::SecurityEventType::StartupOfTheDevice,
+                crate::state::SecurityEventType::TamperDetectionActivated
+            ],
+            "both critical events must survive the flood, and the flood itself must never have \
+             been queued for the CSMS at all"
+        );
+    }
+
+    #[tokio::test]
     async fn security_events_persisted_survives_a_reboot_and_replays_in_order() {
         let storage = Arc::new(InMemoryStorage::new());
 
@@ -2754,9 +2851,24 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        // Two boots bracket the backlog, and both are meant. The first is the pre-cut charge
+        // point's, raised while the connection was down and recovered from storage with the rest;
+        // the last is *this* charge point's own, raised after the reboot. A CSMS reading this
+        // sequence can see exactly where the power cut fell.
         assert_eq!(
-            csms2.delivered.lock().unwrap().clone(),
-            alloc::vec![first, second]
+            csms2
+                .delivered
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| event.event_type.clone())
+                .collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![
+                crate::state::SecurityEventType::StartupOfTheDevice,
+                first.event_type.clone(),
+                second.event_type.clone(),
+                crate::state::SecurityEventType::StartupOfTheDevice,
+            ]
         );
     }
 
@@ -2789,14 +2901,8 @@ mod tests {
                 crate::clock::SystemClock,
             )
             .await;
-        report_security_event(
-            &builder1.runtime.actor(),
-            SecurityEvent {
-                event_type: crate::state::SecurityEventType::StartupOfTheDevice,
-                tech_info: None,
-            },
-        )
-        .await;
+        // `StartupOfTheDevice` is not raised by hand any more - `ChargePointBuilder::start`
+        // raises it for real (F4.2), so the log below opens with a boot this test did not fake.
         report_security_event(
             &builder1.runtime.actor(),
             SecurityEvent {
@@ -3135,9 +3241,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // Exactly one SecurityEventNotification for the one raised event: the repeat
-        // `security_events_persisted` registration must not have spawned a second forwarder.
-        assert_eq!(csms.calls.load(Ordering::SeqCst), 1);
+        // Two notifications for two critical events - the boot `ChargePointBuilder::start` raises
+        // (F4.2) and the tamper raised above - which is still *exactly one each*: the repeat
+        // `security_events_persisted` registration must not have spawned a second forwarder, which
+        // would double both.
+        assert_eq!(csms.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

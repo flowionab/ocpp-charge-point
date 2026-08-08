@@ -55,6 +55,21 @@ pub async fn handle_reset(
         recorder(kind).await;
     }
 
+    // F4.2: a reset is a critical security event in OCPP's own appendix, and it is one of the few
+    // this crate can detect for itself. Raised *before* the event that may reboot hardware
+    // immediately, for the same reason the boot-reason recorder runs first: after an `Immediate`
+    // reset there may be no process left to raise anything.
+    crate::security::report_security_event(
+        actor,
+        crate::state::SecurityEvent {
+            event_type: crate::state::SecurityEventType::ResetOrReboot,
+            tech_info: Some(alloc::format!(
+                "{kind:?} reset requested by the CSMS for {target:?}"
+            )),
+        },
+    )
+    .await;
+
     let _ = actor
         .send(ChargePointEvent::ResetRequested { target, kind })
         .await;

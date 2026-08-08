@@ -73,12 +73,29 @@ pub async fn handle_set_network_profile(
         return SetNetworkProfileOutcome::Rejected;
     }
 
+    // F4.2/F3.3: a network profile carries the security profile and the endpoint this charge
+    // point will authenticate to, so writing one *is* a reconfiguration of security parameters -
+    // OCPP's own words for this event. Raised only for a profile that was actually accepted: a
+    // refused write changed nothing, and reporting it would tell the CSMS its rejected profile
+    // took effect.
+    let security_profile = profile.security_profile;
     let _ = actor
         .send(ChargePointEvent::NetworkProfileSet {
             slot,
             profile: Box::new(profile),
         })
         .await;
+    crate::security::report_security_event(
+        actor,
+        crate::state::SecurityEvent {
+            event_type: crate::state::SecurityEventType::ReconfigurationOfSecurityParameters,
+            tech_info: Some(alloc::format!(
+                "network connection profile written to slot {slot} with security profile \
+                 {security_profile}"
+            )),
+        },
+    )
+    .await;
     SetNetworkProfileOutcome::Accepted
 }
 

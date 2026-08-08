@@ -273,11 +273,10 @@ fn connection_options_from_device_model<'a>() -> ConnectOptions<'a> {
 
 /// Runs a full OCPP 2.0.1 session against `client` (A1).
 ///
-/// Registers every functional block 2.0.1 has an adapter for. **`SecurityEventNotification` is
-/// absent**, and not because this crate skipped it: `ocpp-client` 0.2.1 generates no 2.0.1 action
-/// for it at all (verified against its `ocpp_2_0_1::actions` list - see
-/// `docs/PRODUCTION-ROADMAP.md` D1). Security events raised on a 2.0.1 connection are recorded in
-/// the durable log and reach no CSMS until that lands upstream.
+/// Registers every functional block 2.0.1 has an adapter for - including
+/// `SecurityEventNotification`, which used to be the one documented omission here because
+/// `ocpp-client` 0.2.0 generated no 2.0.1 action for it. D1 landed that upstream and 0.2.2 carries
+/// it, so a 2.0.1 session reports security events like a 2.1 one (F4.4).
 #[cfg(feature = "ocpp_2_0_1")]
 async fn setup_ocpp_2_0_1<T, E, C, X, B>(
     charge_point: T,
@@ -319,6 +318,11 @@ where
         .device_model(&client)
         .await
         .meter_values(&client, backoff.clone(), SystemClock)
+        .await
+        // F4.4: 2.0.1 reports security events now. This registration was absent because
+        // `ocpp-client` 0.2.0 generated no 2.0.1 action for `SecurityEventNotification` at all;
+        // D1 added it upstream and 0.2.2 carries it.
+        .security_events(&client)
         .await;
 
     // C3.1: the same capability gating `setup()` applies - an absent capability means no handler,
