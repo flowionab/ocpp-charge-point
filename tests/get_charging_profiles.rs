@@ -292,6 +292,7 @@ async fn reports_what_set_charging_profile_installed() {
         &format!("ws://{addr}"),
         None,
         None,
+        None,
         TokioExecutor,
         TokioBackoff,
     )

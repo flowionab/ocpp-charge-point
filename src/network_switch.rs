@@ -49,6 +49,7 @@
 
 use crate::actor::ChargePointActor;
 use crate::network_profile::selected_profile;
+use crate::payload_limit::{PayloadLimits, SizeLimitedStream};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -118,6 +119,14 @@ struct Inner {
     /// [`run_network_profile_switching`] snapshots it across the switch grace period to tell
     /// "the connection has not moved yet" from "it already moved on its own".
     dials: u64,
+    /// The inbound-frame ceiling every redial's transport is wrapped with - see
+    /// [`ConnectionTarget::set_max_inbound_frame_bytes`] and [`crate::payload_limit`] (F5.2).
+    max_inbound_frame_bytes: usize,
+    /// Where a redial's [`SizeLimitedStream`] reports a `MemoryExhaustion` security event when it
+    /// refuses an oversized frame. `None` only before [`ConnectionTarget::attach_security_reporting`]
+    /// has been called - unreachable for a redial in practice, since that happens once the actor
+    /// this target's `Client` belongs to exists, which is before any redial can occur.
+    security_actor: Option<ChargePointActor>,
 }
 
 impl ConnectionTarget {
@@ -139,8 +148,30 @@ impl ConnectionTarget {
                 jitter_range_secs: 0,
                 jitter_state: jitter_seed(address, options.username),
                 dials: 0,
+                max_inbound_frame_bytes: crate::payload_limit::PayloadLimits::default()
+                    .max_inbound_frame_bytes,
+                security_actor: None,
             }),
         })
+    }
+
+    /// Overrides the default inbound-frame ceiling ([`crate::payload_limit`],
+    /// `DEFAULT_MAX_INBOUND_FRAME_BYTES`) every subsequent redial's transport is wrapped with
+    /// (F5.2). Takes effect on the *next* redial, same as [`Self::set_connection_attempts`] - a
+    /// redial already in flight keeps whatever ceiling its transport was built with.
+    pub fn set_max_inbound_frame_bytes(&self, bytes: usize) {
+        self.inner
+            .lock()
+            .expect("target lock")
+            .max_inbound_frame_bytes = bytes;
+    }
+
+    /// Attaches the charge-point actor a redial's [`SizeLimitedStream`] reports a
+    /// `MemoryExhaustion` security event to when it refuses an oversized inbound frame (F5.2).
+    /// Set once the actor exists - see [`Inner::security_actor`] for why every reachable redial
+    /// already has one by the time it dials.
+    pub fn attach_security_reporting(&self, actor: ChargePointActor) {
+        self.inner.lock().expect("target lock").security_actor = Some(actor);
     }
 
     /// Installs this target as `options`' reconnector, so every redial asks it where to go.
@@ -335,9 +366,25 @@ impl ConnectionTarget {
 
         self.record_dial();
         match websocket_transport(&address, version, Some(options)).await {
-            Ok(transport) => {
+            Ok((sink, source)) => {
                 self.record_success();
-                Ok(transport)
+                // F5.2: every redial's inbound stream is wrapped so an oversized frame is
+                // refused before `ocpp-client` ever deserializes it - see `crate::payload_limit`
+                // for exactly what this does and does not cover (in particular: not the very
+                // first connection, dialled through `ocpp_client::connect` itself, which exposes
+                // no such hook).
+                let (max_inbound_frame_bytes, security_actor) = {
+                    let inner = self.inner.lock().expect("target lock");
+                    (inner.max_inbound_frame_bytes, inner.security_actor.clone())
+                };
+                let source: Box<dyn TransportStream> = Box::new(SizeLimitedStream::new(
+                    source,
+                    PayloadLimits {
+                        max_inbound_frame_bytes,
+                    },
+                    security_actor,
+                ));
+                Ok((sink, source))
             }
             Err(error) => {
                 if let Some(rolled_back_to) = self.record_failure() {
