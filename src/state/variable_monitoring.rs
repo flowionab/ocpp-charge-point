@@ -78,6 +78,28 @@ pub struct VariableMonitor {
     delta_baseline: Option<f64>,
 }
 
+/// Which class of monitor the CSMS wants active - OCPP `MonitoringBaseEnum`
+/// (`SetMonitoringBase`). See [`VariableMonitorStore::set_base`] for exactly what changes in this
+/// crate's store when each variant is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MonitoringBase {
+    /// Every monitor - hardwired, factory-preconfigured, and CSMS-installed - stays active. This
+    /// crate has no hardwired or factory-preconfigured monitors of its own (every monitor a CSMS
+    /// can see came from `SetVariableMonitoring`), so setting `All` is a no-op: nothing is
+    /// cleared.
+    #[default]
+    All,
+    /// Only the factory-default monitor set should remain active. This crate ships no factory
+    /// default monitors, so honestly reflecting that means clearing every CSMS-installed monitor -
+    /// leaving any of them running after this request would misreport the charge point's monitor
+    /// set to the CSMS.
+    FactoryDefault,
+    /// Only hardwired monitors should remain active. This crate has no hardwired monitors either,
+    /// so - like [`Self::FactoryDefault`] - honouring this honestly means clearing every
+    /// CSMS-installed monitor.
+    HardWiredOnly,
+}
+
 /// Why [`VariableMonitorStore::precheck`] refuses a brand new monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetMonitorRejection {
@@ -100,16 +122,75 @@ pub struct VariableMonitorStore {
     monitors: BTreeMap<VariableMonitorId, VariableMonitor>,
     next_id: i64,
     max_monitors: usize,
+    base: MonitoringBase,
+    level: u8,
 }
 
 impl VariableMonitorStore {
-    /// An empty store holding at most `max_monitors` monitors (clamped to at least 1).
+    /// An empty store holding at most `max_monitors` monitors (clamped to at least 1), with the
+    /// OCPP defaults [`MonitoringBase::All`] and a report-everything severity level (`9`, the
+    /// lowest/least-restrictive value - see [`Self::is_reportable`]).
     pub fn with_limit(max_monitors: usize) -> Self {
         Self {
             monitors: BTreeMap::new(),
             next_id: 1,
             max_monitors: max_monitors.max(1),
+            base: MonitoringBase::All,
+            level: 9,
         }
+    }
+
+    /// The currently configured monitoring base (OCPP `SetMonitoringBase`) - see
+    /// [`MonitoringBase`].
+    pub fn base(&self) -> MonitoringBase {
+        self.base
+    }
+
+    /// Applies a `SetMonitoringBase` request: records `base`, and - for
+    /// [`MonitoringBase::FactoryDefault`]/[`MonitoringBase::HardWiredOnly`] - clears every
+    /// installed monitor, since this crate has no hardwired/factory-preconfigured monitor set of
+    /// its own to fall back to instead (see [`MonitoringBase`]'s variant docs on why leaving
+    /// CSMS-installed monitors running in that case would misreport this charge point's monitor
+    /// set). Returns whether anything actually changed - the base itself, the store being
+    /// cleared, or both.
+    pub fn set_base(&mut self, base: MonitoringBase) -> bool {
+        let base_changed = self.base != base;
+        self.base = base;
+        let cleared = match base {
+            MonitoringBase::All => false,
+            MonitoringBase::FactoryDefault | MonitoringBase::HardWiredOnly => {
+                let had_any = !self.monitors.is_empty();
+                self.monitors.clear();
+                had_any
+            }
+        };
+        base_changed || cleared
+    }
+
+    /// The severity threshold at or below which a triggered monitor is reported to the CSMS
+    /// (OCPP `SetMonitoringLevel`) - see [`Self::is_reportable`].
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
+    /// Sets [`Self::level`] (OCPP `SetMonitoringLevel`; already validated into range `0..=9` by
+    /// [`crate::variable_monitoring::handle_set_monitoring_level`]). Returns whether it actually
+    /// changed.
+    pub fn set_level(&mut self, severity: u8) -> bool {
+        let changed = self.level != severity;
+        self.level = severity;
+        changed
+    }
+
+    /// Whether a monitor firing at `severity` should be reported to the CSMS at all, per the
+    /// currently configured [`Self::level`] - OCPP: "the Charging Station SHALL only report
+    /// events with a severity number lower than or equal to this severity." Consulted by
+    /// [`crate::variable_monitoring::run_variable_monitor_events`]/
+    /// [`crate::variable_monitoring::run_periodic_variable_monitors`] before ever calling the
+    /// notifier, so a level tightened by the CSMS actually suppresses reports rather than being a
+    /// value this crate remembers but never acts on.
+    pub fn is_reportable(&self, severity: u8) -> bool {
+        severity <= self.level
     }
 
     /// The configured maximum - see [`crate::state::StateLimits::max_variable_monitors`].
@@ -329,6 +410,19 @@ pub enum VariableMonitoringEvent {
         /// The monitor to remove.
         id: VariableMonitorId,
     },
+    /// Sets the monitoring base - OCPP `SetMonitoringBase`. See
+    /// [`VariableMonitorStore::set_base`] for what this actually does to the store.
+    BaseSet {
+        /// The new base.
+        base: MonitoringBase,
+    },
+    /// Sets the monitoring level - OCPP `SetMonitoringLevel`. See
+    /// [`VariableMonitorStore::set_level`].
+    LevelSet {
+        /// The new severity threshold, already validated into OCPP's `0..=9` range by
+        /// [`crate::variable_monitoring::handle_set_monitoring_level`].
+        severity: u8,
+    },
 }
 
 /// One monitor firing, reported to the CSMS via `NotifyEvent`.
@@ -543,6 +637,86 @@ mod tests {
         let mut store = VariableMonitorStore::with_limit(10);
 
         assert!(!store.clear(VariableMonitorId(999)));
+    }
+
+    #[test]
+    fn a_fresh_store_defaults_to_base_all_and_level_nine() {
+        let store = VariableMonitorStore::with_limit(10);
+
+        assert_eq!(store.base(), MonitoringBase::All);
+        assert_eq!(store.level(), 9);
+        // Level 9 is the least restrictive value - everything 0-9 should still report.
+        assert!((0..=9).all(|severity| store.is_reportable(severity)));
+    }
+
+    #[test]
+    fn setting_base_to_all_does_not_clear_installed_monitors() {
+        let mut store = VariableMonitorStore::with_limit(10);
+        let id = store.next_id();
+        store.set(id, component(), variable(), MonitorType::Delta, 1.0, 5);
+
+        let changed = store.set_base(MonitoringBase::All);
+
+        assert!(!changed, "All is a no-op when the base was already All");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn setting_base_to_factory_default_clears_every_installed_monitor() {
+        let mut store = VariableMonitorStore::with_limit(10);
+        let id = store.next_id();
+        store.set(id, component(), variable(), MonitorType::Delta, 1.0, 5);
+
+        let changed = store.set_base(MonitoringBase::FactoryDefault);
+
+        assert!(changed);
+        assert!(store.is_empty());
+        assert_eq!(store.base(), MonitoringBase::FactoryDefault);
+    }
+
+    #[test]
+    fn setting_base_to_hard_wired_only_also_clears_every_installed_monitor() {
+        let mut store = VariableMonitorStore::with_limit(10);
+        let id = store.next_id();
+        store.set(id, component(), variable(), MonitorType::Delta, 1.0, 5);
+
+        let changed = store.set_base(MonitoringBase::HardWiredOnly);
+
+        assert!(changed);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn setting_base_to_factory_default_on_an_already_empty_store_still_reports_the_base_change() {
+        let mut store = VariableMonitorStore::with_limit(10);
+
+        let changed = store.set_base(MonitoringBase::FactoryDefault);
+
+        assert!(
+            changed,
+            "the base itself changed even though nothing was cleared"
+        );
+    }
+
+    #[test]
+    fn setting_the_level_narrows_what_is_reportable() {
+        let mut store = VariableMonitorStore::with_limit(10);
+
+        let changed = store.set_level(3);
+
+        assert!(changed);
+        assert_eq!(store.level(), 3);
+        assert!(store.is_reportable(0));
+        assert!(store.is_reportable(3));
+        assert!(!store.is_reportable(4));
+        assert!(!store.is_reportable(9));
+    }
+
+    #[test]
+    fn setting_the_level_to_its_current_value_reports_no_change() {
+        let mut store = VariableMonitorStore::with_limit(10);
+
+        assert!(!store.set_level(9));
     }
 
     #[test]

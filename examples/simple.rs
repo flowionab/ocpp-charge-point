@@ -240,6 +240,37 @@ impl ocpp_charge_point::variable_monitoring::VariableMonitorEventNotifier
 }
 
 #[async_trait::async_trait]
+impl ocpp_charge_point::variable_monitoring::SetMonitoringBaseHandler for AlwaysAcceptBootNotifier {
+    async fn register_set_monitoring_base_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ocpp_charge_point::variable_monitoring::SetMonitoringLevelHandler
+    for AlwaysAcceptBootNotifier
+{
+    async fn register_set_monitoring_level_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ocpp_charge_point::variable_monitoring::GetMonitoringReportHandler
+    for AlwaysAcceptBootNotifier
+{
+    async fn register_get_monitoring_report_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
 impl GetBaseReportHandler for AlwaysAcceptBootNotifier {
     async fn register_get_base_report_handler(
         &self,

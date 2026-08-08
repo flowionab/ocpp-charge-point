@@ -74,6 +74,6 @@ pub use self::tariff::{
 };
 pub use self::transaction::{StopReason, Transaction, TransactionChargingState, TransactionId};
 pub use self::variable_monitoring::{
-    EventTrigger, MonitorType, SetMonitorRejection, TriggeredMonitor, VariableMonitor,
-    VariableMonitorId, VariableMonitorStore, VariableMonitoringEvent,
+    EventTrigger, MonitorType, MonitoringBase, SetMonitorRejection, TriggeredMonitor,
+    VariableMonitor, VariableMonitorId, VariableMonitorStore, VariableMonitoringEvent,
 };

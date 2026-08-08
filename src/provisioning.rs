@@ -1142,6 +1142,33 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::variable_monitoring::SetMonitoringBaseHandler for FixedBootNotifier {
+        async fn register_set_monitoring_base_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::SetMonitoringLevelHandler for FixedBootNotifier {
+        async fn register_set_monitoring_level_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::GetMonitoringReportHandler for FixedBootNotifier {
+        async fn register_get_monitoring_report_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::reporting::GetBaseReportHandler for FixedBootNotifier {
         async fn register_get_base_report_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }
