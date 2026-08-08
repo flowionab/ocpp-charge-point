@@ -13,27 +13,31 @@ use chrono::{DateTime, Utc};
 
 use ocpp_client::ocpp_2_1::OCPP2_1Client;
 use ocpp_client::ocpp_types::v21::common::{
-    ChargingProfileKindEnum, ChargingProfilePurposeEnum, ChargingProfileStatusEnum,
-    ChargingRateUnitEnum, ClearChargingProfileStatusEnum,
-    CompositeSchedule as WireCompositeSchedule, GenericStatusEnum, RecurrencyKindEnum,
+    ChargingProfile as WireChargingProfile, ChargingProfileKindEnum, ChargingProfilePurposeEnum,
+    ChargingProfileStatusEnum, ChargingRateUnitEnum, ChargingSchedule as WireChargingSchedule,
+    ClearChargingProfileStatusEnum, CompositeSchedule as WireCompositeSchedule, GenericStatusEnum,
+    GetChargingProfileStatusEnum, RecurrencyKindEnum,
 };
 use ocpp_client::ocpp_types::v21::{
-    ClearChargingProfileRequest, ClearChargingProfileResponse, GetCompositeScheduleRequest,
-    GetCompositeScheduleResponse, SetChargingProfileRequest, SetChargingProfileResponse,
+    ClearChargingProfileRequest, ClearChargingProfileResponse, GetChargingProfilesRequest,
+    GetChargingProfilesResponse, GetCompositeScheduleRequest, GetCompositeScheduleResponse,
+    ReportChargingProfilesRequest, SetChargingProfileRequest, SetChargingProfileResponse,
 };
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::smart_charging::{
     ChargingLimitProjection, ClearChargingProfileHandler, ClearChargingProfileOutcome,
-    CompositeSchedule, GetCompositeScheduleHandler, GetCompositeScheduleOutcome,
-    SetChargingProfileHandler, SetChargingProfileOutcome, handle_clear_charging_profile,
+    CompositeSchedule, GetChargingProfilesHandler, GetCompositeScheduleHandler,
+    GetCompositeScheduleOutcome, SetChargingProfileHandler, SetChargingProfileOutcome,
+    chunk_charging_profile_report, handle_clear_charging_profile, handle_get_charging_profiles,
     handle_get_composite_schedule, handle_set_charging_profile,
 };
 use crate::state::{
-    ChargingProfile, ChargingProfileCriteria, ChargingProfileId, ChargingProfileKind,
-    ChargingProfilePurpose, ChargingProfileScope, ChargingRateUnit, ChargingSchedule,
-    ChargingSchedulePeriod, RecurrencyKind, TransactionId,
+    ChargingLimitSource, ChargingProfile, ChargingProfileCriteria, ChargingProfileId,
+    ChargingProfileKind, ChargingProfilePurpose, ChargingProfileQuery, ChargingProfileScope,
+    ChargingRateUnit, ChargingSchedule, ChargingSchedulePeriod, InstalledChargingProfile,
+    RecurrencyKind, TransactionId,
 };
 
 /// 2.1's purpose enum onto this crate's. Every 2.1 value has an internal counterpart, so nothing is
@@ -56,10 +60,7 @@ fn map_purpose(purpose: &ChargingProfilePurposeEnum) -> ChargingProfilePurpose {
     }
 }
 
-/// This crate's purpose enum back onto 2.1's, for `ReportChargingProfiles`/`GetChargingProfiles`.
-/// Not yet wired (see B2.5's remaining rows), but kept beside its inverse so the two cannot drift
-/// apart, and covered by the round-trip test below.
-#[cfg_attr(not(test), allow(dead_code))]
+/// This crate's purpose enum back onto 2.1's, for `ReportChargingProfiles`.
 pub(super) fn wire_purpose(purpose: ChargingProfilePurpose) -> ChargingProfilePurposeEnum {
     match purpose {
         ChargingProfilePurpose::ChargePointMax => {
@@ -178,9 +179,7 @@ fn map_scope(evse_id: i64) -> Option<ChargingProfileScope> {
     }
 }
 
-/// The inverse of [`map_scope`], for reporting a stored profile back - paired with
-/// [`wire_purpose`], and unwired for the same reason.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The inverse of [`map_scope`], for reporting a stored profile back.
 pub(super) fn wire_evse_id(scope: ChargingProfileScope) -> i64 {
     match scope {
         ChargingProfileScope::ChargePoint => 0,
@@ -247,6 +246,204 @@ pub(super) fn wire_composite_schedule(
         duration: i64::from(composed.duration_secs),
         evse_id: evse_id as i64 + 1,
         schedule_start: composed.start.to_rfc3339(),
+    }
+}
+
+fn wire_kind(kind: ChargingProfileKind) -> ChargingProfileKindEnum {
+    match kind {
+        ChargingProfileKind::Absolute => ChargingProfileKindEnum::Absolute,
+        ChargingProfileKind::Recurring => ChargingProfileKindEnum::Recurring,
+        ChargingProfileKind::Relative => ChargingProfileKindEnum::Relative,
+    }
+}
+
+fn wire_recurrency(kind: RecurrencyKind) -> RecurrencyKindEnum {
+    match kind {
+        RecurrencyKind::Daily => RecurrencyKindEnum::Daily,
+        RecurrencyKind::Weekly => RecurrencyKindEnum::Weekly,
+    }
+}
+
+/// One stored schedule back onto 2.1's wire shape.
+///
+/// Every 2.1 field this crate's model has no concept of goes out as `None` rather than a guess -
+/// the same fields [`map_schedule`] reads past on the way in, so a profile that arrived here and
+/// is reported back describes exactly what this charge point is acting on.
+fn wire_schedule(schedule: &ChargingSchedule) -> WireChargingSchedule {
+    WireChargingSchedule {
+        absolute_price_schedule: None,
+        charging_rate_unit: wire_rate_unit(schedule.rate_unit),
+        charging_schedule_period: schedule
+            .periods
+            .iter()
+            .map(
+                |period| ocpp_client::ocpp_types::v21::common::ChargingSchedulePeriod {
+                    custom_data: None,
+                    discharge_limit: None,
+                    discharge_limit_l2: None,
+                    discharge_limit_l3: None,
+                    evse_sleep: None,
+                    limit: Some(period.limit),
+                    limit_l2: None,
+                    limit_l3: None,
+                    number_phases: period.number_phases.map(i64::from),
+                    operation_mode: None,
+                    phase_to_use: None,
+                    preconditioning_request: None,
+                    setpoint: None,
+                    setpoint_l2: None,
+                    setpoint_l3: None,
+                    setpoint_reactive: None,
+                    setpoint_reactive_l2: None,
+                    setpoint_reactive_l3: None,
+                    start_period: i64::from(period.start_period_secs),
+                    v2x_baseline: None,
+                    v2x_freq_watt_curve: None,
+                    v2x_signal_watt_curve: None,
+                },
+            )
+            .collect(),
+        custom_data: None,
+        digest_value: None,
+        duration: schedule.duration_secs.map(i64::from),
+        id: i64::from(schedule.id),
+        limit_at_so_c: None,
+        min_charging_rate: schedule.min_charging_rate,
+        power_tolerance: None,
+        price_level_schedule: None,
+        randomized_delay: None,
+        sales_tariff: None,
+        signature_id: None,
+        start_schedule: schedule.start_schedule.map(|start| start.to_rfc3339()),
+        use_local_time: None,
+    }
+}
+
+/// One stored profile back onto 2.1's wire shape - the inverse of [`map_profile`].
+///
+/// 2.1 caps `chargingSchedule` at three entries (one per rate unit, which is all a profile can
+/// meaningfully carry). A profile holding more is truncated with a warning rather than dropped
+/// from the report: telling the CSMS about most of a profile beats telling it the profile does not
+/// exist.
+fn wire_profile(profile: &ChargingProfile) -> WireChargingProfile {
+    let mut schedules = heapless::Vec::new();
+    for schedule in &profile.schedules {
+        if schedules.push(wire_schedule(schedule)).is_err() {
+            tracing::warn!(
+                profile_id = profile.id.0,
+                schedules = profile.schedules.len(),
+                "truncating a reported charging profile to the three schedules 2.1 can carry"
+            );
+            break;
+        }
+    }
+    WireChargingProfile {
+        charging_profile_kind: wire_kind(profile.kind),
+        charging_profile_purpose: wire_purpose(profile.purpose),
+        charging_schedule: schedules,
+        custom_data: None,
+        dyn_update_interval: None,
+        dyn_update_time: None,
+        id: i64::from(profile.id.0),
+        invalid_after_offline_duration: None,
+        max_offline_duration: None,
+        price_schedule_signature: None,
+        recurrency_kind: profile.recurrency.map(wire_recurrency),
+        stack_level: i64::from(profile.stack_level),
+        transaction_id: profile
+            .transaction_id
+            .and_then(|id| heapless::String::try_from(alloc::format!("{}", id.0).as_str()).ok()),
+        valid_from: profile.valid_from.map(|valid| valid.to_rfc3339()),
+        valid_to: profile.valid_to.map(|valid| valid.to_rfc3339()),
+    }
+}
+
+/// 2.1 carries `chargingLimitSource` as a free-form 20-character string rather than 2.0.1's enum,
+/// so this produces the Appendix's `ChargingLimitSourceEnumStringType` values by name.
+fn wire_limit_source(source: ChargingLimitSource) -> heapless::String<20> {
+    let name = match source {
+        ChargingLimitSource::Ems => "EMS",
+        ChargingLimitSource::Cso => "CSO",
+        ChargingLimitSource::So => "SO",
+        ChargingLimitSource::Other => "Other",
+    };
+    heapless::String::try_from(name).unwrap_or_default()
+}
+
+/// 2.1's `chargingLimitSource` strings back onto this crate's enum, for filtering a
+/// `GetChargingProfiles`. An unrecognised value maps to [`ChargingLimitSource::Other`], which is
+/// what it is from this charge point's point of view - and since nothing here is `Other`-sourced,
+/// filtering on it correctly matches nothing rather than everything.
+fn map_limit_source(source: &str) -> ChargingLimitSource {
+    match source {
+        "EMS" => ChargingLimitSource::Ems,
+        "CSO" => ChargingLimitSource::Cso,
+        "SO" => ChargingLimitSource::So,
+        _ => ChargingLimitSource::Other,
+    }
+}
+
+/// A `GetChargingProfiles` request onto this crate's query.
+fn map_query(request: &GetChargingProfilesRequest) -> ChargingProfileQuery {
+    let criterion = &request.charging_profile;
+    ChargingProfileQuery {
+        ids: criterion
+            .charging_profile_id
+            .as_ref()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| i32::try_from(*id).ok())
+                    .map(ChargingProfileId)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // An `evseId` the request omits means "every scope", which is a `None` scope here. One
+        // this charge point cannot address (a negative id) is left as `None` too rather than
+        // reported as charge-point-wide.
+        scope: request.evse_id.and_then(map_scope),
+        purpose: criterion.charging_profile_purpose.as_ref().map(map_purpose),
+        stack_level: criterion
+            .stack_level
+            .and_then(|level| u32::try_from(level).ok()),
+        sources: criterion
+            .charging_limit_source
+            .as_ref()
+            .map(|sources| {
+                sources
+                    .iter()
+                    .map(|source| map_limit_source(source))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Sends the profiles a `GetChargingProfiles` matched as one or more `ReportChargingProfiles`.
+///
+/// A message that fails to send is logged and the rest still go - the same "log and continue"
+/// treatment every other fire-and-forget report send in this crate gets. Nothing is sent at all
+/// for an empty match; the `NoProfiles` response has already said so.
+async fn send_charging_profile_report(
+    client: &OCPP2_1Client,
+    request_id: i64,
+    profiles: &[InstalledChargingProfile],
+) {
+    for chunk in chunk_charging_profile_report(profiles) {
+        let request = ReportChargingProfilesRequest {
+            charging_limit_source: wire_limit_source(chunk.source),
+            charging_profile: chunk
+                .profiles
+                .iter()
+                .map(|installed| wire_profile(&installed.profile))
+                .collect(),
+            custom_data: None,
+            evse_id: wire_evse_id(chunk.scope),
+            request_id,
+            tbc: Some(chunk.tbc),
+        };
+        if let Err(err) = client.send_report_charging_profiles(request).await {
+            tracing::warn!(error = %err, "failed to send a ReportChargingProfiles message");
+        }
     }
 }
 
@@ -367,6 +564,39 @@ impl<C: Clock + Clone + Send + Sync + 'static> ClearChargingProfileHandler
 }
 
 #[async_trait::async_trait]
+impl<C: Clock + Clone + Send + Sync + 'static> GetChargingProfilesHandler
+    for Ocpp2_1SmartChargingHandler<C>
+{
+    async fn register_get_charging_profiles_handler(&self, actor: ChargePointActor) {
+        self.client
+            .on_get_charging_profiles(move |request: GetChargingProfilesRequest, client| {
+                let actor = actor.clone();
+                async move {
+                    let matched = handle_get_charging_profiles(&actor, &map_query(&request));
+                    let status = if matched.is_empty() {
+                        GetChargingProfileStatusEnum::NoProfiles
+                    } else {
+                        GetChargingProfileStatusEnum::Accepted
+                    };
+                    // The reports go out *before* this response, because the transport only
+                    // writes the response once this closure returns and there is no executor at
+                    // this boundary to defer them onto. OCPP would rather the response came
+                    // first, but `requestId` is what correlates the two, so a CSMS matching on it
+                    // is unaffected - and `crate::reporting`'s `NotifyReport` has the same
+                    // ordering for the same reason. Recorded in `docs/PRODUCTION-ROADMAP.md` B2.
+                    send_charging_profile_report(&client, request.request_id, &matched).await;
+                    Ok(GetChargingProfilesResponse {
+                        custom_data: None,
+                        status,
+                        status_info: None,
+                    })
+                }
+            })
+            .await;
+    }
+}
+
+#[async_trait::async_trait]
 impl<C: Clock + Clone + Send + Sync + 'static> GetCompositeScheduleHandler
     for Ocpp2_1SmartChargingHandler<C>
 {
@@ -446,6 +676,15 @@ mod std_impls {
     }
 
     #[async_trait::async_trait]
+    impl GetChargingProfilesHandler for OCPP2_1Client {
+        async fn register_get_charging_profiles_handler(&self, actor: ChargePointActor) {
+            Ocpp2_1SmartChargingHandler::new(self.clone())
+                .register_get_charging_profiles_handler(actor)
+                .await;
+        }
+    }
+
+    #[async_trait::async_trait]
     impl GetCompositeScheduleHandler for OCPP2_1Client {
         async fn register_get_composite_schedule_handler(
             &self,
@@ -497,7 +736,7 @@ mod tests {
         }
     }
 
-    fn wire_schedule() -> WireChargingSchedule {
+    fn wire_schedule_fixture() -> WireChargingSchedule {
         WireChargingSchedule {
             absolute_price_schedule: None,
             charging_rate_unit: ChargingRateUnitEnum::A,
@@ -521,13 +760,13 @@ mod tests {
         }
     }
 
-    fn wire_profile() -> WireChargingProfile {
+    fn wire_profile_fixture() -> WireChargingProfile {
         WireChargingProfile {
             charging_profile_kind: ChargingProfileKindEnum::Absolute,
             charging_profile_purpose: ChargingProfilePurposeEnum::TxDefaultProfile,
             charging_schedule: {
                 let mut schedules = heapless::Vec::new();
-                schedules.push(wire_schedule()).ok();
+                schedules.push(wire_schedule_fixture()).ok();
                 schedules
             },
             custom_data: None,
@@ -547,7 +786,7 @@ mod tests {
 
     #[test]
     fn a_wire_profile_maps_onto_the_internal_model_field_for_field() {
-        let mapped = map_profile(&wire_profile());
+        let mapped = map_profile(&wire_profile_fixture());
 
         assert_eq!(mapped.id, ChargingProfileId(42));
         assert_eq!(mapped.stack_level, 3);
@@ -589,7 +828,7 @@ mod tests {
 
     #[test]
     fn a_period_with_no_limit_at_all_is_dropped_rather_than_invented() {
-        let mut schedule = wire_schedule();
+        let mut schedule = wire_schedule_fixture();
         schedule.charging_schedule_period[1].limit = None;
 
         let mapped = map_schedule(&schedule);
@@ -600,7 +839,7 @@ mod tests {
 
     #[test]
     fn periods_are_sorted_so_composition_can_rely_on_their_order() {
-        let mut schedule = wire_schedule();
+        let mut schedule = wire_schedule_fixture();
         schedule.charging_schedule_period.reverse();
 
         let mapped = map_schedule(&schedule);
@@ -678,5 +917,133 @@ mod tests {
         assert_eq!(wire.schedule_start, composed.start.to_rfc3339());
         assert_eq!(wire.charging_schedule_period[0].limit, Some(16.0));
         assert_eq!(wire.charging_schedule_period[0].number_phases, Some(1));
+    }
+
+    #[test]
+    fn a_stored_profile_round_trips_back_onto_the_wire_it_arrived_on() {
+        // The strongest statement this adapter can make about reporting: whatever the CSMS set,
+        // it gets back. Anything the model drops on the way in (a period with no limit) is
+        // already covered by its own test; this asserts nothing is lost on the way out.
+        let mut original = wire_profile_fixture();
+        // The fixture leaves the optional fields empty; a round-trip test that did the same
+        // would pass just as happily against a mapping that dropped every one of them.
+        original.recurrency_kind = Some(RecurrencyKindEnum::Daily);
+        original.valid_from = Some("2024-01-01T00:00:00+00:00".into());
+        original.valid_to = Some("2024-02-01T00:00:00+00:00".into());
+        let stored = map_profile(&original);
+
+        let reported = wire_profile(&stored);
+
+        assert_eq!(reported.id, original.id);
+        assert_eq!(reported.stack_level, original.stack_level);
+        assert_eq!(reported.recurrency_kind, original.recurrency_kind);
+        assert_eq!(reported.valid_from, original.valid_from);
+        assert_eq!(reported.valid_to, original.valid_to);
+        assert_eq!(
+            reported.charging_profile_purpose,
+            original.charging_profile_purpose
+        );
+        assert_eq!(
+            reported.charging_profile_kind,
+            original.charging_profile_kind
+        );
+        assert_eq!(reported.valid_from, original.valid_from);
+        assert_eq!(reported.valid_to, original.valid_to);
+        assert_eq!(reported.charging_schedule.len(), 1);
+        let (reported_schedule, original_schedule) = (
+            &reported.charging_schedule[0],
+            &original.charging_schedule[0],
+        );
+        assert_eq!(reported_schedule.id, original_schedule.id);
+        assert_eq!(
+            reported_schedule.charging_rate_unit,
+            original_schedule.charging_rate_unit
+        );
+        assert_eq!(reported_schedule.duration, original_schedule.duration);
+        assert_eq!(
+            reported_schedule.charging_schedule_period.len(),
+            original_schedule.charging_schedule_period.len()
+        );
+        assert_eq!(
+            reported_schedule.charging_schedule_period[0].limit,
+            original_schedule.charging_schedule_period[0].limit
+        );
+    }
+
+    #[test]
+    fn a_profile_with_more_schedules_than_the_wire_holds_is_truncated_not_dropped() {
+        let mut stored = map_profile(&wire_profile_fixture());
+        stored.schedules = alloc::vec![stored.schedules[0].clone(); 5];
+
+        let reported = wire_profile(&stored);
+
+        // Three is 2.1's cap. Reporting most of a profile beats reporting none of it.
+        assert_eq!(reported.charging_schedule.len(), 3);
+    }
+
+    #[test]
+    fn a_get_request_maps_every_criterion_the_wire_can_carry() {
+        let query = map_query(&GetChargingProfilesRequest {
+            charging_profile: ocpp_client::ocpp_types::v21::common::ChargingProfileCriterion {
+                charging_limit_source: Some(
+                    [heapless::String::try_from("EMS").unwrap()]
+                        .into_iter()
+                        .collect(),
+                ),
+                charging_profile_id: Some(alloc::vec![7, 9]),
+                charging_profile_purpose: Some(ChargingProfilePurposeEnum::TxDefaultProfile),
+                custom_data: None,
+                stack_level: Some(2),
+            },
+            custom_data: None,
+            evse_id: Some(1),
+            request_id: 42,
+        });
+
+        assert_eq!(
+            query.ids,
+            alloc::vec![ChargingProfileId(7), ChargingProfileId(9)]
+        );
+        assert_eq!(query.scope, Some(ChargingProfileScope::Evse(0)));
+        assert_eq!(query.purpose, Some(ChargingProfilePurpose::TxDefault));
+        assert_eq!(query.stack_level, Some(2));
+        assert_eq!(query.sources, alloc::vec![ChargingLimitSource::Ems]);
+    }
+
+    #[test]
+    fn an_omitted_evse_id_asks_about_every_scope_rather_than_the_charge_point() {
+        let query = map_query(&GetChargingProfilesRequest {
+            charging_profile: ocpp_client::ocpp_types::v21::common::ChargingProfileCriterion {
+                charging_limit_source: None,
+                charging_profile_id: None,
+                charging_profile_purpose: None,
+                custom_data: None,
+                stack_level: None,
+            },
+            custom_data: None,
+            evse_id: None,
+            request_id: 1,
+        });
+
+        // `evseId: 0` would mean the charge point itself; absent means all of them, and
+        // conflating the two would hide every EVSE-scoped profile from the CSMS.
+        assert_eq!(query.scope, None);
+        assert!(query.ids.is_empty());
+        assert!(query.sources.is_empty());
+    }
+
+    #[test]
+    fn limit_sources_round_trip_through_the_wire_strings() {
+        for source in [
+            ChargingLimitSource::Ems,
+            ChargingLimitSource::Cso,
+            ChargingLimitSource::So,
+            ChargingLimitSource::Other,
+        ] {
+            assert_eq!(map_limit_source(&wire_limit_source(source)), source);
+        }
+        // An unknown source is `Other` - so a CSMS filtering on it matches nothing here rather
+        // than everything.
+        assert_eq!(map_limit_source("Martian"), ChargingLimitSource::Other);
     }
 }

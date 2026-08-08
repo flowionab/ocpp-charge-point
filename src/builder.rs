@@ -1099,6 +1099,22 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers inbound `GetChargingProfiles` handling: the CSMS asking which charging profiles
+    /// are installed, answered with one or more `ReportChargingProfiles`
+    /// (`docs/PRODUCTION-ROADMAP.md` B2).
+    ///
+    /// Separate from [`Self::smart_charging`] because it is **2.x only** - 1.6J has no way to ask
+    /// what is installed at all - and folding it into that method's bounds would make the block
+    /// unregisterable on a 1.6J connection.
+    pub async fn charging_profile_reports<N>(self, csms: &N) -> Self
+    where
+        N: crate::smart_charging::GetChargingProfilesHandler + Send + Sync + 'static,
+    {
+        csms.register_get_charging_profiles_handler(self.runtime.actor())
+            .await;
+        self
+    }
+
     /// Registers inbound `ClearCache` handling (`docs/ROADMAP.md` §3,
     /// `docs/PRODUCTION-ROADMAP.md` B1.2): a CSMS emptying the authorization cache.
     ///

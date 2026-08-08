@@ -20,7 +20,8 @@ use crate::reservation::{CancelReservationHandler, ReserveNowHandler};
 use crate::reset::ResetHandler;
 use crate::security::SecurityEventNotifier;
 use crate::smart_charging::{
-    ClearChargingProfileHandler, GetCompositeScheduleHandler, SetChargingProfileHandler,
+    ClearChargingProfileHandler, GetChargingProfilesHandler, GetCompositeScheduleHandler,
+    SetChargingProfileHandler,
 };
 use crate::transactions::TransactionNotifier;
 
@@ -86,6 +87,7 @@ where
         + SetChargingProfileHandler
         + ClearChargingProfileHandler
         + GetCompositeScheduleHandler
+        + GetChargingProfilesHandler
         + ReconnectHandler
         + Clone
         + Send
@@ -148,6 +150,8 @@ where
                 clock,
                 backoff.clone(),
             )
+            .await
+            .charging_profile_reports(&csms)
             .await;
     }
 
@@ -483,6 +487,16 @@ mod tests {
             &self,
             _actor: crate::actor::ChargePointActor,
         ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::smart_charging::GetChargingProfilesHandler for RecordingCsms {
+        async fn register_get_charging_profiles_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+            self.smart_charging_registered.store(true, Ordering::SeqCst);
         }
     }
 

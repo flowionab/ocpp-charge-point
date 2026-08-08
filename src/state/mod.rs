@@ -26,10 +26,10 @@ pub use self::authorization_status::AuthorizationStatus;
 pub use self::boot_reason::BootReasonCause;
 pub use self::charge_point_state::{ChargePointState, LifecycleState, TimeSyncAnchor};
 pub use self::charging_profile::{
-    ChargingProfile, ChargingProfileCriteria, ChargingProfileId, ChargingProfileKind,
-    ChargingProfilePurpose, ChargingProfileRejection, ChargingProfileScope, ChargingProfileStore,
-    ChargingRateUnit, ChargingSchedule, ChargingSchedulePeriod, InstalledChargingProfile,
-    RecurrencyKind,
+    ChargingLimitSource, ChargingProfile, ChargingProfileCriteria, ChargingProfileId,
+    ChargingProfileKind, ChargingProfilePurpose, ChargingProfileQuery, ChargingProfileRejection,
+    ChargingProfileScope, ChargingProfileStore, ChargingRateUnit, ChargingSchedule,
+    ChargingSchedulePeriod, InstalledChargingProfile, RecurrencyKind,
 };
 pub use self::connector_state::ConnectorState;
 pub use self::connector_status::ConnectorStatus;

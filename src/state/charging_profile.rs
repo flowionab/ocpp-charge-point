@@ -271,6 +271,75 @@ impl ChargingProfileCriteria {
     }
 }
 
+/// Who installed a charging profile, OCPP's `ChargingLimitSourceEnum`.
+///
+/// Every profile this crate holds is [`ChargingLimitSource::Cso`]: the only way one gets installed
+/// is `SetChargingProfile`, which is the CSMS (the charge point operator) talking. The other
+/// variants exist because a CSMS may *filter* on them in `GetChargingProfiles` - asking for only
+/// EMS-installed profiles is a question this charge point must be able to answer truthfully, and
+/// the answer is "none" rather than "all of them".
+///
+/// Limits arriving from somewhere other than the CSMS - a local energy manager, a DSO signal - are
+/// not profiles and are not stored here; reporting them is `NotifyChargingLimit`
+/// (`docs/PRODUCTION-ROADMAP.md` B2), which this crate does not implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargingLimitSource {
+    /// An energy management system on site.
+    Ems,
+    /// The charge point operator, via the CSMS - the source of every profile stored here.
+    Cso,
+    /// The system operator (grid/DSO).
+    So,
+    /// Anything else.
+    Other,
+}
+
+impl InstalledChargingProfile {
+    /// Who installed this profile - always [`ChargingLimitSource::Cso`]; see that type for why
+    /// this is a fact about how profiles get here rather than a stub.
+    pub fn source(&self) -> ChargingLimitSource {
+        ChargingLimitSource::Cso
+    }
+}
+
+/// Which profiles a `GetChargingProfiles` selects.
+///
+/// Deliberately not [`ChargingProfileCriteria`], which `ClearChargingProfile` uses: OCPP's *get*
+/// criterion matches a **list** of profile ids and a list of limit sources, where *clear* matches
+/// at most one id and no source at all. Sharing one type would mean widening the clear path to
+/// fields it must never act on - clearing by a criterion the CSMS did not send is destructive in a
+/// way over-reporting is not.
+///
+/// An empty list means "no filter on this field", matching OCPP's absent-means-all rule.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChargingProfileQuery {
+    /// Match any of these profile ids.
+    pub ids: Vec<ChargingProfileId>,
+    /// Match only profiles installed at this scope.
+    pub scope: Option<ChargingProfileScope>,
+    /// Match only profiles with this purpose.
+    pub purpose: Option<ChargingProfilePurpose>,
+    /// Match only profiles at this stack level.
+    pub stack_level: Option<u32>,
+    /// Match only profiles installed by any of these sources.
+    pub sources: Vec<ChargingLimitSource>,
+}
+
+impl ChargingProfileQuery {
+    /// Whether `installed` is selected by this query.
+    pub fn matches(&self, installed: &InstalledChargingProfile) -> bool {
+        (self.ids.is_empty() || self.ids.contains(&installed.profile.id))
+            && self.scope.is_none_or(|scope| installed.scope == scope)
+            && self
+                .purpose
+                .is_none_or(|purpose| installed.profile.purpose == purpose)
+            && self
+                .stack_level
+                .is_none_or(|level| installed.profile.stack_level == level)
+            && (self.sources.is_empty() || self.sources.contains(&installed.source()))
+    }
+}
+
 /// Why [`ChargingProfileStore::install`] refused a profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChargingProfileRejection {
@@ -379,12 +448,22 @@ impl ChargingProfileStore {
         before - self.profiles.len()
     }
 
-    /// Every profile matching `criteria`, in installation order - what `GetChargingProfiles`
-    /// reports.
+    /// Every profile matching `criteria`, in installation order - what `ClearChargingProfile`
+    /// would remove.
     pub fn matching(&self, criteria: &ChargingProfileCriteria) -> Vec<&InstalledChargingProfile> {
         self.profiles
             .iter()
             .filter(|installed| criteria.matches(installed))
+            .collect()
+    }
+
+    /// Every profile matching `query`, in installation order - what `GetChargingProfiles`
+    /// reports. Separate from [`Self::matching`] for the reason [`ChargingProfileQuery`] is
+    /// separate from [`ChargingProfileCriteria`].
+    pub fn selected_by(&self, query: &ChargingProfileQuery) -> Vec<&InstalledChargingProfile> {
+        self.profiles
+            .iter()
+            .filter(|installed| query.matches(installed))
             .collect()
     }
 

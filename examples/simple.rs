@@ -22,8 +22,8 @@ use ocpp_charge_point::reset::ResetHandler;
 use ocpp_charge_point::security::SecurityEventNotifier;
 use ocpp_charge_point::setup;
 use ocpp_charge_point::smart_charging::{
-    ChargingLimitProjection, ClearChargingProfileHandler, GetCompositeScheduleHandler,
-    SetChargingProfileHandler,
+    ChargingLimitProjection, ClearChargingProfileHandler, GetChargingProfilesHandler,
+    GetCompositeScheduleHandler, SetChargingProfileHandler,
 };
 use ocpp_charge_point::state::{
     AuthorizationStatus, BootReasonCause, ChargePointEvent, ConnectorEvent, ConnectorStatus,
@@ -303,6 +303,15 @@ impl SetChargingProfileHandler for AlwaysAcceptBootNotifier {
 #[async_trait::async_trait]
 impl ClearChargingProfileHandler for AlwaysAcceptBootNotifier {
     async fn register_clear_charging_profile_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetChargingProfilesHandler for AlwaysAcceptBootNotifier {
+    async fn register_get_charging_profiles_handler(
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {

@@ -510,7 +510,7 @@ first: without it there is no load management.
 | SetChargingProfile | ✅ | ✅ | ✅ |
 | ClearChargingProfile | ✅ | ✅ | ✅ |
 | GetCompositeSchedule | ✅ | ✅ | ✅ |
-| GetChargingProfiles / ReportChargingProfiles | — | ⬜ | ⬜ |
+| GetChargingProfiles / ReportChargingProfiles | — | ✅ | ✅ |
 | NotifyChargingLimit / ClearedChargingLimit | — | ⬜ | ⬜ |
 | NotifyEVChargingNeeds / NotifyEVChargingSchedule | — | ⬜ | ⬜ |
 | NotifyPriorityCharging / UsePriorityCharging | — | — | ⬜ |
@@ -617,11 +617,37 @@ first: without it there is no load management.
       handler, since re-anchoring at every evaluation would make a schedule with a duration
       restart forever instead of ending.
 
-      **Not done, and each needs its own slice**: `GetChargingProfiles`/`ReportChargingProfiles`
-      (the protocol-agnostic `handle_get_charging_profiles` and the wire-side purpose/scope
-      mappings exist and are tested; the multi-part report sender does not),
-      `NotifyChargingLimit`/`ClearedChargingLimit`, and
-      `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`.
+      **Not done, and each needs its own slice**: `NotifyChargingLimit`/`ClearedChargingLimit`,
+      and `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule` (which additionally needs
+      EV-supplied ISO 15118 data this crate has no hardware binding for - see
+      [B4.5](#b4--certificates-and-iso-15118-r1-r13)).
+- [x] **B2.7** `GetChargingProfiles`/`ReportChargingProfiles` on **2.0.1 and 2.1** - the CSMS
+      asking what is installed, answered from the store across as many `ReportChargingProfiles`
+      messages as it takes. 1.6J has no such message and no way to ask at all.
+
+      `ChargingProfileQuery` is deliberately *not* `ChargingProfileCriteria`: OCPP's get-criterion
+      matches a **list** of ids and a list of limit sources where clear matches at most one id and
+      no source, and sharing one type would widen the clear path to fields it must never act on -
+      clearing by a criterion the CSMS did not send is destructive in a way over-reporting is not.
+
+      Every stored profile reports `chargingLimitSource: CSO`, which is a fact rather than a stub:
+      `SetChargingProfile` is the only way a profile gets here, and that is the operator talking
+      through the CSMS. The other sources exist so a CSMS filtering on `EMS` is told there are
+      none rather than handed all of them. Chunking groups by scope **and** source, because the
+      message carries one `evseId` and one `chargingLimitSource` for everything in it, and `tbc`
+      clears only on the last message of the whole report - clearing it at the end of each scope
+      would tell the CSMS the report had finished while another scope was still coming. An empty
+      match sends **no** report at all (the `NoProfiles` status already says so), which is the
+      opposite of [`chunk_report`]'s empty `NotifyReport` - and the difference is OCPP's:
+      `GetBaseReport` has no "nothing matched" status to answer with.
+
+      Two known limits. The reports are sent from inside the request handler, so they reach the
+      CSMS *before* the response it answers - the transport only writes the response once the
+      handler returns, and there is no executor at that boundary to defer them onto. `requestId`
+      is what correlates the two, and `NotifyReport` has had the same ordering for the same reason
+      since it was written. And 2.1's generated `ChargingProfile` is **56 KB by value** (see
+      [D2.3](#62-d2--type-completeness-audit)), so building one to send is expensive in a way that
+      matters on an MCU.
 - [ ] **B2.6** 2.1 dynamic schedule updates and priority charging. Untouched. The model already
       carries `ChargingProfilePurpose::PriorityCharging` and the 2.1 adapter maps it both ways, so
       the store and composition are ready; what is missing is the messages
@@ -991,6 +1017,18 @@ exists).
       `rust-ocpp` too, so switching type crates wouldn't help.
       [`UPSTREAM-GAPS.md`](./UPSTREAM-GAPS.md) lays out the cost either way;
       **the user decides.**
+
+- [ ] **D2.3** `ocpp-types` v21's `ChargingProfile` is **56 KB by value** (`ChargingSchedule`
+      alone is 18.6 KB, and a profile inlines three of them); 2.0.1's equivalent is 2.6 KB. The
+      cause is `ChargingSchedule` inlining `AbsolutePriceSchedule`, `PriceLevelSchedule` and
+      `SalesTariff` at their `heapless` capacities rather than behind a `Box`, in a build that
+      has `alloc` anyway. Measured, not estimated, while wiring
+      [B2.7](#b2--smart-charging-r11): constructing one to send overflows an unoptimised 2 MB
+      worker stack (`tests/get_charging_profiles.rs` raises it and says why), and a release build
+      is fine only because the temporaries are elided. This is a genuine obstacle to the no_std
+      goal - an MCU whose entire stack is 64 KB cannot build a single one of these - and the fix
+      is upstream: box the optional price/tariff sub-structures. Affects every 2.1 outbound
+      message carrying a profile, not just this one.
 
 ### 6.3 D3 — Dependency policy
 
@@ -2226,12 +2264,13 @@ StopTransaction, TriggerMessage, UnlockConnector
 **Missing:** DiagnosticsStatusNotification,
 FirmwareStatusNotification, GetDiagnostics, UpdateFirmware
 
-### A.2 OCPP 2.0.1 — 29 of 63 wired
+### A.2 OCPP 2.0.1 — 30 of 63 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
-GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
-GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
+GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
+GetReport, GetVariables, Heartbeat, NotifyReport, ReportChargingProfiles,
+RequestStartTransaction,
 MeterValues, RequestStopTransaction, ReserveNow, Reset, SendLocalList,
 SetChargingProfile, SetNetworkProfile, SetVariables, StatusNotification,
 TransactionEvent, TriggerMessage, UnlockConnector
@@ -2239,13 +2278,13 @@ TransactionEvent, TriggerMessage, UnlockConnector
 **Missing:** CertificateSigned,
 ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
 CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
-Get15118EVCertificate, GetCertificateStatus, GetChargingProfiles,
+Get15118EVCertificate, GetCertificateStatus,
 GetDisplayMessages, GetInstalledCertificateIds,
 GetLog, GetMonitoringReport, GetTransactionStatus, InstallCertificate,
 LogStatusNotification, NotifyChargingLimit,
 NotifyCustomerInformation, NotifyDisplayMessages, NotifyEVChargingNeeds,
 NotifyEVChargingSchedule, NotifyEvent, NotifyMonitoringReport,
-PublishFirmware, PublishFirmwareStatusNotification, ReportChargingProfiles,
+PublishFirmware, PublishFirmwareStatusNotification,
 ReservationStatusUpdate, SetDisplayMessage,
 SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
@@ -2254,12 +2293,13 @@ SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 `ocpp-types` v201, but `ocpp-client` 0.2.0 generates no action for it — see
 [D1](#61-d1--missing-action-wrappers).
 
-### A.3 OCPP 2.1 — 30 of 86 wired
+### A.3 OCPP 2.1 — 31 of 86 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
-GetBaseReport, GetCompositeSchedule, GetLocalListVersion, GetReport,
-GetVariables, Heartbeat, NotifyReport, RequestStartTransaction,
+GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
+GetReport, GetVariables, Heartbeat, NotifyReport, ReportChargingProfiles,
+RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
 MeterValues, SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
 StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
@@ -2269,7 +2309,7 @@ CertificateSigned, ChangeTransactionTariff, ClearDERControl, ClearDisplayMessage
 ClearVariableMonitoring, ClearedChargingLimit, ClosePeriodicEventStream,
 CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
 Get15118EVCertificate, GetCertificateChainStatus, GetCertificateStatus,
-GetChargingProfiles, GetDisplayMessages,
+GetDisplayMessages,
 GetInstalledCertificateIds, GetLog, GetMonitoringReport,
 GetPeriodicEventStream, GetTariffs, GetTransactionStatus,
 InstallCertificate, LogStatusNotification,
@@ -2279,7 +2319,7 @@ NotifyEVChargingNeeds, NotifyEVChargingSchedule, NotifyEvent,
 NotifyMonitoringReport, NotifyPeriodicEventStream, NotifyPriorityCharging,
 NotifySettlement, NotifyWebPaymentStarted, OpenPeriodicEventStream,
 PublishFirmware, PublishFirmwareStatusNotification,
-PullDynamicScheduleUpdate, ReportChargingProfiles, ReportDERControl,
+PullDynamicScheduleUpdate, ReportDERControl,
 RequestBatterySwap, ReservationStatusUpdate,
 SetDefaultTariff, SetMonitoringBase, SetMonitoringLevel,
 SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware,
@@ -2302,5 +2342,5 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 769 | `#[test]` + `#[tokio::test]`, re-counted at the A9 commit (760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 784 | `#[test]` + `#[tokio::test]`, re-counted at the B2.7 commit (769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

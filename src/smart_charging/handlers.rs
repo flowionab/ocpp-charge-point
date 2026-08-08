@@ -16,8 +16,8 @@ use crate::smart_charging::{
     ChargingLimitProjection, CompositeSchedule, compose, connector_composition_context,
 };
 use crate::state::{
-    ChargePointEvent, ChargingProfile, ChargingProfileCriteria, ChargingProfileScope,
-    ChargingRateUnit, InstalledChargingProfile,
+    ChargePointEvent, ChargingLimitSource, ChargingProfile, ChargingProfileCriteria,
+    ChargingProfileQuery, ChargingProfileScope, ChargingRateUnit, InstalledChargingProfile,
 };
 
 /// The outcome of a CSMS-initiated `SetChargingProfile`, matching OCPP's
@@ -156,11 +156,15 @@ pub async fn handle_get_composite_schedule<C: Clock>(
 /// Handles a CSMS-initiated `GetChargingProfiles` against `actor`, returning the profiles that
 /// match - what the charge point then reports back in one or more `ReportChargingProfiles`.
 ///
-/// Returns an empty vector when nothing matches, which the caller reports as OCPP's
-/// `NoProfiles` status rather than sending an empty report.
+/// Returns an empty vector when nothing matches, which the caller reports as OCPP's `NoProfiles`
+/// status and sends **no** report for. That is the opposite of
+/// [`crate::reporting::chunk_report`], which emits one empty `NotifyReport` - and the difference
+/// is OCPP's, not this crate's: `GetBaseReport` has no "nothing matched" status to answer with, so
+/// its emptiness has to be carried by a message, while `GetChargingProfiles` says it in the
+/// response and a report afterwards would contradict it.
 pub fn handle_get_charging_profiles(
     actor: &ChargePointActor,
-    criteria: ChargingProfileCriteria,
+    query: &ChargingProfileQuery,
 ) -> Vec<InstalledChargingProfile> {
     let state = actor.state();
     if !crate::refusal::capability_present(&state.capabilities, "GetChargingProfiles") {
@@ -168,10 +172,84 @@ pub fn handle_get_charging_profiles(
     }
     state
         .charging_profiles
-        .matching(&criteria)
+        .selected_by(query)
         .into_iter()
         .cloned()
         .collect()
+}
+
+/// The most profiles carried in a single `ReportChargingProfiles` message (see
+/// [`chunk_charging_profile_report`]).
+///
+/// Far smaller than [`crate::reporting::REPORT_CHUNK_SIZE`], and deliberately: one `ReportEntry` is
+/// a component, a variable and a value, while one charging profile carries a whole set of
+/// schedules, each with as many periods as the CSMS chose to send. Sizing both the same would make
+/// this the one report that can overflow a frame. Four profiles' worth of schedules stays
+/// comfortably inside an OCPP-J message even when each is at its most verbose, and a charge point
+/// bounded to [`max_charging_profiles`](crate::state::StateLimits::max_charging_profiles) never
+/// needs many messages to get through them all.
+pub const CHARGING_PROFILE_REPORT_CHUNK_SIZE: usize = 4;
+
+/// One `ReportChargingProfiles` message's worth of a chunked charging-profile report.
+///
+/// Grouped by scope *and* source because the OCPP message carries a single `evseId` and a single
+/// `chargingLimitSource` for everything in it - profiles from two different EVSEs cannot share a
+/// message however small they are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChargingProfileReportChunk {
+    /// The scope every profile in this chunk was installed at.
+    pub scope: ChargingProfileScope,
+    /// The source that installed every profile in this chunk.
+    pub source: ChargingLimitSource,
+    /// Whether another message follows this one - across the *whole* report, not just this scope.
+    pub tbc: bool,
+    /// This message's profiles (at most [`CHARGING_PROFILE_REPORT_CHUNK_SIZE`]).
+    pub profiles: Vec<InstalledChargingProfile>,
+}
+
+/// Splits `profiles` into the sequence of `ReportChargingProfiles` messages that answers one
+/// `GetChargingProfiles`, with `tbc` false on exactly the last one.
+///
+/// An empty input produces **no** chunks: see [`handle_get_charging_profiles`] for why an empty
+/// charging-profile report is silence rather than an empty message.
+pub fn chunk_charging_profile_report(
+    profiles: &[InstalledChargingProfile],
+) -> Vec<ChargingProfileReportChunk> {
+    let mut groups: Vec<(ChargingProfileScope, ChargingLimitSource, Vec<_>)> = Vec::new();
+    for profile in profiles {
+        let key = (profile.scope, profile.source());
+        // Linear rather than a map: this runs over at most `max_charging_profiles` items, and
+        // preserving first-seen group order keeps the report deterministic (and its tests
+        // readable) where a hash map would not.
+        match groups
+            .iter_mut()
+            .find(|(scope, source, _)| (*scope, *source) == key)
+        {
+            Some((_, _, members)) => members.push(profile.clone()),
+            None => groups.push((key.0, key.1, alloc::vec![profile.clone()])),
+        }
+    }
+
+    let mut chunks: Vec<ChargingProfileReportChunk> = groups
+        .into_iter()
+        .flat_map(|(scope, source, members)| {
+            members
+                .chunks(CHARGING_PROFILE_REPORT_CHUNK_SIZE)
+                .map(|chunk| ChargingProfileReportChunk {
+                    scope,
+                    source,
+                    // Fixed up below: only the final chunk of the whole report ends it, and a
+                    // group cannot know whether another group follows.
+                    tbc: true,
+                    profiles: chunk.to_vec(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if let Some(last) = chunks.last_mut() {
+        last.tbc = false;
+    }
+    chunks
 }
 
 /// Registers this charge point's inbound `SetChargingProfile` handling with the CSMS connection.
@@ -187,6 +265,15 @@ pub trait SetChargingProfileHandler {
 pub trait ClearChargingProfileHandler {
     /// Registers a `ClearChargingProfile` handler dispatching against `actor`.
     async fn register_clear_charging_profile_handler(&self, actor: ChargePointActor);
+}
+
+/// Registers this charge point's inbound `GetChargingProfiles` handling with the CSMS connection.
+///
+/// 2.x only - 1.6J has no `GetChargingProfiles`, and no way to ask what is installed at all.
+#[async_trait::async_trait]
+pub trait GetChargingProfilesHandler {
+    /// Registers a `GetChargingProfiles` handler dispatching against `actor`.
+    async fn register_get_charging_profiles_handler(&self, actor: ChargePointActor);
 }
 
 /// Registers this charge point's inbound `GetCompositeSchedule` handling with the CSMS connection.
@@ -411,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn getting_charging_profiles_returns_what_matches_the_criteria() {
+    async fn getting_charging_profiles_returns_what_matches_the_query() {
         let actor = actor_with_smart_charging().await;
         handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), profile(1), now()).await;
         let mut second = profile(2);
@@ -419,13 +506,13 @@ mod tests {
         handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), second, now()).await;
 
         assert_eq!(
-            handle_get_charging_profiles(&actor, ChargingProfileCriteria::default()).len(),
+            handle_get_charging_profiles(&actor, &ChargingProfileQuery::default()).len(),
             2
         );
         assert_eq!(
             handle_get_charging_profiles(
                 &actor,
-                ChargingProfileCriteria {
+                &ChargingProfileQuery {
                     stack_level: Some(3),
                     ..Default::default()
                 }
@@ -433,5 +520,119 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_query_naming_several_ids_matches_any_of_them() {
+        let actor = actor_with_smart_charging().await;
+        for id in 1..=3 {
+            // Distinct stack levels, or `install`'s replacement rule (same purpose and level at
+            // the same scope supersedes) would leave only the last one.
+            let mut installed = profile(id);
+            installed.stack_level = id as u32;
+            handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), installed, now())
+                .await;
+        }
+
+        let matched = handle_get_charging_profiles(
+            &actor,
+            &ChargingProfileQuery {
+                ids: alloc::vec![
+                    crate::state::ChargingProfileId(1),
+                    crate::state::ChargingProfileId(3),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(matched.len(), 2);
+        assert!(matched.iter().all(|installed| installed.profile.id.0 != 2));
+    }
+
+    #[tokio::test]
+    async fn asking_for_profiles_from_a_source_that_installs_none_here_matches_nothing() {
+        let actor = actor_with_smart_charging().await;
+        handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), profile(1), now()).await;
+
+        // Everything here arrived by SetChargingProfile, so it is CSO-installed. A CSMS asking
+        // for EMS-installed profiles must be told there are none, not handed these.
+        assert!(
+            handle_get_charging_profiles(
+                &actor,
+                &ChargingProfileQuery {
+                    sources: alloc::vec![ChargingLimitSource::Ems],
+                    ..Default::default()
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            handle_get_charging_profiles(
+                &actor,
+                &ChargingProfileQuery {
+                    sources: alloc::vec![ChargingLimitSource::Cso],
+                    ..Default::default()
+                }
+            )
+            .len(),
+            1
+        );
+    }
+
+    fn installed(scope: ChargingProfileScope, id: i32) -> InstalledChargingProfile {
+        InstalledChargingProfile {
+            scope,
+            profile: profile(id),
+        }
+    }
+
+    #[test]
+    fn an_empty_charging_profile_report_is_no_messages_at_all() {
+        assert!(chunk_charging_profile_report(&[]).is_empty());
+    }
+
+    #[test]
+    fn profiles_are_split_by_scope_because_one_message_carries_one_evse() {
+        let chunks = chunk_charging_profile_report(&[
+            installed(ChargingProfileScope::Evse(0), 1),
+            installed(ChargingProfileScope::ChargePoint, 2),
+            installed(ChargingProfileScope::Evse(0), 3),
+        ]);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].scope, ChargingProfileScope::Evse(0));
+        assert_eq!(chunks[0].profiles.len(), 2);
+        assert_eq!(chunks[1].scope, ChargingProfileScope::ChargePoint);
+        assert_eq!(chunks[1].profiles.len(), 1);
+    }
+
+    #[test]
+    fn only_the_final_message_of_the_whole_report_clears_tbc() {
+        let profiles: Vec<_> = (0..CHARGING_PROFILE_REPORT_CHUNK_SIZE + 1)
+            .map(|index| installed(ChargingProfileScope::Evse(0), index as i32))
+            .chain(core::iter::once(installed(
+                ChargingProfileScope::ChargePoint,
+                99,
+            )))
+            .collect();
+
+        let chunks = chunk_charging_profile_report(&profiles);
+
+        // Two messages for the EVSE (size + 1 profiles), one for the charge-point scope.
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.tbc).collect::<Vec<_>>(),
+            alloc::vec![true, true, false],
+            "a `tbc` that clears at the end of a scope would tell the CSMS the report finished \
+             while another scope was still coming"
+        );
+    }
+
+    #[test]
+    fn every_reported_profile_is_cso_installed() {
+        let chunks =
+            chunk_charging_profile_report(&[installed(ChargingProfileScope::ChargePoint, 1)]);
+
+        assert_eq!(chunks[0].source, ChargingLimitSource::Cso);
     }
 }

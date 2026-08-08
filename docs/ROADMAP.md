@@ -1258,8 +1258,10 @@ Charging profiles and schedule negotiation.
   assumption over-limits by 5× - a safety question, not a billing one), and a
   `Relative` schedule's anchor when the transaction's start time isn't known.
 
-  Still missing: `GetChargingProfiles`/`ReportChargingProfiles` (the store-side
-  query exists; the multi-part report sender doesn't), `NotifyChargingLimit`/
+  `GetChargingProfiles`/`ReportChargingProfiles` is wired on 2.0.1 and 2.1
+  (1.6J has no such message): the CSMS asks what is installed and the answer
+  comes from the store, chunked by scope and source across as many
+  `ReportChargingProfiles` as it takes. Still missing: `NotifyChargingLimit`/
   `ClearedChargingLimit`, `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`,
   2.1's dynamic schedule updates and priority-charging messages. The profile
   store itself is durable (`persistence::ChargingProfileSnapshotStore`, wired

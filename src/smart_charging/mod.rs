@@ -51,10 +51,11 @@ pub use self::ocpp_2_0_1::Ocpp2_0_1SmartChargingHandler;
 pub use self::ocpp_2_1::Ocpp2_1SmartChargingHandler;
 
 pub use self::handlers::{
-    ClearChargingProfileHandler, ClearChargingProfileOutcome, GetCompositeScheduleHandler,
+    CHARGING_PROFILE_REPORT_CHUNK_SIZE, ChargingProfileReportChunk, ClearChargingProfileHandler,
+    ClearChargingProfileOutcome, GetChargingProfilesHandler, GetCompositeScheduleHandler,
     GetCompositeScheduleOutcome, SetChargingProfileHandler, SetChargingProfileOutcome,
-    handle_clear_charging_profile, handle_get_charging_profiles, handle_get_composite_schedule,
-    handle_set_charging_profile,
+    chunk_charging_profile_report, handle_clear_charging_profile, handle_get_charging_profiles,
+    handle_get_composite_schedule, handle_set_charging_profile,
 };
 pub use self::projection::{
     ChargingLimitProjection, connector_composition_context, run_charging_limit_projection,

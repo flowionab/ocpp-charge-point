@@ -301,6 +301,9 @@ where
                 SystemClock,
                 backoff.clone(),
             )
+            .await
+            // 2.x only - see `ChargePointBuilder::charging_profile_reports`.
+            .charging_profile_reports(&client)
             .await;
     }
 

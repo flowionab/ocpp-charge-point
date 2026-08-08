@@ -1161,6 +1161,15 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::smart_charging::GetChargingProfilesHandler for FixedBootNotifier {
+        async fn register_get_charging_profiles_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::smart_charging::GetCompositeScheduleHandler for FixedBootNotifier {
         async fn register_get_composite_schedule_handler(
             &self,
