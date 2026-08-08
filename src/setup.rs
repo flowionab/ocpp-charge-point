@@ -768,6 +768,10 @@ mod tests {
                         periodic_event_stream: enabled,
                         ..Default::default()
                     },
+                    "battery_swap" => crate::hardware::Capabilities {
+                        battery_swap: enabled,
+                        ..Default::default()
+                    },
                     other => panic!(
                         "CAPABILITY_GATES grew a new entry (`{other}`) this test doesn't know \
                          how to set yet - extend the match above so it stays data-driven"

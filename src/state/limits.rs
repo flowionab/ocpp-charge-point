@@ -86,6 +86,11 @@ pub use crate::state::authorization_cache::DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRI
 /// [`crate::state::DEFAULT_MAX_NETWORK_PROFILE_SLOTS`].
 pub use crate::state::network_profile::DEFAULT_MAX_NETWORK_PROFILE_SLOTS;
 
+/// Default maximum number of pending `RequestBatterySwap` requests - see
+/// [`crate::state::DEFAULT_MAX_PENDING_BATTERY_SWAPS`], which documents the reasoning; this
+/// re-export exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
+pub use crate::state::battery_swap::DEFAULT_MAX_PENDING_BATTERY_SWAPS;
+
 /// The configured maxima for every growable collection in [`crate::state::ChargePointState`], so a
 /// charge point's peak memory is a function of its configuration rather than of how much a CSMS or
 /// a hardware binding decides to push at it - see `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.2). Passed
@@ -161,6 +166,11 @@ pub struct StateLimits {
     /// [`crate::state::PeriodicEventStreamStore::open`]); re-opening an already-open id always
     /// succeeds. Clamped to at least 1.
     pub max_periodic_event_streams: usize,
+    /// The most [`crate::state::PendingBatterySwap`]s the battery-swap store may hold at once
+    /// (OCPP 2.1 `RequestBatterySwap`). A request for a *new* `requestId` beyond it is refused
+    /// (see [`crate::state::BatterySwapStore::insert`]); replacing an already-pending request's
+    /// id always succeeds. Clamped to at least 1.
+    pub max_pending_battery_swaps: usize,
 }
 
 impl StateLimits {
@@ -177,6 +187,7 @@ impl StateLimits {
             max_variable_monitors: DEFAULT_MAX_VARIABLE_MONITORS,
             max_display_messages: DEFAULT_MAX_DISPLAY_MESSAGES,
             max_periodic_event_streams: DEFAULT_MAX_PERIODIC_EVENT_STREAMS,
+            max_pending_battery_swaps: DEFAULT_MAX_PENDING_BATTERY_SWAPS,
         }
     }
 
@@ -231,6 +242,12 @@ impl StateLimits {
     /// Overrides [`Self::max_device_model_variables`].
     pub const fn with_max_device_model_variables(mut self, max: usize) -> Self {
         self.max_device_model_variables = max;
+        self
+    }
+
+    /// Overrides [`Self::max_pending_battery_swaps`].
+    pub const fn with_max_pending_battery_swaps(mut self, max: usize) -> Self {
+        self.max_pending_battery_swaps = max;
         self
     }
 }

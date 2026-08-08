@@ -5,16 +5,16 @@ use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
-    AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
-    ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, DisplayMessageStore, EventTrigger,
-    EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
-    MeterSample, NetworkProfileStore, PendingReset, PeriodicEventStreamStore, RegistrationStatus,
-    ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget, SecurityEvent,
-    SecurityEventType, StateLimits, StopReason, TariffStore, Transaction, TransactionChargingState,
-    TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
-    TriggeredMonitor, Variable, VariableAttributeType, VariableMonitorStore,
-    VariableMonitoringEvent,
+    AuthorizationCache, AuthorizationRequested, BatterySwapStore, ChargePointEffect,
+    ChargePointEvent, ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent,
+    ConnectorState, ConnectorStatusChanged, DeviceModel, DeviceModelEvent, DisplayMessageStore,
+    EventTrigger, EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList,
+    LocalListEntry, MeterSample, NetworkProfileStore, PendingReset, PeriodicEventStreamStore,
+    RegistrationStatus, ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget,
+    SecurityEvent, SecurityEventType, StateLimits, StopReason, TariffStore, Transaction,
+    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
+    TransactionUpdateReason, TriggeredMonitor, Variable, VariableAttributeType,
+    VariableMonitorStore, VariableMonitoringEvent,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -99,6 +99,10 @@ pub struct ChargePointState {
     /// `NotifyPeriodicEventStream` from. See [`PeriodicEventStreamStore`] and
     /// `docs/PRODUCTION-ROADMAP.md` B5.6.
     pub periodic_event_streams: PeriodicEventStreamStore,
+    /// `RequestBatterySwap` requests this charge point has accepted but not yet correlated with a
+    /// reported `BatterySwap` event. See [`crate::battery_swap`] and
+    /// `docs/PRODUCTION-ROADMAP.md` B8.3. **2.1 only.**
+    pub battery_swaps: BatterySwapStore,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -157,6 +161,7 @@ impl ChargePointState {
             periodic_event_streams: PeriodicEventStreamStore::with_limit(
                 limits.max_periodic_event_streams,
             ),
+            battery_swaps: BatterySwapStore::with_max_pending(limits.max_pending_battery_swaps),
         }
     }
 
@@ -613,6 +618,18 @@ impl ChargePointState {
             }
             ChargePointEvent::DisplayMessageSet(message) => self.display_messages.set(*message),
             ChargePointEvent::DisplayMessageCleared(id) => self.display_messages.clear(id),
+            ChargePointEvent::BatterySwapRequested(pending) => self.battery_swaps.insert(pending),
+            ChargePointEvent::BatterySwapCancelled(request_id) => {
+                self.battery_swaps.remove(request_id).is_some()
+            }
+            ChargePointEvent::BatterySwapReported(event) => {
+                // A driver-initiated swap the CSMS never asked for correlates with nothing
+                // pending, and that's a normal, spec-valid case - not every `BatterySwap` follows
+                // a `RequestBatterySwap`. Either way the event itself is always reported.
+                let removed = self.battery_swaps.remove(event.request_id).is_some();
+                effects.push(ChargePointEffect::BatterySwapEventOccurred(event));
+                removed
+            }
             ChargePointEvent::TimeSynced {
                 csms_time,
                 recorded_at,

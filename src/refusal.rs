@@ -62,6 +62,7 @@
 //! | `AdjustPeriodicEventStream`  | n/a | n/a | CALLRESULT `GenericStatusEnum::Rejected` |
 //! | `ClosePeriodicEventStream`   | n/a | n/a | CALLERROR (`ClosePeriodicEventStreamResponse` is `{}`, no status field) |
 //! | `GetPeriodicEventStream`     | n/a | n/a | CALLERROR (`GetPeriodicEventStreamResponse` is `{ constantStreamData? }`, no status field) |
+//! | `RequestBatterySwap`         | n/a (2.1-only) | n/a | CALLRESULT `GenericStatusEnum::Rejected` |
 //!
 //! Nothing here needed to fall back on assumption where the vendored spec/generated types didn't
 //! settle it - every response type above either has a documented status enum or documented-empty
@@ -241,6 +242,11 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         message: "GetPeriodicEventStream",
         capability: |c| c.periodic_event_stream,
         shape: RefusalShape::CallError,
+    },
+    RefusalGate {
+        message: "RequestBatterySwap",
+        capability: |c| c.battery_swap,
+        shape: RefusalShape::CallResultStatus,
     },
 ];
 

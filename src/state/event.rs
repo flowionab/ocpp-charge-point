@@ -5,14 +5,14 @@ use chrono::{DateTime, Utc};
 use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::{
-    AuthorizationCacheEntry, AuthorizationStatus, ChargingProfile, ChargingProfileCriteria,
-    ChargingProfileId, ChargingProfileScope, Component, ConnectorState, ConnectorStatus,
-    DeviceModelEvent, DisplayMessageId, DisplayedMessage, IdToken, InstalledChargingProfile,
-    LocalListEntry, MeterSample, NetworkConnectionProfile, NetworkProfileSlot,
-    PeriodicEventStreamId, PeriodicEventStreamParams, RegistrationStatus, Reservation,
-    ReservationId, ResetKind, ResetTarget, SecurityEvent, StopReason, Tariff, TariffClearCriteria,
-    TariffScope, Transaction, TransactionId, TriggeredMonitor, Variable, VariableAttributeType,
-    VariableMonitorId, VariableMonitoringEvent,
+    AuthorizationCacheEntry, AuthorizationStatus, BatterySwapEvent, ChargingProfile,
+    ChargingProfileCriteria, ChargingProfileId, ChargingProfileScope, Component, ConnectorState,
+    ConnectorStatus, DeviceModelEvent, DisplayMessageId, DisplayedMessage, IdToken,
+    InstalledChargingProfile, LocalListEntry, MeterSample, NetworkConnectionProfile,
+    NetworkProfileSlot, PendingBatterySwap, PeriodicEventStreamId, PeriodicEventStreamParams,
+    RegistrationStatus, Reservation, ReservationId, ResetKind, ResetTarget, SecurityEvent,
+    StopReason, Tariff, TariffClearCriteria, TariffScope, Transaction, TransactionId,
+    TriggeredMonitor, Variable, VariableAttributeType, VariableMonitorId, VariableMonitoringEvent,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -355,6 +355,19 @@ pub enum ChargePointEvent {
     /// `crate::variable_monitoring`. See `docs/ROADMAP.md` §2/§14 (B5.2). **2.x only** - 1.6J has
     /// no such messages.
     VariableMonitoring(VariableMonitoringEvent),
+    /// The CSMS accepted a `RequestBatterySwap`, asking this charge point to prepare a swap - see
+    /// [`crate::battery_swap::handle_request_battery_swap`]. **2.1 only.**
+    BatterySwapRequested(PendingBatterySwap),
+    /// A previously recorded [`PendingBatterySwap`] is withdrawn without ever being correlated
+    /// with a reported swap - e.g. the station's own hardware failed to prepare for it. Raised
+    /// by [`crate::battery_swap::handle_request_battery_swap`] to roll back the store entry it
+    /// just recorded when [`crate::hardware::BatterySwapStation::prepare_swap`] fails, so a
+    /// `RequestBatterySwap` answered `Rejected` does not leave a pending entry the CSMS was just
+    /// told does not exist. **2.1 only.**
+    BatterySwapCancelled(crate::state::BatterySwapRequestId),
+    /// Hardware reported a battery-swap lifecycle event (OCPP `BatterySwap`) - see
+    /// [`crate::battery_swap::report_battery_swap_event`]. **2.1 only.**
+    BatterySwapReported(BatterySwapEvent),
 }
 
 /// An event addressed to one EVSE, either changing the EVSE's own availability/fault status or
@@ -533,6 +546,9 @@ pub enum ChargePointEffect {
     /// reports on its own clock, independent of a value changing at all - see
     /// `crate::variable_monitoring::run_periodic_variable_monitors`.
     VariableMonitorTriggered(TriggeredMonitor),
+    /// A battery-swap event occurred; the Battery Swap functional block reports this to the CSMS
+    /// via `BatterySwap` (2.1 only). See [`crate::battery_swap::report_battery_swap_event`].
+    BatterySwapEventOccurred(BatterySwapEvent),
 }
 
 /// A priority-charging grant the charge point made on its own, reported to the CSMS as
