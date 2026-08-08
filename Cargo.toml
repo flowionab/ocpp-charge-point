@@ -91,8 +91,10 @@ firmware-management = []
 # its own firmware without being a local controller, and vice versa.
 firmware-publishing = []
 # Declares the Diagnostics capability - log upload (roadmap B5.1) is registered through
-# `ChargePointBuilder::log_uploads`. GetTransactionStatus, CustomerInformation and the monitoring
-# engine are still unimplemented.
+# `ChargePointBuilder::log_uploads`. `GetTransactionStatus` (B5.4), `CustomerInformation` (B5.5)
+# and the variable monitoring engine and its reports (B5.2/B5.3) have since landed; what remains
+# unimplemented in this block is 2.1's periodic event streams, which have their own
+# `periodic-event-stream` feature.
 diagnostics = []
 # Declares the certificate-management capability - Install/Delete/GetInstalledCertificateIds
 # (roadmap B4.2), registered through `ChargePointBuilder::certificates` with a
@@ -126,7 +128,11 @@ payment = []
 iso15118 = []
 # Gates nothing yet: 2.1 DER control (roadmap B8.2) has no implementation in this crate yet.
 der-control = []
-# Gates nothing yet: 2.1 battery swap (roadmap B8.3) has no implementation in this crate yet.
+# Gates `crate::battery_swap` (`BatterySwap` outbound / `RequestBatterySwap` inbound, roadmap
+# B8.3) and `ChargePointBuilder::battery_swap`, which registers them against a
+# `hardware::BatterySwapStation`. 2.1-only, and niche: a conventional charge point has no swap
+# hardware, so an absent runtime capability refuses `RequestBatterySwap` through `crate::refusal`
+# even in a build with this feature on.
 battery-swap = []
 # Gates `crate::periodic_event_stream` (`OpenPeriodicEventStream`/`ClosePeriodicEventStream`/
 # `AdjustPeriodicEventStream`/`GetPeriodicEventStream`/`NotifyPeriodicEventStream`, roadmap B5.6)

@@ -1387,9 +1387,15 @@ Over-the-air firmware updates.
   (Downloading/Downloaded/Installing/Installed/Failed), signature
   verification hook.
 - Status: 🚧 partial - **the update flow is wired end to end on all three
-  versions** (B3.2). `UpdateFirmware` is answered immediately and the update runs
-  on a worker: download, wait, install, reporting every state change as a
-  `FirmwareStatusNotification` with the request id that started it.
+  versions** (B3.2), and **local-controller publishing joined it on 2.x** (B3.4):
+  `PublishFirmware`/`UnpublishFirmware`/`PublishFirmwareStatusNotification`, reusing
+  the same `hardware::FileTransfer` download path behind a new
+  `hardware::FirmwarePublisher`. `UpdateFirmware` is answered immediately and the
+  update runs on a worker: download, wait, install, reporting every state change as a
+  `FirmwareStatusNotification` with the request id that started it. What keeps this
+  block partial is **signature verification** (B3.3) - this crate has no crypto, so
+  `signingCertificate`/`signature` are accepted and not checked, and the
+  `InvalidFirmwareSignature` security event is never raised.
 
   Both of OCPP's scheduling points are honoured *and announced* -
   `DownloadScheduled` for a future `retrieveDateTime`, `InstallScheduled` for a
@@ -1440,7 +1446,14 @@ Log/diagnostics retrieval for troubleshooting.
 - Internal state needed: log upload state machine, log source
   abstraction (what logs exist, how they're packaged).
 - Status: 🚧 partial - **log upload is wired end to end on all three versions**
-  (B5.1). `GetLog` (2.x) and `GetDiagnostics` (1.6J) are answered immediately and
+  (B5.1), and 2.x's monitoring half is now complete: the variable monitoring engine
+  (B5.2) plus `SetMonitoringBase`/`SetMonitoringLevel`/`GetMonitoringReport`/
+  `NotifyMonitoringReport` (B5.3), chunked through the same scheme `NotifyReport`
+  uses. 2.1's **periodic event streams** (B5.6) are wired too - all five messages,
+  behind the `periodic-event-stream` feature. `GetTransactionStatus` (B5.4) and
+  `CustomerInformation` (B5.5) are done. Nothing in this block is outstanding on 2.x;
+  it stays partial only because 1.6J has no equivalent for any of it beyond
+  `GetDiagnostics`. `GetLog` (2.x) and `GetDiagnostics` (1.6J) are answered immediately and
   the transfer runs on its own task, because OCPP's N01 sequence requires the
   response to precede the `Uploading` notification - a handler that uploaded
   before returning would deliver its status reports after the response they are
@@ -1574,13 +1587,23 @@ V2X/V2G power export and distributed energy resource control.
 
 Support for battery-swap style "charging" stations.
 
-- Messages: battery swap specific `NotifyBatterySwap` /
-  swap-related transaction extensions. **(verify vs 2.1 spec)**
-- Internal state needed: swap station/bay state model, distinct from the
-  connector-based charging model.
-- Status: ⬜ not started, and likely out of scope unless a hardware
-  partner targets battery-swap hardware specifically — flag as
-  low-priority pending a concrete use case.
+- Messages: `BatterySwap` (outbound) and `RequestBatterySwap` (inbound). The
+  `NotifyBatterySwap` this row used to guess at **does not exist** — verified
+  against `ocpp-client` 0.5.0's generated 2.1 action list, which is
+  schema-derived. The "(verify vs 2.1 spec)" marker is discharged for this
+  block.
+- Internal state needed: a `PendingBatterySwap` store correlating an accepted
+  `RequestBatterySwap` with the `BatterySwap` event that reports the result,
+  keyed by OCPP's `requestId`. Deliberately *not* a full swap station/bay
+  model: OCPP defines no wire-level "swap in progress" status, so only the
+  half that must survive between the two CALLs is modelled.
+- Status: ✅ done (`docs/PRODUCTION-ROADMAP.md` B8.3) — both messages wired
+  for 2.1, behind the `battery-swap` Cargo feature and the `battery_swap`
+  runtime capability, with `hardware::BatterySwapStation` as the (small)
+  integrator surface and a C5-correct refusal when the capability is absent.
+  The "low-priority pending a concrete use case" framing still holds for
+  *deployments* — this is niche hardware and most builds compile it out — but
+  the library no longer lacks it.
 
 ---
 

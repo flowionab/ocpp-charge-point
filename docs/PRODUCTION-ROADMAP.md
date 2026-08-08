@@ -68,8 +68,8 @@ see [Appendix A](#appendix-a--verified-message-inventory)):
 | Version | Wired | Available in `ocpp-client` 0.5.0 | Remaining |
 |---------|-------|---------------------------------|-----------|
 | **1.6J** | **28** | 39 | 11 — the whole security-whitepaper set ([D2.2](#62-d2--type-completeness-audit)) |
-| **2.0.1** | **49** | 64 | 15 |
-| **2.1** | **57** | 91 | 34, of which 18 are 2.1-only hardware blocks |
+| **2.0.1** | **56** | 64 | 8 |
+| **2.1** | **71** | 91 | 20, of which 10 are DER/V2X |
 
 Two things this table hides, both good news:
 
@@ -101,12 +101,12 @@ close — mostly missing one version each.
 | Area | Status | Note |
 |------|--------|------|
 | Actor model, version-independent state | ✅ | `ChargePointState` owns transactions, reservations, local auth list, cost, reset, device model — all mutated only via `ChargePointEvent`. |
-| Hardware abstraction | 🚧 | `ChargePoint` / `Evse` / `Connector`: lock, unlock, contactor, reboot. **No capability model, no current-limit hook, no file transfer, no display, no RTC.** |
+| Hardware abstraction | 🚧 | Eleven traits: `ChargePoint`/`Evse`/`Connector` (lock, unlock, contactor, reboot, `set_current_limit`), plus `Storage`, `FileTransfer`, `FirmwareInstaller`, `FirmwarePublisher`, `CertificateStore`, `Display`, `BatterySwapStation`, `Watchdog`. Every negative this row used to carry — no capability model, no current-limit hook, no file transfer, no display — is now false; `Capabilities` ([C2](#52-c2--runtime-capability-declaration)) is the model. Still 🚧 because the surface is **not frozen** ([H5.5](#105-h5--release)) and DER/V2X, ISO 15118 and payment hardware have no trait yet. Time is `crate::clock`, not a hardware trait — `Capabilities::has_rtc` is how hardware declares a real-time clock. |
 | `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. Until the [G3.1](#93-g3--time) follow-up, this held only for a build with *no version feature* — every OCPP adapter was `std`-gated dead code, so a bare-metal build could not actually speak OCPP. All three version adapters are now reachable without `std`. |
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the authorization cache, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: certificates, network profiles. |
-| Test suite | 🚧 | 1121 test functions in `src/`, seven integration test binaries (`connect_2_1_websocket`, `lifecycle`, `get_charging_profiles`, `memory_budget`, `memory_growth`, `network_profile_switch`, `power_cut_recovery`). Strong unit coverage, and end-to-end now runs against the [H2.1](#102-h2--integration-testing) mock CSMS over a real socket. |
+| Test suite | 🚧 | 1227 test functions in `src/`, nine integration test binaries (`connect_2_1_websocket`, `lifecycle`, `get_charging_profiles`, `malformed_payload`, `memory_budget`, `memory_growth`, `network_profile_switch`, `payload_size_limit`, `power_cut_recovery`). Strong unit coverage, and end-to-end runs against the [H2.1](#102-h2--integration-testing) mock CSMS over a real socket. |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too, plus a coverage floor on the protocol adapter files ([H1.6](#101-h1--ci-hardening)). Whole-crate coverage stays informational. |
 
 ### 2.4 The structural blocker — resolved
@@ -783,7 +783,7 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 |---------|:----:|:-----:|:---:|
 | UpdateFirmware | ✅ | ✅ | ✅ |
 | FirmwareStatusNotification | ✅ | ✅ | ✅ |
-| PublishFirmware / UnpublishFirmware / PublishFirmwareStatusNotification | — | ⬜ | ⬜ |
+| PublishFirmware / UnpublishFirmware / PublishFirmwareStatusNotification | — | ✅ | ✅ |
 
 - [x] **B3.1** File-transfer abstraction in `crate::hardware` — `FileTransfer`, with
       `TransferProgress`/`TransferReport`, `UploadSource`, `LogKind` and a `NoFileTransfer`
@@ -892,7 +892,34 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
       `signature`; 1.6J security whitepaper `SignedUpdateFirmware`), driving
       the `InvalidFirmwareSignature` / `InvalidFirmwareSigningCertificate`
       security events.
-- [ ] **B3.4** Local-controller firmware publishing (2.x only).
+- [x] **B3.4** Local-controller firmware publishing (2.x only).
+
+      `PublishFirmware`/`UnpublishFirmware`/`PublishFirmwareStatusNotification` on 2.0.1 and 2.1,
+      in a new `crate::publish_firmware` shaped like `crate::firmware`'s queue-and-worker. The
+      *download* half is not new work: it reuses `hardware::FileTransfer` verbatim, including the
+      `retryInterval` handling `UpdateFirmware` already had. The new hardware surface is one trait,
+      `hardware::FirmwarePublisher` (`publish(checksum) -> urls`, `unpublish(checksum) -> bool`),
+      deliberately separate from `FirmwareInstaller` — a charge point can update its own firmware
+      without being a local controller, and the reverse, so a single trait would force integrators
+      to implement a half they do not have. Gated by a new `firmware-publishing` feature and
+      `Capabilities::firmware_publishing`, registered in `CAPABILITY_GATES`/`REFUSAL_GATES`.
+
+      Two design decisions worth recording. **Published images are a bounded set** (default 4)
+      rather than one-at-a-time: unlike downloading, publishing is not exclusive, and once full a
+      genuinely new checksum is refused rather than silently evicting an image another station is
+      still fetching. **`UnpublishFirmware` answers synchronously** against the publisher rather
+      than being queued, because OCPP defines no async-progress message for it; a hardware failure
+      maps to `DownloadOngoing` as the nearest "retry later" the enum offers, since
+      `UnpublishFirmwareStatusEnum` has no failure value at all.
+
+      **Not done, and named rather than implied:** checksum verification never emits
+      `InvalidChecksum`/`ChecksumVerified` — this crate has no crypto, the same punt
+      [B3.3](#b3--firmware-management-r12) records for signature verification — but the checksum
+      *is* handed to `FirmwarePublisher::publish`, so an integrator who can hash verifies there.
+      `DownloadScheduled`/`DownloadPaused` are modelled for wire completeness and never emitted
+      (the request carries no `retrieveDateTime`, and there is no pause/resume).
+      `PublishFirmwareStatusNotification` is not in `TriggerMessage`'s set, consistent with
+      `FirmwareStatusNotification` also being absent from it today.
 
 ### B4 — Certificates and ISO 15118 (R§1, R§13)
 
@@ -991,12 +1018,12 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 | GetDiagnostics / DiagnosticsStatusNotification | ✅ | — | — |
 | GetLog / LogStatusNotification | — | ✅ | ✅ |
 | SetVariableMonitoring / ClearVariableMonitoring | — | ✅ | ✅ |
-| SetMonitoringBase / SetMonitoringLevel | — | ⬜ | ⬜ |
-| GetMonitoringReport / NotifyMonitoringReport | — | ⬜ | ⬜ |
+| SetMonitoringBase / SetMonitoringLevel | — | ✅ | ✅ |
+| GetMonitoringReport / NotifyMonitoringReport | — | ✅ | ✅ |
 | NotifyEvent | — | ✅ | ✅ |
 | CustomerInformation / NotifyCustomerInformation | — | ✅ | ✅ |
 | GetTransactionStatus | — | ✅ | ✅ |
-| Open/Close/Adjust/Get PeriodicEventStream, NotifyPeriodicEventStream | — | — | ⬜ |
+| Open/Close/Adjust/Get PeriodicEventStream, NotifyPeriodicEventStream | — | — | ✅ |
 
 - [x] **B5.1** Log upload — `GetLog` (2.x) and `GetDiagnostics` (1.6J) end to end, on top of
       [B3.1](#b3--firmware-management-r12)'s `FileTransfer`. Implemented against the vendored
@@ -1117,8 +1144,34 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
       `TargetDelta`/`TargetDeltaRelative` monitor types (2.1's V2X-flavoured monitors, which need a
       `Target` attribute this device model never sets) - a `SetVariableMonitoring` naming one of
       those is refused `UnsupportedMonitorType` rather than silently downgraded to something else.
-- [ ] **B5.3** Monitoring report generation, chunked like `NotifyReport`
+- [x] **B5.3** Monitoring report generation, chunked like `NotifyReport`
       already is.
+
+      `SetMonitoringBase`, `SetMonitoringLevel`, `GetMonitoringReport` and
+      `NotifyMonitoringReport` on 2.0.1 and 2.1, on top of [B5.2](#b5--diagnostics-and-monitoring-r14)'s
+      existing `VariableMonitorStore` rather than a second copy of the same state.
+      `GetMonitoringReport` filters by `monitoringCriteria`/`componentVariable` with the same OR
+      semantics `crate::reporting::handle_get_report` uses, groups matches per
+      (component, variable), and chunks the answer through the *same* `seqNo`/`tbc`/`requestId`
+      scheme and `REPORT_CHUNK_SIZE` constant `crate::reporting::chunk_report` established — one
+      chunking scheme in the crate, not two. Registered through a new
+      `ChargePointBuilder::monitoring_reports`, kept separate from `::variable_monitoring` the way
+      `device_model`/`configuration` already split.
+
+      The two setters **do something**, which is the part worth checking rather than assuming.
+      `SetMonitoringBase(FactoryDefault | HardWiredOnly)` actually clears every CSMS-installed
+      monitor; `SetMonitoringLevel`'s severity threshold is enforced live in
+      `run_variable_monitor_events`/`run_periodic_variable_monitors` before each `NotifyEvent`,
+      not merely stored. A handler that returned `Accepted` and changed nothing would be lying to
+      the CSMS.
+
+      **Two honest caveats.** `FactoryDefault` and `HardWiredOnly` both reduce to "clear every
+      CSMS monitor" because this crate has no concept of hardwired or factory-preconfigured
+      monitors to revert *to* — a real difference from the spec's intent, and it stays until such
+      monitors exist. And the live severity gate inside the two loop functions has **no test**:
+      `VariableMonitorStore::is_reportable` is unit-tested directly, but neither loop has a mock
+      notifier fixture (none existed before this task either), so an inverted comparison there
+      would not be caught. Named because the behaviour is claimed above.
 - [x] **B5.4** `GetTransactionStatus` (2.x only — 1.6J has no such message) —
       implemented against the vendored spec's E14 "Check transaction status"
       use case and its E14.FR.01–.08.
@@ -1219,7 +1272,32 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
       today. Builder-only rather than folded into `setup()`, matching B5.4's
       `get_transaction_status` - so a future slower customer-data source can
       still slot in here without changing `setup()`'s signature.
-- [ ] **B5.6** 2.1 periodic event streams.
+- [x] **B5.6** 2.1 periodic event streams.
+
+      All five: `OpenPeriodicEventStream`, `ClosePeriodicEventStream`, `AdjustPeriodicEventStream`,
+      `GetPeriodicEventStream` inbound and `NotifyPeriodicEventStream` outbound, 2.1-only. A new
+      `PeriodicEventStreamStore` (bounded by a new `StateLimits::max_periodic_event_streams`,
+      default 4) mutated only through three new `ChargePointEvent` variants, mirroring
+      `TariffStore`/`DisplayMessageStore`. `run_periodic_event_streams` is the driver — a
+      fixed-interval sweep shaped like `run_periodic_variable_monitors`/`run_reservation_expiry`,
+      and **skipped while the clock is unsynchronized**, since a station that does not know the
+      time should not be stamping periodic samples with a guess.
+
+      Upstream naming trap, confirmed rather than assumed: `ocpp-client` 0.5.0 generates the
+      outbound action as `NotifyPeriodicEventStreamAction` (the bare name collides with its own
+      payload type) while the method stays `send_notify_periodic_event_stream`. This is exactly
+      what defeated the old Appendix A name-match sweep — see its reconciliation note.
+
+      Gated behind the previously-inert `periodic-event-stream` feature and
+      `Capabilities::periodic_event_stream`, now wired into `CAPABILITY_GATES` and
+      `REFUSAL_GATES`. The refusal shapes split by response schema: `Open`/`Adjust` refuse through
+      `GenericStatusEnum`, while `Close`/`Get` must refuse with a CALLERROR because neither
+      response type has a status field to say no with.
+
+      **Not done:** OCPP's `values` batching parameter (how many samples to carry per send) is
+      parsed, stored and reported faithfully via `GetPeriodicEventStream`, but the driver always
+      emits one data element per sweep with `pending: 0` — this crate has no sample-buffering
+      infrastructure to batch on top of yet. Documented at the module level, not silent.
 
 ### B6 — Display message (R§15)
 
@@ -1371,8 +1449,41 @@ unblocked this block.
       `GetDERControl`/`SetDERControl` (no longer 🔒 — `ocpp-client` 0.2.2 generates both; see
       [B2.6](#b2--smart-charging-r11)). Feature-flagged; needs bidirectional
       power hardware.
-- [ ] **B8.3** Battery swap (2.1): `BatterySwap`, `RequestBatterySwap`.
+- [x] **B8.3** Battery swap (2.1): `BatterySwap`, `RequestBatterySwap`.
       Feature-flagged; niche hardware.
+
+      `BatterySwap` outbound and `RequestBatterySwap` inbound, behind the `battery-swap` feature
+      and the `battery_swap` runtime capability (both of which existed as inert placeholders and
+      now gate real code). State is a bounded `BatterySwapStore` of `PendingBatterySwap` requests
+      correlated by OCPP's `requestId` with reported `BatterySwapEvent`s
+      (`BatteryIn`/`BatteryOut`/`BatteryOutTimeout`). It tracks only the half that must survive
+      between the two CALLs, because OCPP defines no wire-level "swap in progress" status to
+      mirror — inventing one would be modelling something the protocol does not have.
+
+      `soC`/`soH` are stored as formatted decimal strings rather than `f64` so `ChargePointEvent`/
+      `ChargePointEffect` can keep deriving `Eq`, following `TriggeredMonitor::actual_value`'s
+      existing precedent rather than weakening the event type for one field. The hardware surface
+      is one small trait, `hardware::BatterySwapStation::prepare_swap`, with a
+      `NoBatterySwapStation` that refuses honestly. `handle_request_battery_swap` **rolls back the
+      pending-store entry when the station's own preparation fails**, so a `Rejected` CALLRESULT
+      never leaves a dangling entry behind it. Builder-only registration
+      (`ChargePointBuilder::battery_swap`), matching certificates and display messages, since it
+      needs hardware `setup()`'s signature cannot receive.
+
+      `ctrlr_component` is `None` in `CAPABILITY_GATES`, and the reason generalizes well beyond
+      this row: **`docs/OCPP-2.1/` is gitignored** (`.gitignore:18`), so it exists only in a
+      working copy someone populated by hand. Any fresh clone, CI job or git worktree sees a
+      `docs/` with no spec material in it at all. The agent that wrote this block was working in a
+      worktree, could not open the appendix, and correctly declined to guess a `*Ctrlr` name —
+      taking semantics from the generated `ocpp-types` 0.3.0 source instead, which is
+      schema-derived and authoritative for message shape, but says nothing about device-model
+      component naming.
+
+      This is worth fixing at the root rather than per-row. Every "verify vs the vendored spec"
+      instruction in these documents — including [H3.5](#103-h3--compliance)'s whole sweep and
+      [H3.2](#103-h3--compliance)'s part-6 checklist — silently assumes a directory that is not in
+      the repository. Either vendor the appendices for real (licensing permitting) or state
+      plainly that they must be fetched separately and name where from.
 
 ---
 
@@ -2358,8 +2469,38 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
 ### 8.5 F5 — Hardening
 
 - [ ] **F5.1** Threat model document — a certification auditor will ask.
-- [ ] **F5.2** Reject oversized/malformed payloads before allocation;
+- [x] **F5.2** Reject oversized/malformed payloads before allocation;
       `MemoryExhaustion` event when limits are hit.
+
+      `crate::payload_limit`: a configurable inbound frame ceiling (`PayloadLimits`, set through
+      `ChargePointBuilder` and `connect_and_setup`) enforced by a `SizeLimitedStream` that wraps
+      `ocpp_client::TransportStream`, plus a `MemoryExhaustion` security event on every refusal.
+      Deliberately transport-agnostic — it needs only `TransportStream`, which is behind no Cargo
+      feature — so an embedded integrator supplying their own transport to `setup()` wraps it the
+      same way without pulling in this crate's WebSocket wiring.
+
+      **"Before allocation" is honoured only partially, and the module says so at length rather
+      than claiming the row outright.** Investigating `ocpp-client` 0.5.0's real surface (not the
+      roadmap's description of it) established two things: it passes `None` for
+      `tokio_tungstenite`'s `WebSocketConfig`, hard-coding tungstenite's 64 MiB message ceiling
+      with nothing in `ConnectOptions` reaching it; and its read loop runs
+      `serde_json::from_str::<Value>` — a full JSON DOM — before it knows which action a CALL
+      even names. Both allocations happen inside `ocpp-client` before any code here runs.
+
+      So on the **initial** dial, which `ocpp_client::connect*` builds, this crate has no hook and
+      does not pretend to. On every **redial** it does: `network_switch::ConnectionTarget::dial`
+      goes through the public `websocket_transport`, which hands back the raw sink/stream halves
+      before a `Client` exists, and an oversized frame there is dropped without ever reaching
+      either deserialization. What that actually buys is the *second* and far more expensive
+      allocation — the sized Rust structures, where [D2.3](#62-d2--type-completeness-audit)'s
+      56 KB `ChargingProfile` lives — not the first. Lowering the 64 MiB frame ceiling and adding
+      a pre-parse hook are upstream asks, recorded here rather than worked around locally per
+      `CLAUDE.md`.
+
+      Note the **breaking change**: `connect_and_setup` takes a new `Option<PayloadLimits>`
+      parameter, threaded through five existing call sites. Malformed payloads are covered by
+      `tests/malformed_payload.rs` and the ceiling by `tests/payload_size_limit.rs`, both against
+      the real socket harness rather than a unit test of a comparison.
 - [ ] **F5.3** Replay protection where the spec requires it
       (`AttemptedReplayAttacks`).
 - [ ] **F5.4** Secure-boot integration points for integrators that have it.
@@ -3118,6 +3259,25 @@ project. 2.1's setpoints, discharge limits and per-phase asymmetries are parsed 
 > log upload; variable monitoring. A field unit can be updated and
 > diagnosed remotely — without this, every fault is a truck roll.
 
+**Progress (2026-08-09).** Two of the four exit criteria are met: **log upload** landed with
+[B5.1](#b5--diagnostics-and-monitoring-r14), and **variable monitoring** is now complete end to
+end — [B5.2](#b5--diagnostics-and-monitoring-r14)'s engine plus
+[B5.3](#b5--diagnostics-and-monitoring-r14)'s reports and monitoring base/level.
+[B3.4](#b3--firmware-management-r12) and [F5.2](#85-f5--hardening) also landed. That leaves nine
+open tasks, and they form one chain rather than nine independent items:
+
+> [F2.4](#82-f2--tls) secure key storage → [B4.3](#b4--certificates-and-iso-15118-r1-r13) CSR /
+> `SignCertificate` round trip → [F1.3](#81-f1--security-profiles) security profile 3 (mutual
+> TLS) and [F3.2](#83-f3--credentials) renewal-before-expiry
+
+**[F2.4](#82-f2--tls) is the head of it and blocks the most.** Nothing else in M4 is waiting on
+anything: [F2.2](#82-f2--tls) (trust store) is unblocked now that B4.1 has landed,
+[B3.3](#b3--firmware-management-r12) needs signature verification this crate has no crypto for
+yet, [B4.4](#b4--certificates-and-iso-15118-r1-r13) is OCSP, and
+[F5.1](#85-f5--hardening)/[F5.3](#85-f5--hardening)/[F5.4](#85-f5--hardening) are independent
+hardening items. **Signed firmware over the air** — the exit criterion with the most product
+value — needs B3.3, which in practice needs the same certificate machinery. Start at F2.4.
+
 ### M5 — Full coverage and certification
 
 [B6](#b6--display-message-r15) display · [B7](#b7--tariff-cost-and-payment-r9) tariff/payment · [B8.2](#b8--reservation-derv2x-battery-swap)–[B8.3](#b8--reservation-derv2x-battery-swap) DER, battery swap ·
@@ -3131,6 +3291,21 @@ Everything in M5 is capability-gated and hardware-dependent — a given
 product ships the subset its hardware supports. M5 completes the *library*,
 not every deployment.
 
+**Progress (2026-08-09).** [B5.6](#b5--diagnostics-and-monitoring-r14) (periodic event streams)
+and [B8.3](#b8--reservation-derv2x-battery-swap) (battery swap) are done, alongside
+[B6](#b6--display-message-r15) and [B7.1](#b7--tariff-cost-and-payment-r9) earlier. What is left
+in M5 splits cleanly in two, and the halves want different treatment:
+
+- **Hardware-dependent blocks** — [B8.2](#b8--reservation-derv2x-battery-swap) DER/V2X (8
+  messages, the single largest remaining gap on 2.1),
+  [B4.5](#b4--certificates-and-iso-15118-r1-r13) ISO 15118 and
+  [B7.2](#b7--tariff-cost-and-payment-r9) payment. Each ships only where the hardware exists.
+- **Process** — [H3](#103-h3--compliance)–[H5](#105-h5--release), 15 of M5's remaining tasks and
+  not one of them a functional block. [H3.2](#103-h3--compliance) and
+  [H3.5](#103-h3--compliance) both depend on spec material that is **gitignored** and therefore
+  absent from any clone; see [B8.3](#b8--reservation-derv2x-battery-swap) for what that broke in
+  practice. Settle that before scheduling either.
+
 ---
 
 ## Appendix A — verified message inventory
@@ -3141,27 +3316,35 @@ plus files under a path of that name), matched against the action names
 `ocpp-client` **0.5.0** generates per version. Re-run it after any coverage
 work; it's the honest number.
 
-**Last re-counted 2026-08-08**, and the previous count was badly stale: it
-predated B5.2–B5.5, B6 and B7.1, so it listed display messages, variable
-monitoring, customer information, `GetTransactionStatus` and the whole 2.1
-tariff set as missing when the B-tables above already marked them ✅. 2.0.1
-moved 39 → 49 and 2.1 moved 43 → 57 on re-count, with no code written. The
-lesson is the one this appendix already states — re-run it after coverage work,
-which had not been happening.
+**Last re-counted 2026-08-09**, after B3.4, B5.3, B5.6 and B8.3 landed together.
 
 | Version | Wired | Total | Remaining |
 |---------|------:|------:|----------:|
 | 1.6J | 28 | 39 | 11 |
-| 2.0.1 | 49 | 64 | 15 |
-| 2.1 | 57 | 91 | 34 |
-| **All three** | **134** | **194** | **60** |
+| 2.0.1 | 56 | 64 | 8 |
+| 2.1 | 71 | 91 | 20 |
+| **All three** | **155** | **194** | **39** |
+
+Two traps this sweep has now hit twice, both worth knowing before trusting a
+future re-count:
+
+- **A name-match sweep is not enough.** `ocpp-client` generates
+  `NotifyPeriodicEventStream` as `NotifyPeriodicEventStreamAction` (the bare name
+  collides with its own payload type) while the method stays
+  `send_notify_periodic_event_stream`. Matching action names to method names
+  needs that special case, or the message reads as unwired when it is not — which
+  is exactly what produced the old "three unaudited messages" residue, alongside
+  `GetDERControl`/`SetDERControl`.
+- **The count goes stale silently.** Before 2026-08-08 this appendix had not been
+  re-run since before B5.2–B5.5, B6 and B7.1, and understated 2.x coverage by 24
+  messages. Nothing failed; the number just quietly stopped being true.
 
 ### A.1 OCPP 1.6J — 28 of 39 wired
 
-**The core profile is complete.** Every message OCPP 1.6J's core profile defines is handled;
-the denominator moved because `ocpp-client` 0.4.0 added the security whitepaper set to its 1.6
-action list, raising it from 28 actions to 39. All 11 gaps are that set, and they are one
-decision — [D2.2](#62-d2--type-completeness-audit) — rather than eleven pieces of work.
+**The core profile is complete.** Every message OCPP 1.6J's core profile defines is handled; the
+denominator moved because `ocpp-client` 0.4.0 added the security whitepaper set to its 1.6 action
+list, raising it from 28 actions to 39. All 11 gaps are that set, and they are one decision —
+[D2.2](#62-d2--type-completeness-audit) — rather than eleven pieces of work.
 
 **Wired:** Authorize, BootNotification, CancelReservation, ChangeAvailability,
 ChangeConfiguration, ClearCache, ClearChargingProfile, DataTransfer,
@@ -3176,72 +3359,75 @@ GetInstalledCertificateIds, GetLog, InstallCertificate, LogStatusNotification,
 SecurityEventNotification, SignCertificate, SignedFirmwareStatusNotification,
 SignedUpdateFirmware
 
-### A.2 OCPP 2.0.1 — 49 of 64 wired
+### A.2 OCPP 2.0.1 — 56 of 64 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation, ChangeAvailability, ClearCache,
 ClearChargingProfile, ClearDisplayMessage, ClearVariableMonitoring, CostUpdated,
 CustomerInformation, DataTransfer, DeleteCertificate, FirmwareStatusNotification,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetDisplayMessages,
-GetInstalledCertificateIds, GetLocalListVersion, GetLog, GetReport, GetTransactionStatus,
-GetVariables, Heartbeat, InstallCertificate, LogStatusNotification, MeterValues,
-NotifyCustomerInformation, NotifyDisplayMessages, NotifyEvent, NotifyReport,
+GetInstalledCertificateIds, GetLocalListVersion, GetLog, GetMonitoringReport, GetReport,
+GetTransactionStatus, GetVariables, Heartbeat, InstallCertificate, LogStatusNotification,
+MeterValues, NotifyCustomerInformation, NotifyDisplayMessages, NotifyEvent,
+NotifyMonitoringReport, NotifyReport, PublishFirmware, PublishFirmwareStatusNotification,
 ReportChargingProfiles, RequestStartTransaction, RequestStopTransaction,
 ReservationStatusUpdate, ReserveNow, Reset, SecurityEventNotification, SendLocalList,
-SetChargingProfile, SetDisplayMessage, SetNetworkProfile, SetVariableMonitoring, SetVariables,
-StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector, UpdateFirmware
+SetChargingProfile, SetDisplayMessage, SetMonitoringBase, SetMonitoringLevel,
+SetNetworkProfile, SetVariableMonitoring, SetVariables, StatusNotification, TransactionEvent,
+TriggerMessage, UnlockConnector, UnpublishFirmware, UpdateFirmware
 
-**Missing**, and it falls into exactly four blocks:
+**Missing** — now just two blocks:
 
 | Block | Messages | Owner |
 |-------|----------|-------|
 | Certificates / ISO 15118 | CertificateSigned, SignCertificate, GetCertificateStatus, Get15118EVCertificate | [B4.3](#b4--certificates-and-iso-15118-r1-r13)–[B4.5](#b4--certificates-and-iso-15118-r1-r13) |
-| Monitoring reports | GetMonitoringReport, NotifyMonitoringReport, SetMonitoringBase, SetMonitoringLevel | [B5.3](#b5--diagnostics-and-monitoring-r14) |
 | Smart-charging notifications | NotifyChargingLimit, ClearedChargingLimit, NotifyEVChargingNeeds, NotifyEVChargingSchedule | [B2](#b2--smart-charging-r11) residue |
-| Firmware publishing | PublishFirmware, UnpublishFirmware, PublishFirmwareStatusNotification | [B3.4](#b3--firmware-management-r12) |
 
-### A.3 OCPP 2.1 — 57 of 91 wired
+That second block has no numbered task of its own — B2 is otherwise complete — so it is the one
+piece of remaining 2.0.1 coverage nothing in Workstream B currently owns. Worth giving a row.
 
-**Wired:** Authorize, BootNotification, CancelReservation, ChangeAvailability,
-ChangeTransactionTariff, ClearCache, ClearChargingProfile, ClearDisplayMessage, ClearTariffs,
-ClearVariableMonitoring, CostUpdated, CustomerInformation, DataTransfer, DeleteCertificate,
+### A.3 OCPP 2.1 — 71 of 91 wired
+
+**Wired:** AdjustPeriodicEventStream, Authorize, BatterySwap, BootNotification,
+CancelReservation, ChangeAvailability, ChangeTransactionTariff, ClearCache,
+ClearChargingProfile, ClearDisplayMessage, ClearTariffs, ClearVariableMonitoring,
+ClosePeriodicEventStream, CostUpdated, CustomerInformation, DataTransfer, DeleteCertificate,
 FirmwareStatusNotification, GetBaseReport, GetChargingProfiles, GetCompositeSchedule,
-GetDisplayMessages, GetInstalledCertificateIds, GetLocalListVersion, GetLog, GetReport,
-GetTariffs, GetTransactionStatus, GetVariables, Heartbeat, InstallCertificate,
-LogStatusNotification, MeterValues, NotifyCustomerInformation, NotifyDisplayMessages,
-NotifyEvent, NotifyPriorityCharging, NotifyReport, PullDynamicScheduleUpdate,
-ReportChargingProfiles, RequestStartTransaction, RequestStopTransaction,
+GetDisplayMessages, GetInstalledCertificateIds, GetLocalListVersion, GetLog,
+GetMonitoringReport, GetPeriodicEventStream, GetReport, GetTariffs, GetTransactionStatus,
+GetVariables, Heartbeat, InstallCertificate, LogStatusNotification, MeterValues,
+NotifyCustomerInformation, NotifyDisplayMessages, NotifyEvent, NotifyMonitoringReport,
+NotifyPeriodicEventStream, NotifyPriorityCharging, NotifyReport, OpenPeriodicEventStream,
+PublishFirmware, PublishFirmwareStatusNotification, PullDynamicScheduleUpdate,
+ReportChargingProfiles, RequestBatterySwap, RequestStartTransaction, RequestStopTransaction,
 ReservationStatusUpdate, ReserveNow, Reset, SecurityEventNotification, SendLocalList,
-SetChargingProfile, SetDefaultTariff, SetDisplayMessage, SetNetworkProfile,
-SetVariableMonitoring, SetVariables, StatusNotification, TransactionEvent, TriggerMessage,
-UnlockConnector, UpdateDynamicSchedule, UpdateFirmware, UsePriorityCharging
+SetChargingProfile, SetDefaultTariff, SetDisplayMessage, SetMonitoringBase,
+SetMonitoringLevel, SetNetworkProfile, SetVariableMonitoring, SetVariables,
+StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector, UnpublishFirmware,
+UpdateDynamicSchedule, UpdateFirmware, UsePriorityCharging
 
-**Missing**, grouped the same way. 2.0.1's four blocks all recur here, plus four that are
-2.1-only:
+**Missing:**
 
 | Block | Messages | Owner |
 |-------|----------|-------|
-| Certificates / ISO 15118 | CertificateSigned, SignCertificate, GetCertificateStatus, Get15118EVCertificate, GetCertificateChainStatus | [B4.3](#b4--certificates-and-iso-15118-r1-r13)–[B4.5](#b4--certificates-and-iso-15118-r1-r13) |
-| Monitoring reports | GetMonitoringReport, NotifyMonitoringReport, SetMonitoringBase, SetMonitoringLevel | [B5.3](#b5--diagnostics-and-monitoring-r14) |
-| Smart-charging notifications | NotifyChargingLimit, ClearedChargingLimit, NotifyEVChargingNeeds, NotifyEVChargingSchedule | [B2](#b2--smart-charging-r11) residue |
-| Firmware publishing | PublishFirmware, UnpublishFirmware, PublishFirmwareStatusNotification | [B3.4](#b3--firmware-management-r12) |
 | DER control / V2X | GetDERControl, SetDERControl, ClearDERControl, ReportDERControl, NotifyDERAlarm, NotifyDERStartStop, AFRRSignal, NotifyAllowedEnergyTransfer | [B8.2](#b8--reservation-derv2x-battery-swap) |
-| Periodic event streams | OpenPeriodicEventStream, ClosePeriodicEventStream, AdjustPeriodicEventStream, GetPeriodicEventStream, NotifyPeriodicEventStream | [B5.6](#b5--diagnostics-and-monitoring-r14) |
+| Certificates / ISO 15118 | CertificateSigned, SignCertificate, GetCertificateStatus, Get15118EVCertificate, GetCertificateChainStatus | [B4.3](#b4--certificates-and-iso-15118-r1-r13)–[B4.5](#b4--certificates-and-iso-15118-r1-r13) |
+| Smart-charging notifications | NotifyChargingLimit, ClearedChargingLimit, NotifyEVChargingNeeds, NotifyEVChargingSchedule | [B2](#b2--smart-charging-r11) residue |
 | Payment / settlement | NotifySettlement, NotifyWebPaymentStarted, VatNumberValidation | [B7.2](#b7--tariff-cost-and-payment-r9) |
-| Battery swap | BatterySwap, RequestBatterySwap | [B8.3](#b8--reservation-derv2x-battery-swap) |
 
-**Inventory reconciliation.** All three versions now reconcile exactly: 28 + 11 = 39,
-49 + 15 = 64, 57 + 34 = 91. The **three-message residue** the previous count could not
-account for is resolved — it was `GetDERControl`, `SetDERControl` and
-`NotifyPeriodicEventStream`, the last of which `ocpp-client` generates as
-`NotifyPeriodicEventStreamAction` (the bare name collides with its own stream type), which is
-why a name-match sweep missed it. Nothing is unaudited any more, so
-[H3.5](#103-h3--compliance)'s sweep no longer inherits this.
+**Inventory reconciliation.** All three versions reconcile exactly: 28 + 11 = 39, 56 + 8 = 64,
+71 + 20 = 91. Nothing is unaudited, so [H3.5](#103-h3--compliance)'s sweep does not inherit a
+residue.
 
-**No message is missing an action wrapper.** This list used to name four
-(SetDisplayMessage, GetDERControl, SetDERControl, UpdateDynamicSchedule) plus TriggerMessage;
-the pinned `ocpp-client` is **0.5.0** and generates 39 / 64 / 91 actions including every one of
-them. Every remaining gap in this appendix is this crate's own to close — with the single
-exception of 1.6J's eleven, whose *types* are absent upstream ([D2.2](#62-d2--type-completeness-audit)).
+**No message is missing an action wrapper.** The pinned `ocpp-client` is **0.5.0** and generates
+39 / 64 / 91 actions. Every remaining gap is this crate's own to close — with the single
+exception of 1.6J's eleven, whose *types* are absent upstream
+([D2.2](#62-d2--type-completeness-audit)).
+
+**What the remaining 39 are made of.** Ten are DER/V2X and battery-adjacent 2.1 blocks that need
+hardware most products will never have. Eleven are 1.6J's one upstream decision. Nine are
+certificates, which is [M4](#m4--security-and-remote-management)'s critical path. The last eight
+— four smart-charging notifications on each 2.x version — are the odd ones out: small, no
+hardware dependency, and owned by no numbered task.
 
 ### A.4 Other verified figures
 
@@ -3254,6 +3440,6 @@ exception of 1.6J's eleven, whose *types* are absent upstream ([D2.2](#62-d2--ty
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
-| Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 1121 | `#[test]` + `#[tokio::test]`, re-counted after merging the B5.2/B5.5/B6/B7.1/H4.2 worktrees (974 at G1.3/H2.6 and at G4/H2, (963 after merging the B5.4/E2.11/H1.6 worktrees (942 at B4.2, 920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
-| Integration tests | 18 across 7 binaries, plus 2 runnable examples | `tests/` (`connect_2_1_websocket`, `lifecycle`, `get_charging_profiles`, `memory_budget`, `memory_growth`, `network_profile_switch`, `power_cut_recovery`), sharing the H2.1 mock CSMS in `tests/common/` |
+| Protocol trait bounds on `setup()`'s CSMS parameter | 48 (+ `Clone`/`Send`/`Sync`/`'static`) — was 28; B3.4, B5.3 and B5.6 added twenty between them. Exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N`, and a standing argument for [C4.2](#54-c4--builder-refactor)/[C4.3](#54-c4--builder-refactor). | `src/setup.rs` |
+| Test functions in `src/` | 1227 | `#[test]` + `#[tokio::test]`, re-counted after merging the B3.4/B5.3/B5.6/B8.3/F5.2 worktrees (1121 before them; 974 at G1.3/H2.6, 963 after the B5.4/E2.11/H1.6 worktrees, 496 at the M2 boot-reason commit). **Treat a worktree agent's own test-count claim as unverified**: all five of those branches overstated it, by 20-50%, while every other claim they made held up — the number to trust is the `cargo test` delta, not the summary. | `src/` |
+| Integration tests | 21 across 9 binaries, plus 2 runnable examples | `tests/` (`connect_2_1_websocket`, `lifecycle`, `get_charging_profiles`, `malformed_payload`, `memory_budget`, `memory_growth`, `network_profile_switch`, `payload_size_limit`, `power_cut_recovery`), sharing the H2.1 mock CSMS in `tests/common/` |
