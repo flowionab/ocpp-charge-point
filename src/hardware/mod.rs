@@ -7,6 +7,7 @@
 //! responsibility, not something an integrator needs to touch.
 
 mod capabilities;
+mod certificate;
 mod charge_point;
 mod command_executor;
 mod command_receiver;
@@ -20,6 +21,11 @@ mod storage;
 pub use self::capabilities::{
     CAPABILITY_GATES, Capabilities, CapabilityGate, Iso15118SupportLevel,
     supported_feature_profiles_1_6, warn_on_feature_mismatches,
+};
+pub use self::certificate::{
+    CertificateHashData, CertificateStore, CertificateUse, DEFAULT_MAX_CERTIFICATES,
+    DeleteCertificateOutcome, HashAlgorithm, InstallCertificateOutcome, InstalledCertificate,
+    NoCertificateStore, NoCertificateStoreError, StoredCertificates, StoredCertificatesError,
 };
 pub use self::charge_point::ChargePoint;
 pub use self::command_executor::execute_hardware_command;

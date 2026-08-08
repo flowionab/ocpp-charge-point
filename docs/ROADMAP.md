@@ -555,8 +555,15 @@ Secures the OCPP connection and reports security-relevant events.
   implemented on **both 2.1 and 2.0.1**; the certificate messages (`SignCertificate`,
   `CertificateSigned`, `Get15118EVCertificate`, `GetCertificateStatus`,
   `DeleteCertificate`, `InstallCertificate`, `GetInstalledCertificateIds`)
-  are not - no certificate store abstraction exists, and several need real
-  crypto (signing, verification) this crate has no hook for yet. A
+  are not. A **certificate store** now exists (`hardware::CertificateStore`,
+  B4.1) - a trait the integrator implements, so it can sit behind a secure
+  element, with `StoredCertificates` over `hardware::Storage` for hardware
+  without one. The crate never sees a private key: the only question it asks is
+  whether one exists, because security profile 3 needs to know whether a client
+  certificate can be presented and nothing above needs the key. What is still
+  missing is the messages themselves and the crypto several of them need
+  (parsing X.509, computing hashes, signing) - which is why the store takes hash
+  data from whoever parsed the certificate rather than deriving it. A
   `SecurityEvent` (`event_type: SecurityEventType`, `tech_info: Option<
   String>`) is reported via a new `src/security.rs` module, wired the same
   way as every other outbound report: a protocol-agnostic

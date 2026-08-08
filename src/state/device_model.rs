@@ -923,7 +923,9 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         instance: None,
         data_type: VariableDataType::Integer,
         unit: None,
-        // No certificate store exists yet (B4.1), so it holds none.
+        // Zero until an integrator wires a `hardware::CertificateStore` (B4.1). The store now
+        // exists; what this crate cannot do is know how many certificates *someone else's*
+        // implementation holds without being handed one, so the honest default is none.
         value: "0",
         mutability: VariableMutability::ReadOnly,
         persistent: false,

@@ -898,8 +898,44 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 | GetCertificateChainStatus | — | — | ⬜ |
 | Get15118EVCertificate | — | ⬜ | ⬜ |
 
-- [ ] **B4.1** Certificate store abstraction (depends on [E1](#71-e1--storage-trait); on
-      real hardware this should be able to sit behind a secure element).
+- [x] **B4.1** Certificate store abstraction — `hardware::CertificateStore`, with
+      `CertificateUse`, `CertificateHashData`, the two outcome enums, a `NoCertificateStore`
+      fallback and `StoredCertificates` over [E1](#71-e1--storage-trait)'s `Storage`.
+
+      **The secure-element note in this row's own text is what shaped it.** A secure element holds
+      a private key and will not give it back — it signs on request and the key never leaves the
+      chip. Any design where this crate reads a key out of storage and hands it to a TLS stack has
+      already given that up. So the store is a **trait the integrator implements**, and the crate
+      never sees a private key at all: the only question it asks is `has_private_key()`, a yes/no,
+      because security profile 3 needs to know whether a client certificate *can* be presented and
+      nothing above needs the key itself.
+
+      `StoredCertificates` is the ready-made implementation over `Storage` for the many charge
+      points with no secure element — which is the sense in which B4.1 "depends on E1". It answers
+      `has_private_key()` **false**, and that is not a stub: a key in ordinary flash is a key an
+      attacker holding the flash has, so a station needing profile 3 wants a secure-element-backed
+      implementation of the trait instead. It is bounded (G2.2, 10 by default), replaces rather
+      than duplicates on reinstall, survives a reboot, and comes up empty on a corrupt index rather
+      than refusing to come up — a charge point that cannot read its certificates should let the
+      CSMS reinstall them.
+
+      Certificates are addressed by **hash**, not by a local id, because that is how
+      `DeleteCertificate` and `GetInstalledCertificateIds` address them; inventing an id would only
+      have to be mapped back. The hashes are computed by whoever parses the certificate, since that
+      means parsing X.509 and hashing DER — crypto this crate does not have. `StoredCertificates`
+      therefore refuses the bare `install` (a certificate with no hash data would be unaddressable
+      and so undeletable, which is worse than refusing it) and offers `install_with_hash` for an
+      integrator that can parse but has no secure element.
+
+      The charge point's **own** certificates (`ChargingStation`, `V2GCertificateChain`) are
+      listable but not installable: they arrive by `CertificateSigned` in answer to a CSR, so
+      accepting one through `InstallCertificate` would mean accepting a certificate for a key pair
+      this charge point may not hold.
+
+      **Unblocks** [B4.2](#b4--certificates-and-iso-15118-r1-r13)–B4.4,
+      [E2.9](#72-e2--what-must-survive), [F1.3](#81-f1--security-profiles),
+      [F2.2](#82-f2--tls) and [F3.2](#83-f3--credentials). Nothing wires it yet — the messages are
+      B4.2.
 - [ ] **B4.2** Install / delete / enumerate, per certificate-use type.
 - [ ] **B4.3** CSR generation and `SignCertificate` → `CertificateSigned`
       round trip, including automatic renewal before expiry.
@@ -1619,7 +1655,7 @@ mid-transaction currently loses the transaction.
       the blocks that would (`GetLog`, customer-information erasure) are [B5.1](#b5--diagnostics-and-monitoring-r14)/[B5.5](#b5--diagnostics-and-monitoring-r14) - which is
       the honest remaining half of [F4.3](#84-f4--security-events): the durable log exists, the `GetLog` reader
       does not.
-- [ ] **E2.9** Certificates — still blocked on [B4.1](#b4--certificates-and-iso-15118-r1-r13),
+- [ ] **E2.9** Certificates — **no longer blocked**: [B4.1](#b4--certificates-and-iso-15118-r1-r13)'s `StoredCertificates` is already `Storage`-backed and survives a reboot, so this row is now about a secure-element-backed store's own durability rather than about a store existing. Formerly blocked on
       which does not exist.
 - [ ] **E2.11** Network profiles. **No longer blocked** —
       [B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)'s slot store landed
@@ -2745,5 +2781,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 909 | `#[test]` + `#[tokio::test]`, re-counted at the F1–F3 commit (895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 920 | `#[test]` + `#[tokio::test]`, re-counted at the B4.1 commit (909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |
