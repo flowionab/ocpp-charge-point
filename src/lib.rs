@@ -26,6 +26,11 @@ extern crate alloc;
 pub mod actor;
 pub mod authorization;
 pub mod availability;
+/// Battery Swap functional block (OCPP 2.1 only, `docs/PRODUCTION-ROADMAP.md` B8.3):
+/// `RequestBatterySwap`/`BatterySwap`, for battery-swap station hardware. Behind the
+/// `battery-swap` Cargo feature - see [`battery_swap`]'s own docs for why.
+#[cfg(feature = "battery-swap")]
+pub mod battery_swap;
 mod builder;
 pub mod certificates;
 pub mod clock;

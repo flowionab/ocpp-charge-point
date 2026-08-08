@@ -1,5 +1,6 @@
 mod authorization_cache;
 mod authorization_status;
+mod battery_swap;
 mod boot_reason;
 mod charge_point_state;
 mod charging_profile;
@@ -26,6 +27,10 @@ pub use self::authorization_cache::{
     AuthorizationCache, AuthorizationCacheEntry, DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
 };
 pub use self::authorization_status::AuthorizationStatus;
+pub use self::battery_swap::{
+    BatteryData, BatterySwapEvent, BatterySwapEventKind, BatterySwapRequestId, BatterySwapStore,
+    DEFAULT_MAX_PENDING_BATTERY_SWAPS, PendingBatterySwap,
+};
 pub use self::boot_reason::BootReasonCause;
 pub use self::charge_point_state::{ChargePointState, LifecycleState, TimeSyncAnchor};
 pub use self::charging_profile::{

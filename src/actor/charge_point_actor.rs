@@ -1,8 +1,8 @@
 use crate::executor::Executor;
 use crate::state::{
-    AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
-    ConnectorStatusChanged, HardwareCommand, PriorityChargingChange, ReservationUpdate, ResetKind,
-    SecurityEvent, TransactionEventOccurred, TriggeredMonitor,
+    AuthorizationRequested, BatterySwapEvent, ChargePointEffect, ChargePointEvent,
+    ChargePointState, ConnectorStatusChanged, HardwareCommand, PriorityChargingChange,
+    ReservationUpdate, ResetKind, SecurityEvent, TransactionEventOccurred, TriggeredMonitor,
 };
 use crate::sync::{
     BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
@@ -40,6 +40,7 @@ struct EffectSenders {
     reservation_updates: BroadcastSender<ReservationUpdate>,
     priority_charging_changes: BroadcastSender<PriorityChargingChange>,
     variable_monitor_events: BroadcastSender<TriggeredMonitor>,
+    battery_swap_events: BroadcastSender<BatterySwapEvent>,
 }
 
 /// An error sending an event to a [`ChargePointActor`].
@@ -77,6 +78,7 @@ pub struct ChargePointActor {
     reservation_updates: BroadcastSender<ReservationUpdate>,
     priority_charging_changes: BroadcastSender<PriorityChargingChange>,
     variable_monitor_events: BroadcastSender<TriggeredMonitor>,
+    battery_swap_events: BroadcastSender<BatterySwapEvent>,
     // A plain shared cell rather than a `Watch` - this is a settable-once, read-many hook, not a
     // stream of values anything needs to await a *change* in. See `set_boot_reason_recorder`'s
     // docs for what it's for and why `crate::reset::handle_reset` needs a synchronous way to
@@ -142,6 +144,7 @@ impl ChargePointActor {
         let reservation_updates = broadcast_channel();
         let priority_charging_changes = broadcast_channel();
         let variable_monitor_events = broadcast_channel();
+        let battery_swap_events = broadcast_channel();
         let effects = EffectSenders {
             commands: commands.clone(),
             status_notifications: status_notifications.clone(),
@@ -151,6 +154,7 @@ impl ChargePointActor {
             reservation_updates: reservation_updates.clone(),
             priority_charging_changes: priority_charging_changes.clone(),
             variable_monitor_events: variable_monitor_events.clone(),
+            battery_swap_events: battery_swap_events.clone(),
         };
         executor.spawn(Box::pin(run(
             state,
@@ -171,6 +175,7 @@ impl ChargePointActor {
             reservation_updates,
             priority_charging_changes,
             variable_monitor_events,
+            battery_swap_events,
             boot_reason_recorder: Arc::new(BlockingMutex::new(RefCell::new(None))),
         }
     }
@@ -280,6 +285,13 @@ impl ChargePointActor {
         self.variable_monitor_events.subscribe()
     }
 
+    /// Subscribes to every battery-swap lifecycle event hardware reports - forwarded to the CSMS
+    /// via `BatterySwap` by the Battery Swap functional block (see
+    /// [`crate::battery_swap::run_battery_swap_events`]). **2.1 only.**
+    pub fn subscribe_battery_swap_events(&self) -> BroadcastReceiver<BatterySwapEvent> {
+        self.battery_swap_events.subscribe()
+    }
+
     /// Installs `recorder`, called by [`crate::reset::handle_reset`] with the accepted `Reset`'s
     /// `ResetKind` synchronously *before* the `ResetRequested` event that may immediately produce
     /// a `HardwareCommand::Reboot` is sent to this actor - so a durable-storage-backed `recorder`
@@ -354,6 +366,9 @@ async fn run(
                 }
                 ChargePointEffect::VariableMonitorTriggered(triggered) => {
                     effects.variable_monitor_events.send(triggered);
+                }
+                ChargePointEffect::BatterySwapEventOccurred(event) => {
+                    effects.battery_swap_events.send(event);
                 }
             }
         }

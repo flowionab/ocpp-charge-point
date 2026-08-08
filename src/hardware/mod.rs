@@ -6,6 +6,8 @@
 //! protocol handling, state machines, transaction lifecycle, and networking are this crate's own
 //! responsibility, not something an integrator needs to touch.
 
+#[cfg(feature = "battery-swap")]
+mod battery_swap;
 mod capabilities;
 mod certificate;
 mod charge_point;
@@ -22,6 +24,8 @@ mod firmware;
 mod storage;
 mod watchdog;
 
+#[cfg(feature = "battery-swap")]
+pub use self::battery_swap::{BatterySwapStation, NoBatterySwapStation, NoBatterySwapStationError};
 pub use self::capabilities::{
     CAPABILITY_GATES, Capabilities, CapabilityGate, Iso15118SupportLevel,
     supported_feature_profiles_1_6, warn_on_feature_mismatches,

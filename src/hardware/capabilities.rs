@@ -246,6 +246,20 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         feature_profile_1_6: Some("FirmwareManagement"),
         has_handler: false,
     },
+    CapabilityGate {
+        name: "battery_swap",
+        cargo_feature: "battery-swap",
+        enabled: |c| c.battery_swap,
+        // No vendored OCPP 2.1 device-model appendix in this checkout to confirm a dedicated
+        // `*Ctrlr` component name for battery swap against - recorded as `None` rather than
+        // guessing at a name this crate can't verify (see `ctrlr_component`'s docs).
+        ctrlr_component: None,
+        // 2.1-only - no battery-swap messages exist before 2.1, so 1.6J has no profile for it.
+        feature_profile_1_6: None,
+        // Builder-only, like `certificate_management`/`diagnostics`/`firmware_management`: needs
+        // a `hardware::BatterySwapStation`, which `setup()`'s signature cannot receive.
+        has_handler: false,
+    },
 ];
 
 /// One `(capability name, Cargo feature name, whether the capability is set)` row consulted by

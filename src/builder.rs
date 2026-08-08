@@ -1996,6 +1996,33 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers the Battery Swap functional block (`docs/PRODUCTION-ROADMAP.md` B8.3):
+    /// `RequestBatterySwap` inbound handling, dispatching hardware preparation to `station`.
+    ///
+    /// **2.1 only** - battery swap does not exist before 2.1. Niche and feature-gated: only
+    /// present when the `battery-swap` Cargo feature is compiled in, and refuses at runtime (C5)
+    /// unless [`Capabilities::battery_swap`] is also declared - see [`crate::battery_swap`]'s
+    /// docs. Builder-only for the same reason [`Self::certificates`]/[`Self::log_uploads`] are:
+    /// it needs a [`crate::hardware::BatterySwapStation`], which `setup()`'s signature cannot
+    /// receive.
+    ///
+    /// Reporting the charge point's own `BatterySwap` events back to the CSMS as hardware detects
+    /// them is a separate call - see [`crate::battery_swap::report_battery_swap_event`] and
+    /// [`crate::battery_swap::run_battery_swap_events`], which this method does not spawn: unlike
+    /// [`Self::display_messages`]'s render loop, there is no charge-point-state-derived trigger to
+    /// poll here, only real hardware events an integrator's own code already has to be watching
+    /// for.
+    #[cfg(feature = "battery-swap")]
+    pub async fn battery_swap<N, S>(self, csms: &N, station: S) -> Self
+    where
+        N: crate::battery_swap::RequestBatterySwapHandler + Send + Sync + 'static,
+        S: crate::hardware::BatterySwapStation + Send + Sync + 'static,
+    {
+        csms.register_request_battery_swap_handler(self.runtime.actor(), station)
+            .await;
+        self
+    }
+
     /// Registers the Display Message functional block (`docs/PRODUCTION-ROADMAP.md` B6):
     /// `SetDisplayMessage`, `GetDisplayMessages`, `ClearDisplayMessage` inbound handling, plus the
     /// worker that renders whichever message

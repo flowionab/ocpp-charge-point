@@ -56,6 +56,7 @@
 //! | `SetDisplayMessage`          | n/a (2.x-only) | CALLRESULT `DisplayMessageStatusEnum::Rejected` | CALLRESULT `DisplayMessageStatusEnum::Rejected` |
 //! | `ClearDisplayMessage`        | n/a (2.x-only) | CALLRESULT `ClearMessageStatusEnum::Unknown` (no `Rejected` in 2.0.1) | CALLRESULT `ClearMessageStatusEnum::Rejected` |
 //! | `GetDisplayMessages`         | n/a (2.x-only) | CALLRESULT `GetDisplayMessagesStatusEnum::Unknown` (no `Rejected`/`NotSupported` in either version - an absent capability answers through the same "nothing matched" status an empty store would, not a separate refusal) | same as 2.0.1 |
+//! | `RequestBatterySwap`         | n/a (2.1-only) | n/a | CALLRESULT `GenericStatusEnum::Rejected` |
 //!
 //! Nothing here needed to fall back on assumption where the vendored spec/generated types didn't
 //! settle it - every response type above either has a documented status enum or documented-empty
@@ -204,6 +205,11 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
     RefusalGate {
         message: "ClearDisplayMessage",
         capability: |c| c.has_display,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "RequestBatterySwap",
+        capability: |c| c.battery_swap,
         shape: RefusalShape::CallResultStatus,
     },
 ];
