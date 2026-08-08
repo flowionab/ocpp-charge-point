@@ -38,6 +38,16 @@ pub const DEFAULT_MAX_DEVICE_MODEL_VARIABLES: usize = 256;
 /// exists at all.
 pub const DEFAULT_MAX_CHARGING_PROFILES: usize = 16;
 
+/// Default maximum number of default tariffs the tariff store holds (see
+/// [`StateLimits::max_tariffs`]).
+///
+/// 8 covers a charge-point-wide default plus one override per EVSE on a small-to-mid-size
+/// installation, while bounding the store to a couple of KB - a tariff, deliberately shallow (see
+/// [`crate::state::Tariff`]), is just an id, a currency code and an optional timestamp. A site
+/// with more EVSEs than that needing per-EVSE tariffs should raise it via
+/// [`StateLimits::with_max_tariffs`] rather than have `SetDefaultTariff` refused.
+pub const DEFAULT_MAX_TARIFFS: usize = 8;
+
 /// Default maximum number of cached authorization decisions - see
 /// [`crate::state::DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES`], which documents the reasoning; this
 /// re-export exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
@@ -91,6 +101,12 @@ pub struct StateLimits {
     /// let the charge point draw more current than the CSMS last told it to. Replacing an
     /// already-installed profile is always allowed, even at the bound. Clamped to at least 1.
     pub max_charging_profiles: usize,
+    /// The most default tariffs the tariff store may hold across every scope (OCPP 2.1
+    /// `SetDefaultTariff`). A `SetDefaultTariff` that would exceed it is refused with
+    /// [`TariffSetRejection::TooManyTariffs`](crate::state::TariffSetRejection::TooManyTariffs)
+    /// rather than evicting one the CSMS still believes is installed. Replacing the tariff already
+    /// installed at a scope is always allowed, even at the bound. Clamped to at least 1.
+    pub max_tariffs: usize,
     /// The most authorization decisions the cache may remember. Reaching it evicts the least
     /// recently authorized entry rather than refusing the new one - unlike
     /// [`Self::max_charging_profiles`], where forgetting is a safety problem: a forgotten *cache*
@@ -111,9 +127,16 @@ impl StateLimits {
             max_local_authorization_list_entries: DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES,
             max_device_model_variables: DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
             max_charging_profiles: DEFAULT_MAX_CHARGING_PROFILES,
+            max_tariffs: DEFAULT_MAX_TARIFFS,
             max_authorization_cache_entries: DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
             max_network_profile_slots: DEFAULT_MAX_NETWORK_PROFILE_SLOTS,
         }
+    }
+
+    /// Overrides [`Self::max_tariffs`].
+    pub const fn with_max_tariffs(mut self, max: usize) -> Self {
+        self.max_tariffs = max;
+        self
     }
 
     /// Overrides [`Self::max_network_profile_slots`].

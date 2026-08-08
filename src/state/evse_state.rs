@@ -1,7 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::state::{ConnectorState, EvseEvent, MeterSample, Reservation, Transaction};
+use crate::state::{ConnectorState, EvseEvent, MeterSample, Reservation, Tariff, Transaction};
 
 /// The internal state of one EVSE (Electric Vehicle Supply Equipment): its own availability/
 /// fault status, plus one entry per connector it owns in each of the parallel `Vec`s below.
@@ -23,6 +23,13 @@ pub struct EvseState {
     /// with no carried-over cost from a previous one on the same connector. See
     /// `docs/ROADMAP.md` §9.
     pub running_costs: Vec<Option<f64>>,
+    /// The driver tariff assigned to each connector's active transaction (OCPP 2.1
+    /// `ChangeTransactionTariff`), indexed the same as `connectors`. `None` when the CSMS hasn't
+    /// assigned one, or the transaction it was assigned to has since ended - mirrors
+    /// [`Self::running_costs`] exactly, for the same reason: a new transaction on the same
+    /// connector must never inherit a previous driver's tariff. See `docs/ROADMAP.md` §9 and
+    /// `docs/PRODUCTION-ROADMAP.md` B7.1.
+    pub transaction_tariffs: Vec<Option<Tariff>>,
     /// The most recent meter reading each connector's hardware pushed in, indexed the same as
     /// `connectors` - recorded whether or not a transaction is running on it, unlike
     /// [`Transaction::last_meter_sample`](crate::state::Transaction::last_meter_sample), which is
@@ -76,6 +83,7 @@ impl EvseState {
             transactions: vec![None; connector_count],
             reservations: vec![None; connector_count],
             running_costs: vec![None; connector_count],
+            transaction_tariffs: vec![None; connector_count],
             latest_meter_samples: vec![None; connector_count],
             charging_limits: vec![None; connector_count],
             applied_charging_limits: vec![None; connector_count],

@@ -24,6 +24,11 @@ use crate::connection::{ReconnectHandler, reregister_on_reconnect};
 #[cfg(feature = "tariff-cost")]
 use crate::cost::CostUpdatedHandler;
 use crate::device_model::{GetVariablesHandler, SetVariablesHandler};
+#[cfg(feature = "tariff-cost")]
+use crate::tariff::{
+    ChangeTransactionTariffHandler, ClearTariffsHandler, GetTariffsHandler,
+    SetDefaultTariffHandler,
+};
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
@@ -1584,8 +1589,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
-    /// Registers the Tariff and Cost functional block: the CostUpdated handler feeds into the
-    /// runtime's actor.
+    /// Registers the inbound half of the Tariff and Cost functional block's cost reporting: the
+    /// `CostUpdated` handler feeds into the runtime's actor. See [`Self::tariffs`] for the tariff
+    /// store/assignment messages (`docs/PRODUCTION-ROADMAP.md` B7.1) - kept as a separate call
+    /// so a CSMS client implementing only one half doesn't need the other.
     ///
     /// Only present when the `tariff-cost` Cargo feature is enabled - see [`Self::reservation`]'s
     /// doc comment for why the method itself disappears rather than becoming a no-op.
@@ -1595,6 +1602,37 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         N: CostUpdatedHandler + Send + Sync + 'static,
     {
         csms.register_cost_updated_handler(self.runtime.actor())
+            .await;
+
+        self
+    }
+
+    /// Registers the Tariff and Cost functional block's tariff store and per-transaction
+    /// assignment: `SetDefaultTariff`, `ChangeTransactionTariff`, `ClearTariffs` and `GetTariffs`
+    /// all feed into the runtime's actor (`docs/PRODUCTION-ROADMAP.md` B7.1). **2.1 only** - see
+    /// [`crate::tariff`]'s docs; `ocpp-client`'s 1.6J/2.0.1 clients don't implement these traits
+    /// at all, since neither version has tariff messages.
+    ///
+    /// Only present when the `tariff-cost` Cargo feature is enabled - see [`Self::reservation`]'s
+    /// doc comment for why the method itself disappears rather than becoming a no-op.
+    #[cfg(feature = "tariff-cost")]
+    pub async fn tariffs<N>(self, csms: &N) -> Self
+    where
+        N: SetDefaultTariffHandler
+            + ChangeTransactionTariffHandler
+            + ClearTariffsHandler
+            + GetTariffsHandler
+            + Send
+            + Sync
+            + 'static,
+    {
+        csms.register_set_default_tariff_handler(self.runtime.actor())
+            .await;
+        csms.register_change_transaction_tariff_handler(self.runtime.actor())
+            .await;
+        csms.register_clear_tariffs_handler(self.runtime.actor())
+            .await;
+        csms.register_get_tariffs_handler(self.runtime.actor())
             .await;
 
         self
@@ -3611,6 +3649,8 @@ mod tests {
             .device_model(&csms)
             .await
             .cost(&csms)
+            .await
+            .tariffs(&csms)
             .await
             .build();
 

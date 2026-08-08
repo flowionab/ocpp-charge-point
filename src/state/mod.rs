@@ -17,6 +17,7 @@ mod registration_status;
 mod reservation;
 mod reset;
 mod security_event;
+mod tariff;
 mod transaction;
 
 pub use self::authorization_cache::{
@@ -48,7 +49,7 @@ pub use self::evse_state::{EvseState, EvseStatus};
 pub use self::id_token::{IdToken, IdTokenKind};
 pub use self::limits::{
     DEFAULT_MAX_CHARGING_PROFILES, DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
-    DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, StateLimits,
+    DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, DEFAULT_MAX_TARIFFS, StateLimits,
 };
 pub use self::local_authorization_list::{LocalAuthorizationList, LocalListEntry};
 pub use self::meter_sample::MeterSample;
@@ -60,4 +61,8 @@ pub use self::registration_status::RegistrationStatus;
 pub use self::reservation::{Reservation, ReservationId};
 pub use self::reset::{PendingReset, ResetKind, ResetTarget};
 pub use self::security_event::{SecurityEvent, SecurityEventType};
+pub use self::tariff::{
+    InstalledTariff, Tariff, TariffClearCriteria, TariffId, TariffScope, TariffSetRejection,
+    TariffStore,
+};
 pub use self::transaction::{StopReason, Transaction, TransactionChargingState, TransactionId};

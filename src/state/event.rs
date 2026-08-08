@@ -9,8 +9,8 @@ use crate::state::{
     ChargingProfileId, ChargingProfileScope, Component, ConnectorState, ConnectorStatus,
     DeviceModelEvent, IdToken, InstalledChargingProfile, LocalListEntry, MeterSample,
     NetworkConnectionProfile, NetworkProfileSlot, RegistrationStatus, Reservation, ReservationId,
-    ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, TransactionId, Variable,
-    VariableAttributeType,
+    ResetKind, ResetTarget, SecurityEvent, StopReason, Tariff, TariffClearCriteria, TariffScope,
+    Transaction, TransactionId, Variable, VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -122,6 +122,30 @@ pub enum ChargePointEvent {
     ChargingProfilesCleared {
         /// Which profiles to clear - see [`ChargingProfileCriteria`].
         criteria: ChargingProfileCriteria,
+    },
+    /// The CSMS installed a default tariff (OCPP 2.1 `SetDefaultTariff`), scoped to one EVSE or
+    /// the whole charge point (`evseId = 0`). Applied through [`crate::state::TariffStore::set_default`],
+    /// so the per-scope replacement rule and the
+    /// [`StateLimits::max_tariffs`](crate::state::StateLimits::max_tariffs) bound both hold
+    /// however the tariff arrived. A tariff the store refuses is logged and dropped here;
+    /// `crate::tariff::handle_set_default_tariff` checks acceptance against the store itself
+    /// before dispatching this, so the CSMS gets the real answer rather than an optimistic one.
+    /// See `docs/ROADMAP.md` §9.
+    DefaultTariffSet {
+        /// Where the tariff was installed - one EVSE, or the whole charge point.
+        scope: TariffScope,
+        /// The tariff itself. Boxed for the same reason
+        /// [`Self::ChargingProfileSet`]'s profile is - to keep this enum small on every mailbox
+        /// entry that isn't this variant.
+        tariff: alloc::boxed::Box<Tariff>,
+    },
+    /// Default tariffs were cleared (OCPP 2.1 `ClearTariffs`), by id, by EVSE scope, or both. Only
+    /// ever affects [`crate::state::TariffStore`] - a driver tariff assigned to a running
+    /// transaction (`ChangeTransactionTariff`) already ends with that transaction on its own (see
+    /// [`ConnectorEvent::TariffAssigned`]), so there is nothing here for it to clear.
+    TariffsCleared {
+        /// Which tariffs to clear - see [`TariffClearCriteria`].
+        criteria: TariffClearCriteria,
     },
     /// A dynamic charging profile took a new limit - OCPP 2.1's `UpdateDynamicSchedule` pushed by
     /// the CSMS, or the response to a `PullDynamicScheduleUpdate` this charge point asked for
@@ -376,6 +400,12 @@ pub enum ConnectorEvent {
     /// The CSMS reported a new running total cost for this connector's active transaction (OCPP
     /// `CostUpdated`). Ignored if there's no active transaction. See `docs/ROADMAP.md` §9.
     CostUpdated(f64),
+    /// The CSMS assigned a driver tariff to this connector's active transaction (OCPP 2.1
+    /// `ChangeTransactionTariff`). Ignored if there's no active transaction - mirrors
+    /// [`Self::CostUpdated`] exactly, including how the assignment is cleared the moment the
+    /// transaction starts or ends (see `crate::state::EvseState::transaction_tariffs`). See
+    /// `docs/ROADMAP.md` §9 and `docs/PRODUCTION-ROADMAP.md` B7.1.
+    TariffAssigned(Tariff),
     /// A CSMS-initiated `Reset` (`ResetKind::Immediate`) covers this connector. Any state where
     /// a cable is engaged (`Connected`/`Locked`/`Authorizing`/`Starting`/`Charging`) is driven
     /// through the same fail-safe stop already used for a normal charging stop (open the

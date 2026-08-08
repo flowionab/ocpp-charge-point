@@ -10,9 +10,9 @@ use crate::state::{
     ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
     IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, NetworkProfileStore,
     PendingReset, RegistrationStatus, ReservationEndReason, ReservationUpdate, ResetKind,
-    ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
-    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
-    TransactionUpdateReason, Variable, VariableAttributeType,
+    ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, TariffStore,
+    Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
+    TransactionId, TransactionUpdateReason, Variable, VariableAttributeType,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -73,6 +73,12 @@ pub struct ChargePointState {
     /// Every charging profile the CSMS has installed, across every scope - the Smart Charging
     /// functional block's state. See [`ChargingProfileStore`] and `docs/ROADMAP.md` §11.
     pub charging_profiles: ChargingProfileStore,
+    /// Every default tariff the CSMS has installed, across every scope (OCPP 2.1
+    /// `SetDefaultTariff`) - the Tariff and Cost functional block's tariff-assignment state. A
+    /// tariff assigned to one running transaction (`ChangeTransactionTariff`) lives on
+    /// [`EvseState::transaction_tariffs`] instead, not here - see [`TariffStore`] and
+    /// `docs/ROADMAP.md` §9.
+    pub tariffs: TariffStore,
     /// This charge point's best current estimate of the CSMS's clock, established by
     /// BootNotification/Heartbeat's `currentTime` - see [`TimeSyncAnchor`] and
     /// [`ChargePointEvent::TimeSynced`]. `None` until the first exchange that carried a
@@ -129,6 +135,7 @@ impl ChargePointState {
                 limits.max_authorization_cache_entries,
             ),
             charging_profiles: ChargingProfileStore::with_limit(limits.max_charging_profiles),
+            tariffs: TariffStore::with_limit(limits.max_tariffs),
             time_sync: None,
         }
     }
@@ -348,6 +355,21 @@ impl ChargePointState {
             ChargePointEvent::ChargingProfilesCleared { criteria } => {
                 self.charging_profiles.clear(&criteria) > 0
             }
+            ChargePointEvent::DefaultTariffSet { scope, tariff } => {
+                let id = tariff.id.clone();
+                match self.tariffs.set_default(scope, *tariff) {
+                    Ok(()) => true,
+                    Err(rejection) => {
+                        // Reached only if a caller dispatched this without asking the store first
+                        // (`crate::tariff::handle_set_default_tariff` does ask, so the CSMS never
+                        // sees an optimistic Accepted); logged rather than panicking, per
+                        // `apply`'s documented tolerance for events that don't apply.
+                        tracing::warn!(?id, ?rejection, "a default tariff was refused by the store");
+                        false
+                    }
+                }
+            }
+            ChargePointEvent::TariffsCleared { criteria } => self.tariffs.clear(&criteria) > 0,
             ChargePointEvent::DeviceModel(event) => match event {
                 DeviceModelEvent::VariableRegistered {
                     component,
@@ -559,6 +581,10 @@ impl ChargePointState {
             ConnectorEvent::CostUpdated(total_cost) => Some(*total_cost),
             _ => None,
         };
+        let tariff_update = match &event {
+            ConnectorEvent::TariffAssigned(tariff) => Some(tariff.clone()),
+            _ => None,
+        };
         let computed_limit = match &event {
             ConnectorEvent::CurrentLimitComputed(limit_ma) => Some(*limit_ma),
             _ => None,
@@ -660,14 +686,18 @@ impl ChargePointState {
                 stop_reason,
                 authorized_id_token,
             ) {
-                // A new transaction must not inherit a previous one's running cost, and an ended
-                // transaction's cost is no longer meaningful.
+                // A new transaction must not inherit a previous one's running cost or driver
+                // tariff, and an ended transaction's cost/tariff is no longer meaningful.
                 if matches!(
                     kind,
                     TransactionEventKind::Started | TransactionEventKind::Ended
-                ) && let Some(cost_slot) = evse.running_costs.get_mut(connector_id)
-                {
-                    *cost_slot = None;
+                ) {
+                    if let Some(cost_slot) = evse.running_costs.get_mut(connector_id) {
+                        *cost_slot = None;
+                    }
+                    if let Some(tariff_slot) = evse.transaction_tariffs.get_mut(connector_id) {
+                        *tariff_slot = None;
+                    }
                 }
                 effects.push(ChargePointEffect::TransactionEvent(
                     TransactionEventOccurred {
@@ -745,7 +775,24 @@ impl ChargePointState {
             }
             false
         });
-        transition.changed || cost_recorded || limit_changed || limit_confirmed || sample_recorded
+        let tariff_recorded = tariff_update.is_some_and(|tariff| {
+            if evse
+                .transactions
+                .get(connector_id)
+                .is_some_and(Option::is_some)
+                && let Some(tariff_slot) = evse.transaction_tariffs.get_mut(connector_id)
+            {
+                *tariff_slot = Some(tariff);
+                return true;
+            }
+            false
+        });
+        transition.changed
+            || cost_recorded
+            || tariff_recorded
+            || limit_changed
+            || limit_confirmed
+            || sample_recorded
     }
 
     /// Every `evse_id` a [`ResetTarget`] covers - every EVSE, for
@@ -2199,6 +2246,121 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::CostUpdated(4.5));
 
         assert_eq!(state.evses[0].running_costs[0], Some(4.5));
+    }
+
+    fn test_tariff(id: &str) -> crate::state::Tariff {
+        crate::state::Tariff {
+            id: crate::state::TariffId(id.into()),
+            currency: "EUR".into(),
+            valid_from: None,
+        }
+    }
+
+    #[test]
+    fn a_default_tariff_is_installed_at_its_scope() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::DefaultTariffSet {
+            scope: crate::state::TariffScope::Evse(0),
+            tariff: alloc::boxed::Box::new(test_tariff("t1")),
+        });
+
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+        assert_eq!(state.tariffs.len(), 1);
+        assert_eq!(
+            state.tariffs.installed()[0].tariff.id,
+            crate::state::TariffId("t1".into())
+        );
+    }
+
+    #[test]
+    fn a_default_tariff_the_store_refuses_is_dropped_rather_than_installed() {
+        let mut state = ChargePointState::with_limits(
+            [1],
+            StateLimits::default().with_max_tariffs(1),
+        );
+        state.apply(ChargePointEvent::DefaultTariffSet {
+            scope: crate::state::TariffScope::Evse(0),
+            tariff: alloc::boxed::Box::new(test_tariff("t1")),
+        });
+
+        let effects = state.apply(ChargePointEvent::DefaultTariffSet {
+            scope: crate::state::TariffScope::Evse(1),
+            tariff: alloc::boxed::Box::new(test_tariff("t2")),
+        });
+
+        assert!(!effects.contains(&ChargePointEffect::StateChanged));
+        assert_eq!(state.tariffs.len(), 1);
+    }
+
+    #[test]
+    fn tariffs_cleared_removes_matching_tariffs() {
+        let mut state = ChargePointState::new([1]);
+        state.apply(ChargePointEvent::DefaultTariffSet {
+            scope: crate::state::TariffScope::Evse(0),
+            tariff: alloc::boxed::Box::new(test_tariff("t1")),
+        });
+
+        let effects = state.apply(ChargePointEvent::TariffsCleared {
+            criteria: crate::state::TariffClearCriteria::default(),
+        });
+
+        assert!(effects.contains(&ChargePointEffect::StateChanged));
+        assert!(state.tariffs.is_empty());
+    }
+
+    #[test]
+    fn a_transaction_tariff_is_recorded_while_a_transaction_is_active() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::TariffAssigned(test_tariff("t1")));
+
+        assert_eq!(
+            state.evses[0].transaction_tariffs[0],
+            Some(test_tariff("t1"))
+        );
+    }
+
+    #[test]
+    fn a_transaction_tariff_with_no_active_transaction_is_ignored() {
+        let mut state = ChargePointState::new([1]);
+
+        apply_connector_event(&mut state, ConnectorEvent::TariffAssigned(test_tariff("t1")));
+
+        assert_eq!(state.evses[0].transaction_tariffs[0], None);
+    }
+
+    #[test]
+    fn a_new_transaction_does_not_inherit_the_previous_ones_tariff() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        apply_connector_event(&mut state, ConnectorEvent::TariffAssigned(test_tariff("t1")));
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        assert_eq!(state.evses[0].transaction_tariffs[0], None);
+
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+
+        assert_eq!(state.evses[0].transaction_tariffs[0], None);
     }
 
     fn test_charging_profile(id: i32) -> crate::state::ChargingProfile {

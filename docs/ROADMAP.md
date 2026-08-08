@@ -1177,10 +1177,24 @@ Reserving a connector/EVSE ahead of use.
 
 Communicating price/cost to the driver.
 
-- Messages: `NotifyPriceSchedule` (2.1), `CostUpdated`, running cost in
-  `TransactionEvent`.
+- Messages: `NotifyPriceSchedule` (2.1), `CostUpdated`, `SetDefaultTariff` /
+  `ChangeTransactionTariff` / `ClearTariffs` / `GetTariffs` (2.1), running
+  cost in `TransactionEvent`.
 - Internal state needed: tariff model, running-cost accumulation hook.
-- Status: 🚧 partial — `CostUpdated` (inbound only) is implemented:
+- Status: 🚧 partial — the tariff store and per-transaction assignment
+  (`docs/PRODUCTION-ROADMAP.md` B7.1) are now done: a new `state::TariffStore`
+  holds default tariffs (`SetDefaultTariff`), scoped one-per-EVSE-or-charge-point
+  exactly like `ChargingProfileStore`; a driver tariff
+  (`ChangeTransactionTariff`) lives on a new `EvseState::transaction_tariffs`
+  side-table instead, indexed and cleared on transaction start/end the same
+  way `running_costs` already is, so it never outlives the session it was
+  assigned to. `ClearTariffs`/`GetTariffs` report per-tariff status rather
+  than failing as a batch, and `GetTariffs` folds in any transaction's driver
+  tariff for the queried EVSE. All wired via a new `src/tariff.rs`, 2.1-only
+  (1.6J/2.0.1 have no tariff messages at all - a spec boundary, not a gap).
+  Deliberately shallow: `state::Tariff` keeps only id/currency/`validFrom`,
+  not OCPP's priced structure - see B7.1's own paragraph for why. `CostUpdated`
+  (inbound only) was already implemented:
   `EvseState` gained a `running_costs: Vec<Option<f64>>` side-table,
   indexed the same as `connectors`/`transactions` - a `CostUpdated`'s
   `totalCost` is recorded there via a new `ConnectorEvent::CostUpdated(f64)`,
@@ -1208,7 +1222,9 @@ Communicating price/cost to the driver.
   that blocks `TriggerMessage` (§6) - and outbound cost reporting via
   `TransactionEvent.cost_details`, which needs an actual tariff/pricing
   model (charging periods, dimensions) this crate has no reason to build
-  without a consumer for it yet.
+  without a consumer for it yet. B7.1's tariff store doesn't change that:
+  it stores and reports tariffs, it does not compute a cost from one -
+  see that item's own paragraph in `docs/PRODUCTION-ROADMAP.md`.
 - Version notes: **(verify vs 2.1 spec)** — tariff/cost was extended
   significantly across 2.0.1 → 2.1; not present in 1.6J at all (block is
   a no-op under that adapter).
