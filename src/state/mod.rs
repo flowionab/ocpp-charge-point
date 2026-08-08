@@ -6,6 +6,7 @@ mod charging_profile;
 mod connector_state;
 mod connector_status;
 mod device_model;
+mod display_message;
 mod event;
 mod evse_state;
 mod id_token;
@@ -36,6 +37,10 @@ pub use self::connector_status::ConnectorStatus;
 pub use self::device_model::{
     Component, DeviceModel, DeviceModelEvent, Variable, VariableAttribute, VariableAttributeType,
     VariableCharacteristics, VariableDataType, VariableDefinition, VariableMutability,
+};
+pub use self::display_message::{
+    DEFAULT_MAX_DISPLAY_MESSAGES, DisplayMessageId, DisplayMessageStore, DisplayedMessage,
+    MessageContent, MessageFormat, MessagePriority, MessageState,
 };
 pub use self::event::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ConnectorEvent,

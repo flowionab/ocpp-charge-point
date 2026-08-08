@@ -7,10 +7,10 @@ use crate::hardware::Capabilities;
 use crate::state::{
     AuthorizationCacheEntry, AuthorizationStatus, ChargingProfile, ChargingProfileCriteria,
     ChargingProfileId, ChargingProfileScope, Component, ConnectorState, ConnectorStatus,
-    DeviceModelEvent, IdToken, InstalledChargingProfile, LocalListEntry, MeterSample,
-    NetworkConnectionProfile, NetworkProfileSlot, RegistrationStatus, Reservation, ReservationId,
-    ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, TransactionId, Variable,
-    VariableAttributeType,
+    DeviceModelEvent, DisplayMessageId, DisplayedMessage, IdToken, InstalledChargingProfile,
+    LocalListEntry, MeterSample, NetworkConnectionProfile, NetworkProfileSlot, RegistrationStatus,
+    Reservation, ReservationId, ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction,
+    TransactionId, Variable, VariableAttributeType,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -268,6 +268,14 @@ pub enum ChargePointEvent {
         /// The recovered profiles, in the order they were installed before the restart.
         profiles: Vec<InstalledChargingProfile>,
     },
+    /// The CSMS installed/replaced a display message (OCPP `SetDisplayMessage`), accepted by
+    /// [`crate::display_message::handle_set_display_message`]. Boxed for the same reason
+    /// [`Self::ChargingProfileSet`]'s profile is - the largest thing this variant could carry
+    /// (message content up to 1024 bytes) should not be paid for by every event on the mailbox.
+    DisplayMessageSet(alloc::boxed::Box<DisplayedMessage>),
+    /// The CSMS removed a display message (OCPP `ClearDisplayMessage`), accepted by
+    /// [`crate::display_message::handle_clear_display_message`].
+    DisplayMessageCleared(DisplayMessageId),
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {
         /// The addressed EVSE's index.

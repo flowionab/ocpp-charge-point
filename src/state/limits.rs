@@ -38,6 +38,11 @@ pub const DEFAULT_MAX_DEVICE_MODEL_VARIABLES: usize = 256;
 /// exists at all.
 pub const DEFAULT_MAX_CHARGING_PROFILES: usize = 16;
 
+/// Default maximum number of display messages the store holds - see
+/// [`crate::state::DEFAULT_MAX_DISPLAY_MESSAGES`], which documents the reasoning; this re-export
+/// exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
+pub use crate::state::display_message::DEFAULT_MAX_DISPLAY_MESSAGES;
+
 /// Default maximum number of cached authorization decisions - see
 /// [`crate::state::DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES`], which documents the reasoning; this
 /// re-export exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
@@ -101,6 +106,11 @@ pub struct StateLimits {
     /// for a *new* slot beyond it is refused with OCPP's `Rejected`; replacing an already-occupied
     /// slot always succeeds. Clamped to at least 1.
     pub max_network_profile_slots: usize,
+    /// The most [`crate::state::DisplayedMessage`]s the display message store may hold. A
+    /// `SetDisplayMessage` for a *new* id beyond it is refused (see
+    /// [`crate::state::DisplayMessageStore::set`]); replacing an already-stored id always
+    /// succeeds. Clamped to at least 1.
+    pub max_display_messages: usize,
 }
 
 impl StateLimits {
@@ -113,12 +123,19 @@ impl StateLimits {
             max_charging_profiles: DEFAULT_MAX_CHARGING_PROFILES,
             max_authorization_cache_entries: DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
             max_network_profile_slots: DEFAULT_MAX_NETWORK_PROFILE_SLOTS,
+            max_display_messages: DEFAULT_MAX_DISPLAY_MESSAGES,
         }
     }
 
     /// Overrides [`Self::max_network_profile_slots`].
     pub const fn with_max_network_profile_slots(mut self, max: usize) -> Self {
         self.max_network_profile_slots = max;
+        self
+    }
+
+    /// Overrides [`Self::max_display_messages`].
+    pub const fn with_max_display_messages(mut self, max: usize) -> Self {
+        self.max_display_messages = max;
         self
     }
 

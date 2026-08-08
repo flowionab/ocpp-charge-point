@@ -47,6 +47,8 @@ pub mod cost;
 pub mod data_transfer;
 pub mod device_model;
 pub mod diagnostics;
+#[cfg(feature = "display-message")]
+pub mod display_message;
 pub mod executor;
 pub mod firmware;
 pub mod hardware;

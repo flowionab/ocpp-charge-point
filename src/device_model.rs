@@ -135,6 +135,18 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         mutability: VariableMutability::ReadWrite,
     },
     CapabilityGatedVariable {
+        component: "DisplayMessageCtrlr",
+        variable: "DisplayMessages",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        // How many messages are currently installed (OCPP: "Amount of different messages that
+        // are currently configured ... via SetDisplayMessageRequest"). Registered at 0 and, like
+        // `LocalAuthListCtrlr.Entries`, not yet kept live as messages are set/cleared - B6's
+        // known gap; see `docs/PRODUCTION-ROADMAP.md`.
+        value: "0",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
         component: "TariffCostCtrlr",
         variable: "Currency",
         instance: None,

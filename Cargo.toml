@@ -94,8 +94,11 @@ certificate-management = []
 # Gates nothing yet: SetVariableMonitoring/NotifyEvent and the rest of the 2.x monitoring engine
 # (roadmap B5.2/B5.3) have no implementation in this crate yet.
 variable-monitoring = []
-# Gates nothing yet: SetDisplayMessage/GetDisplayMessages/ClearDisplayMessage (roadmap B6) have no
-# implementation in this crate yet.
+# Gates `crate::display_message` (SetDisplayMessage/GetDisplayMessages/ClearDisplayMessage,
+# answered via NotifyDisplayMessages - roadmap B6) and
+# `ChargePointBuilder::display_messages`, which registers them against a `hardware::Display`.
+# 2.x only - 1.6J has no display-message concept. Off by default in a build with no display
+# hardware/UX story.
 display-message = []
 # Gates `crate::reservation` (the `ReserveNowHandler`/`CancelReservationHandler` traits) and
 # `ChargePointBuilder::reservation`, which register them. Off by default in a build that has no

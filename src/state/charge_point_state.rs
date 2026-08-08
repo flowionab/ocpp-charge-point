@@ -7,12 +7,13 @@ use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
     ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
-    IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, NetworkProfileStore,
-    PendingReset, RegistrationStatus, ReservationEndReason, ReservationUpdate, ResetKind,
-    ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, Transaction,
-    TransactionChargingState, TransactionEventKind, TransactionEventOccurred, TransactionId,
-    TransactionUpdateReason, Variable, VariableAttributeType,
+    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, DisplayMessageStore, EvseEvent,
+    EvseState, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry, MeterSample,
+    NetworkProfileStore, PendingReset, RegistrationStatus, ReservationEndReason,
+    ReservationUpdate, ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits,
+    StopReason, Transaction, TransactionChargingState, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason, Variable,
+    VariableAttributeType,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -78,6 +79,9 @@ pub struct ChargePointState {
     /// [`ChargePointEvent::TimeSynced`]. `None` until the first exchange that carried a
     /// parseable `currentTime`.
     pub time_sync: Option<TimeSyncAnchor>,
+    /// Messages the CSMS has asked to be shown to the driver (OCPP `SetDisplayMessage`/
+    /// `ClearDisplayMessage`). See [`crate::display_message`] and `docs/ROADMAP.md` §15.
+    pub display_messages: DisplayMessageStore,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -130,6 +134,9 @@ impl ChargePointState {
             ),
             charging_profiles: ChargingProfileStore::with_limit(limits.max_charging_profiles),
             time_sync: None,
+            display_messages: DisplayMessageStore::with_max_messages(
+                limits.max_display_messages,
+            ),
         }
     }
 
@@ -480,6 +487,8 @@ impl ChargePointState {
             ChargePointEvent::CapabilitiesDeclared(capabilities) => {
                 set_if_changed(&mut self.capabilities, capabilities)
             }
+            ChargePointEvent::DisplayMessageSet(message) => self.display_messages.set(*message),
+            ChargePointEvent::DisplayMessageCleared(id) => self.display_messages.clear(id),
             ChargePointEvent::TimeSynced {
                 csms_time,
                 recorded_at,
