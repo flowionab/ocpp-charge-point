@@ -18,6 +18,7 @@ mod reservation;
 mod reset;
 mod security_event;
 mod transaction;
+mod variable_monitoring;
 
 pub use self::authorization_cache::{
     AuthorizationCache, AuthorizationCacheEntry, DEFAULT_MAX_AUTHORIZATION_CACHE_ENTRIES,
@@ -48,7 +49,7 @@ pub use self::evse_state::{EvseState, EvseStatus};
 pub use self::id_token::{IdToken, IdTokenKind};
 pub use self::limits::{
     DEFAULT_MAX_CHARGING_PROFILES, DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
-    DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, StateLimits,
+    DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, DEFAULT_MAX_VARIABLE_MONITORS, StateLimits,
 };
 pub use self::local_authorization_list::{LocalAuthorizationList, LocalListEntry};
 pub use self::meter_sample::MeterSample;
@@ -61,3 +62,7 @@ pub use self::reservation::{Reservation, ReservationId};
 pub use self::reset::{PendingReset, ResetKind, ResetTarget};
 pub use self::security_event::{SecurityEvent, SecurityEventType};
 pub use self::transaction::{StopReason, Transaction, TransactionChargingState, TransactionId};
+pub use self::variable_monitoring::{
+    EventTrigger, MonitorType, SetMonitorRejection, TriggeredMonitor, VariableMonitor,
+    VariableMonitorId, VariableMonitorStore, VariableMonitoringEvent,
+};

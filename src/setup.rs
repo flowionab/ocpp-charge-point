@@ -24,6 +24,9 @@ use crate::smart_charging::{
     SetChargingProfileHandler,
 };
 use crate::transactions::TransactionNotifier;
+use crate::variable_monitoring::{
+    ClearVariableMonitoringHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
+};
 
 /// Starts the hardware, then runs the Provisioning functional block's BootNotification
 /// exchange (retrying with `backoff` on `Pending`/`Rejected` or a transport failure - see
@@ -89,6 +92,9 @@ where
         + ClearChargingProfileHandler
         + GetCompositeScheduleHandler
         + GetChargingProfilesHandler
+        + SetVariableMonitoringHandler
+        + ClearVariableMonitoringHandler
+        + VariableMonitorEventNotifier
         + ReconnectHandler
         + Clone
         + Send
@@ -126,7 +132,13 @@ where
         .device_model(&csms)
         .await
         .meter_values(&csms, backoff.clone(), clock.clone())
-        .await;
+        .await
+        .variable_monitoring(&csms)
+        .await
+        // B5.2: 60 s between periodic-monitor sweeps - fine-grained enough against monitors
+        // configured in the tens of seconds and up (see `run_periodic_variable_monitors`'s docs),
+        // and the same cadence `reservation_status_updates` already sweeps expiry at.
+        .variable_monitor_events(&csms, backoff.clone(), clock.clone(), 60);
 
     // C3.1 (docs/PRODUCTION-ROADMAP.md §5.3): each of these blocks is only registered when the
     // hardware actually declares the matching capability - an absent capability means the CSMS
@@ -425,6 +437,35 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::device_model::SetVariablesHandler for RecordingCsms {
         async fn register_set_variables_handler(&self, _actor: crate::actor::ChargePointActor) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::SetVariableMonitoringHandler for RecordingCsms {
+        async fn register_set_variable_monitoring_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::ClearVariableMonitoringHandler for RecordingCsms {
+        async fn register_clear_variable_monitoring_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::VariableMonitorEventNotifier for RecordingCsms {
+        type Error = core::convert::Infallible;
+        async fn notify_variable_monitor_event(
+            &self,
+            _event: &crate::state::TriggeredMonitor,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]

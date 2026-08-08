@@ -1081,6 +1081,35 @@ pub(crate) mod test_support {
     }
 
     #[async_trait::async_trait]
+    impl crate::variable_monitoring::SetVariableMonitoringHandler for FixedBootNotifier {
+        async fn register_set_variable_monitoring_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::ClearVariableMonitoringHandler for FixedBootNotifier {
+        async fn register_clear_variable_monitoring_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::variable_monitoring::VariableMonitorEventNotifier for FixedBootNotifier {
+        type Error = core::convert::Infallible;
+        async fn notify_variable_monitor_event(
+            &self,
+            _event: &crate::state::TriggeredMonitor,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::reporting::GetBaseReportHandler for FixedBootNotifier {
         async fn register_get_base_report_handler(&self, _actor: crate::actor::ChargePointActor) {}
     }

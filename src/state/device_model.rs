@@ -126,8 +126,12 @@ pub struct VariableCharacteristics {
     pub max_limit: Option<f64>,
     /// The allowed values, for `OptionList`/`SequenceList`/`MemberList` variables.
     pub values_list: Option<Vec<String>>,
-    /// Whether this variable supports variable monitoring (OCPP `SetVariableMonitoring`) - not
-    /// implemented by this crate yet (see `docs/ROADMAP.md` §2), so always `false` today.
+    /// Whether this variable supports variable monitoring (OCPP `SetVariableMonitoring`).
+    /// `crate::variable_monitoring::handle_set_variable_monitoring` refuses (`Rejected`) a
+    /// monitor on a variable where this is `false` - see B5.2, `docs/ROADMAP.md` §2/§14. None of
+    /// this crate's own built-in default variables set it `true` today; a hardware binding
+    /// registering its own variables (e.g. a temperature or voltage reading worth alerting on)
+    /// decides this per variable when it registers one.
     pub supports_monitoring: bool,
 }
 

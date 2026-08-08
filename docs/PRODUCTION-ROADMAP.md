@@ -985,10 +985,10 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 |---------|:----:|:-----:|:---:|
 | GetDiagnostics / DiagnosticsStatusNotification | ✅ | — | — |
 | GetLog / LogStatusNotification | — | ✅ | ✅ |
-| SetVariableMonitoring / ClearVariableMonitoring | — | ⬜ | ⬜ |
+| SetVariableMonitoring / ClearVariableMonitoring | — | ✅ | ✅ |
 | SetMonitoringBase / SetMonitoringLevel | — | ⬜ | ⬜ |
 | GetMonitoringReport / NotifyMonitoringReport | — | ⬜ | ⬜ |
-| NotifyEvent | — | ⬜ | ⬜ |
+| NotifyEvent | — | ✅ | ✅ |
 | CustomerInformation / NotifyCustomerInformation | — | ✅ | ✅ |
 | GetTransactionStatus | — | ⬜ | ⬜ |
 | Open/Close/Adjust/Get PeriodicEventStream, NotifyPeriodicEventStream | — | — | ⬜ |
@@ -1049,8 +1049,69 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
       `FileTransfer` binding `setup()`'s signature has no way to receive, exactly the position
       `Storage` is in. The `diagnostics` capability gate is therefore `has_handler: false`, which
       C3.5's data-driven test enforced rather than let slide.
-- [ ] **B5.2** Variable monitoring engine: thresholds, deltas, periodics on
-      device-model variables → `NotifyEvent`.
+- [x] **B5.2** Variable monitoring engine: thresholds, deltas, and periodics on
+      device-model variables, reported to the CSMS via `NotifyEvent`. `SetVariableMonitoring`/
+      `ClearVariableMonitoring` inbound and `NotifyEvent` outbound are wired for both 2.0.1 and
+      2.1; 1.6J has none of these messages, so there is no `ocpp_1_6` projection anywhere in this
+      block - the honest thing to do was write nothing rather than fake a downgrade of a feature
+      that doesn't exist on that wire.
+
+      **The store lives in `ChargePointState` next to `DeviceModel`, exactly like the note in this
+      item's brief said it should.** `VariableMonitorStore` is bounded by a new
+      `StateLimits::max_variable_monitors` the same way `max_charging_profiles` bounds the profile
+      store (G2.2) - a CSMS that keeps installing new monitors gets `Rejected` once the bound is
+      reached, not an unbounded heap.
+
+      **`crate::device_model.rs`'s own docs point at the trigger** - "a value change originates" -
+      and that is exactly where thresholds and deltas are evaluated: inside
+      `ChargePointState::apply`'s `DeviceModelEvent::AttributeValueSet` arm, reading the
+      variable's previous `Actual` value before overwriting it so `VariableMonitorStore::evaluate`
+      sees the transition, not just the new value. A threshold fires on the crossing (old value on
+      one side, new value on the other), not on every write that happens to stay past it, so a
+      value sitting above an `UpperThreshold` doesn't report itself again on every subsequent
+      write. A delta monitor tracks its own baseline (seeded at first evaluation, moved forward
+      each time it fires) rather than comparing to whatever the last *reported* value happened to
+      be from some other monitor's perspective. This needed no new outbound plumbing beyond one
+      more `ChargePointEffect`/broadcast channel pair, following the same
+      `subscribe_security_events`/`run_security_events` shape every other CSMS-facing stream in
+      this crate already uses.
+
+      **Periodic monitors are not a value-change consumer at all** - nothing about the charge
+      point's state differs before and after a periodic interval elapses, so evaluating them from
+      `apply` would mean inventing a state change that never happened. `run_periodic_variable_monitors`
+      is its own `Backoff`/`Clock`-driven sweep, mirroring `run_reservation_expiry`'s fixed-interval
+      shape rather than computing an exact next-wake time per monitor - simpler, and negligible
+      drift against monitors configured in the tens of seconds and up. It skips a sweep entirely
+      while the clock is unsynchronized, the same stance `run_reservation_expiry` takes, rather
+      than stamping a `NotifyEvent` with a guessed timestamp.
+
+      **A monitor is only accepted on a variable that says it supports monitoring.**
+      `VariableCharacteristics::supports_monitoring` already existed in the device model, always
+      `false`, with a doc comment promising this block would be what finally consulted it - it now
+      is. None of this crate's own built-in default variables set it `true`: claiming a heartbeat
+      interval or a retry policy is worth alerting on would be inventing urgency this crate cannot
+      judge. A hardware binding registering a real sensor reading (temperature, voltage) is what
+      turns monitoring on for it, one variable at a time.
+
+      **The `id` a CSMS can supply is honoured even when it names a monitor this store has never
+      seen** - OCPP only requires an id to *replace* an existing monitor, but refusing an unknown
+      one would be pickier than the spec asks for, and a monitor that remembers the id an operator
+      expected is more useful than one that doesn't. An auto-assigned id is resolved from the same
+      state snapshot the accept/reject decision is made against (`VariableMonitorStore::next_id`,
+      documented race and all - the same snapshot-then-optimistically-apply shape
+      `crate::device_model::handle_set_variables` already uses for its own batch decisions).
+
+      **`SetMonitoringStatusEnum` has no "out of room" status**, so a monitor refused by the store's
+      bound is reported `Rejected` - the closest honest fit among what the wire actually offers,
+      the same reasoning B5.1 already used for collapsing 2.x's four upload failure statuses to
+      one.
+
+      Left open, honestly: B5.3 (`GetMonitoringReport`/`NotifyMonitoringReport` - a CSMS cannot yet
+      ask what monitors are installed, only install/clear/receive them), `SetMonitoringBase`/
+      `SetMonitoringLevel` (bulk monitor-severity controls), and OCPP's `PeriodicClockAligned`/
+      `TargetDelta`/`TargetDeltaRelative` monitor types (2.1's V2X-flavoured monitors, which need a
+      `Target` attribute this device model never sets) - a `SetVariableMonitoring` naming one of
+      those is refused `UnsupportedMonitorType` rather than silently downgraded to something else.
 - [ ] **B5.3** Monitoring report generation, chunked like `NotifyReport`
       already is.
 - [x] **B5.4** `GetTransactionStatus` (2.x only — 1.6J has no such message) —

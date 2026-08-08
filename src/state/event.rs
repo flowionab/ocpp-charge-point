@@ -9,8 +9,8 @@ use crate::state::{
     ChargingProfileId, ChargingProfileScope, Component, ConnectorState, ConnectorStatus,
     DeviceModelEvent, IdToken, InstalledChargingProfile, LocalListEntry, MeterSample,
     NetworkConnectionProfile, NetworkProfileSlot, RegistrationStatus, Reservation, ReservationId,
-    ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, TransactionId, Variable,
-    VariableAttributeType,
+    ResetKind, ResetTarget, SecurityEvent, StopReason, Transaction, TransactionId,
+    TriggeredMonitor, Variable, VariableAttributeType, VariableMonitoringEvent,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -287,6 +287,11 @@ pub enum ChargePointEvent {
         /// The event to apply to that EVSE.
         event: EvseEvent,
     },
+    /// An event mutating the variable monitoring engine's store (OCPP `SetVariableMonitoring`/
+    /// `ClearVariableMonitoring`) - see `crate::state::variable_monitoring` and
+    /// `crate::variable_monitoring`. See `docs/ROADMAP.md` §2/§14 (B5.2). **2.x only** - 1.6J has
+    /// no such messages.
+    VariableMonitoring(VariableMonitoringEvent),
 }
 
 /// An event addressed to one EVSE, either changing the EVSE's own availability/fault status or
@@ -454,6 +459,11 @@ pub enum ChargePointEffect {
     /// produces no effect - see
     /// [`ChargePointEvent::PriorityChargingSet::locally_initiated`](ChargePointEvent::PriorityChargingSet).
     PriorityChargingChanged(PriorityChargingChange),
+    /// A threshold or delta variable monitor fired; the variable monitoring engine reports this
+    /// to the CSMS via `NotifyEvent` (2.x only). A periodic monitor never produces this - it
+    /// reports on its own clock, independent of a value changing at all - see
+    /// `crate::variable_monitoring::run_periodic_variable_monitors`.
+    VariableMonitorTriggered(TriggeredMonitor),
 }
 
 /// A priority-charging grant the charge point made on its own, reported to the CSMS as
