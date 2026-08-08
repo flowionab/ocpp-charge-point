@@ -44,6 +44,8 @@ mod id_tag;
 pub mod local_authorization_list;
 pub mod meter_values;
 pub mod network_profile;
+#[cfg(feature = "websocket")]
+pub mod network_switch;
 pub mod offline_queue;
 pub mod persistence;
 pub mod provisioning;

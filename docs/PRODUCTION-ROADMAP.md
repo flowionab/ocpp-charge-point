@@ -135,44 +135,49 @@ that can't reliably reconnect is worse than one missing a functional block.
 | **A2** | **Version negotiation** — **done.** The handshake already offered every compiled-in version; what was missing was running the result, which [A1](#3-workstream-a--transport-negotiation-connection-lifecycle) supplied. `UnsupportedNegotiatedVersion` is now only reachable for a version this build wasn't compiled with. An end-to-end test negotiates 1.6J and asserts the *1.6J* BootNotification shape on the wire, so it proves the right adapter set ran rather than that something connected. | ✅ |
 | **A3** | Configurable subprotocol preference order — **done** (`connect_and_setup`'s `versions`, which existed but was only meaningful once [A1](#3-workstream-a--transport-negotiation-connection-lifecycle) made non-2.1 outcomes usable). Tested: naming one version offers only that one, even against a CSMS that would speak another. | ✅ |
 | **A4** | WebSocket keepalive — **blocked upstream.** `ocpp-client` 0.2.1's `ConnectOptions` has no ping-interval field and its WebSocket transport only *replies* to pings; there is nothing to configure from here. `WebSocketPingInterval` is registered and readable, with a value of `0` (disabled), which is the honest reading of a cadence this charge point does not drive. Needs an `ocpp-client` change, the same shape as [D1](#61-d1--missing-action-wrappers)'s wrappers. | 🔒 |
-| **A5** | Reconnect backoff from the device model — **partly done, and the limit is structural.** All three variables are registered and readable; `RetryBackOffWaitMinimum`/`RetryBackOffRepeatTimes` are converted into the transport's `ReconnectPolicy` when the caller supplies no `ConnectOptions`, so what a CSMS reads is what the connection does. What a CSMS *writes* applies to the next connection, not the current one - changing a live connection is [A9](#3-workstream-a--transport-negotiation-connection-lifecycle). `RetryBackOffRandomRange` (jitter) has **no** counterpart in the transport and is registered as `0` rather than reported as a value this crate does not apply. | 🚧 |
+| **A5** | Reconnect backoff from the device model — **partly done, and the limit is structural.** All three variables are registered and readable; `RetryBackOffWaitMinimum`/`RetryBackOffRepeatTimes` are converted into the transport's `ReconnectPolicy` when the caller supplies no `ConnectOptions`, so what a CSMS reads is what the connection does. What a CSMS *writes* applies to the next connection, not the current one, and [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) does not change that: it re-points *where* a connection goes, while the backoff and timeout are fixed in the transport when it is built. `RetryBackOffRandomRange` (jitter) has **no** counterpart in the transport and is registered as `0` rather than reported as a value this crate does not apply. | 🚧 |
 | **A6** | Per-message timeouts and retry — **done.** `MessageTimeout[Default]` becomes the transport's per-call timeout at connect time (same next-connection caveat as [A5](#3-workstream-a--transport-negotiation-connection-lifecycle)); `MessageAttempts[TransactionEvent]` now caps how many times a queued message is retried, which is **head-of-line unblocking**: without it a message the CSMS will never accept is retried forever at the front of the queue and blocks everything behind it. `MessageAttemptInterval` landed with [A7](#3-workstream-a--transport-negotiation-connection-lifecycle). | ✅ |
 | **A7** | `MessageAttemptInterval` / queue-depth limits — **done.** Queue depth is now configurable (`ChargePointBuilder::offline_queue_capacity`, previously hardcoded at the default); `MessageAttemptInterval[TransactionEvent]` drives a retry timer that sweeps every registered queue, re-read each cycle. Drop policy and the `MemoryExhaustion` event on overflow were already done ([G2.1](#92-g2--bounded-memory)) and are unchanged - including the security queue's deliberate exception, which must not report its own overflow through itself. | ✅ |
 | **A8** | `NotImplemented` CALLERROR — **done.** An integration test boots a real session over a WebSocket, has the mock CSMS call `GetLog` (a message this build has no handler for), and asserts a CALLERROR with `NotImplemented` comes back. The wait is bounded, because the failure it really guards is *silence*: a CSMS waiting on a response that never arrives is worse than one told no, and an unbounded wait would hang the suite instead of failing it. | ✅ |
-| **A9** | Network profile *selection* is done — `network_profile::selected_profile` answers "which profile does the CSMS want me on?" from `NetworkConfigurationPriority`, which is now a live value that gains a slot when one is written and drops slots that no longer exist, while never reordering what the operator set. **Applying it to a live connection is blocked upstream** — see below. | 🔒 |
+| **A9** | Network profile selection *and* application — **done.** `NetworkConfigurationPriority` is a live value (a stored slot joins the order, a vacated one leaves it, the operator's ordering is never rewritten), `network_profile::selected_profile` says which slot it picks, and `network_switch` moves the live connection there and rolls back after `NetworkProfileConnectionAttempts` failures. See below for the rules and the two limits. | ✅ |
 
-**A9's blocker, verified against the pinned dependency rather than assumed.** The switch itself
-is one line of logic — *re-point the transport's reconnect target and force a redial* — and it is
-the right mechanism: the `ocpp-client` `Client` would keep its identity, so every registered
-handler, every offline queue and every forwarder survives the switch, and queued reports carry
-over to the new connection instead of being stranded on the old one. Rollback is then just
-restoring the previous target before the next attempt.
+**How a switch works, and what it deliberately does not do.** The mechanism is the one the
+blocked-upstream note here used to describe: re-point the transport's reconnect target, then close
+the connection. `ocpp-client` redials the new address through the **same** `Client`, so every
+registered handler, every offline queue and every forwarder survives the move — a switch is
+invisible to the rest of the crate, where dropping the client and reconnecting would strand all of
+it. This needed `ConnectOptions::reconnector` plus a public `websocket_transport()`, both shipped
+in `ocpp-client` 0.2.2 (the change was written here, upstreamed, and released rather than worked
+around locally, per `CLAUDE.md`'s "do not duplicate transport concerns").
 
-`ocpp-client` 0.2.1 does not allow it. `Client::from_transport_with_reconnect` takes a
-`Reconnector` (public, dyn-safe) — but `connect`/`connect_1_6`/`connect_2_0_1`/`connect_2_1` build
-one internally from a fixed address and expose no way to supply one, and the WebSocket transport
-that would let this crate build its own lives behind a private `mod transport`. The only route
-without an upstream change is re-implementing `TransportSink`/`TransportStream` over
-tokio-tungstenite here, which `CLAUDE.md` rules out in as many words: *delegate networking and
-transport concerns to `ocpp-client`; do not duplicate connection-management functionality here.*
+*Rollback.* A profile the CSMS wrote may simply not work, and a charge point that moved to it and
+stayed would be unreachable — unreachable in a way the CSMS cannot fix, because it can no longer
+reach the charge point to correct the profile it just wrote. So the target reverts to the last
+address that **worked** after `OCPPCommCtrlr`/`NetworkProfileConnectionAttempts` consecutive
+failures (OCPP's own count for this, not an invented constant). Two switches without a successful
+connection in between keep the original fallback rather than reverting to an address that was never
+proven either.
 
-What unblocks it, in ascending order of upstream surface: a `connect_*_with_reconnector` variant,
-a `ConnectOptions::reconnector` field, or making the WebSocket transport publicly constructible.
-Any one is a small, concrete change of the same shape as [D1](#61-d1--missing-action-wrappers)'s
-macro entries. Until then an integrator driving its own connection can read
-`selected_profile(&runtime.state())` and redial, which is the supported interim path rather than
-poking at state fields.
+*A one-second grace period* separates the decision from the close. A switch is nearly always
+triggered by the CSMS's own `SetNetworkProfile`, and closing immediately races that request's
+response out of the socket — leaving the CSMS never knowing whether the profile was accepted, which
+is exactly what it needs before it stops expecting this charge point on the old address. There is
+nothing to acknowledge instead: OCPP defines no "response flushed" handshake and the transport
+exposes none.
 
-**Status:** the upstream change is written and tested, on the `connect-options-reconnector` branch
-of `ocpp-client` (unpushed, same as D1.1's was): `ConnectOptions::reconnector` takes an
-`Arc<dyn Reconnector>`, and a new public `websocket_transport(address, version, options)` opens the
-transport halves such a reconnector must return, so this crate can point a live connection at a
-different address without owning any WebSocket plumbing. A9 unblocks here as soon as that ships in
-a released `ocpp-client`.
+Two limits, both real rather than oversights. **Credentials are not carried across a switch** —
+they belong to the CSMS that issued them, and sending them to whatever host a profile names would
+hand this charge point's password to a different server; combined with `basicAuthPassword` being
+dropped on the way in ([B1.8](#b1--core-spine-must-be-complete-for-any-production-deployment)), a
+profile whose endpoint demands Basic auth will fail and roll back until workstream F lands. And
+**only `connect_and_setup` can switch**: a caller who built their own client owns their own
+transport, so they get `selected_profile` and drive their own redial rather than a switch that
+silently does nothing.
 
-Closing A9 would also finish [A5](#3-workstream-a--transport-negotiation-connection-lifecycle):
-the same mechanism is what lets a CSMS's `RetryBackOff*` write apply to the live connection rather
-than only the next one.
+[A5](#3-workstream-a--transport-negotiation-connection-lifecycle) is *not* finished by this. A9
+re-points where a connection goes; the backoff and per-call timeout are fixed in the transport when
+it is built, so a CSMS's `RetryBackOff*` write still applies to the next connection rather than the
+current one.
 
 ---
 
@@ -466,9 +471,9 @@ version.
       working-looking slot store. OCPP says a profile applies to a *future* connection attempt and
       the CSMS orders slots separately, so storing is genuinely the message's job — but a charge
       point built on this crate keeps talking to whatever address its integrator passed
-      `connect_and_setup`. Dialling a stored profile, with rollback when the new one fails to
-      connect, is [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) and remains
-      open.
+      `connect_and_setup` until the switching loop moves it. Dialling a stored profile, with
+      rollback when the new one fails to connect, is
+      [A9](#3-workstream-a--transport-negotiation-connection-lifecycle) and is now done.
 
       Three requests are refused rather than stored, each for a reason the charge point can defend:
       a **negative slot** (addresses nothing), **SOAP transport** (OCPP 2.x is JSON over WebSocket;
@@ -492,8 +497,8 @@ version.
 
       **E2.11 (persisting the slots) is unblocked by this** and left outstanding —
       `ChargePointEvent::PersistedNetworkProfilesRestored` is already in place for a restore to
-      use. It matters less than the other durability rows until A9 lands: profiles this crate does
-      not dial with are worth less after a reboot than a load limit or a cached authorization.
+      use. It matters more now that A9 has landed: a charge point that reboots forgets which
+      profile it was moved onto and comes back on the address its integrator compiled in.
 
 ### B2 — Smart charging (R§11)
 
@@ -2297,5 +2302,5 @@ it, for all three versions — re-verified at the B1.3/B1.4 commit.)
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 18 | `src/state/security_event.rs` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 760 | `#[test]` + `#[tokio::test]`, re-counted at the A5/A6 commit (750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 769 | `#[test]` + `#[tokio::test]`, re-counted at the A9 commit (760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

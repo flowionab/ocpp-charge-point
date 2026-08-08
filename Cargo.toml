@@ -121,7 +121,7 @@ certificates = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
-ocpp-client = { version = "0.2.1", default-features = false }
+ocpp-client = { version = "0.2.2", default-features = false }
 async-trait = "^0.1"
 # `default-features = false` drops `tracing`'s (really `tracing-core`'s) `std` feature, which
 # pulls in `once_cell` - and `once_cell`'s default build does not compile for a bare-metal

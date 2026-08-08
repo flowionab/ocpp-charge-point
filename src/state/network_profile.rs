@@ -3,17 +3,18 @@
 //!
 //! # What storing one does, and what it doesn't
 //!
-//! `SetNetworkProfile` writes a profile into a numbered configuration slot. It does **not** switch
-//! the live connection - OCPP is explicit that the profile applies to a future connection attempt,
-//! and the CSMS orders slots separately via `OCPPCommCtrlr`/`NetworkConfigurationPriority`. So
-//! this crate stores profiles, reports them, keeps them across a reboot, and tracks which one the
-//! CSMS's priority order selects ([`crate::network_profile::selected_profile`]); *dialling* it,
-//! and rolling back when a new profile fails to connect, is
-//! [A9](../../docs/PRODUCTION-ROADMAP.md) and is blocked on an `ocpp-client` change.
+//! `SetNetworkProfile` writes a profile into a numbered configuration slot. Storing one does
+//! **not** connect to it on the spot - OCPP is explicit that a profile applies to a future
+//! connection attempt, and the CSMS orders slots separately via
+//! `OCPPCommCtrlr`/`NetworkConfigurationPriority`. So this type is only the store: profiles are
+//! written here, reported from here, and recovered here after a reboot.
 //!
-//! That boundary is worth stating plainly because it is easy to mistake a full slot store for a
-//! working profile switch: a charge point built on this crate today connects to whatever address
-//! its integrator passed to [`crate::connect::connect_and_setup`], whatever these slots say.
+//! Which stored profile is *selected* is [`crate::network_profile::selected_profile`], and moving
+//! the live connection onto it - with rollback when it turns out not to work - is
+//! [`crate::network_switch`] (A9). A charge point whose client this crate did not dial
+//! ([`crate::connect::connect_and_setup`]) has no transport to re-point, so it stays on whatever
+//! address its integrator connected to; that is worth knowing before mistaking a full slot store
+//! for a connection that has moved.
 //!
 //! # 2.x only
 //!

@@ -798,8 +798,10 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         instance: None,
         data_type: VariableDataType::String,
         unit: None,
-        // One network profile, slot 0 - this crate has no `SetNetworkProfile` yet (B1.8), so
-        // there is exactly one connection and it is the one the integrator dialled.
+        // Slot 0, the connection the charge point was started on. This is a live value: a stored
+        // profile joins the order and a vacated slot leaves it (see
+        // `ChargePointState::refresh_network_configuration_priority`), and the first occupied slot
+        // in it is the one `network_switch` connects to.
         value: "0",
         mutability: VariableMutability::ReadWrite,
         persistent: false,

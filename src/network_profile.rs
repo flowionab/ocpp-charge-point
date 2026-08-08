@@ -1,14 +1,16 @@
 //! `SetNetworkProfile`: the CSMS writing a network connection profile into a configuration slot
 //! (`docs/ROADMAP.md` §2, `docs/PRODUCTION-ROADMAP.md` B1.8).
 //!
-//! **This block stores profiles; it does not switch connections.** OCPP is explicit that a profile
-//! applies to a *future* connection attempt, and which slot to try is the CSMS's own
-//! `OCPPCommCtrlr`/`NetworkConfigurationPriority` ordering. Actually dialling a stored profile -
-//! and rolling back when the new one fails to connect - is
-//! [A9](../docs/PRODUCTION-ROADMAP.md), and is not implemented: a charge point built on this crate
-//! today connects to whatever address its integrator passed
-//! [`crate::connect::connect_and_setup`], whatever these slots say. The gap is stated here rather
-//! than left for someone to infer from a working-looking slot store.
+//! **This block stores profiles; it does not itself switch connections.** OCPP is explicit that a
+//! profile applies to a *future* connection attempt, and which slot to try is the CSMS's own
+//! `OCPPCommCtrlr`/`NetworkConfigurationPriority` ordering - so storing and switching are separate
+//! steps, and this is the first one. [`selected_profile`] says which slot that ordering picks, and
+//! [`crate::network_switch`] (A9) is what moves the live connection there and rolls back if the
+//! new address does not work.
+//!
+//! A charge point whose client this crate did not dial has no transport to re-point and stays
+//! where its integrator connected it; only [`crate::connect::connect_and_setup`] installs the
+//! redial target a switch needs.
 //!
 //! 2.x only - 1.6J has no `SetNetworkProfile` (see [`crate::state::network_profile`]).
 
@@ -84,13 +86,11 @@ pub async fn handle_set_network_profile(
 /// `OCPPCommCtrlr`/`NetworkConfigurationPriority` - the highest-priority slot that actually holds
 /// one.
 ///
-/// **Nothing in this crate dials it yet**, and that is A9's remaining half rather than an
-/// oversight: switching a live connection means re-pointing the transport's reconnect target,
-/// which `ocpp-client` 0.2.1 fixes at construction and exposes no way to change (see
-/// `docs/PRODUCTION-ROADMAP.md` A9). Until that lands upstream, this is the supported way for an
-/// integrator driving its own connection to ask "which profile does the CSMS want me on?" -
-/// reading it here rather than reimplementing the priority parse against
-/// [`crate::state::NetworkProfileStore`].
+/// [`crate::connect::connect_and_setup`] acts on this: when the selection changes, it moves the live
+/// connection there and rolls back if the new address does not work (see
+/// [`crate::network_switch`]). An integrator who built their own client instead has no transport
+/// this crate can re-point, and reads this to drive their own redial - rather than reimplementing
+/// the priority parse against [`crate::state::NetworkProfileStore`].
 ///
 /// `None` when no slot in the priority order is occupied, including when no profile has ever been
 /// set: a charge point then stays on whatever address it was started with.

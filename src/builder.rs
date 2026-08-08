@@ -1053,10 +1053,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// `docs/PRODUCTION-ROADMAP.md` B1.8): the CSMS writing a network connection profile into a
     /// configuration slot.
     ///
-    /// **Storing a profile does not switch the connection.** This charge point keeps talking to
-    /// whatever address it was started with; dialling a stored profile, and rolling back if the
-    /// new one fails, is A9 and is not implemented. See [`crate::network_profile`], which says the
-    /// same thing where an integrator will actually read it.
+    /// **Storing a profile does not by itself switch the connection** - that is
+    /// [`Self::network_profile_switching`], registered separately because it needs a transport
+    /// this crate can re-point, which only [`crate::connect_and_setup`] builds.
     ///
     /// 2.x only - 1.6J has no such message.
     pub async fn network_profiles<N>(self, csms: &N) -> Self
@@ -1065,6 +1064,38 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     {
         csms.register_set_network_profile_handler(self.runtime.actor())
             .await;
+        self
+    }
+
+    /// Moves the live CSMS connection onto whichever stored network profile the priority order
+    /// selects, rolling back if the new address does not work (A9). See
+    /// [`crate::network_switch`] for the switch and rollback rules.
+    ///
+    /// Separate from [`Self::network_profiles`] - which stores what the CSMS wrote - because
+    /// switching needs a [`ConnectionTarget`](crate::network_switch::ConnectionTarget) installed
+    /// as the transport's reconnector *before* the first connection was made. A caller who built
+    /// their own client has no such target and registers only `network_profiles`; their
+    /// connection stays where they put it, which is the honest outcome rather than a switch that
+    /// silently does nothing.
+    #[cfg(feature = "websocket")]
+    pub fn network_profile_switching<D, B>(
+        self,
+        target: &alloc::sync::Arc<crate::network_switch::ConnectionTarget>,
+        closer: D,
+        backoff: B,
+    ) -> Self
+    where
+        D: crate::network_switch::ConnectionCloser + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+    {
+        let actor = self.runtime.actor();
+        let target = target.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::network_switch::run_network_profile_switching(
+                &actor, &target, &closer, &backoff,
+            )
+            .await;
+        }));
         self
     }
 

@@ -742,10 +742,12 @@ Boot, configuration, and the Component/Variable device model.
   rather than kept, being a credential this crate cannot use. 1.6J has no such
   message. `NetworkConfigurationPriority` is live - a stored slot joins the
   order and a vanished one leaves it, without ever reordering what the operator
-  set - and `network_profile::selected_profile` answers which profile the CSMS
-  wants in force. Dialling it is blocked upstream (A9: `ocpp-client` fixes the
-  reconnect target at construction), so an integrator driving its own connection
-  reads that and redials. Still missing: variable monitoring
+  set - `network_profile::selected_profile` answers which profile the CSMS wants
+  in force, and `network_switch` moves the live connection onto it, rolling back
+  to the last working address after `NetworkProfileConnectionAttempts` failures
+  (A9). An integrator who built their own client has no transport this crate can
+  re-point and reads the selection to drive their own redial. Still missing:
+  variable monitoring
   (`SetVariableMonitoring`/`GetMonitoringReport`/`NotifyMonitoringReport`).
   Two items previously listed here are done: device-model persistence across
   restarts (E2.3 - `VariableAttribute::persistent` is acted on now), and the

@@ -28,6 +28,7 @@ use crate::builder::ChargePointBuilder;
 use crate::clock::{SystemClock, SystemMonotonicClock};
 use crate::executor::Executor;
 use crate::hardware::{ChargePoint, Connector, Evse};
+use crate::network_switch::ConnectionTarget;
 use crate::provisioning::Backoff;
 use crate::setup::setup;
 use crate::state::{Component, DeviceModel, Variable, VariableAttributeType};
@@ -86,14 +87,22 @@ where
     T: ChargePoint<E, C>,
     E: Evse<C>,
     C: Connector,
-    X: Executor,
+    // `Clone` because the profile-switching loop (A9) is spawned alongside the session rather
+    // than inside it: `setup()` takes the executor by value and knows nothing about redial
+    // targets. `TokioExecutor` - the only executor this std/tokio entry point is built for - is
+    // `Copy`.
+    X: Executor + Clone,
     B: Backoff + Clone + Send + Sync + 'static,
 {
     // A5/A6: a caller who supplied `ConnectOptions` is configuring the transport deliberately and
     // is left alone; one who didn't gets the reconnect backoff and per-call timeout OCPP models as
     // device-model variables, so what a CSMS reads there matches what the connection does.
-    let options = Some(options.unwrap_or_else(connection_options_from_device_model));
-    let negotiated = ocpp_client::connect(address, versions, options)
+    let options = options.unwrap_or_else(connection_options_from_device_model);
+    // A9: the redial target has to exist before the connection does, because it *is* the
+    // connection's reconnector. Which version it redials is filled in below, once the CSMS has
+    // picked one.
+    let target = ConnectionTarget::new(address, &options);
+    let negotiated = ocpp_client::connect(address, versions, Some(target.install(options)))
         .await
         .map_err(ConnectAndSetupError::Connect)?;
 
@@ -102,25 +111,58 @@ where
     // so there is no embedded-target caller for whom a different clock would matter, the same
     // reasoning `executor.spawn`'s tokio dependency here already follows.
     match negotiated {
-        NegotiatedClient::V2_1(client) => setup(
-            charge_point,
-            client,
-            executor,
-            backoff,
-            SystemMonotonicClock,
-            SystemClock,
-        )
-        .await
-        .map_err(ConnectAndSetupError::Start),
+        NegotiatedClient::V2_1(client) => {
+            target.set_version(OcppVersion::V2_1);
+            setup_ocpp_2_1(charge_point, client, executor, backoff, target).await
+        }
         #[cfg(feature = "ocpp_2_0_1")]
         NegotiatedClient::V2_0_1(client) => {
-            setup_ocpp_2_0_1(charge_point, client, executor, backoff).await
+            target.set_version(OcppVersion::V2_0_1);
+            setup_ocpp_2_0_1(charge_point, client, executor, backoff, Some(target)).await
         }
         #[cfg(feature = "ocpp_1_6")]
         NegotiatedClient::V1_6(client) => {
+            target.set_version(OcppVersion::V1_6);
             setup_ocpp_1_6(charge_point, client, executor, backoff).await
         }
     }
+}
+
+/// Runs a full OCPP 2.1 session against `client`, adding the network-profile switching
+/// [`setup`](crate::setup) itself cannot register - it takes no redial target, because a caller
+/// who built their own client owns their own transport.
+#[cfg(feature = "ocpp_2_1")]
+async fn setup_ocpp_2_1<T, E, C, X, B>(
+    charge_point: T,
+    client: ocpp_client::ocpp_2_1::OCPP2_1Client,
+    executor: X,
+    backoff: B,
+    target: alloc::sync::Arc<ConnectionTarget>,
+) -> Result<ChargePointRuntime<T>, ConnectAndSetupError<T::StartError>>
+where
+    T: ChargePoint<E, C>,
+    E: Evse<C>,
+    C: Connector,
+    X: Executor + Clone,
+    B: Backoff + Clone + Send + Sync + 'static,
+{
+    let runtime = setup(
+        charge_point,
+        client.clone(),
+        executor.clone(),
+        backoff.clone(),
+        SystemMonotonicClock,
+        SystemClock,
+    )
+    .await
+    .map_err(ConnectAndSetupError::Start)?;
+
+    let actor = runtime.actor();
+    executor.spawn(alloc::boxed::Box::pin(async move {
+        crate::network_switch::run_network_profile_switching(&actor, &target, &client, &backoff)
+            .await;
+    }));
+    Ok(runtime)
 }
 
 /// Reads an integer `OCPPCommCtrlr` variable out of a fresh [`DeviceModel`], falling back to
@@ -156,8 +198,9 @@ fn ocpp_comm_ctrlr_secs(model: &DeviceModel, variable: &str, default: u64) -> u6
 /// [`DeviceModel`], i.e. this crate's registered defaults, because the connection has to exist
 /// before the actor that owns the live model does. So a CSMS *reading* these variables sees the
 /// values genuinely in force, and a CSMS *writing* them changes what the next connection uses -
-/// not the current one. Applying a change to a live connection means tearing it down and dialling
-/// again, which is [A9](../docs/PRODUCTION-ROADMAP.md)'s job and is not implemented.
+/// not the current one. Applying a change to the *live* connection is A5's remaining half and is
+/// not implemented: [`crate::network_switch`] can re-point where a connection goes, but the
+/// backoff and timeout are fixed in the transport when it is built.
 ///
 /// Two honest gaps rather than approximations. `RetryBackOffRandomRange` (jitter) has **no**
 /// counterpart in the transport's reconnect policy, so it is registered as `0` and applied
@@ -201,6 +244,7 @@ async fn setup_ocpp_2_0_1<T, E, C, X, B>(
     client: ocpp_client::ocpp_2_0_1::OCPP2_0_1Client,
     executor: X,
     backoff: B,
+    target: Option<alloc::sync::Arc<ConnectionTarget>>,
 ) -> Result<ChargePointRuntime<T>, ConnectAndSetupError<T::StartError>>
 where
     T: ChargePoint<E, C>,
@@ -258,6 +302,11 @@ where
                 backoff.clone(),
             )
             .await;
+    }
+
+    // A9: move the connection when the CSMS's selected profile changes.
+    if let Some(target) = target {
+        builder = builder.network_profile_switching(&target, client.clone(), backoff.clone());
     }
 
     // A7: sweep the queues registered above on OCPP's own MessageAttemptInterval - see
