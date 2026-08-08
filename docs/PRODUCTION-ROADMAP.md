@@ -779,9 +779,46 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 | FirmwareStatusNotification | ⬜ | ⬜ | ⬜ |
 | PublishFirmware / UnpublishFirmware / PublishFirmwareStatusNotification | — | ⬜ | ⬜ |
 
-- [ ] **B3.1** File-transfer abstraction in `crate::hardware` (fetch a URL
-      to storage, report progress). **Shared with [B5](#b5--diagnostics-and-monitoring-r14)** — do
-      these two blocks together.
+- [x] **B3.1** File-transfer abstraction in `crate::hardware` — `FileTransfer`, with
+      `TransferProgress`/`TransferReport`, `UploadSource`, `LogKind` and a `NoFileTransfer`
+      fallback. **Shared with [B5](#b5--diagnostics-and-monitoring-r14)**, which is why it is
+      general rather than firmware-shaped.
+
+      **Why it is hardware surface at all**, when `CLAUDE.md` sends every other network concern to
+      `ocpp-client`: a file transfer is not an OCPP concern. OCPP hands over a bare URL and says
+      nothing about how to fetch it — the scheme is whatever the operator deployed (HTTPS, FTP/S,
+      SFTP, a vendor's own), and the credentials, trust store and interface are the integrator's.
+      A charge point that hard-coded one HTTP client could not talk to half the deployments that
+      exist.
+
+      **No content crosses the boundary on the way down.** `download` returns `Ok(())`, not bytes.
+      A firmware image is megabytes against an MCU's kilobytes of RAM, so buffering one to hand
+      back would be impossible on the target hardware and pointless anyway — the only thing this
+      crate would do with it is give it straight back to be flashed. That is also why
+      [`Storage`](#71-e1--storage-trait) is not reused: its values are `Vec<u8>`, the wrong shape
+      for something that must never be resident in full.
+
+      **Upload is asymmetric, and `UploadSource` says why.** The security log is *this crate's* —
+      bounded, in `SecurityEventLog`, and unproducible by an integrator who is never told a
+      security event happened — so it goes out as `Bytes`. A diagnostics log is the integrator's:
+      this crate cannot know what a given station considers diagnostic output, and it may be far
+      too large to hold. So one arrives as bytes and the other as a name.
+
+      Two contracts stated rather than left implicit: **retries belong to the caller** (OCPP
+      carries `retries`/`retryInterval` on the requests that start a transfer, so honouring them
+      in the implementor too would multiply out to a count no CSMS asked for), and an
+      implementation must be **safe to cancel at an await point** — a CSMS may supersede a
+      transfer, which 2.1 names `AcceptedCanceled` — without leaving a half-written artifact a
+      later download would mistake for complete.
+
+      `NoFileTransfer` fails rather than succeeding silently, on the same reasoning as
+      [`NoStorage`](#71-e1--storage-trait): a charge point reporting `Downloaded` without having
+      downloaded anything leaves a CSMS about to install an update that does not exist.
+
+      **Not yet wired to anything** — by design, since its two consumers are the next two tasks.
+      A streaming implementor in the tests exercises the shape end to end (chunked reads, an await
+      between chunks, progress out, content retained) so the ergonomics are proven rather than
+      assumed.
 - [ ] **B3.2** Firmware state machine: Downloading → Downloaded →
       Installing → Installed / failure states, each mapped to
       `FirmwareStatusNotification` on all three versions.
@@ -824,7 +861,11 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 | GetTransactionStatus | — | ⬜ | ⬜ |
 | Open/Close/Adjust/Get PeriodicEventStream, NotifyPeriodicEventStream | — | — | ⬜ |
 
-- [ ] **B5.1** Log upload via the [B3.1](#b3--firmware-management-r12) file-transfer abstraction.
+- [ ] **B5.1** Log upload via the [B3.1](#b3--firmware-management-r12) file-transfer abstraction,
+      which now exists: `FileTransfer::upload` takes the security log as `UploadSource::Bytes` and
+      a diagnostics log as `UploadSource::Local`. What is left here is the `GetLog`/`GetDiagnostics`
+      handlers, the `LogStatusNotification`/`DiagnosticsStatusNotification` reporting, and
+      rendering `SecurityEventLog` to bytes. Closes [F4.3](#84-f4--security-events) with it.
 - [ ] **B5.2** Variable monitoring engine: thresholds, deltas, periodics on
       device-model variables → `NotifyEvent`.
 - [ ] **B5.3** Monitoring report generation, chunked like `NotifyReport`
@@ -2546,5 +2587,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 840 | `#[test]` + `#[tokio::test]`, re-counted at the F4 commit (833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 848 | `#[test]` + `#[tokio::test]`, re-counted at the B3.1 commit (840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

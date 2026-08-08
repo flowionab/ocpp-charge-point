@@ -1344,7 +1344,17 @@ Over-the-air firmware updates.
 - Internal state needed: firmware update state machine
   (Downloading/Downloaded/Installing/Installed/Failed), signature
   verification hook.
-- Status: ⬜ not started.
+- Status: 🚧 the shared foundation is in. `crate::hardware::FileTransfer` (B3.1)
+  is the hardware trait both this block and §14 need: fetch a URL, or send a log
+  to one, with optional progress. It is deliberately general rather than
+  firmware-shaped, and deliberately never carries downloaded content back into
+  this crate - a firmware image is megabytes against an MCU's kilobytes, and the
+  only thing the crate would do with it is hand it straight back to be flashed.
+  Retries stay with the caller (OCPP puts `retries`/`retryInterval` on the
+  request), and an implementation must be safe to cancel mid-transfer without
+  leaving a half-written image behind. Nothing drives it yet: the firmware state
+  machine (Downloading → Downloaded → Installing → Installed) and the
+  `FirmwareStatusNotification` mapping are still to come.
 - Version notes: 1.6J's `FirmwareStatusNotification` status enum is a
   subset of 2.x's.
 
@@ -1368,7 +1378,13 @@ Log/diagnostics retrieval for troubleshooting.
   `DiagnosticsStatusNotification`).
 - Internal state needed: log upload state machine, log source
   abstraction (what logs exist, how they're packaged).
-- Status: ⬜ not started.
+- Status: 🚧 the shared foundation is in - see §12. `FileTransfer::upload` takes
+  this crate's own security log as bytes and an integrator-held diagnostics log
+  by name, which is the split that lets one abstraction serve both blocks: the
+  security log is bounded and lives here, while a diagnostics log is whatever
+  the integrator considers diagnostic output and may be far too large to hold.
+  The `GetLog`/`GetDiagnostics` handlers, the status notifications and the
+  variable-monitoring engine are still to come.
 - Version notes: 1.6J's diagnostics flow maps to 2.x's `GetLog` flow with
   a narrower log-type set.
 

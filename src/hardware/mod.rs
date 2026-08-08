@@ -13,6 +13,7 @@ mod command_receiver;
 mod connector;
 mod event_sender;
 mod evse;
+mod file_transfer;
 mod storage;
 
 pub use self::capabilities::{
@@ -25,6 +26,10 @@ pub use self::command_receiver::HardwareCommandReceiver;
 pub use self::connector::Connector;
 pub use self::event_sender::HardwareEventSender;
 pub use self::evse::Evse;
+pub use self::file_transfer::{
+    FileTransfer, LogKind, NoFileTransfer, NoFileTransferError, TransferProgress, TransferReport,
+    UploadSource,
+};
 pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]
 pub use self::storage::{InMemoryStorage, InMemoryStorageError};
