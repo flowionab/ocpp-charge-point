@@ -14,9 +14,12 @@ mod command_receiver;
 mod connector;
 mod event_sender;
 mod evse;
+#[cfg(test)]
+mod fault_injection;
 mod file_transfer;
 mod firmware;
 mod storage;
+mod watchdog;
 
 pub use self::capabilities::{
     CAPABILITY_GATES, Capabilities, CapabilityGate, Iso15118SupportLevel,
@@ -43,3 +46,4 @@ pub use self::firmware::{
 pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]
 pub use self::storage::{InMemoryStorage, InMemoryStorageError};
+pub use self::watchdog::{NoWatchdog, Watchdog};

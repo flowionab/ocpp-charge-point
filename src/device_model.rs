@@ -1936,12 +1936,20 @@ mod ocpp_1_6 {
     /// [`crate::hardware::CAPABILITY_GATES`]/`Capabilities` directly.
     const SUPPORTED_FEATURE_PROFILES_KEY: &str = "SupportedFeatureProfiles";
 
+    // G4.2: the conversion below cannot fail, and this is what makes that a fact rather than a
+    // claim. If the key were ever renamed past the wire field's 50-byte bound, this fails the
+    // *build* - where an `unwrap()` would have failed a charge point in the field, on a code path
+    // a CSMS reaches simply by sending GetConfiguration.
+    const _: () = assert!(SUPPORTED_FEATURE_PROFILES_KEY.len() <= 50);
+
     /// Builds the synthetic `SupportedFeatureProfiles` [`ConfigurationKeyItem`] - see
     /// [`SUPPORTED_FEATURE_PROFILES_KEY`]'s docs.
     fn supported_feature_profiles_item(capabilities: &Capabilities) -> ConfigurationKeyItem {
         let value = crate::hardware::supported_feature_profiles_1_6(capabilities);
         ConfigurationKeyItem {
-            key: heapless::String::try_from(SUPPORTED_FEATURE_PROFILES_KEY).unwrap(),
+            // Infallible by the const assertion above; `unwrap_or_default` rather than `unwrap`
+            // so no panic exists on this path at all.
+            key: heapless::String::try_from(SUPPORTED_FEATURE_PROFILES_KEY).unwrap_or_default(),
             readonly: true,
             value: heapless::String::try_from(truncate_to_byte_boundary(&value, 500)).ok(),
         }

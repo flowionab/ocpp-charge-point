@@ -1533,6 +1533,27 @@ Support for battery-swap style "charging" stations.
 
 ---
 
+## Failure containment
+
+Not an OCPP functional block, but the property `CLAUDE.md`'s error-handling
+section asks for, now enforced rather than asserted (G4):
+
+- `#![deny(clippy::unwrap_used, clippy::panic)]` holds over library code, so a
+  panic on a path a glitching sensor or a hostile CSMS can reach is a compile
+  error. The three sites that existed were compile-time constants; each now
+  carries a `const` assertion, so outgrowing a wire bound fails the build rather
+  than a charge point in the field.
+- `hardware::Watchdog` is fed from the actor's run loop and nowhere else, once
+  per applied event and *after* its effects are dispatched. A timer-fed watchdog
+  proves the timer is alive; this proves the actor is draining its mailbox,
+  which is the thing that actually matters when a connector is energised.
+- The actor mailbox is bounded and **refuses** rather than dropping. It carries
+  order-dependent state-machine transitions, so dropping either end can wedge a
+  connector in a state the hardware has already left; senders are told instead.
+- Fault-injection tests cover every fallible hardware method, and assert the
+  ordering that makes a fail-safe transition safe - contactor open *before*
+  unlock, since releasing a latch while current flows exposes a live pin.
+
 ## Suggested sequencing
 
 The functional blocks above are independent for planning purposes, but in

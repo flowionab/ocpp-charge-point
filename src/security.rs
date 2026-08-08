@@ -64,6 +64,20 @@ fn wire_type(event_type: &SecurityEventType) -> alloc::string::String {
     }
 }
 
+/// What a security event's `type` becomes when the vendor-supplied string will not fit OCPP's
+/// 50-byte bound.
+///
+/// Reporting *something* beats reporting nothing: the event still reaches the CSMS with its
+/// timestamp and `techInfo`, and an operator sees that a vendor event occurred even if its name
+/// was too long to carry. The const assertion is what lets this be panic-free (G4.2) - a literal
+/// that outgrew the bound would fail the build rather than a charge point in the field.
+#[cfg(any(feature = "ocpp_2_1", feature = "ocpp_2_0_1"))]
+pub(crate) fn oversized_event_type() -> heapless::String<50> {
+    const OVERSIZED_EVENT_TYPE: &str = "Other";
+    const _: () = assert!(OVERSIZED_EVENT_TYPE.len() <= 50);
+    heapless::String::try_from(OVERSIZED_EVENT_TYPE).unwrap_or_default()
+}
+
 #[cfg(all(test, feature = "ocpp_2_1"))]
 mod wire_type_tests {
     use super::wire_type;
@@ -594,9 +608,11 @@ mod ocpp_2_1 {
                 tech_info: tech_info.and_then(|info| heapless::String::try_from(info).ok()),
                 timestamp: now.to_rfc3339(),
                 // Falls back to a fixed literal if a vendor-supplied `Other` string exceeds
-                // OCPP's 50-byte bound - every standardized value fits by construction.
+                // OCPP's 50-byte bound - every standardized value fits by construction. The
+                // fallback itself cannot fail (G4.2): `OVERSIZED_EVENT_TYPE` is asserted to fit at
+                // compile time, so this path contains no panic even for a hostile input.
                 r#type: heapless::String::try_from(wire_type(event_type).as_str())
-                    .unwrap_or_else(|_| heapless::String::try_from("Other").unwrap()),
+                    .unwrap_or_else(|_| crate::security::oversized_event_type()),
             }
         }
 
@@ -751,7 +767,7 @@ mod ocpp_2_0_1 {
             tech_info: tech_info.and_then(|info| heapless::String::try_from(info).ok()),
             timestamp: now.to_rfc3339(),
             r#type: heapless::String::try_from(wire_type(event_type).as_str())
-                .unwrap_or_else(|_| heapless::String::try_from("Other").unwrap()),
+                .unwrap_or_else(|_| crate::security::oversized_event_type()),
         }
     }
 

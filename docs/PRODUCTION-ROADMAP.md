@@ -2471,20 +2471,64 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
 
 ### 9.4 G4 — Failure containment
 
-- [ ] **G4.1** Audit for `unwrap`/`expect`/`panic!` on any path reachable
-      from hardware or network input.
-- [ ] **G4.2** `#![deny(clippy::unwrap_used, clippy::panic)]` in library
-      code, with test-only exemptions.
-- [ ] **G4.3** Watchdog hook — the actor should be able to prove liveness to
-      hardware.
-- [ ] **G4.4** Fault-injection tests: every `hardware` trait method failing,
-      timing out, and returning inconsistent state, asserting the state
-      machine reaches `Faulted`/`FaultedSafe` fail-safely
-      (contactor open *before* unlock) rather than wedging.
-- [ ] **G4.5** Actor mailbox backpressure policy — what happens when
-      hardware pushes events faster than they're drained.
+Complete. `CLAUDE.md`'s error-handling stance — hardware is erratic, every binding call is
+fallible, a fault must never take the charge point down — was asserted everywhere and enforced
+nowhere. These five rows make it mechanical.
 
----
+- [x] **G4.1 / G4.2** `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::panic))]` in
+      `lib.rs`, and the audit it forced. The crate was in better shape than a raw grep suggested
+      (503 raw hits, but 500 of them in `#[cfg(test)]` modules); **three** real sites remained, all
+      the same shape: `heapless::String::try_from(<compile-time constant>).unwrap()`.
+
+      They are fixed by making the impossibility provable rather than asserted. Each constant now
+      carries a `const _: () = assert!(…len() <= N)` and the call uses `unwrap_or_default()`, so a
+      literal that outgrew its wire bound fails the **build** — where the `unwrap()` would have
+      failed a charge point in the field, on a path a CSMS reaches by sending `GetConfiguration`.
+      `not(test)` rather than an allow-list, because test code panics on purpose and a
+      `#[cfg(test)]` module is not shipped.
+- [x] **G4.3** Watchdog hook — `hardware::Watchdog`, fed from `ChargePointActor`'s run loop and
+      nowhere else.
+
+      That placement is the whole design. A timer task that pets the dog on its own schedule proves
+      the *timer* is running, which it will be right up until the actor deadlocks and the charge
+      point sits there with a contactor closed feeding a watchdog that believes everything is fine.
+      Fed once per applied event, it proves the precise property worth proving — the actor is
+      draining its mailbox — and it is fed **after** effects are dispatched, so an event that wedges
+      mid-apply stops the feeding rather than petting the dog on its way in. `NoWatchdog` is the
+      default and does nothing: most stations have no watchdog peripheral and must behave exactly
+      as before.
+- [x] **G4.4** Fault-injection tests — one variant per fallible hardware method, so a method added
+      without a fault test shows up as a missing enum variant.
+
+      The assertion is stated precisely rather than broadly: after a hardware failure the connector
+      must never be left **`Charging`**. Transient states are correct and expected — `Stopping` and
+      `Finishing` *are* the fail-safe stop in progress, waiting on a confirmation the hardware owes
+      — and an earlier draft of this test wrongly treated them as wedging. What would be wrong is
+      `Charging`, which tells the CSMS and the driver that current flows under control the charge
+      point has just lost.
+
+      Ordering is asserted from the recorded call sequence, not inferred from the end state: a
+      fail-safe transition opens the contactor **before** unlocking, because releasing a latch while
+      current flows exposes a live pin, and a test that only checked the end state would pass on an
+      implementation that unlocked first. Commands addressed to hardware that does not exist are
+      covered too — reachable from a stale CSMS request, so it must degrade rather than panic.
+- [x] **G4.5** Actor mailbox backpressure — **the mailbox was unbounded**, which is a G2.2-class
+      hole: "a bound a remote peer can push past is not a bound" applies just as well to a
+      chattering connector or a binding looping on a stuck reading. On a device with kilobytes of
+      RAM that grows until allocation fails.
+
+      Now bounded (256 by default), and **overflow refuses the send rather than dropping**. Both
+      drop policies are wrong for this queue specifically, because it carries *state-machine
+      transitions* and they are order-dependent: dropping the oldest reorders history, dropping the
+      newest loses the transition that would have moved the connector on, and either can wedge a
+      connector in a state the hardware has already left. So a full mailbox returns
+      `ActorError::MailboxFull` — which senders already have to handle — and a hardware binding
+      then *knows* its event did not land instead of believing the state machine agrees with it.
+
+      No `MemoryExhaustion` event is raised on overflow, deliberately: that would mean sending an
+      event into the very mailbox that is full, the same unbounded feedback loop the offline
+      security-event queue documents at its own overflow handler. It is logged at error level
+      instead.
 
 ## 10. Workstream H — test, compliance, release
 
@@ -2875,5 +2919,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 963 | `#[test]` + `#[tokio::test]`, re-counted after merging the B5.4/E2.11/H1.6 worktrees (942 at B4.2, 920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 974 | `#[test]` + `#[tokio::test]`, re-counted at the G4 commit (963 after merging the B5.4/E2.11/H1.6 worktrees (942 at B4.2, 920 at B4.1, 909 at F1–F3, 895 at B3.2, 873 at B5.1, 848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

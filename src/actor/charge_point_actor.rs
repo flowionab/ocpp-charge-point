@@ -48,6 +48,14 @@ pub enum ActorError {
     /// the actor lives for the process lifetime in practice - but callers should not treat it as
     /// fatal; see [`crate::hardware::HardwareEventSender::send`].
     Stopped,
+    /// The actor's mailbox is full: it is not draining events as fast as they are arriving, and
+    /// this event was refused rather than queued (G4.5).
+    ///
+    /// A hardware binding seeing this should treat its own view of the hardware as unconfirmed -
+    /// the state machine has *not* been told - and either retry or drive the connector to a
+    /// fail-safe state. See [`crate::sync`]'s mailbox docs for why a full mailbox refuses instead
+    /// of dropping.
+    MailboxFull,
 }
 
 /// A cloneable handle onto the charge point's actor: the single owner of
@@ -101,6 +109,26 @@ impl ChargePointActor {
         executor: &dyn Executor,
         limits: crate::state::StateLimits,
     ) -> Self {
+        Self::spawn_with_watchdog(
+            connector_counts,
+            executor,
+            limits,
+            Arc::new(crate::hardware::NoWatchdog),
+        )
+    }
+
+    /// [`Self::spawn_with_limits`], additionally feeding `watchdog` once per applied event so the
+    /// hardware can tell that the actor is still draining its mailbox (G4.3).
+    ///
+    /// Separate constructor rather than a parameter on the others because most charge points have
+    /// no watchdog peripheral and should not have to name one - see
+    /// [`crate::hardware::Watchdog`] for why this is fed from the run loop and nowhere else.
+    pub fn spawn_with_watchdog(
+        connector_counts: impl IntoIterator<Item = usize>,
+        executor: &dyn Executor,
+        limits: crate::state::StateLimits,
+        watchdog: Arc<dyn crate::hardware::Watchdog>,
+    ) -> Self {
         let state = ChargePointState::with_limits(connector_counts, limits);
         let mailbox = Chan::new();
         let (updates, state_receiver) = watch_channel(state.clone());
@@ -120,7 +148,13 @@ impl ChargePointActor {
             reservation_updates: reservation_updates.clone(),
             priority_charging_changes: priority_charging_changes.clone(),
         };
-        executor.spawn(Box::pin(run(state, mailbox.clone(), updates, effects)));
+        executor.spawn(Box::pin(run(
+            state,
+            mailbox.clone(),
+            updates,
+            effects,
+            watchdog,
+        )));
 
         Self {
             mailbox,
@@ -143,12 +177,27 @@ impl ChargePointActor {
     ///
     /// `Err(ActorError::Stopped)` is not expected in normal operation - see [`ActorError`] -
     /// but callers should not treat it as fatal.
+    ///
+    /// `Err(ActorError::MailboxFull)` means the actor is not draining fast enough and this event
+    /// was **not** applied (G4.5). It is not dropped silently: the caller is told, because a
+    /// hardware binding that believes an event landed will go on to believe the state machine
+    /// agrees with its hardware.
     pub async fn send(&self, event: ChargePointEvent) -> Result<(), ActorError> {
         let acknowledged = OneShot::new();
-        self.mailbox.send(Command::Event {
+        if !self.mailbox.send(Command::Event {
             event,
             acknowledged: acknowledged.clone(),
-        });
+        }) {
+            // Deliberately only logged, never reported through the actor: raising a
+            // `MemoryExhaustion` security event here would mean sending an event into the very
+            // mailbox that is full, which overflows again - the same unbounded feedback loop the
+            // offline security-event queue documents at its own overflow handler.
+            tracing::error!(
+                "the charge point actor's mailbox is full; refusing an event rather than dropping \
+                 a state-machine transition, which would wedge a connector"
+            );
+            return Err(ActorError::MailboxFull);
+        }
         acknowledged.wait().await;
         Ok(())
     }
@@ -253,6 +302,7 @@ async fn run(
     mailbox: Chan<Command>,
     updates: crate::sync::WatchSender<ChargePointState>,
     effects: EffectSenders,
+    watchdog: Arc<dyn crate::hardware::Watchdog>,
 ) {
     loop {
         let Command::Event {
@@ -290,6 +340,63 @@ async fn run(
                 }
             }
         }
+        // G4.3: fed here and nowhere else. This is the one place that proves the property worth
+        // proving - the actor is draining its mailbox and applying events - and it is fed *after*
+        // the effects are dispatched, so an event that wedges mid-apply stops the feeding rather
+        // than petting the dog on its way in. See `crate::hardware::Watchdog`.
+        watchdog.pet().await;
         acknowledged.send(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn the_watchdog_is_fed_once_per_applied_event_not_on_a_timer() {
+        use crate::hardware::Watchdog;
+
+        struct CountingWatchdog {
+            pets: Arc<BlockingMutex<CriticalSectionRawMutex, RefCell<u32>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Watchdog for CountingWatchdog {
+            async fn pet(&self) {
+                self.pets.lock(|pets| *pets.borrow_mut() += 1);
+            }
+        }
+
+        let pets = Arc::new(BlockingMutex::new(RefCell::new(0)));
+        let actor = ChargePointActor::spawn_with_watchdog(
+            [1],
+            &crate::executor::TokioExecutor,
+            crate::state::StateLimits::default(),
+            Arc::new(CountingWatchdog { pets: pets.clone() }),
+        );
+
+        // Nothing has been applied yet, so nothing has been proven.
+        pets.lock(|p| assert_eq!(*p.borrow(), 0));
+
+        let _ = actor.send(ChargePointEvent::BootCompleted).await;
+        let _ = actor.send(ChargePointEvent::SetUnavailable).await;
+        let _ = actor.send(ChargePointEvent::SetAvailable).await;
+
+        // Three events applied, three proofs of life - the count tracks work done, not time
+        // elapsed, which is the whole point: a timer-fed watchdog would keep petting happily
+        // while the actor sat wedged with a contactor closed.
+        pets.lock(|p| assert_eq!(*p.borrow(), 3));
+    }
+
+    #[tokio::test]
+    async fn a_charge_point_with_no_watchdog_behaves_exactly_as_before() {
+        let actor = ChargePointActor::spawn([1], &crate::executor::TokioExecutor);
+
+        let _ = actor.send(ChargePointEvent::BootCompleted).await;
+
+        assert_eq!(
+            actor.state().lifecycle,
+            crate::state::LifecycleState::Available
+        );
     }
 }

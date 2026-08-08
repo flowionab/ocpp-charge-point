@@ -60,27 +60,73 @@ struct ChanInner<T> {
     signal: Signal<CriticalSectionRawMutex, ()>,
 }
 
-/// Unbounded multi-producer, single-consumer mailbox, replacing the bounded
+/// How many un-drained events the actor's mailbox holds before it refuses more (G4.5).
+///
+/// 256 is far above any burst a real charge point produces - a connector transition is a handful
+/// of events and a busy multi-EVSE station generates a few per second - while staying small
+/// enough that the queue's worst case is tens of KB rather than unbounded. An integrator whose
+/// hardware bursts harder raises it explicitly.
+pub(crate) const DEFAULT_MAILBOX_CAPACITY: usize = 256;
+
+/// Multi-producer, single-consumer mailbox, replacing the bounded
 /// `tokio::sync::mpsc::channel` used for the actor's event queue.
+///
+/// **Bounded** (G4.5). It was unbounded, which on a device with kilobytes of RAM is a bound a
+/// glitching sensor can push past: a connector that chatters, or a hardware binding looping on a
+/// stuck reading, grows the queue until allocation fails. See [`Self::with_capacity`] for why
+/// overflow refuses rather than drops.
 pub(crate) struct Chan<T> {
     inner: Arc<ChanInner<T>>,
+    capacity: usize,
 }
 
 impl<T> Chan<T> {
     pub(crate) fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAILBOX_CAPACITY)
+    }
+
+    /// A mailbox holding at most `capacity` un-drained values.
+    ///
+    /// **Overflow refuses the send; it never drops.** Both drop policies are wrong here, and the
+    /// reason is specific to what this queue carries: these are *state machine transitions*, and
+    /// they are order-dependent. Dropping the oldest reorders history; dropping the newest loses
+    /// the transition that would have moved the connector on. Either can wedge a connector in a
+    /// state the hardware has already left - a contactor the state machine believes is open while
+    /// current flows.
+    ///
+    /// So a full mailbox returns an error to the sender instead, and the sender already has to
+    /// handle one ([`crate::actor::ActorError`]). A hardware binding then *knows* its event did
+    /// not land and can retry or fault, rather than believing it was delivered.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: Arc::new(ChanInner {
                 queue: Lock::new(RefCell::new(VecDeque::new())),
                 signal: Signal::new(),
             }),
+            capacity: capacity.max(1),
         }
     }
 
-    pub(crate) fn send(&self, value: T) {
-        self.inner
-            .queue
-            .lock(|queue| queue.borrow_mut().push_back(value));
-        self.inner.signal.signal(());
+    /// Queues `value`, returning `false` if the mailbox is full and the value was **not** queued.
+    pub(crate) fn send(&self, value: T) -> bool {
+        let queued = self.inner.queue.lock(|queue| {
+            let mut queue = queue.borrow_mut();
+            if queue.len() >= self.capacity {
+                return false;
+            }
+            queue.push_back(value);
+            true
+        });
+        if queued {
+            self.inner.signal.signal(());
+        }
+        queued
+    }
+
+    /// How many values are waiting to be drained - what a backpressure check reads.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.queue.lock(|queue| queue.borrow().len())
     }
 
     /// Waits for the next queued value. `Signal`'s "latch" semantics (a `signal()` call before
@@ -102,6 +148,7 @@ impl<T> Chan<T> {
 impl<T> Clone for Chan<T> {
     fn clone(&self) -> Self {
         Self {
+            capacity: self.capacity,
             inner: self.inner.clone(),
         }
     }
@@ -305,5 +352,44 @@ impl<T> BroadcastReceiver<T> {
             }
             self.queue.signal.wait().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod mailbox_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_mailbox_refuses_rather_than_dropping_a_transition() {
+        let chan = Chan::with_capacity(2);
+
+        assert!(chan.send(1));
+        assert!(chan.send(2));
+        // G4.5: the third is refused, and 1 and 2 are still there. Dropping either would reorder
+        // or lose a state-machine transition, which can leave a connector in a state the hardware
+        // has already left - a contactor the state machine believes is open while current flows.
+        assert!(!chan.send(3));
+        assert_eq!(chan.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn draining_makes_room_again() {
+        let chan = Chan::with_capacity(1);
+        assert!(chan.send(1));
+        assert!(!chan.send(2));
+
+        assert_eq!(chan.recv().await, 1);
+
+        // Backpressure is transient, not a latch: once the actor catches up, senders proceed.
+        assert!(chan.send(2));
+        assert_eq!(chan.recv().await, 2);
+    }
+
+    #[test]
+    fn a_zero_capacity_mailbox_is_clamped_so_it_can_never_accept_nothing() {
+        // A capacity of 0 would refuse every event forever, which is a charge point that cannot
+        // run at all - clamped to 1 for the same reason every other bound here is.
+        let chan = Chan::with_capacity(0);
+        assert!(chan.send(1));
     }
 }
