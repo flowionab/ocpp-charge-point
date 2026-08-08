@@ -740,7 +740,12 @@ Boot, configuration, and the Component/Variable device model.
   negative slot, a new slot past the bound). Storing one does **not** switch the
   live connection - that is A9, still open - and `basicAuthPassword` is dropped
   rather than kept, being a credential this crate cannot use. 1.6J has no such
-  message. Still missing: variable monitoring
+  message. `NetworkConfigurationPriority` is live - a stored slot joins the
+  order and a vanished one leaves it, without ever reordering what the operator
+  set - and `network_profile::selected_profile` answers which profile the CSMS
+  wants in force. Dialling it is blocked upstream (A9: `ocpp-client` fixes the
+  reconnect target at construction), so an integrator driving its own connection
+  reads that and redials. Still missing: variable monitoring
   (`SetVariableMonitoring`/`GetMonitoringReport`/`NotifyMonitoringReport`).
   Two items previously listed here are done: device-model persistence across
   restarts (E2.3 - `VariableAttribute::persistent` is acted on now), and the

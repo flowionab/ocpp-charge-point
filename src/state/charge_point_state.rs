@@ -6,12 +6,13 @@ use crate::hardware::Capabilities;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
     AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
-    ChargingProfileScope, ChargingProfileStore, ConnectorEvent, ConnectorState,
+    ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent, ConnectorState,
     ConnectorStatusChanged, DeviceModel, DeviceModelEvent, EvseEvent, EvseState, HardwareCommand,
     IdToken, LocalAuthorizationList, LocalListEntry, MeterSample, NetworkProfileStore,
     PendingReset, RegistrationStatus, ResetKind, ResetTarget, SecurityEvent, SecurityEventType,
     StateLimits, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
-    TransactionEventOccurred, TransactionId, TransactionUpdateReason,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason, Variable,
+    VariableAttributeType,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -193,10 +194,15 @@ impl ChargePointState {
                 true
             }
             ChargePointEvent::NetworkProfileSet { slot, profile } => {
-                self.network_profiles.set(slot, *profile)
+                let stored = self.network_profiles.set(slot, *profile);
+                if stored {
+                    self.refresh_network_configuration_priority();
+                }
+                stored
             }
             ChargePointEvent::PersistedNetworkProfilesRestored { slots } => {
                 let dropped = self.network_profiles.replace(slots);
+                self.refresh_network_configuration_priority();
                 if dropped > 0 {
                     tracing::warn!(
                         dropped,
@@ -695,6 +701,56 @@ impl ChargePointState {
                 )),
             }));
         }
+    }
+
+    /// Appends any newly-occupied slot to `OCPPCommCtrlr`/`NetworkConfigurationPriority`, which
+    /// OCPP defines as the comma-separated slot numbers in the order the charge point should try
+    /// them.
+    ///
+    /// **Appends, never reorders.** The order is the CSMS's decision - it writes that variable
+    /// deliberately - so rewriting it whenever a profile arrives would clobber a configuration
+    /// this charge point was told to use. A slot absent from the list would never be tried at
+    /// all, though, so a newly stored profile is added at the end: the CSMS's own ordering is
+    /// preserved, and a profile it just wrote does not silently become unreachable.
+    fn refresh_network_configuration_priority(&mut self) {
+        let component = Component {
+            name: "OCPPCommCtrlr".into(),
+            instance: None,
+            evse: None,
+        };
+        let variable = Variable {
+            name: "NetworkConfigurationPriority".into(),
+            instance: None,
+        };
+        let current = self
+            .device_model
+            .get(&component, &variable)
+            .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+            .map(|attribute| attribute.value.clone())
+            .unwrap_or_default();
+        let mut order: Vec<i32> = current
+            .split(',')
+            .filter_map(|slot| slot.trim().parse().ok())
+            .collect();
+        // Drop slots that are no longer occupied - reporting a slot the CSMS could select and
+        // this charge point has nothing for would be worse than a shorter list.
+        order.retain(|slot| self.network_profiles.get(*slot).is_some());
+        for occupied in self.network_profiles.slots() {
+            if !order.contains(&occupied.slot) {
+                order.push(occupied.slot);
+            }
+        }
+        let value = order
+            .iter()
+            .map(alloc::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.device_model.set_attribute_value(
+            &component,
+            &variable,
+            VariableAttributeType::Actual,
+            value,
+        );
     }
 
     fn target_evse_ids(&self, target: ResetTarget) -> Vec<usize> {

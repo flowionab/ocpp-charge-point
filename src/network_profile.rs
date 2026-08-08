@@ -80,6 +80,59 @@ pub async fn handle_set_network_profile(
     SetNetworkProfileOutcome::Accepted
 }
 
+/// The profile this charge point should be connected through, per
+/// `OCPPCommCtrlr`/`NetworkConfigurationPriority` - the highest-priority slot that actually holds
+/// one.
+///
+/// **Nothing in this crate dials it yet**, and that is A9's remaining half rather than an
+/// oversight: switching a live connection means re-pointing the transport's reconnect target,
+/// which `ocpp-client` 0.2.1 fixes at construction and exposes no way to change (see
+/// `docs/PRODUCTION-ROADMAP.md` A9). Until that lands upstream, this is the supported way for an
+/// integrator driving its own connection to ask "which profile does the CSMS want me on?" -
+/// reading it here rather than reimplementing the priority parse against
+/// [`crate::state::NetworkProfileStore`].
+///
+/// `None` when no slot in the priority order is occupied, including when no profile has ever been
+/// set: a charge point then stays on whatever address it was started with.
+pub fn selected_profile(
+    state: &crate::state::ChargePointState,
+) -> Option<(i32, &NetworkConnectionProfile)> {
+    let priority = priority_order(state);
+    priority.into_iter().find_map(|slot| {
+        state
+            .network_profiles
+            .get(slot)
+            .map(|profile| (slot, profile))
+    })
+}
+
+/// `OCPPCommCtrlr`/`NetworkConfigurationPriority` parsed into slot numbers, in the order the CSMS
+/// wants them tried. Unparseable entries are skipped rather than failing the whole list - a
+/// CSMS's typo in one slot should not make the charge point forget the rest of its ordering.
+fn priority_order(state: &crate::state::ChargePointState) -> alloc::vec::Vec<i32> {
+    let component = crate::state::Component {
+        name: "OCPPCommCtrlr".into(),
+        instance: None,
+        evse: None,
+    };
+    let variable = crate::state::Variable {
+        name: "NetworkConfigurationPriority".into(),
+        instance: None,
+    };
+    state
+        .device_model
+        .get(&component, &variable)
+        .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
+        .map(|attribute| {
+            attribute
+                .value
+                .split(',')
+                .filter_map(|slot| slot.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Registers this charge point's inbound `SetNetworkProfile` handling with the CSMS connection.
 /// Implemented for 2.0.1 and 2.1; 1.6J has no such message.
 #[async_trait::async_trait]
@@ -172,6 +225,68 @@ mod tests {
                 .map(|profile| profile.csms_url.clone()),
             Some("wss://replacement".into())
         );
+    }
+
+    #[tokio::test]
+    async fn a_stored_profile_joins_the_priority_order_so_it_can_be_selected_at_all() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        handle_set_network_profile(&actor, 2, profile("wss://second")).await;
+        handle_set_network_profile(&actor, 1, profile("wss://first")).await;
+
+        // Appended in the order they arrived, so slot 2 - written first - is tried first. A
+        // charge point must not silently reorder what the CSMS asked for.
+        let state = actor.state();
+        assert_eq!(
+            selected_profile(&state).map(|(slot, profile)| (slot, profile.csms_url.clone())),
+            Some((2, "wss://second".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_csms_ordering_is_honoured_and_never_rewritten_by_a_later_profile() {
+        use crate::state::{ChargePointEvent, DeviceModelEvent, VariableAttributeType};
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        handle_set_network_profile(&actor, 1, profile("wss://first")).await;
+        handle_set_network_profile(&actor, 2, profile("wss://second")).await;
+
+        // The CSMS reorders: try slot 2 first.
+        let _ = actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: crate::state::Component {
+                        name: "OCPPCommCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: crate::state::Variable {
+                        name: "NetworkConfigurationPriority".into(),
+                        instance: None,
+                    },
+                    attribute_type: VariableAttributeType::Actual,
+                    value: "2,1".into(),
+                },
+            ))
+            .await;
+        assert_eq!(
+            selected_profile(&actor.state()).map(|(slot, _)| slot),
+            Some(2)
+        );
+
+        // A third profile arrives - it must append, not reset the operator's ordering.
+        handle_set_network_profile(&actor, 3, profile("wss://third")).await;
+        assert_eq!(
+            selected_profile(&actor.state()).map(|(slot, _)| slot),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_charge_point_with_no_profiles_selects_nothing() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        assert!(selected_profile(&actor.state()).is_none());
     }
 
     #[tokio::test]

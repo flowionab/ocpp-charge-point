@@ -6,9 +6,10 @@
 //! `SetNetworkProfile` writes a profile into a numbered configuration slot. It does **not** switch
 //! the live connection - OCPP is explicit that the profile applies to a future connection attempt,
 //! and the CSMS orders slots separately via `OCPPCommCtrlr`/`NetworkConfigurationPriority`. So
-//! this crate stores profiles, reports them, and keeps them across a reboot; *dialling* one, and
-//! rolling back when a new profile fails to connect, is
-//! [A9](../../docs/PRODUCTION-ROADMAP.md) and is not done.
+//! this crate stores profiles, reports them, keeps them across a reboot, and tracks which one the
+//! CSMS's priority order selects ([`crate::network_profile::selected_profile`]); *dialling* it,
+//! and rolling back when a new profile fails to connect, is
+//! [A9](../../docs/PRODUCTION-ROADMAP.md) and is blocked on an `ocpp-client` change.
 //!
 //! That boundary is worth stating plainly because it is easy to mistake a full slot store for a
 //! working profile switch: a charge point built on this crate today connects to whatever address
