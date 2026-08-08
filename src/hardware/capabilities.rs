@@ -68,6 +68,13 @@ pub struct Capabilities {
     pub smart_charging: bool,
     /// The hardware supports firmware management (`UpdateFirmware` and related messages).
     pub firmware_management: bool,
+    /// The charge point acts as an OCPP local controller and can serve a downloaded firmware
+    /// image to other charge points on the local network (`PublishFirmware`/`UnpublishFirmware`/
+    /// `PublishFirmwareStatusNotification` - `docs/PRODUCTION-ROADMAP.md` B3.4). Needs a
+    /// [`crate::hardware::FirmwarePublisher`], which the overwhelming majority of charge points -
+    /// anything that isn't itself acting as a local controller - do not have, so this defaults to
+    /// absent like every other capability.
+    pub firmware_publishing: bool,
     /// The hardware supports the diagnostics functional block (log upload, etc.).
     pub diagnostics: bool,
     /// The charge point can hold and manage X.509 certificates - see
@@ -114,6 +121,7 @@ impl Default for Capabilities {
             local_auth_list: false,
             smart_charging: false,
             firmware_management: false,
+            firmware_publishing: false,
             diagnostics: false,
             certificate_management: false,
             variable_monitoring: false,
@@ -246,6 +254,23 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         feature_profile_1_6: Some("FirmwareManagement"),
         has_handler: false,
     },
+    CapabilityGate {
+        name: "firmware_publishing",
+        cargo_feature: "firmware-publishing",
+        enabled: |c| c.firmware_publishing,
+        // The 2.1 appendix names a `LocalController` component (`components.csv`) but defines no
+        // variables for it in `dm_components_vars.csv` - nothing there to mirror an `Available`
+        // flag onto, so this is `None` for the same reason `firmware_management` is.
+        ctrlr_component: None,
+        // 1.6J predates the local-controller concept entirely - no feature profile covers it.
+        feature_profile_1_6: None,
+        // Builder-only, like `firmware_management`/`diagnostics`/`certificate_management`:
+        // registering it needs a `hardware::FirmwarePublisher` (on top of the
+        // `hardware::FileTransfer` `firmware_management` already needs), which `setup()`'s
+        // signature cannot receive. An integrator wanting it calls
+        // `ChargePointBuilder::publish_firmware`.
+        has_handler: false,
+    },
 ];
 
 /// One `(capability name, Cargo feature name, whether the capability is set)` row consulted by
@@ -254,7 +279,7 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
 /// mistakes early, so it deliberately checks more than C3 needs to propagate).
 fn all_capability_feature_pairs(
     capabilities: &Capabilities,
-) -> [(&'static str, &'static str, bool); 15] {
+) -> [(&'static str, &'static str, bool); 16] {
     [
         (
             "smart_charging",
@@ -265,6 +290,11 @@ fn all_capability_feature_pairs(
             "firmware_management",
             "firmware-management",
             capabilities.firmware_management,
+        ),
+        (
+            "firmware_publishing",
+            "firmware-publishing",
+            capabilities.firmware_publishing,
         ),
         ("diagnostics", "diagnostics", capabilities.diagnostics),
         (
@@ -362,6 +392,7 @@ fn feature_enabled(feature: &str) -> bool {
     match feature {
         "smart-charging" => cfg!(feature = "smart-charging"),
         "firmware-management" => cfg!(feature = "firmware-management"),
+        "firmware-publishing" => cfg!(feature = "firmware-publishing"),
         "diagnostics" => cfg!(feature = "diagnostics"),
         "certificate-management" => cfg!(feature = "certificate-management"),
         "variable-monitoring" => cfg!(feature = "variable-monitoring"),
@@ -496,6 +527,13 @@ impl Capabilities {
         self
     }
 
+    /// Sets `firmware_publishing` - see that field.
+    #[must_use]
+    pub fn with_firmware_publishing(mut self, enabled: bool) -> Self {
+        self.firmware_publishing = enabled;
+        self
+    }
+
     /// Sets `diagnostics` - see that field.
     #[must_use]
     pub fn with_diagnostics(mut self, enabled: bool) -> Self {
@@ -578,6 +616,7 @@ mod tests {
         assert!(!capabilities.local_auth_list);
         assert!(!capabilities.smart_charging);
         assert!(!capabilities.firmware_management);
+        assert!(!capabilities.firmware_publishing);
         assert!(!capabilities.diagnostics);
         assert!(!capabilities.variable_monitoring);
         assert!(!capabilities.tariff_and_cost);

@@ -65,6 +65,7 @@ pub mod network_switch;
 pub mod offline_queue;
 pub mod persistence;
 pub mod provisioning;
+pub mod publish_firmware;
 pub mod refusal;
 pub mod remote_control;
 pub mod reporting;

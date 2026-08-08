@@ -19,6 +19,7 @@ mod evse;
 mod fault_injection;
 mod file_transfer;
 mod firmware;
+mod firmware_publisher;
 mod storage;
 mod watchdog;
 
@@ -44,6 +45,9 @@ pub use self::file_transfer::{
 };
 pub use self::firmware::{
     FirmwareInstallOutcome, FirmwareInstaller, NoFirmwareInstaller, NoFirmwareInstallerError,
+};
+pub use self::firmware_publisher::{
+    FirmwarePublisher, NoFirmwarePublisher, NoFirmwarePublisherError,
 };
 pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]

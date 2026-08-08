@@ -56,6 +56,8 @@
 //! | `SetDisplayMessage`          | n/a (2.x-only) | CALLRESULT `DisplayMessageStatusEnum::Rejected` | CALLRESULT `DisplayMessageStatusEnum::Rejected` |
 //! | `ClearDisplayMessage`        | n/a (2.x-only) | CALLRESULT `ClearMessageStatusEnum::Unknown` (no `Rejected` in 2.0.1) | CALLRESULT `ClearMessageStatusEnum::Rejected` |
 //! | `GetDisplayMessages`         | n/a (2.x-only) | CALLRESULT `GetDisplayMessagesStatusEnum::Unknown` (no `Rejected`/`NotSupported` in either version - an absent capability answers through the same "nothing matched" status an empty store would, not a separate refusal) | same as 2.0.1 |
+//! | `PublishFirmware`            | n/a (2.x-only - no local-controller concept in 1.6J) | CALLRESULT `GenericStatusEnum::Rejected` | CALLRESULT `GenericStatusEnum::Rejected` |
+//! | `UnpublishFirmware`          | n/a (2.x-only) | CALLRESULT `UnpublishFirmwareStatusEnum::NoFirmware` (no dedicated "unsupported" value; a local controller that can never publish anything genuinely has no firmware to unpublish) | same as 2.0.1 |
 //!
 //! Nothing here needed to fall back on assumption where the vendored spec/generated types didn't
 //! settle it - every response type above either has a documented status enum or documented-empty
@@ -206,6 +208,16 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         capability: |c| c.has_display,
         shape: RefusalShape::CallResultStatus,
     },
+    RefusalGate {
+        message: "PublishFirmware",
+        capability: |c| c.firmware_publishing,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "UnpublishFirmware",
+        capability: |c| c.firmware_publishing,
+        shape: RefusalShape::CallResultStatus,
+    },
 ];
 
 /// Looks up the [`RefusalGate`] for `message` (by `Action::NAME`), if this crate has one.
@@ -311,6 +323,17 @@ mod tests {
         assert!(!capability_present(&absent, "GetLocalListVersion"));
         assert!(capability_present(&present, "SendLocalList"));
         assert!(capability_present(&present, "GetLocalListVersion"));
+    }
+
+    #[test]
+    fn capability_present_reflects_firmware_publishing() {
+        let absent = Capabilities::default();
+        let present = capabilities_with(|c| c.firmware_publishing = true);
+
+        assert!(!capability_present(&absent, "PublishFirmware"));
+        assert!(!capability_present(&absent, "UnpublishFirmware"));
+        assert!(capability_present(&present, "PublishFirmware"));
+        assert!(capability_present(&present, "UnpublishFirmware"));
     }
 
     #[test]

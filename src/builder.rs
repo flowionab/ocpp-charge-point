@@ -1979,6 +1979,55 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers the local-controller Firmware Publishing block
+    /// (`docs/PRODUCTION-ROADMAP.md` B3.4): inbound `PublishFirmware`/`UnpublishFirmware`, and the
+    /// worker that downloads and publishes every accepted request, reporting every state change
+    /// to `csms`. **2.x only** - 1.6J has no local-controller concept.
+    ///
+    /// Needs `transfer` to fetch the image (the same `hardware::FileTransfer` as
+    /// [`Self::firmware_updates`]) and `publisher` to serve it on the local network, which is why,
+    /// like [`Self::firmware_updates`], this is builder-only: `setup()` has no way to receive
+    /// either. Independent of [`Self::firmware_updates`] - a charge point can publish firmware for
+    /// others without ever calling it on itself, and vice versa.
+    pub async fn publish_firmware<N, R, F, B>(
+        self,
+        csms: &N,
+        transfer: R,
+        publisher: F,
+        backoff: B,
+    ) -> Self
+    where
+        N: crate::publish_firmware::PublishFirmwareHandler
+            + crate::publish_firmware::PublishFirmwareStatusNotifier
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        R: crate::hardware::FileTransfer + Send + Sync + 'static,
+        F: crate::hardware::FirmwarePublisher + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+    {
+        let publishes = crate::publish_firmware::PublishFirmwareQueue::new();
+        let state = Arc::new(crate::publish_firmware::PublishFirmwareState::new());
+        let publisher = Arc::new(publisher);
+        csms.register_publish_firmware_handlers(
+            self.runtime.actor(),
+            publishes.clone(),
+            publisher.clone(),
+            state.clone(),
+        )
+        .await;
+
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::publish_firmware::run_publish_firmware(
+                publishes, &state, &transfer, &publisher, &notifier, &backoff,
+            )
+            .await;
+        }));
+        self
+    }
+
     /// Registers certificate management (`docs/PRODUCTION-ROADMAP.md` B4.2): `InstallCertificate`,
     /// `DeleteCertificate` and `GetInstalledCertificateIds`, all answered from `store`.
     ///
