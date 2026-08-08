@@ -1729,6 +1729,48 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers the Diagnostics block's log upload (`docs/PRODUCTION-ROADMAP.md` B5.1): inbound
+    /// `GetLog` (2.x) / `GetDiagnostics` (1.6J), and the worker that performs each accepted upload
+    /// through `transfer` while reporting its progress to `csms`.
+    ///
+    /// `log` is the same [`SecurityEventLog`](crate::security::SecurityEventLog) handle
+    /// [`Self::security_log_persisted`] restores into, so a `GetLog` for the security log uploads
+    /// the history that survived the last reboot rather than only what has happened since.
+    ///
+    /// The upload runs on its own task because OCPP's sequence requires the response to go out
+    /// before the transfer starts - see [`crate::diagnostics`].
+    pub async fn log_uploads<N, F, B>(
+        self,
+        csms: &N,
+        transfer: F,
+        log: Arc<crate::security::SecurityEventLog>,
+        backoff: B,
+    ) -> Self
+    where
+        N: crate::diagnostics::GetLogHandler
+            + crate::diagnostics::LogStatusNotifier
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        F: crate::hardware::FileTransfer + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+    {
+        let uploads = crate::diagnostics::LogUploadQueue::new();
+        let state = Arc::new(crate::diagnostics::LogUploadState::new());
+        csms.register_get_log_handler(self.runtime.actor(), uploads.clone(), state.clone())
+            .await;
+
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::diagnostics::run_log_uploads(
+                uploads, &state, &transfer, &notifier, &log, &backoff,
+            )
+            .await;
+        }));
+        self
+    }
+
     /// Finishes building, handing back the [`ChargePointRuntime`] every registered block is now
     /// wired to.
     pub fn build(self) -> ChargePointRuntime<T> {

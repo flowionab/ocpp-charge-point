@@ -851,8 +851,8 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 
 | Message | 1.6J | 2.0.1 | 2.1 |
 |---------|:----:|:-----:|:---:|
-| GetDiagnostics / DiagnosticsStatusNotification | ⬜ | — | — |
-| GetLog / LogStatusNotification | — | ⬜ | ⬜ |
+| GetDiagnostics / DiagnosticsStatusNotification | ✅ | — | — |
+| GetLog / LogStatusNotification | — | ✅ | ✅ |
 | SetVariableMonitoring / ClearVariableMonitoring | — | ⬜ | ⬜ |
 | SetMonitoringBase / SetMonitoringLevel | — | ⬜ | ⬜ |
 | GetMonitoringReport / NotifyMonitoringReport | — | ⬜ | ⬜ |
@@ -861,11 +861,62 @@ own yet and need the EV-side ISO 15118 surface [B4.5](#b4--certificates-and-iso-
 | GetTransactionStatus | — | ⬜ | ⬜ |
 | Open/Close/Adjust/Get PeriodicEventStream, NotifyPeriodicEventStream | — | — | ⬜ |
 
-- [ ] **B5.1** Log upload via the [B3.1](#b3--firmware-management-r12) file-transfer abstraction,
-      which now exists: `FileTransfer::upload` takes the security log as `UploadSource::Bytes` and
-      a diagnostics log as `UploadSource::Local`. What is left here is the `GetLog`/`GetDiagnostics`
-      handlers, the `LogStatusNotification`/`DiagnosticsStatusNotification` reporting, and
-      rendering `SecurityEventLog` to bytes. Closes [F4.3](#84-f4--security-events) with it.
+- [x] **B5.1** Log upload — `GetLog` (2.x) and `GetDiagnostics` (1.6J) end to end, on top of
+      [B3.1](#b3--firmware-management-r12)'s `FileTransfer`. Implemented against the vendored
+      spec's N01.FR.01–.17.
+
+      **The upload cannot happen in the handler**, which shaped the design. N01's sequence is:
+      respond `Accepted` *first*, then report `Uploading`, then upload, then report `Uploaded`. A
+      handler doing the transfer before returning would hold the response until a multi-megabyte
+      upload over a slow link finished — by which point the CSMS has timed out, and the status
+      notifications would arrive *after* the response they are meant to follow. So the handler does
+      only what is immediate (decide, name the file) and hands the work to `run_log_uploads`, a
+      worker the builder spawns: the same actor discipline as the rest of the crate, where the
+      decision is synchronous and the work is a message.
+
+      **`UploadSource` earns its split here.** A `SecurityLog` request renders
+      `SecurityEventLog` to bytes and hands them over; a `DiagnosticsLog` request passes a name and
+      the integrator streams its own. That is B3.1's asymmetry doing exactly the job it was shaped
+      for.
+
+      **What "cancel" can honestly mean** (N01.FR.12): a second `GetLog` answers
+      `AcceptedCanceled` and *supersedes* the running upload — its result is discarded rather than
+      reported, so the CSMS never sees a stale `Uploaded` for a request it was told was replaced —
+      but the transfer is not aborted mid-flight. Aborting needs a `select!` racing the transfer
+      against a cancel signal, which this crate does not have on both `no_std` and std (the same
+      constraint `run_charging_limit_projection` documents). The supersede is checked at retry
+      boundaries. A monotonic ticket rather than a flag, because a flag cannot distinguish
+      "someone replaced me" from "someone replaced the one before me".
+
+      Two smaller decisions. **The log is rendered once, before the retry loop** — re-rendering
+      between attempts would silently change the file's contents depending on how many times the
+      network failed, when what the CSMS asked for was a snapshot. And **an entry with no
+      timestamp is kept** when the CSMS narrows the window: it cannot be shown to fall outside
+      one, and dropping events a charge point could not time is the wrong bias for a security log,
+      where the period around an unset clock is exactly when something interesting happened.
+
+      Format: OCPP explicitly does not prescribe one ("The format of this log file is not
+      prescribed"), so this is a decision — tab-separated `timestamp / type / techInfo`, one line
+      per event, oldest first. `techInfo` is free-form text off the wire, so tabs and newlines in
+      it are replaced rather than escaped: a newline there would otherwise **invent a security
+      event that never happened**.
+
+      **Version differences, all one-directional.** 1.6J has no log type (so a 1.6J CSMS cannot
+      request the security log at all), no `requestId` to correlate with, and no
+      `AcceptedCanceled`; 2.0.1 has no `DataCollectorLog` and no `statusInfo` on the notification.
+      2.x's four failure statuses collapse to `UploadFailure`, because distinguishing them would
+      mean the `FileTransfer` implementor classifying its own error against a protocol enum — a
+      detail B3.1 deliberately keeps off the hardware surface.
+
+      `FileTransferProtocols` (a Required device-model variable) stays empty, and the reason
+      changed rather than went away: file transfer now exists, but *which protocols* it speaks is a
+      fact about the integrator's binding, so naming HTTP here would advertise something this
+      crate neither implements nor can verify.
+
+      Registered through `ChargePointBuilder::log_uploads` only, **not** `setup()` — it needs a
+      `FileTransfer` binding `setup()`'s signature has no way to receive, exactly the position
+      `Storage` is in. The `diagnostics` capability gate is therefore `has_handler: false`, which
+      C3.5's data-driven test enforced rather than let slide.
 - [ ] **B5.2** Variable monitoring engine: thresholds, deltas, periodics on
       device-model variables → `NotifyEvent`.
 - [ ] **B5.3** Monitoring report generation, chunked like `NotifyReport`
@@ -1810,9 +1861,11 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
 - [ ] **F4.3** Durable, size-bounded security log ([E2](#72-e2--what-must-survive)), readable via
       `GetLog`. *Partial* - the log itself is done ([E2.10](#72-e2--what-must-survive)): bounded,
       durable, restored at boot, and clearable with a `SecurityLogWasCleared` report. What's left
-      is the `GetLog` reader that uploads it, which needs [B5.1](#b5--diagnostics-and-monitoring-r14)'s
-      file-transfer abstraction. Non-critical events make this more valuable than it was: they are
-      now *only* in the log, so the log is the only way a CSMS ever learns of them.
+      was the `GetLog` reader that uploads it — **which [B5.1](#b5--diagnostics-and-monitoring-r14)
+      now provides**: a `GetLog` with `logType = SecurityLog` renders the durable log and uploads
+      it. This row stays open only for the parts of `GetLog` that are not the security log
+      (monitoring reports, and 2.1's data-collector log), so the security-log half of F4.3 is
+      done.
 - [x] **F4.4** `SecurityEventNotification` for 2.0.1 — **done**, and the "after D1" caveat was
       stale: D1 landed and the pinned `ocpp-client` 0.2.2 generates the 2.0.1 action. The wire
       request is field-for-field identical to 2.1's, so the adapter shares `wire_type` exactly as
@@ -2500,19 +2553,19 @@ work; it's the honest number.
 ChangeAvailability, ChangeConfiguration, ClearCache, DataTransfer, GetConfiguration,
 ClearChargingProfile, GetCompositeSchedule, GetLocalListVersion, Heartbeat,
 MeterValues, RemoteStartTransaction, RemoteStopTransaction, ReserveNow, Reset,
-SendLocalList, SetChargingProfile, StartTransaction, StatusNotification,
-StopTransaction, TriggerMessage, UnlockConnector
+DiagnosticsStatusNotification, GetDiagnostics, SendLocalList, SetChargingProfile,
+StartTransaction, StatusNotification, StopTransaction, TriggerMessage,
+UnlockConnector
 
-**Missing:** DiagnosticsStatusNotification,
-FirmwareStatusNotification, GetDiagnostics, UpdateFirmware
+**Missing:** FirmwareStatusNotification, UpdateFirmware
 
-### A.2 OCPP 2.0.1 — 32 of 64 wired
+### A.2 OCPP 2.0.1 — 34 of 64 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
-GetReport, GetVariables, Heartbeat, NotifyReport, ReportChargingProfiles,
-ReservationStatusUpdate, RequestStartTransaction,
+GetLog, GetReport, GetVariables, Heartbeat, LogStatusNotification, NotifyReport,
+ReportChargingProfiles, ReservationStatusUpdate, RequestStartTransaction,
 MeterValues, RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
 SendLocalList, SetChargingProfile, SetNetworkProfile, SetVariables,
 StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
@@ -2521,8 +2574,7 @@ StatusNotification, TransactionEvent, TriggerMessage, UnlockConnector
 ClearDisplayMessage, ClearVariableMonitoring, ClearedChargingLimit,
 CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
 Get15118EVCertificate, GetCertificateStatus,
-GetDisplayMessages, GetInstalledCertificateIds,
-GetLog, GetMonitoringReport, GetTransactionStatus, InstallCertificate,
+GetDisplayMessages, GetInstalledCertificateIds, GetMonitoringReport, GetTransactionStatus, InstallCertificate,
 LogStatusNotification, NotifyChargingLimit,
 NotifyCustomerInformation, NotifyDisplayMessages, NotifyEVChargingNeeds,
 NotifyEVChargingSchedule, NotifyEvent, NotifyMonitoringReport,
@@ -2534,12 +2586,13 @@ SetVariableMonitoring, SignCertificate, UnpublishFirmware, UpdateFirmware
 2.0.1 spec and in `ocpp-types` v201 but ungenerated by `ocpp-client` 0.2.0. D1
 fixed that upstream; 0.2.2 generates all 64 actions, and F4.4 wired this one.
 
-### A.3 OCPP 2.1 — 36 of 91 wired
+### A.3 OCPP 2.1 — 38 of 91 wired
 
 **Wired:** Authorize, BootNotification, CancelReservation,
 ChangeAvailability, ClearCache, ClearChargingProfile, CostUpdated, DataTransfer,
 GetBaseReport, GetChargingProfiles, GetCompositeSchedule, GetLocalListVersion,
-GetReport, GetVariables, Heartbeat, NotifyPriorityCharging, NotifyReport,
+GetLog, GetReport, GetVariables, Heartbeat, LogStatusNotification,
+NotifyPriorityCharging, NotifyReport,
 ReportChargingProfiles, ReservationStatusUpdate, RequestStartTransaction,
 RequestStopTransaction, ReserveNow, Reset, SecurityEventNotification,
 MeterValues, PullDynamicScheduleUpdate, SendLocalList, SetChargingProfile,
@@ -2552,9 +2605,9 @@ ClearVariableMonitoring, ClearedChargingLimit, ClosePeriodicEventStream,
 CustomerInformation, DeleteCertificate, FirmwareStatusNotification,
 Get15118EVCertificate, GetCertificateChainStatus, GetCertificateStatus,
 GetDisplayMessages,
-GetInstalledCertificateIds, GetLog, GetMonitoringReport,
+GetInstalledCertificateIds, GetMonitoringReport,
 GetPeriodicEventStream, GetTariffs, GetTransactionStatus,
-InstallCertificate, LogStatusNotification,
+InstallCertificate,
 NotifyAllowedEnergyTransfer, NotifyChargingLimit, NotifyCustomerInformation,
 NotifyDERAlarm, NotifyDERStartStop, NotifyDisplayMessages,
 NotifyEVChargingNeeds, NotifyEVChargingSchedule, NotifyEvent,
@@ -2587,5 +2640,5 @@ gap is entirely this crate's to close.
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | 28 (+ `Clone`/`Send`/`Sync`/`'static`) — three added by B2's handlers, which is exactly the growth [C4](#54-c4--builder-refactor)'s builder exists to keep off everyone else's `N` | `src/setup.rs` |
-| Test functions in `src/` | 848 | `#[test]` + `#[tokio::test]`, re-counted at the B3.1 commit (840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
+| Test functions in `src/` | 873 | `#[test]` + `#[tokio::test]`, re-counted at the B5.1 commit (848 at B3.1, 840 at F4, 833 at A5, 827 at B2.6's dynamic-schedule half, 803 at B2.6's priority-charging half, 792 at B8.1, 784 at B2.7, 769 at A9, 760 at A9's selection half, 750 at A7/A8, 746 at B1.8, 732 at B1.7, 730 at B1.6, 725 at E2.5, 717 at B1.2, 694 at B1.5, 684 at B1.3/B1.4, 672 at B1.1, 658 at E2.7, 646 at B2, 564 at E2.10, 496 at the M2 boot-reason commit; an earlier recorded 668 was wrong) |
 | Integration tests | 3 | `tests/` (`connect_2_1_websocket`, `memory_budget`, `power_cut_recovery`) |

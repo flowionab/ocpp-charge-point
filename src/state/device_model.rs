@@ -779,8 +779,13 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         instance: None,
         data_type: VariableDataType::MemberList,
         unit: None,
-        // Empty, and truthfully so: file transfer arrives with firmware management and
-        // diagnostics (B3/B5), neither of which exists yet, so this charge point supports none.
+        // Empty, and still truthfully so - but for a different reason since B5.1. File transfer
+        // now exists as `hardware::FileTransfer`, and *which protocols* it speaks is a fact about
+        // the integrator's implementation: OCPP hands over a bare URL and the scheme in it is
+        // whatever the operator deployed. Naming "HTTP,HTTPS" here would be this crate
+        // advertising something it neither implements nor can verify (C2's honesty criterion). An
+        // integrator with a transfer binding should overwrite this with what theirs really
+        // speaks; one without leaves it empty, which remains the truth.
         value: "",
         mutability: VariableMutability::ReadOnly,
         persistent: false,

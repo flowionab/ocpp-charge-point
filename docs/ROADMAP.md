@@ -1378,13 +1378,26 @@ Log/diagnostics retrieval for troubleshooting.
   `DiagnosticsStatusNotification`).
 - Internal state needed: log upload state machine, log source
   abstraction (what logs exist, how they're packaged).
-- Status: 🚧 the shared foundation is in - see §12. `FileTransfer::upload` takes
-  this crate's own security log as bytes and an integrator-held diagnostics log
-  by name, which is the split that lets one abstraction serve both blocks: the
-  security log is bounded and lives here, while a diagnostics log is whatever
-  the integrator considers diagnostic output and may be far too large to hold.
-  The `GetLog`/`GetDiagnostics` handlers, the status notifications and the
-  variable-monitoring engine are still to come.
+- Status: 🚧 partial - **log upload is wired end to end on all three versions**
+  (B5.1). `GetLog` (2.x) and `GetDiagnostics` (1.6J) are answered immediately and
+  the transfer runs on its own task, because OCPP's N01 sequence requires the
+  response to precede the `Uploading` notification - a handler that uploaded
+  before returning would deliver its status reports after the response they are
+  meant to follow. `FileTransfer::upload` (§12) takes this crate's own security
+  log as rendered bytes and an integrator-held diagnostics log by name, which is
+  the split that lets one abstraction serve both blocks.
+
+  A second `GetLog` supersedes the first (`AcceptedCanceled`): the superseded
+  upload's result is discarded rather than reported, so the CSMS never sees a
+  stale `Uploaded` for a request it was told was replaced. The transfer itself is
+  not aborted mid-flight - that needs a `select!` this crate does not have on both
+  no_std and std - so the supersede takes effect at a retry boundary.
+
+  1.6J is genuinely poorer rather than differently named: no log type (so a 1.6J
+  CSMS cannot ask for the security log at all), no `requestId` to correlate
+  notifications with, and no `AcceptedCanceled`. Still missing here: variable
+  monitoring, monitoring reports, `GetTransactionStatus`, customer information,
+  and 2.1's periodic event streams.
 - Version notes: 1.6J's diagnostics flow maps to 2.x's `GetLog` flow with
   a narrower log-type set.
 

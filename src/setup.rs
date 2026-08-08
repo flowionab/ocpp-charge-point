@@ -576,6 +576,10 @@ mod tests {
                         firmware_management: enabled,
                         ..Default::default()
                     },
+                    "diagnostics" => crate::hardware::Capabilities {
+                        diagnostics: enabled,
+                        ..Default::default()
+                    },
                     other => panic!(
                         "CAPABILITY_GATES grew a new entry (`{other}`) this test doesn't know \
                          how to set yet - extend the match above so it stays data-driven"

@@ -202,6 +202,21 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         has_handler: false,
     },
     CapabilityGate {
+        name: "diagnostics",
+        cargo_feature: "diagnostics",
+        enabled: |c| c.diagnostics,
+        // No dedicated `*Ctrlr` component for diagnostics in the 2.1 appendix.
+        ctrlr_component: None,
+        feature_profile_1_6: Some("FirmwareManagement"),
+        // `false` even though B5.1 landed a real `GetLog` handler, because this field means
+        // specifically "`setup()` registers it". It cannot: registering log upload needs a
+        // `hardware::FileTransfer` binding, and `setup()`'s signature has no way to receive one -
+        // exactly the position `Storage` is in, where durability is also
+        // `ChargePointBuilder`-only (see E1/M2's "durability is opt-in per concern"). An
+        // integrator wanting log upload calls `ChargePointBuilder::log_uploads`.
+        has_handler: false,
+    },
+    CapabilityGate {
         name: "firmware_management",
         cargo_feature: "firmware-management",
         enabled: |c| c.firmware_management,
