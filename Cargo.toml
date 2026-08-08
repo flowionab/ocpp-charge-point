@@ -121,8 +121,10 @@ iso15118 = []
 der-control = []
 # Gates nothing yet: 2.1 battery swap (roadmap B8.3) has no implementation in this crate yet.
 battery-swap = []
-# Gates nothing yet: 2.1 periodic event streams (roadmap B5.6) have no implementation in this
-# crate yet.
+# Gates `crate::periodic_event_stream` (`OpenPeriodicEventStream`/`ClosePeriodicEventStream`/
+# `AdjustPeriodicEventStream`/`GetPeriodicEventStream`/`NotifyPeriodicEventStream`, roadmap B5.6)
+# and `ChargePointBuilder::periodic_event_streams`, which registers them. 2.1-only. Off by
+# default in a build with no periodic-streaming CSMS integration.
 periodic-event-stream = []
 # Gates nothing yet: certificate store/install/CSR (roadmap B4.1-B4.4) has no implementation in
 # this crate yet.

@@ -14,6 +14,7 @@ mod limits;
 mod local_authorization_list;
 mod meter_sample;
 mod network_profile;
+mod periodic_event_stream;
 mod registration_status;
 mod reservation;
 mod reset;
@@ -55,14 +56,18 @@ pub use self::evse_state::{EvseState, EvseStatus};
 pub use self::id_token::{IdToken, IdTokenKind};
 pub use self::limits::{
     DEFAULT_MAX_CHARGING_PROFILES, DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
-    DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, DEFAULT_MAX_TARIFFS,
-    DEFAULT_MAX_VARIABLE_MONITORS, StateLimits,
+    DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, DEFAULT_MAX_PERIODIC_EVENT_STREAMS,
+    DEFAULT_MAX_TARIFFS, DEFAULT_MAX_VARIABLE_MONITORS, StateLimits,
 };
 pub use self::local_authorization_list::{LocalAuthorizationList, LocalListEntry};
 pub use self::meter_sample::MeterSample;
 pub use self::network_profile::{
     DEFAULT_MAX_NETWORK_PROFILE_SLOTS, NetworkConnectionProfile, NetworkInterface,
     NetworkProfileSlot, NetworkProfileStore, NetworkTransport,
+};
+pub use self::periodic_event_stream::{
+    DEFAULT_PERIODIC_EVENT_STREAM_INTERVAL_SECS, OpenPeriodicEventStream, PeriodicEventStreamId,
+    PeriodicEventStreamOpenRejection, PeriodicEventStreamParams, PeriodicEventStreamStore,
 };
 pub use self::registration_status::RegistrationStatus;
 pub use self::reservation::{Reservation, ReservationId};
