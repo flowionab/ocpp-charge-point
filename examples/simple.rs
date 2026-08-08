@@ -9,6 +9,10 @@ use ocpp_charge_point::local_authorization_list::{
     GetLocalListVersionHandler, SendLocalListHandler,
 };
 use ocpp_charge_point::meter_values::MeterValuesNotifier;
+use ocpp_charge_point::periodic_event_stream::{
+    AdjustPeriodicEventStreamHandler, ClosePeriodicEventStreamHandler,
+    GetPeriodicEventStreamHandler, OpenPeriodicEventStreamHandler, PeriodicEventStreamNotifier,
+};
 use ocpp_charge_point::provisioning::{
     BootNotificationOutcome, BootNotifier, HeartbeatSender, TokioBackoff,
 };
@@ -346,6 +350,57 @@ impl GetTariffsHandler for AlwaysAcceptBootNotifier {
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
     ) {
+    }
+}
+
+// Periodic event streams (docs/PRODUCTION-ROADMAP.md B5.6): this sample has no monitored
+// variable a CSMS would stream, so every handler is a no-op and outbound notification always
+// succeeds.
+#[async_trait::async_trait]
+impl OpenPeriodicEventStreamHandler for AlwaysAcceptBootNotifier {
+    async fn register_open_periodic_event_stream_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl ClosePeriodicEventStreamHandler for AlwaysAcceptBootNotifier {
+    async fn register_close_periodic_event_stream_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl AdjustPeriodicEventStreamHandler for AlwaysAcceptBootNotifier {
+    async fn register_adjust_periodic_event_stream_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl GetPeriodicEventStreamHandler for AlwaysAcceptBootNotifier {
+    async fn register_get_periodic_event_stream_handler(
+        &self,
+        _actor: ocpp_charge_point::actor::ChargePointActor,
+    ) {
+    }
+}
+
+#[async_trait::async_trait]
+impl PeriodicEventStreamNotifier for AlwaysAcceptBootNotifier {
+    type Error = std::convert::Infallible;
+
+    async fn notify_periodic_event_stream(
+        &self,
+        _sample: ocpp_charge_point::periodic_event_stream::PeriodicStreamSample,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 

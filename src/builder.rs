@@ -34,6 +34,12 @@ use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListH
 use crate::offline_queue::{
     OfflineQueue, OverflowPolicy, run_with_offline_queue, run_with_offline_queue_where,
 };
+#[cfg(feature = "periodic-event-stream")]
+use crate::periodic_event_stream::{
+    AdjustPeriodicEventStreamHandler, ClosePeriodicEventStreamHandler,
+    GetPeriodicEventStreamHandler, OpenPeriodicEventStreamHandler, PeriodicEventStreamNotifier,
+    run_periodic_event_streams,
+};
 use crate::persistence::{
     AuthorizationCacheStore, BootReasonStore, ChargingProfileSnapshotStore, DeviceModelStore,
     LocalAuthorizationListStore, NetworkProfileSnapshotStore, QueueStore, ReservationStore,
@@ -1740,6 +1746,61 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             .await;
         csms.register_get_tariffs_handler(self.runtime.actor())
             .await;
+
+        self
+    }
+
+    /// Registers the Periodic Event Streams functional block: `OpenPeriodicEventStream`/
+    /// `ClosePeriodicEventStream`/`AdjustPeriodicEventStream`/`GetPeriodicEventStream` all feed
+    /// into the runtime's actor, and the sweep that drives outbound `NotifyPeriodicEventStream`
+    /// (`docs/PRODUCTION-ROADMAP.md` B5.6) is spawned via `executor` - see
+    /// [`crate::periodic_event_stream::run_periodic_event_streams`]. **2.1 only** - see
+    /// [`crate::periodic_event_stream`]'s docs; `ocpp-client`'s 1.6J/2.0.1 clients don't implement
+    /// these traits at all, since neither version has periodic event stream messages.
+    ///
+    /// `sweep_interval_secs` is how often open streams are checked for being due - a few seconds
+    /// is ample against streams configured in the tens of seconds and up, mirroring
+    /// [`Self::variable_monitor_events`]'s own sweep.
+    ///
+    /// Only present when the `periodic-event-stream` Cargo feature is enabled - see
+    /// [`Self::reservation`]'s doc comment for why the method itself disappears rather than
+    /// becoming a no-op.
+    #[cfg(feature = "periodic-event-stream")]
+    pub async fn periodic_event_streams<N, C, B>(
+        self,
+        csms: &N,
+        clock: C,
+        backoff: B,
+        sweep_interval_secs: u32,
+    ) -> Self
+    where
+        N: OpenPeriodicEventStreamHandler
+            + ClosePeriodicEventStreamHandler
+            + AdjustPeriodicEventStreamHandler
+            + GetPeriodicEventStreamHandler
+            + PeriodicEventStreamNotifier
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        C: crate::clock::Clock + Send + Sync + 'static,
+        B: Backoff + Send + Sync + 'static,
+    {
+        csms.register_open_periodic_event_stream_handler(self.runtime.actor())
+            .await;
+        csms.register_close_periodic_event_stream_handler(self.runtime.actor())
+            .await;
+        csms.register_adjust_periodic_event_stream_handler(self.runtime.actor())
+            .await;
+        csms.register_get_periodic_event_stream_handler(self.runtime.actor())
+            .await;
+
+        let actor = self.runtime.actor();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            run_periodic_event_streams(&actor, &notifier, &clock, &backoff, sweep_interval_secs)
+                .await;
+        }));
 
         self
     }

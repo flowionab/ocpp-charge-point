@@ -9,11 +9,12 @@ use crate::state::{
     ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent, ConnectorState,
     ConnectorStatusChanged, DeviceModel, DeviceModelEvent, DisplayMessageStore, EventTrigger,
     EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
-    MeterSample, NetworkProfileStore, PendingReset, RegistrationStatus, ReservationEndReason,
-    ReservationUpdate, ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits,
-    StopReason, TariffStore, Transaction, TransactionChargingState, TransactionEventKind,
-    TransactionEventOccurred, TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable,
-    VariableAttributeType, VariableMonitorStore, VariableMonitoringEvent,
+    MeterSample, NetworkProfileStore, PendingReset, PeriodicEventStreamStore, RegistrationStatus,
+    ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget, SecurityEvent,
+    SecurityEventType, StateLimits, StopReason, TariffStore, Transaction, TransactionChargingState,
+    TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
+    TriggeredMonitor, Variable, VariableAttributeType, VariableMonitorStore,
+    VariableMonitoringEvent,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -92,6 +93,12 @@ pub struct ChargePointState {
     /// Messages the CSMS has asked to be shown to the driver (OCPP `SetDisplayMessage`/
     /// `ClearDisplayMessage`). See [`crate::display_message`] and `docs/ROADMAP.md` §15.
     pub display_messages: DisplayMessageStore,
+    /// Periodic event streams the CSMS has opened against a variable monitor (OCPP 2.1
+    /// `OpenPeriodicEventStream`/`ClosePeriodicEventStream`/`AdjustPeriodicEventStream`) - the
+    /// source [`crate::periodic_event_stream::run_periodic_event_streams`] drives
+    /// `NotifyPeriodicEventStream` from. See [`PeriodicEventStreamStore`] and
+    /// `docs/PRODUCTION-ROADMAP.md` B5.6.
+    pub periodic_event_streams: PeriodicEventStreamStore,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -147,6 +154,9 @@ impl ChargePointState {
             time_sync: None,
             variable_monitors: VariableMonitorStore::with_limit(limits.max_variable_monitors),
             display_messages: DisplayMessageStore::with_max_messages(limits.max_display_messages),
+            periodic_event_streams: PeriodicEventStreamStore::with_limit(
+                limits.max_periodic_event_streams,
+            ),
         }
     }
 
@@ -389,6 +399,40 @@ impl ChargePointState {
                 }
             }
             ChargePointEvent::TariffsCleared { criteria } => self.tariffs.clear(&criteria) > 0,
+            ChargePointEvent::PeriodicEventStreamOpened {
+                id,
+                variable_monitoring_id,
+                params,
+            } => {
+                match self
+                    .periodic_event_streams
+                    .open(crate::state::OpenPeriodicEventStream {
+                        id,
+                        variable_monitoring_id,
+                        params,
+                    }) {
+                    Ok(()) => true,
+                    Err(rejection) => {
+                        // Reached only if a caller dispatched this without asking the store first
+                        // (`crate::periodic_event_stream::handle_open_periodic_event_stream` does
+                        // ask, so the CSMS never sees an optimistic Accepted); logged rather than
+                        // panicking, per `apply`'s documented tolerance for events that don't
+                        // apply.
+                        tracing::warn!(
+                            id = id.0,
+                            ?rejection,
+                            "a periodic event stream was refused by the store"
+                        );
+                        false
+                    }
+                }
+            }
+            ChargePointEvent::PeriodicEventStreamClosed { id } => {
+                self.periodic_event_streams.close(id)
+            }
+            ChargePointEvent::PeriodicEventStreamAdjusted { id, params } => {
+                self.periodic_event_streams.adjust(id, params)
+            }
             ChargePointEvent::DeviceModel(event) => match event {
                 DeviceModelEvent::VariableRegistered {
                     component,

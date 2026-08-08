@@ -10,6 +10,10 @@ use crate::hardware::ChargePoint;
 use crate::hardware::Connector;
 use crate::hardware::Evse;
 use crate::local_authorization_list::{GetLocalListVersionHandler, SendLocalListHandler};
+use crate::periodic_event_stream::{
+    AdjustPeriodicEventStreamHandler, ClosePeriodicEventStreamHandler,
+    GetPeriodicEventStreamHandler, OpenPeriodicEventStreamHandler, PeriodicEventStreamNotifier,
+};
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender};
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, TriggerMessageHandler,
@@ -106,6 +110,11 @@ where
         + SetMonitoringBaseHandler
         + SetMonitoringLevelHandler
         + GetMonitoringReportHandler
+        + OpenPeriodicEventStreamHandler
+        + ClosePeriodicEventStreamHandler
+        + AdjustPeriodicEventStreamHandler
+        + GetPeriodicEventStreamHandler
+        + PeriodicEventStreamNotifier
         + ReconnectHandler
         + Clone
         + Send
@@ -178,11 +187,18 @@ where
             .smart_charging(
                 &csms,
                 alloc::sync::Arc::new(crate::smart_charging::ChargingLimitProjection::new()),
-                clock,
+                clock.clone(),
                 backoff.clone(),
             )
             .await
             .charging_profile_reports(&csms)
+            .await;
+    }
+    if capabilities.periodic_event_stream {
+        // B5.6: a few seconds between sweeps is ample against streams configured in the tens of
+        // seconds and up - see `ChargePointBuilder::periodic_event_streams`'s docs.
+        builder = builder
+            .periodic_event_streams(&csms, clock, backoff.clone(), 5)
             .await;
     }
 
@@ -271,8 +287,8 @@ mod tests {
     }
 
     /// A CSMS fake that behaves exactly like [`FixedBootNotifier`] (accepts every registration
-    /// silently) but also records whether the Reservation/Local-Auth-List/Tariff-and-Cost
-    /// registration methods were actually called, the only three
+    /// silently) but also records whether the Reservation/Local-Auth-List/Tariff-and-Cost/
+    /// Periodic-Event-Stream registration methods were actually called, the
     /// [`crate::hardware::CAPABILITY_GATES`] entries that gate a real handler today (see
     /// `has_handler`'s docs). Used by the keystone C3.5 test below to observe C3.1 (handler
     /// registration) the same way the other three surfaces are observed: through the real
@@ -284,6 +300,7 @@ mod tests {
         local_auth_list_registered: Arc<AtomicBool>,
         cost_registered: Arc<AtomicBool>,
         smart_charging_registered: Arc<AtomicBool>,
+        periodic_event_stream_registered: Arc<AtomicBool>,
     }
 
     impl RecordingCsms {
@@ -294,6 +311,7 @@ mod tests {
                 local_auth_list_registered: Arc::new(AtomicBool::new(false)),
                 cost_registered: Arc::new(AtomicBool::new(false)),
                 smart_charging_registered: Arc::new(AtomicBool::new(false)),
+                periodic_event_stream_registered: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -566,6 +584,55 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::periodic_event_stream::OpenPeriodicEventStreamHandler for RecordingCsms {
+        async fn register_open_periodic_event_stream_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+            self.periodic_event_stream_registered
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::ClosePeriodicEventStreamHandler for RecordingCsms {
+        async fn register_close_periodic_event_stream_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::AdjustPeriodicEventStreamHandler for RecordingCsms {
+        async fn register_adjust_periodic_event_stream_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::GetPeriodicEventStreamHandler for RecordingCsms {
+        async fn register_get_periodic_event_stream_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::PeriodicEventStreamNotifier for RecordingCsms {
+        type Error = core::convert::Infallible;
+        async fn notify_periodic_event_stream(
+            &self,
+            _sample: crate::periodic_event_stream::PeriodicStreamSample,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::network_profile::SetNetworkProfileHandler for RecordingCsms {
         async fn register_set_network_profile_handler(
             &self,
@@ -697,6 +764,10 @@ mod tests {
                         firmware_publishing: enabled,
                         ..Default::default()
                     },
+                    "periodic_event_stream" => crate::hardware::Capabilities {
+                        periodic_event_stream: enabled,
+                        ..Default::default()
+                    },
                     other => panic!(
                         "CAPABILITY_GATES grew a new entry (`{other}`) this test doesn't know \
                          how to set yet - extend the match above so it stays data-driven"
@@ -734,6 +805,9 @@ mod tests {
                         "local_auth_list" => csms.local_auth_list_registered.load(Ordering::SeqCst),
                         "tariff_and_cost" => csms.cost_registered.load(Ordering::SeqCst),
                         "smart_charging" => csms.smart_charging_registered.load(Ordering::SeqCst),
+                        "periodic_event_stream" => {
+                            csms.periodic_event_stream_registered.load(Ordering::SeqCst)
+                        }
                         other => panic!("gate `{other}` claims has_handler but isn't wired here"),
                     };
                     assert_eq!(

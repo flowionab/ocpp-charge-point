@@ -271,6 +271,20 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         // `ChargePointBuilder::publish_firmware`.
         has_handler: false,
     },
+    CapabilityGate {
+        name: "periodic_event_stream",
+        cargo_feature: "periodic-event-stream",
+        enabled: |c| c.periodic_event_stream,
+        // No dedicated `*Ctrlr` component for periodic event streams in the 2.1 appendix - see
+        // `ctrlr_component`'s docs; the closest thing, `MonitoringCtrlr`, already has its own
+        // `Available` variable governing variable monitoring itself, and OCPP does not name a
+        // separate one for streams built on top of it.
+        ctrlr_component: None,
+        // 2.1-only - neither 1.6J nor 2.0.1 has a periodic event stream concept, so there is no
+        // feature profile to advertise.
+        feature_profile_1_6: None,
+        has_handler: true,
+    },
 ];
 
 /// One `(capability name, Cargo feature name, whether the capability is set)` row consulted by

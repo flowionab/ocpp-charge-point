@@ -58,6 +58,10 @@
 //! | `GetDisplayMessages`         | n/a (2.x-only) | CALLRESULT `GetDisplayMessagesStatusEnum::Unknown` (no `Rejected`/`NotSupported` in either version - an absent capability answers through the same "nothing matched" status an empty store would, not a separate refusal) | same as 2.0.1 |
 //! | `PublishFirmware`            | n/a (2.x-only - no local-controller concept in 1.6J) | CALLRESULT `GenericStatusEnum::Rejected` | CALLRESULT `GenericStatusEnum::Rejected` |
 //! | `UnpublishFirmware`          | n/a (2.x-only) | CALLRESULT `UnpublishFirmwareStatusEnum::NoFirmware` (no dedicated "unsupported" value; a local controller that can never publish anything genuinely has no firmware to unpublish) | same as 2.0.1 |
+//! | `OpenPeriodicEventStream`    | n/a | n/a | CALLRESULT `GenericStatusEnum::Rejected` |
+//! | `AdjustPeriodicEventStream`  | n/a | n/a | CALLRESULT `GenericStatusEnum::Rejected` |
+//! | `ClosePeriodicEventStream`   | n/a | n/a | CALLERROR (`ClosePeriodicEventStreamResponse` is `{}`, no status field) |
+//! | `GetPeriodicEventStream`     | n/a | n/a | CALLERROR (`GetPeriodicEventStreamResponse` is `{ constantStreamData? }`, no status field) |
 //!
 //! Nothing here needed to fall back on assumption where the vendored spec/generated types didn't
 //! settle it - every response type above either has a documented status enum or documented-empty
@@ -218,6 +222,26 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         capability: |c| c.firmware_publishing,
         shape: RefusalShape::CallResultStatus,
     },
+    RefusalGate {
+        message: "OpenPeriodicEventStream",
+        capability: |c| c.periodic_event_stream,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "AdjustPeriodicEventStream",
+        capability: |c| c.periodic_event_stream,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "ClosePeriodicEventStream",
+        capability: |c| c.periodic_event_stream,
+        shape: RefusalShape::CallError,
+    },
+    RefusalGate {
+        message: "GetPeriodicEventStream",
+        capability: |c| c.periodic_event_stream,
+        shape: RefusalShape::CallError,
+    },
 ];
 
 /// Looks up the [`RefusalGate`] for `message` (by `Action::NAME`), if this crate has one.
@@ -343,6 +367,21 @@ mod tests {
 
         assert!(!capability_present(&absent, "CostUpdated"));
         assert!(capability_present(&present, "CostUpdated"));
+    }
+
+    #[test]
+    fn capability_present_reflects_periodic_event_stream() {
+        let absent = Capabilities::default();
+        let present = capabilities_with(|c| c.periodic_event_stream = true);
+
+        assert!(!capability_present(&absent, "OpenPeriodicEventStream"));
+        assert!(!capability_present(&absent, "AdjustPeriodicEventStream"));
+        assert!(!capability_present(&absent, "ClosePeriodicEventStream"));
+        assert!(!capability_present(&absent, "GetPeriodicEventStream"));
+        assert!(capability_present(&present, "OpenPeriodicEventStream"));
+        assert!(capability_present(&present, "AdjustPeriodicEventStream"));
+        assert!(capability_present(&present, "ClosePeriodicEventStream"));
+        assert!(capability_present(&present, "GetPeriodicEventStream"));
     }
 
     #[cfg(feature = "ocpp_2_1")]

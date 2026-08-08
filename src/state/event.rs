@@ -8,10 +8,11 @@ use crate::state::{
     AuthorizationCacheEntry, AuthorizationStatus, ChargingProfile, ChargingProfileCriteria,
     ChargingProfileId, ChargingProfileScope, Component, ConnectorState, ConnectorStatus,
     DeviceModelEvent, DisplayMessageId, DisplayedMessage, IdToken, InstalledChargingProfile,
-    LocalListEntry, MeterSample, NetworkConnectionProfile, NetworkProfileSlot, RegistrationStatus,
-    Reservation, ReservationId, ResetKind, ResetTarget, SecurityEvent, StopReason, Tariff,
-    TariffClearCriteria, TariffScope, Transaction, TransactionId, TriggeredMonitor, Variable,
-    VariableAttributeType, VariableMonitoringEvent,
+    LocalListEntry, MeterSample, NetworkConnectionProfile, NetworkProfileSlot,
+    PeriodicEventStreamId, PeriodicEventStreamParams, RegistrationStatus, Reservation,
+    ReservationId, ResetKind, ResetTarget, SecurityEvent, StopReason, Tariff, TariffClearCriteria,
+    TariffScope, Transaction, TransactionId, TriggeredMonitor, Variable, VariableAttributeType,
+    VariableMonitorId, VariableMonitoringEvent,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -147,6 +148,35 @@ pub enum ChargePointEvent {
     TariffsCleared {
         /// Which tariffs to clear - see [`TariffClearCriteria`].
         criteria: TariffClearCriteria,
+    },
+    /// The CSMS opened a periodic event stream (OCPP 2.1 `OpenPeriodicEventStream`). Applied
+    /// through [`crate::state::PeriodicEventStreamStore::open`], so the per-id replacement rule
+    /// and the [`StateLimits::max_periodic_event_streams`](crate::state::StateLimits::max_periodic_event_streams)
+    /// bound both hold however the stream arrived. A stream the store refuses is logged and
+    /// dropped here; `crate::periodic_event_stream::handle_open_periodic_event_stream` checks
+    /// acceptance against the store itself before dispatching this, so the CSMS gets the real
+    /// answer rather than an optimistic one. See `docs/PRODUCTION-ROADMAP.md` B5.6.
+    PeriodicEventStreamOpened {
+        /// The stream's CSMS-assigned id.
+        id: PeriodicEventStreamId,
+        /// The variable monitor this stream reports the value of.
+        variable_monitoring_id: VariableMonitorId,
+        /// The stream's initial parameters.
+        params: PeriodicEventStreamParams,
+    },
+    /// The CSMS closed a periodic event stream (OCPP 2.1 `ClosePeriodicEventStream`). A no-op if
+    /// no stream with this id is open.
+    PeriodicEventStreamClosed {
+        /// The stream to close.
+        id: PeriodicEventStreamId,
+    },
+    /// The CSMS adjusted an open periodic event stream's parameters (OCPP 2.1
+    /// `AdjustPeriodicEventStream`). A no-op if no stream with this id is open.
+    PeriodicEventStreamAdjusted {
+        /// The stream to adjust.
+        id: PeriodicEventStreamId,
+        /// Its new parameters, replacing whatever it had.
+        params: PeriodicEventStreamParams,
     },
     /// A dynamic charging profile took a new limit - OCPP 2.1's `UpdateDynamicSchedule` pushed by
     /// the CSMS, or the response to a `PullDynamicScheduleUpdate` this charge point asked for

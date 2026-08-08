@@ -60,6 +60,18 @@ pub const DEFAULT_MAX_VARIABLE_MONITORS: usize = 32;
 /// [`StateLimits::with_max_tariffs`] rather than have `SetDefaultTariff` refused.
 pub const DEFAULT_MAX_TARIFFS: usize = 8;
 
+/// Default maximum number of concurrently open periodic event streams (see
+/// [`StateLimits::max_periodic_event_streams`]).
+///
+/// 4 is deliberately small: each open stream drives its own recurring `NotifyPeriodicEventStream`
+/// traffic (see [`crate::periodic_event_stream::run_periodic_event_streams`]), unlike the mostly
+/// passive stores elsewhere in this table - a handful of concurrently monitored variables is
+/// already a lot of continuous outbound chatter for a small-to-mid-size charge point to sustain. A
+/// site legitimately streaming more variables at once should raise it via
+/// [`StateLimits::with_max_periodic_event_streams`] rather than have `OpenPeriodicEventStream`
+/// refused.
+pub const DEFAULT_MAX_PERIODIC_EVENT_STREAMS: usize = 4;
+
 /// Default maximum number of display messages the store holds - see
 /// [`crate::state::DEFAULT_MAX_DISPLAY_MESSAGES`], which documents the reasoning; this re-export
 /// exists so every bound in [`StateLimits`] has a `DEFAULT_*` constant beside it.
@@ -144,6 +156,11 @@ pub struct StateLimits {
     /// [`crate::state::DisplayMessageStore::set`]); replacing an already-stored id always
     /// succeeds. Clamped to at least 1.
     pub max_display_messages: usize,
+    /// The most periodic event streams ([`crate::state::PeriodicEventStreamStore`]) that may be
+    /// open at once. An `OpenPeriodicEventStream` for a *new* id beyond it is refused (see
+    /// [`crate::state::PeriodicEventStreamStore::open`]); re-opening an already-open id always
+    /// succeeds. Clamped to at least 1.
+    pub max_periodic_event_streams: usize,
 }
 
 impl StateLimits {
@@ -159,7 +176,14 @@ impl StateLimits {
             max_network_profile_slots: DEFAULT_MAX_NETWORK_PROFILE_SLOTS,
             max_variable_monitors: DEFAULT_MAX_VARIABLE_MONITORS,
             max_display_messages: DEFAULT_MAX_DISPLAY_MESSAGES,
+            max_periodic_event_streams: DEFAULT_MAX_PERIODIC_EVENT_STREAMS,
         }
+    }
+
+    /// Overrides [`Self::max_periodic_event_streams`].
+    pub const fn with_max_periodic_event_streams(mut self, max: usize) -> Self {
+        self.max_periodic_event_streams = max;
+        self
     }
 
     /// Overrides [`Self::max_tariffs`].

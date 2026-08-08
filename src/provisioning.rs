@@ -1311,6 +1311,59 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(feature = "periodic-event-stream")]
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::OpenPeriodicEventStreamHandler for FixedBootNotifier {
+        async fn register_open_periodic_event_stream_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[cfg(feature = "periodic-event-stream")]
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::ClosePeriodicEventStreamHandler for FixedBootNotifier {
+        async fn register_close_periodic_event_stream_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[cfg(feature = "periodic-event-stream")]
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::AdjustPeriodicEventStreamHandler for FixedBootNotifier {
+        async fn register_adjust_periodic_event_stream_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[cfg(feature = "periodic-event-stream")]
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::GetPeriodicEventStreamHandler for FixedBootNotifier {
+        async fn register_get_periodic_event_stream_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[cfg(feature = "periodic-event-stream")]
+    #[async_trait::async_trait]
+    impl crate::periodic_event_stream::PeriodicEventStreamNotifier for FixedBootNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_periodic_event_stream(
+            &self,
+            _sample: crate::periodic_event_stream::PeriodicStreamSample,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::connection::ReconnectHandler for FixedBootNotifier {
         async fn register_reconnect_handler<F, FF>(&self, _callback: F)

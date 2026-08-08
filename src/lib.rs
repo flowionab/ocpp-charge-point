@@ -38,7 +38,8 @@ pub mod clock;
     feature = "ocpp_2_1",
     feature = "reservation",
     feature = "local-auth-list",
-    feature = "tariff-cost"
+    feature = "tariff-cost",
+    feature = "periodic-event-stream"
 ))]
 mod connect;
 pub mod connection;
@@ -63,6 +64,12 @@ pub mod network_profile;
 #[cfg(feature = "websocket")]
 pub mod network_switch;
 pub mod offline_queue;
+/// Periodic event streams functional block: `OpenPeriodicEventStream`/
+/// `ClosePeriodicEventStream`/`AdjustPeriodicEventStream`/`GetPeriodicEventStream` inbound,
+/// `NotifyPeriodicEventStream` outbound. See [`periodic_event_stream`]'s own docs for why this is
+/// 2.1-only.
+#[cfg(feature = "periodic-event-stream")]
+pub mod periodic_event_stream;
 pub mod persistence;
 pub mod provisioning;
 pub mod publish_firmware;
@@ -86,7 +93,8 @@ pub mod smart_charging;
 #[cfg(all(
     feature = "reservation",
     feature = "local-auth-list",
-    feature = "tariff-cost"
+    feature = "tariff-cost",
+    feature = "periodic-event-stream"
 ))]
 mod setup;
 /// The protocol-version-independent internal state model: [`state::ChargePointState`], its
@@ -112,14 +120,16 @@ pub use self::builder::ChargePointBuilder;
     feature = "ocpp_2_1",
     feature = "reservation",
     feature = "local-auth-list",
-    feature = "tariff-cost"
+    feature = "tariff-cost",
+    feature = "periodic-event-stream"
 ))]
 pub use self::connect::{ConnectAndSetupError, connect_and_setup};
 pub use self::runtime::ChargePointRuntime;
 #[cfg(all(
     feature = "reservation",
     feature = "local-auth-list",
-    feature = "tariff-cost"
+    feature = "tariff-cost",
+    feature = "periodic-event-stream"
 ))]
 pub use self::setup::setup;
 /// The OCPP versions [`connect_and_setup`] can be asked to offer.
