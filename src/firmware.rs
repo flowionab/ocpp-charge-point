@@ -28,14 +28,30 @@
 //! `AllowNewSessionsPendingFirmwareUpdate`, and restores availability if the install fails, so a
 //! failed update does not leave a charge point silently out of service.
 //!
+//! # Signature verification (B3.3)
+//!
+//! An update whose request carried a `signature` and/or `signingCertificate` is verified against
+//! the downloaded image, through [`crate::hardware::FirmwareVerifier`], strictly between
+//! `Downloaded` and the wait for a scheduled install (`installDateTime`) - **never** after: an
+//! image that fails verification, or that this charge point could not verify at all (no verifier
+//! wired, or an algorithm it does not support), is refused rather than installed, per
+//! `CLAUDE.md`'s fail-safe stance. A failure is reported as `InvalidSignature` and raises the
+//! matching [`crate::state::SecurityEventType`] (`InvalidFirmwareSignature` or
+//! `InvalidFirmwareSigningCertificate`). An update carrying neither field is not a signed update
+//! at all - OCPP allows plain, unsigned `UpdateFirmware` - and skips verification entirely, the
+//! same as before B3.3. See [`crate::hardware::FirmwareVerifier`]'s docs for where the line
+//! between this crate and the integrator is drawn and why.
+//!
 //! # What this block does not do yet
 //!
-//! Signature and certificate verification (L01.FR.02/03/04/11/12/21/22) is B3.3: it needs crypto
-//! and a trust store this crate has no hook for. `signature`/`signingCertificate` are carried to
-//! the integrator so the work can land there without another breaking change, and
-//! `InvalidCertificate` is never returned today. Reporting `Installed` *after* a reboot also
-//! remains open - it needs a marker that survives the restart, the same shape as
-//! [`crate::persistence::BootReasonStore`].
+//! Reporting `Installed` *after* a reboot remains open - it needs a marker that survives the
+//! restart, the same shape as [`crate::persistence::BootReasonStore`]. Pre-download certificate
+//! chain validation (answering 2.x's `InvalidCertificate`/`RevokedCertificate`, or 1.6J's
+//! `SignedUpdateFirmware` equivalents, synchronously in the accept/reject response) is also not
+//! done: that response goes out before any download starts, and
+//! [`crate::hardware::FirmwareVerifier`] is scoped to checking the *downloaded image*, not to
+//! chain-validating a certificate the charge point has not yet fetched anything to check it
+//! against.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -46,9 +62,13 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
-use crate::hardware::{FileTransfer, FirmwareInstallOutcome, FirmwareInstaller, TransferProgress};
+use crate::hardware::{
+    FileTransfer, FirmwareInstallOutcome, FirmwareInstaller, FirmwareVerificationOutcome,
+    FirmwareVerifier, TransferProgress,
+};
 use crate::provisioning::Backoff;
-use crate::state::{ChargePointEvent, EvseEvent};
+use crate::security::report_security_event;
+use crate::state::{ChargePointEvent, EvseEvent, SecurityEvent, SecurityEventType};
 use crate::sync::Chan;
 
 /// How often the worker re-checks a condition it is waiting on - a scheduled start time, or
@@ -80,10 +100,12 @@ pub struct FirmwareUpdateRequest {
     /// When to install. `None`, or an instant already past, means "as soon as able" (L01.FR.05);
     /// a future one means `InstallScheduled` (L01.FR.16).
     pub install_at: Option<DateTime<Utc>>,
-    /// The image's digital signature, carried through to the integrator untouched. Verifying it
-    /// is B3.3; this crate has no crypto.
+    /// The image's digital signature (base64, per OCPP's convention). `Some` marks this as a
+    /// signed update: it is verified (along with `signing_certificate`) through
+    /// [`crate::hardware::FirmwareVerifier`] before installing - see the module docs.
     pub signature: Option<String>,
-    /// The certificate the signature should be verified against. Same status as `signature`.
+    /// The certificate the signature should be verified against (PEM). Same status as
+    /// `signature`.
     pub signing_certificate: Option<String>,
     /// How many times to retry a failed download, beyond the first attempt.
     pub retries: u32,
@@ -130,6 +152,13 @@ pub enum FirmwareStatus {
     InstallationFailed,
     /// The image is staged and the charge point is about to restart to run it (L01.FR.15).
     InstallRebooting,
+    /// The downloaded image's signature was checked against `signingCertificate` and verified
+    /// (B3.3). Only ever reported for a signed update, immediately before installation resumes.
+    SignatureVerified,
+    /// The downloaded image's signature failed verification, or could not be verified at all (no
+    /// verifier configured, or an unsupported algorithm) - B3.3's fail-safe path. The update stops
+    /// here: nothing is installed.
+    InvalidSignature,
 }
 
 /// Reports a firmware update's progress to the CSMS.
@@ -171,6 +200,34 @@ pub trait UpdateFirmwareHandler {
         updates: FirmwareUpdateQueue,
         state: alloc::sync::Arc<FirmwareUpdateState>,
     );
+}
+
+/// Registers this charge point's inbound `SignedUpdateFirmware` handling - the 1.6J Security
+/// Whitepaper's signed alternative to plain `UpdateFirmware` (B3.3).
+///
+/// A distinct trait, not a second method on [`UpdateFirmwareHandler`], because `SignedUpdateFirmware`
+/// is a genuinely different action with its own request/response shape - 1.6J is the only
+/// protocol with two separate actions for the same underlying operation; 2.x's `UpdateFirmware`
+/// already carries `signature`/`signingCertificate` inline, so it needs nothing here.
+///
+/// The default implementation is a no-op: 2.0.1 and 2.1's adapters implement this trait with an
+/// empty body so [`ChargePointBuilder::firmware_updates`](crate::builder::ChargePointBuilder::firmware_updates)
+/// can require it uniformly across every protocol version without 2.x's handlers having anything
+/// to actually register.
+#[async_trait::async_trait]
+pub trait SignedUpdateFirmwareHandler {
+    /// Registers a handler dispatching against `actor`, feeding the same queue and state
+    /// [`UpdateFirmwareHandler::register_update_firmware_handler`] does - a `SignedUpdateFirmware`
+    /// and a plain `UpdateFirmware` are the same update to the worker that drives it, only the
+    /// wire shape differs.
+    async fn register_signed_update_firmware_handler(
+        &self,
+        actor: ChargePointActor,
+        updates: FirmwareUpdateQueue,
+        state: alloc::sync::Arc<FirmwareUpdateState>,
+    ) {
+        let _ = (actor, updates, state);
+    }
 }
 
 /// Tracks which update is current and what was last reported, so a superseded update can be
@@ -246,6 +303,7 @@ impl FirmwareUpdateState {
                 FirmwareStatus::Installed
                     | FirmwareStatus::InstallationFailed
                     | FirmwareStatus::DownloadFailed
+                    | FirmwareStatus::InvalidSignature
             ) {
                 inner.in_progress = false;
             }
@@ -301,7 +359,7 @@ pub async fn handle_update_firmware(
 
 /// Performs every accepted firmware update, reporting each state change to the CSMS.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_firmware_updates<T, I, N, C, B>(
+pub async fn run_firmware_updates<T, I, N, C, B, V>(
     actor: &ChargePointActor,
     updates: FirmwareUpdateQueue,
     state: &FirmwareUpdateState,
@@ -310,12 +368,14 @@ pub async fn run_firmware_updates<T, I, N, C, B>(
     notifier: &N,
     clock: &C,
     backoff: &B,
+    verifier: &V,
 ) where
     T: FileTransfer,
     I: FirmwareInstaller,
     N: FirmwareStatusNotifier,
     C: Clock,
     B: Backoff,
+    V: FirmwareVerifier,
 {
     loop {
         let (ticket, request) = updates.channel.recv().await;
@@ -323,14 +383,14 @@ pub async fn run_firmware_updates<T, I, N, C, B>(
             continue;
         }
         run_one_update(
-            actor, state, ticket, transfer, installer, notifier, clock, backoff, &request,
+            actor, state, ticket, transfer, installer, notifier, clock, backoff, verifier, &request,
         )
         .await;
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_one_update<T, I, N, C, B>(
+async fn run_one_update<T, I, N, C, B, V>(
     actor: &ChargePointActor,
     state: &FirmwareUpdateState,
     ticket: u64,
@@ -339,6 +399,7 @@ async fn run_one_update<T, I, N, C, B>(
     notifier: &N,
     clock: &C,
     backoff: &B,
+    verifier: &V,
     request: &FirmwareUpdateRequest,
 ) where
     T: FileTransfer,
@@ -346,6 +407,7 @@ async fn run_one_update<T, I, N, C, B>(
     N: FirmwareStatusNotifier,
     C: Clock,
     B: Backoff,
+    V: FirmwareVerifier,
 {
     let report = async |status| {
         state.record(request.request_id, status);
@@ -377,6 +439,52 @@ async fn run_one_update<T, I, N, C, B>(
         return;
     }
     report(FirmwareStatus::Downloaded).await;
+
+    // B3.3: an update carrying neither field is unsigned by OCPP's own design (plain
+    // `UpdateFirmware` makes both optional), and is not held to a bar this crate never asked the
+    // CSMS to clear. One carrying either is verified before anything else happens to it - strictly
+    // before the install wait below, never after installing.
+    if request.signature.is_some() || request.signing_certificate.is_some() {
+        let verified = verifier
+            .verify(
+                request.signing_certificate.as_deref(),
+                request.signature.as_deref(),
+            )
+            .await;
+        let event_type = match &verified {
+            Ok(FirmwareVerificationOutcome::Valid) => None,
+            Ok(FirmwareVerificationOutcome::InvalidSignature) => {
+                Some(SecurityEventType::InvalidFirmwareSignature)
+            }
+            Ok(FirmwareVerificationOutcome::InvalidSigningCertificate) => {
+                Some(SecurityEventType::InvalidFirmwareSigningCertificate)
+            }
+            Err(err) => {
+                // Cannot verify at all (no verifier wired, or an algorithm it does not support) -
+                // the fail-safe answer is the same as a definite failure: refuse to install.
+                tracing::warn!(error = %err, "could not verify a firmware image's signature");
+                Some(SecurityEventType::InvalidFirmwareSignature)
+            }
+        };
+        if let Some(event_type) = event_type {
+            report_security_event(
+                actor,
+                SecurityEvent {
+                    event_type,
+                    tech_info: None,
+                },
+            )
+            .await;
+            if state.is_current(ticket) {
+                report(FirmwareStatus::InvalidSignature).await;
+            }
+            return;
+        }
+        if !state.is_current(ticket) {
+            return;
+        }
+        report(FirmwareStatus::SignatureVerified).await;
+    }
 
     // L01.FR.16.
     if is_future(clock, request.install_at) {

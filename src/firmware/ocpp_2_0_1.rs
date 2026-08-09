@@ -13,7 +13,8 @@ use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
 use crate::actor::ChargePointActor;
 use crate::firmware::{
     FirmwareStatus, FirmwareStatusNotifier, FirmwareUpdateQueue, FirmwareUpdateRequest,
-    FirmwareUpdateState, UpdateFirmwareHandler, UpdateFirmwareOutcome, handle_update_firmware,
+    FirmwareUpdateState, SignedUpdateFirmwareHandler, UpdateFirmwareHandler, UpdateFirmwareOutcome,
+    handle_update_firmware,
 };
 
 fn map_request(request: &UpdateFirmwareRequest) -> FirmwareUpdateRequest {
@@ -68,6 +69,9 @@ pub(super) fn wire_status(status: FirmwareStatus) -> FirmwareStatusEnum {
         FirmwareStatus::Installed => FirmwareStatusEnum::Installed,
         FirmwareStatus::InstallationFailed => FirmwareStatusEnum::InstallationFailed,
         FirmwareStatus::InstallRebooting => FirmwareStatusEnum::InstallRebooting,
+        // B3.3.
+        FirmwareStatus::SignatureVerified => FirmwareStatusEnum::SignatureVerified,
+        FirmwareStatus::InvalidSignature => FirmwareStatusEnum::InvalidSignature,
     }
 }
 
@@ -106,6 +110,10 @@ impl UpdateFirmwareHandler for Ocpp2_0_1FirmwareHandler {
             .await;
     }
 }
+
+/// 2.0.1's `UpdateFirmware` already carries `signature`/`signingCertificate` inline - there is no
+/// separate `SignedUpdateFirmware` action to register here. See the trait's docs.
+impl SignedUpdateFirmwareHandler for Ocpp2_0_1FirmwareHandler {}
 
 #[async_trait::async_trait]
 impl FirmwareStatusNotifier for Ocpp2_0_1FirmwareHandler {
@@ -151,6 +159,8 @@ mod std_impls {
                 .await;
         }
     }
+
+    impl SignedUpdateFirmwareHandler for OCPP2_0_1Client {}
 
     #[async_trait::async_trait]
     impl FirmwareStatusNotifier for OCPP2_0_1Client {
@@ -261,6 +271,14 @@ mod tests {
             (
                 FirmwareStatus::InstallRebooting,
                 FirmwareStatusEnum::InstallRebooting,
+            ),
+            (
+                FirmwareStatus::SignatureVerified,
+                FirmwareStatusEnum::SignatureVerified,
+            ),
+            (
+                FirmwareStatus::InvalidSignature,
+                FirmwareStatusEnum::InvalidSignature,
             ),
         ];
         for (internal, wire) in all {

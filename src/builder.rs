@@ -2112,23 +2112,29 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
-    /// Registers the Firmware Management block (`docs/PRODUCTION-ROADMAP.md` B3.2): inbound
-    /// `UpdateFirmware`, and the worker that downloads, waits, installs and reports every state
-    /// change to `csms`.
+    /// Registers the Firmware Management block (`docs/PRODUCTION-ROADMAP.md` B3.2/B3.3): inbound
+    /// `UpdateFirmware` (and, for a 1.6J `csms`, the Security Whitepaper's `SignedUpdateFirmware`,
+    /// see [`crate::firmware::SignedUpdateFirmwareHandler`]), and the worker that downloads,
+    /// verifies a signed image's signature, waits, installs and reports every state change to
+    /// `csms`.
     ///
     /// Needs both halves of the firmware hardware surface - `transfer` to fetch the image,
-    /// `installer` to flash it - which is why, like [`Self::log_uploads`], this is builder-only:
-    /// `setup()` has no way to receive either.
-    pub async fn firmware_updates<N, F, I, K, B>(
+    /// `installer` to flash it - plus `verifier` to check a signed update's image before it is
+    /// installed (B3.3; [`crate::hardware::NoFirmwareVerifier`] if this charge point never
+    /// receives signed updates) - which is why, like [`Self::log_uploads`], this is builder-only:
+    /// `setup()` has no way to receive any of them.
+    pub async fn firmware_updates<N, F, I, K, B, V>(
         self,
         csms: &N,
         transfer: F,
         installer: I,
         clock: K,
         backoff: B,
+        verifier: V,
     ) -> Self
     where
         N: crate::firmware::UpdateFirmwareHandler
+            + crate::firmware::SignedUpdateFirmwareHandler
             + crate::firmware::FirmwareStatusNotifier
             + Clone
             + Send
@@ -2138,17 +2144,25 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         I: crate::hardware::FirmwareInstaller + Send + Sync + 'static,
         K: crate::clock::Clock + Send + Sync + 'static,
         B: Backoff + Send + Sync + 'static,
+        V: crate::hardware::FirmwareVerifier + Send + Sync + 'static,
     {
         let updates = crate::firmware::FirmwareUpdateQueue::new();
         let state = Arc::new(crate::firmware::FirmwareUpdateState::new());
         csms.register_update_firmware_handler(self.runtime.actor(), updates.clone(), state.clone())
             .await;
+        csms.register_signed_update_firmware_handler(
+            self.runtime.actor(),
+            updates.clone(),
+            state.clone(),
+        )
+        .await;
 
         let actor = self.runtime.actor();
         let notifier = csms.clone();
         self.executor.spawn(Box::pin(async move {
             crate::firmware::run_firmware_updates(
                 &actor, updates, &state, &transfer, &installer, &notifier, &clock, &backoff,
+                &verifier,
             )
             .await;
         }));

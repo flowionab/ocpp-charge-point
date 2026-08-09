@@ -2,7 +2,10 @@
 
 use super::*;
 use crate::executor::TokioExecutor;
-use crate::hardware::{Capabilities, NoFileTransferError, NoFirmwareInstallerError, UploadSource};
+use crate::hardware::{
+    Capabilities, FirmwareVerificationOutcome, FirmwareVerifier, NoFileTransferError,
+    NoFirmwareInstallerError, NoFirmwareVerifier, NoFirmwareVerifierError, UploadSource,
+};
 use crate::state::{ConnectorEvent, IdToken, IdTokenKind};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -90,6 +93,34 @@ impl FirmwareInstaller for FakeInstaller {
     }
 }
 
+struct FakeVerifier {
+    outcome: StdMutex<Result<FirmwareVerificationOutcome, ()>>,
+    calls: StdMutex<u32>,
+}
+
+impl FakeVerifier {
+    fn new(outcome: Result<FirmwareVerificationOutcome, ()>) -> Self {
+        Self {
+            outcome: StdMutex::new(outcome),
+            calls: StdMutex::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl FirmwareVerifier for FakeVerifier {
+    type Error = NoFirmwareVerifierError;
+
+    async fn verify(
+        &self,
+        _signing_certificate: Option<&str>,
+        _signature: Option<&str>,
+    ) -> Result<FirmwareVerificationOutcome, Self::Error> {
+        *self.calls.lock().unwrap() += 1;
+        (*self.outcome.lock().unwrap()).map_err(|()| NoFirmwareVerifierError)
+    }
+}
+
 #[derive(Default)]
 struct RecordingNotifier {
     seen: StdMutex<Vec<(Option<i64>, FirmwareStatus)>>,
@@ -133,6 +164,16 @@ fn request() -> FirmwareUpdateRequest {
     }
 }
 
+/// A signed update - carries both `signature` and `signing_certificate`, which is what turns on
+/// B3.3's verification gate.
+fn signed_request() -> FirmwareUpdateRequest {
+    FirmwareUpdateRequest {
+        signature: Some("c2ln".into()),
+        signing_certificate: Some("Y2VydA==".into()),
+        ..request()
+    }
+}
+
 async fn actor_with_firmware() -> ChargePointActor {
     let actor = ChargePointActor::spawn([1], &TokioExecutor);
     let _ = actor
@@ -160,6 +201,32 @@ async fn run(
     notifier: Arc<RecordingNotifier>,
     clock: FixedClock,
 ) {
+    run_with_verifier(
+        actor,
+        updates,
+        state,
+        transfer,
+        installer,
+        notifier,
+        clock,
+        Arc::new(NoFirmwareVerifier),
+    )
+    .await;
+}
+
+/// Like [`run`], but with a caller-chosen [`FirmwareVerifier`] rather than
+/// [`NoFirmwareVerifier`] - for exercising B3.3's verification gate.
+#[allow(clippy::too_many_arguments)]
+async fn run_with_verifier<V: FirmwareVerifier + Send + Sync + 'static>(
+    actor: &ChargePointActor,
+    updates: FirmwareUpdateQueue,
+    state: Arc<FirmwareUpdateState>,
+    transfer: Arc<FakeTransfer>,
+    installer: Arc<FakeInstaller>,
+    notifier: Arc<RecordingNotifier>,
+    clock: FixedClock,
+    verifier: Arc<V>,
+) {
     let worker_actor = actor.clone();
     let handle = tokio::spawn(async move {
         run_firmware_updates(
@@ -171,6 +238,7 @@ async fn run(
             &notifier,
             &clock,
             &InstantBackoff,
+            &verifier,
         )
         .await;
     });
@@ -600,4 +668,202 @@ fn a_triggered_status_is_idle_only_once_the_last_update_finished_installing() {
     // there is no longer an update to correlate to.
     state.record(Some(4), FirmwareStatus::Installed);
     assert_eq!(state.triggered_status(), (None, FirmwareStatus::Idle));
+}
+
+// --- B3.3: signature verification ------------------------------------------------------------
+
+#[tokio::test]
+async fn an_unsigned_update_never_calls_the_verifier() {
+    let actor = actor_with_firmware().await;
+    let updates = FirmwareUpdateQueue::new();
+    let state = Arc::new(FirmwareUpdateState::new());
+    let notifier = Arc::new(RecordingNotifier::default());
+    // Would report `Valid` if ever called - proves the skip, not just a lucky pass.
+    let verifier = Arc::new(FakeVerifier::new(Ok(FirmwareVerificationOutcome::Valid)));
+
+    handle_update_firmware(&actor, &updates, &state, request()).await;
+    run_with_verifier(
+        &actor,
+        updates,
+        state,
+        Arc::new(FakeTransfer::default()),
+        Arc::new(FakeInstaller::new(Ok(FirmwareInstallOutcome::Installed))),
+        notifier.clone(),
+        FixedClock(at(0)),
+        verifier.clone(),
+    )
+    .await;
+
+    assert_eq!(*verifier.calls.lock().unwrap(), 0);
+    // An unsigned update behaves exactly as it did before B3.3 - no signature statuses appear.
+    assert_eq!(
+        notifier.statuses(),
+        alloc::vec![
+            FirmwareStatus::Downloading,
+            FirmwareStatus::Downloaded,
+            FirmwareStatus::Installing,
+            FirmwareStatus::Installed
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_signed_update_with_a_valid_signature_is_verified_then_installed() {
+    let actor = actor_with_firmware().await;
+    let updates = FirmwareUpdateQueue::new();
+    let state = Arc::new(FirmwareUpdateState::new());
+    let notifier = Arc::new(RecordingNotifier::default());
+    let installer = Arc::new(FakeInstaller::new(Ok(FirmwareInstallOutcome::Installed)));
+    let verifier = Arc::new(FakeVerifier::new(Ok(FirmwareVerificationOutcome::Valid)));
+
+    handle_update_firmware(&actor, &updates, &state, signed_request()).await;
+    run_with_verifier(
+        &actor,
+        updates,
+        state,
+        Arc::new(FakeTransfer::default()),
+        installer.clone(),
+        notifier.clone(),
+        FixedClock(at(0)),
+        verifier.clone(),
+    )
+    .await;
+
+    assert_eq!(*verifier.calls.lock().unwrap(), 1);
+    // Verified between `Downloaded` and `Installing` - never after installing.
+    assert_eq!(
+        notifier.statuses(),
+        alloc::vec![
+            FirmwareStatus::Downloading,
+            FirmwareStatus::Downloaded,
+            FirmwareStatus::SignatureVerified,
+            FirmwareStatus::Installing,
+            FirmwareStatus::Installed
+        ]
+    );
+    assert_eq!(*installer.installs.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn an_invalid_signature_refuses_to_install_and_raises_the_matching_security_event() {
+    let actor = actor_with_firmware().await;
+    let mut security_events = actor.subscribe_security_events();
+    let updates = FirmwareUpdateQueue::new();
+    let state = Arc::new(FirmwareUpdateState::new());
+    let notifier = Arc::new(RecordingNotifier::default());
+    let installer = Arc::new(FakeInstaller::new(Ok(FirmwareInstallOutcome::Installed)));
+    let verifier = Arc::new(FakeVerifier::new(Ok(
+        FirmwareVerificationOutcome::InvalidSignature,
+    )));
+
+    handle_update_firmware(&actor, &updates, &state, signed_request()).await;
+    run_with_verifier(
+        &actor,
+        updates,
+        state,
+        Arc::new(FakeTransfer::default()),
+        installer.clone(),
+        notifier.clone(),
+        FixedClock(at(0)),
+        verifier,
+    )
+    .await;
+
+    // Refused before install, never after - nothing reaches the installer.
+    assert_eq!(*installer.installs.lock().unwrap(), 0);
+    assert_eq!(
+        notifier.statuses(),
+        alloc::vec![
+            FirmwareStatus::Downloading,
+            FirmwareStatus::Downloaded,
+            FirmwareStatus::InvalidSignature,
+        ]
+    );
+    let event = security_events.recv().await.unwrap();
+    assert_eq!(
+        event.event_type,
+        crate::state::SecurityEventType::InvalidFirmwareSignature
+    );
+}
+
+#[tokio::test]
+async fn an_untrusted_signing_certificate_raises_the_certificate_specific_security_event() {
+    let actor = actor_with_firmware().await;
+    let mut security_events = actor.subscribe_security_events();
+    let updates = FirmwareUpdateQueue::new();
+    let state = Arc::new(FirmwareUpdateState::new());
+    let notifier = Arc::new(RecordingNotifier::default());
+    let installer = Arc::new(FakeInstaller::new(Ok(FirmwareInstallOutcome::Installed)));
+    let verifier = Arc::new(FakeVerifier::new(Ok(
+        FirmwareVerificationOutcome::InvalidSigningCertificate,
+    )));
+
+    handle_update_firmware(&actor, &updates, &state, signed_request()).await;
+    run_with_verifier(
+        &actor,
+        updates,
+        state,
+        Arc::new(FakeTransfer::default()),
+        installer.clone(),
+        notifier.clone(),
+        FixedClock(at(0)),
+        verifier,
+    )
+    .await;
+
+    assert_eq!(*installer.installs.lock().unwrap(), 0);
+    // The wire status is the same `InvalidSignature` OCPP offers either way - only the security
+    // event distinguishes "bad signature" from "bad certificate".
+    assert_eq!(
+        notifier.statuses(),
+        alloc::vec![
+            FirmwareStatus::Downloading,
+            FirmwareStatus::Downloaded,
+            FirmwareStatus::InvalidSignature,
+        ]
+    );
+    let event = security_events.recv().await.unwrap();
+    assert_eq!(
+        event.event_type,
+        crate::state::SecurityEventType::InvalidFirmwareSigningCertificate
+    );
+}
+
+#[tokio::test]
+async fn a_signed_update_with_no_verifier_configured_fails_safe_and_refuses_to_install() {
+    // The fail-safe default: a charge point that cannot verify at all must not install unchecked.
+    let actor = actor_with_firmware().await;
+    let mut security_events = actor.subscribe_security_events();
+    let updates = FirmwareUpdateQueue::new();
+    let state = Arc::new(FirmwareUpdateState::new());
+    let notifier = Arc::new(RecordingNotifier::default());
+    let installer = Arc::new(FakeInstaller::new(Ok(FirmwareInstallOutcome::Installed)));
+
+    handle_update_firmware(&actor, &updates, &state, signed_request()).await;
+    run_with_verifier(
+        &actor,
+        updates,
+        state,
+        Arc::new(FakeTransfer::default()),
+        installer.clone(),
+        notifier.clone(),
+        FixedClock(at(0)),
+        Arc::new(NoFirmwareVerifier),
+    )
+    .await;
+
+    assert_eq!(*installer.installs.lock().unwrap(), 0);
+    assert_eq!(
+        notifier.statuses(),
+        alloc::vec![
+            FirmwareStatus::Downloading,
+            FirmwareStatus::Downloaded,
+            FirmwareStatus::InvalidSignature,
+        ]
+    );
+    let event = security_events.recv().await.unwrap();
+    assert_eq!(
+        event.event_type,
+        crate::state::SecurityEventType::InvalidFirmwareSignature
+    );
 }
