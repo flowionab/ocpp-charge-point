@@ -1971,7 +1971,21 @@ exists).
       requirement is now `"0.5.0"` (`ocpp-types` 0.3.0), and the whole suite
       runs against it. The 0.5.0 step needed no source changes - see
       [`MIGRATION-ocpp-client-0.4.md`](./MIGRATION-ocpp-client-0.4.md).
-- [ ] **D3.2** Vendor-or-fork contingency if upstream PRs stall.
+- [x] **D3.2** Vendor-or-fork contingency — [`docs/UPSTREAM-POLICY.md`](UPSTREAM-POLICY.md).
+
+      When to upstream versus work around, how long to wait, and what escalation costs — vendoring
+      a patched copy, forking, pinning to a git rev, or implementing locally with a migration path.
+      It is explicit that implementing locally is the *last* resort and never for wire or transport
+      concerns, which `CLAUDE.md` reserves for `ocpp-client` categorically.
+
+      **The most useful part addresses a failure this project actually had**, and it is mechanical
+      rather than aspirational: D2.2 recorded the 1.6J whitepaper types as absent upstream, 0.4.0
+      added them, and the "blocked" framing was quoted as current for months because nobody re-ran
+      the check. The policy's rule is that **any task citing an upstream gap as grounds for
+      "blocked" must re-run that specific check against the currently pinned version before
+      repeating the conclusion** — with the commands to do it. As it puts it: a finding that is
+      silently three releases stale is indistinguishable, to a reader, from one that is still true.
+
 - [x] **D3.3** `cargo-deny` for licences and advisories, in CI. Done
       alongside [H1.5](#101-h1--ci-hardening) — `deny.toml` plus a `deny` job,
       verified locally (`advisories ok, bans ok, licenses ok, sources ok`).
@@ -2850,8 +2864,23 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
 
 ### 9.1 G1 — no_std across the matrix
 
-- [ ] **G1.1** CI job building `--no-default-features` for a real MCU
-      target (`thumbv7em-none-eabihf`), not just `cargo check` on the host.
+- [x] **G1.1** CI now **builds** for the MCU target rather than checking it.
+
+      The gap was exactly as the row described: the `embedded` job ran
+      `cargo check --no-default-features --lib --target thumbv7em-none-eabihf`. `check` stops
+      after type checking — no codegen, no target-specific codegen failures. Now `cargo build`.
+
+      **And it covers capability features, not just the bare build**, which is the part that
+      matters historically: both `AtomicI64` regressions were in feature-gated code
+      (`certificates`, `variable-monitoring`) and one sat broken on `main` for weeks precisely
+      because only the bare `--no-default-features` build was exercised. A second step builds
+      every capability plus all three versions for the same target.
+
+      Linking a final executable stays out of scope and correctly so — that needs a
+      `critical-section` backend and the integrator's own `Executor`/`Backoff`/`Clock`.
+      `getrandom_backend="custom"` is preserved. Unverifiable from here: actual GitHub Actions
+      execution; only the underlying cargo commands were run locally against the real target.
+
 - [x] **G1.2** Every new feature combination stays no_std-clean.
 
       **Three configurations were failing on `main` and had been for some time** —
@@ -3460,12 +3489,26 @@ coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match 
 
 - [ ] **H3.4** Interoperability against at least two independent CSMS
       implementations per version.
-- [ ] **H3.5** Re-verify everything in `ROADMAP.md` marked
-      "(verify vs 2.1 spec)" against the now-vendored 2.1 specification —
-      that caveat predates the PDFs being added. **Note the caveat is doubly stale**: the spec
-      directories it refers to are gitignored and absent from every clone
-      ([B8.3](#b8--reservation-derv2x-battery-swap)), so this row is blocked on that being
-      settled first.
+- [x] **H3.5** Re-verify the "(verify vs 2.1 spec)" markers — **and settle the spec-access
+      problem that blocked them.**
+
+      **The licensing question was answered conservatively, which is the right answer here.** The
+      Open Charge Alliance publishes at least some OCPP documents under CC BY-ND 4.0, which would
+      in principle permit vendoring an unmodified PDF with attribution — confirmed by reading the
+      license page inside one such document. But that was only established for a *supplementary
+      whitepaper*, not the core Part 0–6 set this crate needs, and the download page sits behind a
+      sign-in whose account terms may differ from the license printed on the PDF. Not confident
+      enough to act on, so **the PDFs stay out of the repository**, `.gitignore` and the
+      documentation now agree, and `docs/ROADMAP.md` documents how to obtain them and where to put
+      them. [H3.2](#103-h3--compliance) inherits that answer.
+
+      All four markers are **discharged rather than deleted** — each annotated "discharged
+      2026-08-09, schema-only" with the evidence, since `ocpp-types` 0.3.0 is schema-derived and
+      authoritative for message shape, field presence and enum values even when the PDFs are
+      absent. Spot-checked two independently: `v201` has *no* tariff message types against `v21`'s
+      eight, and 2.1's `ChargingProfilePurposeEnum` does add `PriorityCharging`/`LocalGeneration`.
+      Both hold exactly. What schema cannot settle — prose semantics, device-model component
+      naming — is called out as still depending on the PDFs.
 
 ### 10.4 H4 — Longevity
 
@@ -3545,8 +3588,29 @@ coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match 
 
 ### 10.5 H5 — Release
 
-- [ ] **H5.1** Complete rustdoc on every public item — `#![warn(missing_docs)]`
-      is on; make it `deny`.
+- [x] **H5.1** Complete rustdoc — `missing_docs` is now `deny`.
+
+      **The gap was not where the row assumed.** Under `warn`, `cargo build` produced *zero*
+      missing-documentation diagnostics — across default, `--all-features`,
+      `--no-default-features`, each version feature alone, and all 18 capability features. Every
+      public item was already documented; CLAUDE.md's rule had been followed. The real work was
+      the other half: making `deny` safe to turn on without CI tripping over link rot.
+
+      `cargo doc --no-deps --all-features` had **88** warnings (not the ~37 recorded — that
+      estimate predated recent merges). All 88 fixed, now zero. Most were one systematic pattern:
+      bare names in module-level `//!` comments failing to resolve even when `use`-imported into
+      that module. Two were substantive rather than cosmetic — links to modules that had since
+      become private, and a documented `ChargingProfile::new` **that never existed**, whose
+      claimed sort-by-`start_period_secs` invariant is actually enforced by each version adapter.
+      That doc was corrected to say what is true rather than patched to link somewhere.
+
+      No visibility changed and no item was made private to dodge documenting it.
+
+      **Known limit:** `cargo doc --no-default-features` still warns (~96), because functional-block
+      module docs cross-reference optional modules unconditionally and those modules do not exist
+      under a reduced feature set. `missing_docs` itself is clean there — an uncompiled item
+      cannot be missing docs — so the `deny` is safe; cfg-scoping that much prose is its own task.
+
 - [x] **H5.2** Integrator's guide: implement these traits, pick these
       features, here's a working example — [`docs/INTEGRATORS.md`](INTEGRATORS.md), linked from
       the README.
@@ -3582,8 +3646,21 @@ coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match 
       `connect_and_setup`'s `payload_limits`, `firmware_updates`' `verifier`, and
       `ChargePointEffect` losing `Eq`. It says openly that it is grouped by milestone rather than
       audited commit by commit, rather than implying completeness it does not have.
-- [ ] **H5.5** 1.0 criteria: hardware trait surface frozen. Land every
-      planned breaking change ([B2.3](#b2--smart-charging-r11), [C2.2](#52-c2--runtime-capability-declaration), [E1.1](#71-e1--storage-trait)) before this.
+- [x] **H5.5** 1.0 criteria — assessed in [`docs/RELEASE-1.0.md`](RELEASE-1.0.md).
+      **The recommendation is: do not freeze yet.**
+
+      A per-trait stability assessment across all seventeen hardware traits, and the conclusion
+      the evidence actually supports rather than the one the row hoped for. Three blocks are
+      **wired but not functional**, and closing each plausibly changes a trait that a freeze would
+      have promised not to change: DER actuation needs more than `Connector::set_current_limit`'s
+      single import limit; ISO 15118 needs an integrator HLC stack whose contact with
+      `Iso15118Controller` is untested; `PaymentCtrlr`'s live status needs a hook
+      `PaymentTerminal` does not have.
+
+      Six breaking changes have already landed, several within weeks. **A freeze followed by three
+      more breaking changes is worse than no freeze** — so the document recommends shipping 0.x
+      for longer, names the specific work that should precede any freeze, and leaves the call to a
+      maintainer. No trait was changed by this task, deliberately.
 
 ---
 
@@ -3775,39 +3852,38 @@ Everything in M5 is capability-gated and hardware-dependent — a given
 product ships the subset its hardware supports. M5 completes the *library*,
 not every deployment.
 
-**Progress (2026-08-09), fifth update.** [F3.2](#83-f3--credentials) (renewal),
-[F4.3](#84-f4--security-events), [D2.3](#62-d2--type-completeness-audit),
-[H3.3](#103-h3--compliance), [E2.9](#72-e2--what-must-survive) and [F5.4](#85-f5--hardening) all
-landed. **Workstreams B, C, D, E, F and G are now closed** — every remaining open row is in
-[Workstream H](#10-workstream-h--test-compliance-release) bar `D3.2` and `G1.1`.
+**Progress (2026-08-09), sixth update.** [H5.1](#105-h5--release), [G1.1](#91-g1--no_std-across-the-matrix),
+[H3.5](#103-h3--compliance), [H5.5](#105-h5--release) and [D3.2](#63-d3--dependency-policy) landed.
+**142 of 145 rows are done, and every workstream except H is closed.**
 
-**Eight rows remain, and only two are code:** [H5.1](#105-h5--release) (turn `missing_docs` from
-warn to deny) and [G1.1](#91-g1--no_std-across-the-matrix) (an MCU *build* job in CI, not just a
-check). The rest are process or decisions:
+**Three rows remain, and none of them can be finished from a keyboard here** — each needs
+something external, which is worth stating plainly so nobody plans around it:
 
-- [H3.3](#103-h3--compliance) has now produced [`docs/CERTIFICATION.md`](CERTIFICATION.md) with a
-  recommended claim set — **that recommendation needs a human decision**, and
-  [H3.1](#103-h3--compliance)/[H3.2](#103-h3--compliance)/[H3.4](#103-h3--compliance) all follow
-  from it. This is the single highest-leverage thing left.
-- [H3.2](#103-h3--compliance)/[H3.5](#103-h3--compliance) additionally need the **gitignored spec
-  material** settled — vendor it or say where to fetch it.
-- **`main` is still unprotected.** [H1.8](#101-h1--ci-hardening) built the `ci-required` gate;
-  requiring it is a repository setting.
-- [H5.5](#105-h5--release) is the 1.0 trait freeze, and it should be taken *after* the caveats
-  below, not before.
+| Row | Needs |
+|-----|-------|
+| [H3.1](#103-h3--compliance) | The **OCA Compliance Test Tool**, which is licensed software obtained through OCA membership |
+| [H3.2](#103-h3--compliance) | The **spec PDFs**, which [H3.5](#103-h3--compliance) established should not be committed — obtain them per `docs/ROADMAP.md` and work the part-6 cases |
+| [H3.4](#103-h3--compliance) | **Two independent CSMS implementations** per version to interoperate against |
 
-**Wired is not functional, and this is what H5.5 has to weigh.** Each of these has a working
-message path and no working implementation behind it, which is fine for a library and fatal for a
-certification claim: **DER control cannot actuate** (no hardware trait applies a curve or
-setpoint), **ISO 15118 carries EXI opaquely** and needs an integrator HLC stack,
-**`PaymentCtrlr`'s live status variables are placeholders**, and **firmware-signature verification
-and OCSP are delegated** to traits whose `No*` defaults do nothing.
-[`docs/CERTIFICATION.md`](CERTIFICATION.md) enumerates these against specific profiles.
+All three are compliance activities, and all three depend on a decision that is a maintainer's to
+make: **which certification profiles to claim.** [H3.3](#103-h3--compliance) has produced
+[`docs/CERTIFICATION.md`](CERTIFICATION.md) with a recommended set and the reasoning; accepting or
+amending it is the next step, and everything else in H3 follows from it.
 
-Two loose threads worth naming: a **reconnect-scaled memory growth** that reproduces on some runs
-and not others ([`docs/MEMORY.md`](MEMORY.md)), and **certificate renewal is not builder-wired** —
-`confirm_certificate_renewal`/`discard_certificate_renewal` need an integrator caller or a
-renewal's outcome is never resolved.
+Two more things that need a human, neither of them a roadmap row:
+
+- **`main` is still unprotected.** [H1.8](#101-h1--ci-hardening) built the `ci-required` aggregate
+  gate; requiring it is a GitHub repository setting. Until then CI is an alarm, not a lock.
+- **1.0 should not be declared yet.** [H5.5](#105-h5--release) assessed the trait surface and
+  recommends against freezing — see [`docs/RELEASE-1.0.md`](RELEASE-1.0.md). Three blocks are
+  **wired but not functional** (DER cannot actuate, ISO 15118 needs an integrator HLC stack,
+  `PaymentCtrlr` status is placeholders) and closing each plausibly changes a trait a freeze would
+  have promised not to change.
+
+Two loose engineering threads remain outside the roadmap: a **reconnect-scaled memory growth**
+that reproduces on some runs and not others ([`docs/MEMORY.md`](MEMORY.md)), and **certificate
+renewal is not builder-wired** — `confirm_certificate_renewal`/`discard_certificate_renewal` need
+an integrator caller or a renewal's outcome is never resolved.
 
 ---
 
