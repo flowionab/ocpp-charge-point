@@ -32,6 +32,12 @@ pub mod availability;
 #[cfg(feature = "battery-swap")]
 pub mod battery_swap;
 mod builder;
+/// `GetCertificateStatus`/`GetCertificateChainStatus` (OCPP 2.0.1/2.1, `docs/PRODUCTION-ROADMAP.md`
+/// B4.4): OCSP status checking, runtime-gated by [`hardware::Capabilities::ocsp_checking`] - see
+/// [`certificate_status`]'s own docs for why this is a separate capability from
+/// [`certificates`]. Unconditional like [`certificates`] itself - the `ocsp-checking` Cargo
+/// feature governs advertisement (`hardware::capabilities::CAPABILITY_GATES`), not compilation.
+pub mod certificate_status;
 pub mod certificates;
 pub mod clock;
 // `connect_and_setup` hands its negotiated client straight to `setup()`, so it needs the same

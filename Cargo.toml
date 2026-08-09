@@ -50,6 +50,7 @@ default = [
     "periodic-event-stream",
     "certificates",
     "key-storage",
+    "ocsp-checking",
 ]
 ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
 ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
@@ -154,6 +155,12 @@ certificates = []
 # `crate::hardware::SoftKeyStore`) that never gives up key material. No OCPP messages consume
 # this yet: it exists for F1.3 (mutual TLS) and B4.3 (CSR generation/renewal) to build on.
 key-storage = []
+# Declares the ocsp-checking capability - `crate::hardware::OcspChecker` (roadmap B4.4), registered
+# through `ChargePointBuilder::ocsp_status`/`ChargePointBuilder::ocsp_chain_status`. Deliberately
+# its own feature rather than reusing `certificate-management`: see
+# `crate::hardware::Capabilities::ocsp_checking`'s docs for why the two are independent hardware
+# facts.
+ocsp-checking = []
 
 [dependencies]
 # `rt-multi-thread` is here for `crate::mutual_tls`'s `KeyStoreSigner` (F1.3): rustls's `Signer`

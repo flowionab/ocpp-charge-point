@@ -776,6 +776,10 @@ mod tests {
                         key_storage: enabled,
                         ..Default::default()
                     },
+                    "ocsp_checking" => crate::hardware::Capabilities {
+                        ocsp_checking: enabled,
+                        ..Default::default()
+                    },
                     "der_control" => crate::hardware::Capabilities {
                         der_control: enabled,
                         ..Default::default()

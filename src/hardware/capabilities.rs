@@ -105,6 +105,21 @@ pub struct Capabilities {
     /// security profile 3 (mutual TLS) and CSR generation/renewal, neither of which is wired to
     /// this capability yet (F2.4 has no consumer until F1.3/B4.3 land).
     pub key_storage: bool,
+    /// The hardware/integration can reach an OCSP responder and verify what it says - see
+    /// [`crate::hardware::OcspChecker`]. Needed for `GetCertificateStatus` (2.0.1/2.1) and
+    /// `GetCertificateChainStatus` (2.1).
+    ///
+    /// Deliberately **not** folded into [`Self::certificate_management`]: every certificate an
+    /// OCSP request names is identified inline, by hash data and a responder URL the CSMS
+    /// supplies in the request itself, so this crate's own certificate store (if it has one) is
+    /// never consulted to answer either message. What they need instead is a live path to a
+    /// third-party OCSP responder and independent verification of its response - a
+    /// [`crate::hardware::CertificateStore`], even a secure-element-backed one, gives a charge
+    /// point neither. Tying the two together would misrepresent a charge point with a secure
+    /// element but no outbound path to arbitrary third parties (a common security posture: a
+    /// CSMS-only network allowlist) as OCSP-capable, and would deny OCSP checking to one that
+    /// *can* reach a responder but keeps no certificates of its own.
+    pub ocsp_checking: bool,
 }
 
 impl Default for Capabilities {
@@ -138,6 +153,7 @@ impl Default for Capabilities {
             periodic_event_stream: false,
             certificates: false,
             key_storage: false,
+            ocsp_checking: false,
         }
     }
 }
@@ -359,6 +375,21 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         // which `setup()`'s signature cannot receive.
         has_handler: false,
     },
+    CapabilityGate {
+        name: "ocsp_checking",
+        cargo_feature: "ocsp-checking",
+        enabled: |c| c.ocsp_checking,
+        // No dedicated `*Ctrlr` component: like `certificate_management`, OCSP capability lives
+        // on `SecurityCtrlr`'s general presence rather than a component of its own.
+        ctrlr_component: None,
+        // 1.6J's certificate/OCSP messages live in the Security Whitepaper, not in a core feature
+        // profile, so there is nothing to advertise there.
+        feature_profile_1_6: None,
+        // Builder-only, like `certificate_management`: registering `GetCertificateStatus`/
+        // `GetCertificateChainStatus` needs a `hardware::OcspChecker`, which `setup()`'s signature
+        // cannot receive.
+        has_handler: false,
+    },
 ];
 
 /// One `(capability name, Cargo feature name, whether the capability is set)` row consulted by
@@ -367,7 +398,7 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
 /// mistakes early, so it deliberately checks more than C3 needs to propagate).
 fn all_capability_feature_pairs(
     capabilities: &Capabilities,
-) -> [(&'static str, &'static str, bool); 17] {
+) -> [(&'static str, &'static str, bool); 18] {
     [
         (
             "smart_charging",
@@ -422,6 +453,7 @@ fn all_capability_feature_pairs(
         ),
         ("certificates", "certificates", capabilities.certificates),
         ("key_storage", "key-storage", capabilities.key_storage),
+        ("ocsp_checking", "ocsp-checking", capabilities.ocsp_checking),
     ]
 }
 
@@ -496,6 +528,7 @@ fn feature_enabled(feature: &str) -> bool {
         "periodic-event-stream" => cfg!(feature = "periodic-event-stream"),
         "certificates" => cfg!(feature = "certificates"),
         "key-storage" => cfg!(feature = "key-storage"),
+        "ocsp-checking" => cfg!(feature = "ocsp-checking"),
         _ => false,
     }
 }
@@ -693,6 +726,13 @@ impl Capabilities {
         self.key_storage = enabled;
         self
     }
+
+    /// Sets `ocsp_checking` - see that field.
+    #[must_use]
+    pub fn with_ocsp_checking(mut self, enabled: bool) -> Self {
+        self.ocsp_checking = enabled;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -723,6 +763,7 @@ mod tests {
         assert!(!capabilities.periodic_event_stream);
         assert!(!capabilities.certificates);
         assert!(!capabilities.key_storage);
+        assert!(!capabilities.ocsp_checking);
     }
 
     #[test]
@@ -748,5 +789,27 @@ mod tests {
         let capabilities = Capabilities::default().with_key_storage(true);
         assert!((gate.enabled)(&capabilities));
         assert!(!(gate.enabled)(&Capabilities::default()));
+    }
+
+    #[test]
+    fn ocsp_checking_is_registered_in_the_capability_gate_table_and_is_independent_of_certificate_management()
+     {
+        let gate = CAPABILITY_GATES
+            .iter()
+            .find(|gate| gate.name == "ocsp_checking")
+            .expect("B4.4 must register a CAPABILITY_GATES row for ocsp_checking");
+        assert_eq!(gate.cargo_feature, "ocsp-checking");
+        // Builder-only, like `certificate_management`: needs a `hardware::OcspChecker`.
+        assert!(!gate.has_handler);
+
+        let capabilities = Capabilities::default().with_ocsp_checking(true);
+        assert!((gate.enabled)(&capabilities));
+        assert!(!(gate.enabled)(&Capabilities::default()));
+
+        // The two capabilities are genuinely independent - see `ocsp_checking`'s field docs.
+        let cert_store_only = Capabilities::default().with_certificate_management(true);
+        assert!(!(gate.enabled)(&cert_store_only));
+        let ocsp_only = Capabilities::default().with_ocsp_checking(true);
+        assert!(!ocsp_only.certificate_management);
     }
 }
