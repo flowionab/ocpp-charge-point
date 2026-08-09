@@ -128,8 +128,12 @@ pub use self::setup::setup;
 /// `ocpp-client` and matching its exact version - which is precisely the coupling
 /// `CLAUDE.md` asks this crate to absorb on an integrator's behalf.
 ///
-/// Gated to match the upstream type, which is itself feature-gated: re-exporting it
-/// unconditionally broke the `--no-default-features` build, since a no_std charge point compiles
-/// none of the version adapters it enumerates.
-#[cfg(any(feature = "ocpp_1_6", feature = "ocpp_2_0_1", feature = "ocpp_2_1"))]
+/// Gated to match the upstream type, which is itself feature-gated behind `websocket` (not the
+/// version features alone): re-exporting it unconditionally broke every `--no-default-features
+/// --features ocpp_1_6/ocpp_2_0_1/ocpp_2_1` build, since none of those enable `ocpp-client`'s
+/// `websocket` feature that `OcppVersion` actually lives behind.
+#[cfg(all(
+    feature = "websocket",
+    any(feature = "ocpp_1_6", feature = "ocpp_2_0_1", feature = "ocpp_2_1")
+))]
 pub use ocpp_client::OcppVersion;
