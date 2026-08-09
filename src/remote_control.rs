@@ -4,11 +4,14 @@
 use crate::actor::ChargePointActor;
 use crate::availability::{AvailabilityTarget, StatusNotifier};
 use crate::provisioning::HeartbeatSender;
+use crate::replay_protection::ReplayGuard;
+use crate::security::report_security_event;
 use crate::state::{
     ChargePointEvent, ChargePointState, ConnectorEvent, ConnectorState, EvseEvent, IdToken,
-    StopReason, TransactionId,
+    SecurityEvent, SecurityEventType, StopReason, TransactionId,
 };
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -238,13 +241,46 @@ fn find_transaction(
     })
 }
 
+/// Same as [`handle_request_stop_transaction`], but additionally reports
+/// [`SecurityEventType::AttemptedReplayAttacks`] when `transaction_id` is being asked to stop
+/// again after `guard` already recorded a successful stop for it - see
+/// [`crate::replay_protection`] for why `TransactionId` is the one CSMS-initiated remote-control
+/// key this crate currently treats as strong enough evidence of a replay, and why the report
+/// never changes the returned outcome.
+pub async fn handle_request_stop_transaction_with_replay_guard(
+    actor: &ChargePointActor,
+    guard: &ReplayGuard<TransactionId>,
+    transaction_id: TransactionId,
+) -> RequestStopTransactionOutcome {
+    let outcome = handle_request_stop_transaction(actor, transaction_id).await;
+    match outcome {
+        RequestStopTransactionOutcome::Accepted => guard.record(transaction_id),
+        RequestStopTransactionOutcome::Rejected if guard.contains(&transaction_id) => {
+            report_security_event(
+                actor,
+                SecurityEvent {
+                    event_type: SecurityEventType::AttemptedReplayAttacks,
+                    tech_info: Some(format!(
+                        "RequestStopTransaction repeated for already-stopped transaction {}",
+                        transaction_id.0
+                    )),
+                },
+            )
+            .await;
+        }
+        RequestStopTransactionOutcome::Rejected => {}
+    }
+    outcome
+}
+
 /// Registers this charge point's inbound `RequestStopTransaction` handling with the CSMS
 /// connection. Implemented per protocol version (see the `ocpp_2_1` module), mirroring
 /// [`RequestStartTransactionHandler`].
 #[async_trait::async_trait]
 pub trait RequestStopTransactionHandler {
     /// Registers a `RequestStopTransaction` handler with the CSMS connection that dispatches
-    /// incoming requests to [`handle_request_stop_transaction`] against `actor`.
+    /// incoming requests to [`handle_request_stop_transaction_with_replay_guard`] against
+    /// `actor`, keyed on a guard private to this registration.
     async fn register_request_stop_transaction_handler(&self, actor: ChargePointActor);
 }
 
@@ -396,15 +432,17 @@ mod tests {
     use super::{
         RequestStartTransactionOutcome, RequestStopTransactionOutcome, TriggerMessageOutcome,
         TriggerableMessage, UnlockOutcome, handle_request_start_transaction,
-        handle_request_stop_transaction, handle_trigger_message, handle_unlock_request,
+        handle_request_stop_transaction, handle_request_stop_transaction_with_replay_guard,
+        handle_trigger_message, handle_unlock_request,
     };
     use crate::actor::ChargePointActor;
     use crate::availability::{AvailabilityTarget, StatusNotifier};
     use crate::executor::TokioExecutor;
     use crate::provisioning::HeartbeatSender;
+    use crate::replay_protection::ReplayGuard;
     use crate::state::{
         ChargePointEvent, ConnectorEvent, ConnectorState, ConnectorStatus, EvseEvent,
-        HardwareCommand, TransactionId,
+        HardwareCommand, SecurityEventType, TransactionId,
     };
     use crate::sync::RecvError;
     use alloc::vec::Vec;
@@ -672,6 +710,50 @@ mod tests {
         assert_eq!(
             actor.state().evses[0].connectors[0],
             ConnectorState::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn repeating_a_completed_stop_reports_a_replay_attempt() {
+        let actor = charging_actor().await;
+        let mut security_events = actor.subscribe_security_events();
+        let guard = ReplayGuard::new();
+
+        let first =
+            handle_request_stop_transaction_with_replay_guard(&actor, &guard, TransactionId(0))
+                .await;
+        assert_eq!(first, RequestStopTransactionOutcome::Accepted);
+
+        let second =
+            handle_request_stop_transaction_with_replay_guard(&actor, &guard, TransactionId(0))
+                .await;
+
+        assert_eq!(second, RequestStopTransactionOutcome::Rejected);
+        let event = security_events.recv().await.unwrap();
+        assert_eq!(event.event_type, SecurityEventType::AttemptedReplayAttacks);
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_rejection_reports_nothing() {
+        let actor = charging_actor().await;
+        let mut security_events = actor.subscribe_security_events();
+        let guard = ReplayGuard::new();
+
+        // Never accepted before, so this is an ordinary unknown-transaction rejection, not a
+        // replay of anything this guard has seen - it must not be reported.
+        let outcome =
+            handle_request_stop_transaction_with_replay_guard(&actor, &guard, TransactionId(99))
+                .await;
+
+        assert_eq!(outcome, RequestStopTransactionOutcome::Rejected);
+        assert!(
+            tokio::time::timeout(
+                core::time::Duration::from_millis(50),
+                security_events.recv()
+            )
+            .await
+            .is_err(),
+            "an ordinary rejection must not be reported as a replay"
         );
     }
 
@@ -983,11 +1065,12 @@ mod ocpp_2_1 {
         RequestStartTransactionHandler, RequestStartTransactionOutcome,
         RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
         TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
-        handle_request_start_transaction, handle_request_stop_transaction, handle_trigger_message,
-        handle_unlock_request,
+        handle_request_start_transaction, handle_request_stop_transaction_with_replay_guard,
+        handle_trigger_message, handle_unlock_request,
     };
     use crate::actor::ChargePointActor;
     use crate::availability::AvailabilityTarget;
+    use crate::replay_protection::ReplayGuard;
     use crate::state::{IdToken, IdTokenKind, TransactionId};
     use crate::wire::v21::common::{
         EVSE, MessageTriggerEnum, RequestStartStopStatusEnum, TriggerMessageStatusEnum,
@@ -1000,6 +1083,7 @@ mod ocpp_2_1 {
     };
     use alloc::boxed::Box;
     use alloc::string::ToString;
+    use alloc::sync::Arc;
     use ocpp_client::ocpp_2_1::OCPP2_1Client;
 
     /// Mirrors [`crate::local_authorization_list::ocpp_2_1::map_id_token_kind`] - each `ocpp_2_1`
@@ -1148,12 +1232,19 @@ mod ocpp_2_1 {
     #[async_trait::async_trait]
     impl RequestStopTransactionHandler for OCPP2_1Client {
         async fn register_request_stop_transaction_handler(&self, actor: ChargePointActor) {
+            let guard = Arc::new(ReplayGuard::new());
             self.on_request_stop_transaction(move |request, _client| {
                 let actor = actor.clone();
+                let guard = guard.clone();
                 async move {
                     let outcome = match parse_transaction_id(&request) {
                         Some(transaction_id) => {
-                            handle_request_stop_transaction(&actor, transaction_id).await
+                            handle_request_stop_transaction_with_replay_guard(
+                                &actor,
+                                &guard,
+                                transaction_id,
+                            )
+                            .await
                         }
                         None => RequestStopTransactionOutcome::Rejected,
                     };
@@ -1476,11 +1567,12 @@ pub(crate) mod ocpp_2_0_1 {
         RequestStartTransactionHandler, RequestStartTransactionOutcome,
         RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
         TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
-        handle_request_start_transaction, handle_request_stop_transaction, handle_trigger_message,
-        handle_unlock_request,
+        handle_request_start_transaction, handle_request_stop_transaction_with_replay_guard,
+        handle_trigger_message, handle_unlock_request,
     };
     use crate::actor::ChargePointActor;
     use crate::availability::AvailabilityTarget;
+    use crate::replay_protection::ReplayGuard;
     use crate::state::{IdToken, IdTokenKind, TransactionId};
     use crate::wire::v201::common::{
         EVSE, IdTokenEnum, MessageTriggerEnum, RequestStartStopStatusEnum,
@@ -1493,6 +1585,7 @@ pub(crate) mod ocpp_2_0_1 {
     };
     use alloc::boxed::Box;
     use alloc::string::ToString;
+    use alloc::sync::Arc;
     use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
 
     /// The reverse of [`crate::authorization::ocpp_2_0_1::map_id_token_kind`] - 2.0.1's
@@ -1631,12 +1724,19 @@ pub(crate) mod ocpp_2_0_1 {
     #[async_trait::async_trait]
     impl RequestStopTransactionHandler for OCPP2_0_1Client {
         async fn register_request_stop_transaction_handler(&self, actor: ChargePointActor) {
+            let guard = Arc::new(ReplayGuard::new());
             self.on_request_stop_transaction(move |request, _client| {
                 let actor = actor.clone();
+                let guard = guard.clone();
                 async move {
                     let outcome = match parse_transaction_id(&request) {
                         Some(transaction_id) => {
-                            handle_request_stop_transaction(&actor, transaction_id).await
+                            handle_request_stop_transaction_with_replay_guard(
+                                &actor,
+                                &guard,
+                                transaction_id,
+                            )
+                            .await
                         }
                         None => RequestStopTransactionOutcome::Rejected,
                     };
@@ -1823,12 +1923,13 @@ mod ocpp_1_6 {
         RequestStartTransactionHandler, RequestStartTransactionOutcome,
         RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
         TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
-        handle_request_start_transaction, handle_request_stop_transaction, handle_trigger_message,
-        handle_unlock_request,
+        handle_request_start_transaction, handle_request_stop_transaction_with_replay_guard,
+        handle_trigger_message, handle_unlock_request,
     };
     use crate::actor::ChargePointActor;
     use crate::availability::{AvailabilityTarget, Ocpp1_6StatusNotifier};
     use crate::id_tag::map_id_token;
+    use crate::replay_protection::ReplayGuard;
     use crate::state::TransactionId;
     use crate::topology::unflatten_ocpp_1_6_connector_id;
     use crate::wire::v16::common::{
@@ -2224,13 +2325,19 @@ mod ocpp_1_6 {
     #[async_trait::async_trait]
     impl RequestStopTransactionHandler for OCPP1_6Client {
         async fn register_request_stop_transaction_handler(&self, actor: ChargePointActor) {
+            let guard = Arc::new(ReplayGuard::new());
             self.on_remote_stop_transaction(move |request, _client| {
                 let actor = actor.clone();
+                let guard = guard.clone();
                 async move {
                     let outcome = match u64::try_from(request.transaction_id) {
                         Ok(transaction_id) => {
-                            handle_request_stop_transaction(&actor, TransactionId(transaction_id))
-                                .await
+                            handle_request_stop_transaction_with_replay_guard(
+                                &actor,
+                                &guard,
+                                TransactionId(transaction_id),
+                            )
+                            .await
                         }
                         Err(_) => RequestStopTransactionOutcome::Rejected,
                     };
