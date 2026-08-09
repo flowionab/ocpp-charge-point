@@ -246,6 +246,25 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         feature_profile_1_6: Some("FirmwareManagement"),
         has_handler: false,
     },
+    CapabilityGate {
+        name: "der_control",
+        cargo_feature: "der-control",
+        enabled: |c| c.der_control,
+        // `docs/OCPP-2.1/` is gitignored and unavailable in this worktree (see this repo's task
+        // notes), and the DER control appendix's `*Ctrlr` component name (if the 2.1 device model
+        // even defines a dedicated one, rather than folding DER variables into an existing
+        // component) could not be verified against the real CSV - recorded `None` rather than
+        // guessed, per this table's own rule for exactly this situation.
+        ctrlr_component: None,
+        // 2.1-only - neither 1.6J nor 2.0.1 has a DER control concept or feature profile.
+        feature_profile_1_6: None,
+        // `false` even though this module's handlers are real (unlike `has_display`/
+        // `diagnostics`/`firmware_management`, whose docs this mirrors): registration goes
+        // through `ChargePointBuilder::der_control` rather than `setup()`, which only bounds
+        // itself by `reservation`/`local-auth-list`/`tariff-cost` today - see that method's docs
+        // for the scope decision.
+        has_handler: false,
+    },
 ];
 
 /// One `(capability name, Cargo feature name, whether the capability is set)` row consulted by

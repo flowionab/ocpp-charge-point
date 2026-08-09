@@ -7,11 +7,12 @@ use crate::hardware::Capabilities;
 use crate::state::{
     AuthorizationCacheEntry, AuthorizationStatus, ChargingProfile, ChargingProfileCriteria,
     ChargingProfileId, ChargingProfileScope, Component, ConnectorState, ConnectorStatus,
-    DeviceModelEvent, DisplayMessageId, DisplayedMessage, IdToken, InstalledChargingProfile,
-    LocalListEntry, MeterSample, NetworkConnectionProfile, NetworkProfileSlot, RegistrationStatus,
-    Reservation, ReservationId, ResetKind, ResetTarget, SecurityEvent, StopReason, Tariff,
-    TariffClearCriteria, TariffScope, Transaction, TransactionId, TriggeredMonitor, Variable,
-    VariableAttributeType, VariableMonitoringEvent,
+    DERControlQuery, DeviceModelEvent, DisplayMessageId, DisplayedMessage, IdToken,
+    InstalledChargingProfile, InstalledDERControl, LocalListEntry, MeterSample,
+    NetworkConnectionProfile, NetworkProfileSlot, RegistrationStatus, Reservation, ReservationId,
+    ResetKind, ResetTarget, SecurityEvent, StopReason, Tariff, TariffClearCriteria, TariffScope,
+    Transaction, TransactionId, TriggeredMonitor, Variable, VariableAttributeType,
+    VariableMonitoringEvent,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -193,6 +194,30 @@ pub enum ChargePointEvent {
     /// `SetVariables`, or 1.6J's `GetConfiguration`/`ChangeConfiguration` projection onto it) -
     /// see `crate::state::device_model` and `crate::device_model`. See `docs/ROADMAP.md` §2.
     DeviceModel(DeviceModelEvent),
+    /// The CSMS installed a DER control setting (OCPP 2.1 `SetDERControl`). Applied through
+    /// [`crate::state::DERControlStore::install`], so the replacement-by-id rule and the
+    /// [`StateLimits::max_der_controls`](crate::state::StateLimits::max_der_controls) bound both
+    /// hold however the control arrived. A control the store refuses is logged and dropped here;
+    /// `crate::der_control::handle_set_der_control` checks acceptance against the store itself
+    /// before dispatching this, so the CSMS gets the real answer rather than an optimistic one.
+    /// See `docs/PRODUCTION-ROADMAP.md` B8.2.
+    DERControlSet(alloc::boxed::Box<InstalledDERControl>),
+    /// DER control settings were cleared (OCPP 2.1 `ClearDERControl`), by id, by kind, by
+    /// default/scheduled, or any combination.
+    DERControlsCleared {
+        /// Which controls to clear - see [`DERControlQuery`].
+        query: DERControlQuery,
+    },
+    /// The CSMS pushed an automatic frequency restoration reserve signal (OCPP 2.1 `AFRRSignal`) -
+    /// a grid-balancing setpoint. Recorded as the charge point's latest known signal; nothing in
+    /// this crate acts on it yet (`docs/PRODUCTION-ROADMAP.md` B8.2's store-and-report scope), so
+    /// this is a single value rather than a growable collection - no bound is needed.
+    AfrrSignalReceived {
+        /// The signal value, per `v2xSignalWattCurve`'s own units.
+        signal: i64,
+        /// When the signal becomes active.
+        timestamp: DateTime<Utc>,
+    },
     /// The hardware binding's declared [`Capabilities`], captured once during
     /// [`crate::builder::ChargePointBuilder::start`]. The single source of truth every
     /// capability-propagation surface (handler registration, the device model's `*Ctrlr.Available`

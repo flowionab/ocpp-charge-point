@@ -23,6 +23,11 @@ use crate::clock::MonotonicClock;
 use crate::connection::{ReconnectHandler, reregister_on_reconnect};
 #[cfg(feature = "tariff-cost")]
 use crate::cost::CostUpdatedHandler;
+#[cfg(feature = "der-control")]
+use crate::der_control::{
+    AfrrSignalHandler, ClearDERControlHandler, GetDERControlHandler,
+    NotifyAllowedEnergyTransferHandler, SetDERControlHandler,
+};
 use crate::device_model::{GetVariablesHandler, SetVariablesHandler};
 use crate::executor::Executor;
 use crate::hardware::ChargePoint;
@@ -1704,6 +1709,48 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         csms.register_clear_tariffs_handler(self.runtime.actor())
             .await;
         csms.register_get_tariffs_handler(self.runtime.actor())
+            .await;
+
+        self
+    }
+
+    /// Registers the DER Control functional block: `GetDERControl`, `SetDERControl`,
+    /// `ClearDERControl`, `AFRRSignal` and `NotifyAllowedEnergyTransfer` all feed into the
+    /// runtime's actor (`docs/PRODUCTION-ROADMAP.md` B8.2); `ReportDERControl` is sent inline by
+    /// the `GetDERControl` handler. **2.1 only** - see [`crate::der_control`]'s docs; neither
+    /// 1.6J nor 2.0.1 has any of these messages.
+    ///
+    /// Unlike [`Self::tariffs`]/[`Self::reservation`], this is **not** part of
+    /// [`crate::setup::setup`] today - `setup()` bounds its CSMS type by every block it wires at
+    /// once, and extending that bound for a block this new is a larger, riskier change than this
+    /// task's scope; call this explicitly alongside `setup()`/the rest of this builder until a
+    /// future change folds it in. [`crate::hardware::capabilities::CAPABILITY_GATES`]'s
+    /// `der_control` row therefore records `has_handler: false` even though this method's
+    /// handlers are real - see that row's docs.
+    ///
+    /// Only present when the `der-control` Cargo feature is enabled - see [`Self::reservation`]'s
+    /// doc comment for why the method itself disappears rather than becoming a no-op.
+    #[cfg(feature = "der-control")]
+    pub async fn der_control<N>(self, csms: &N) -> Self
+    where
+        N: SetDERControlHandler
+            + ClearDERControlHandler
+            + GetDERControlHandler
+            + AfrrSignalHandler
+            + NotifyAllowedEnergyTransferHandler
+            + Send
+            + Sync
+            + 'static,
+    {
+        csms.register_set_der_control_handler(self.runtime.actor())
+            .await;
+        csms.register_clear_der_control_handler(self.runtime.actor())
+            .await;
+        csms.register_get_der_control_handler(self.runtime.actor())
+            .await;
+        csms.register_afrr_signal_handler(self.runtime.actor())
+            .await;
+        csms.register_notify_allowed_energy_transfer_handler(self.runtime.actor())
             .await;
 
         self
@@ -4279,5 +4326,91 @@ mod tests {
         );
         assert_eq!(status.ongoing_indicator, Some(true));
         assert!(status.messages_in_queue);
+    }
+
+    /// `ChargePointBuilder::der_control` registers all five of the block's CSMS-initiated
+    /// handlers - a CSMS implementing fewer of them fails to compile against the bound, and one
+    /// implementing all five must see every `register_*` call actually invoked.
+    #[cfg(feature = "der-control")]
+    #[tokio::test]
+    async fn der_control_registers_every_handler() {
+        use crate::der_control::{
+            AfrrSignalHandler, ClearDERControlHandler, GetDERControlHandler,
+            NotifyAllowedEnergyTransferHandler, SetDERControlHandler,
+        };
+
+        #[derive(Clone, Default)]
+        struct DerControlCsms {
+            set: Arc<AtomicBool>,
+            clear: Arc<AtomicBool>,
+            get: Arc<AtomicBool>,
+            afrr: Arc<AtomicBool>,
+            allowed_energy_transfer: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl SetDERControlHandler for DerControlCsms {
+            async fn register_set_der_control_handler(
+                &self,
+                _actor: crate::actor::ChargePointActor,
+            ) {
+                self.set.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl ClearDERControlHandler for DerControlCsms {
+            async fn register_clear_der_control_handler(
+                &self,
+                _actor: crate::actor::ChargePointActor,
+            ) {
+                self.clear.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl GetDERControlHandler for DerControlCsms {
+            async fn register_get_der_control_handler(
+                &self,
+                _actor: crate::actor::ChargePointActor,
+            ) {
+                self.get.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl AfrrSignalHandler for DerControlCsms {
+            async fn register_afrr_signal_handler(&self, _actor: crate::actor::ChargePointActor) {
+                self.afrr.store(true, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl NotifyAllowedEnergyTransferHandler for DerControlCsms {
+            async fn register_notify_allowed_energy_transfer_handler(
+                &self,
+                _actor: crate::actor::ChargePointActor,
+            ) {
+                self.allowed_energy_transfer.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let charge_point = super::test_support::IdleTestChargePoint {
+            evses: [TestEvse {
+                connectors: [TestConnector {
+                    locked: Arc::new(AtomicBool::new(false)),
+                    lock_succeeds: true,
+                }],
+            }],
+        };
+        let csms = DerControlCsms::default();
+        let _runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .der_control(&csms)
+            .await
+            .build();
+
+        assert!(csms.set.load(Ordering::SeqCst));
+        assert!(csms.clear.load(Ordering::SeqCst));
+        assert!(csms.get.load(Ordering::SeqCst));
+        assert!(csms.afrr.load(Ordering::SeqCst));
+        assert!(csms.allowed_energy_transfer.load(Ordering::SeqCst));
     }
 }

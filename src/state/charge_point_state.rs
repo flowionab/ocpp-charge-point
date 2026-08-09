@@ -5,15 +5,16 @@ use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::connector_state::ConnectorCommand;
 use crate::state::{
-    AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
+    AfrrSignal, AuthorizationCache, AuthorizationRequested, ChargePointEffect, ChargePointEvent,
     ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent, ConnectorState,
-    ConnectorStatusChanged, DeviceModel, DeviceModelEvent, DisplayMessageStore, EventTrigger,
-    EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
-    MeterSample, NetworkProfileStore, PendingReset, RegistrationStatus, ReservationEndReason,
-    ReservationUpdate, ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits,
-    StopReason, TariffStore, Transaction, TransactionChargingState, TransactionEventKind,
-    TransactionEventOccurred, TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable,
-    VariableAttributeType, VariableMonitorStore, VariableMonitoringEvent,
+    ConnectorStatusChanged, DERControlStore, DeviceModel, DeviceModelEvent, DisplayMessageStore,
+    EventTrigger, EvseEvent, EvseState, HardwareCommand, IdToken, LocalAuthorizationList,
+    LocalListEntry, MeterSample, NetworkProfileStore, PendingReset, RegistrationStatus,
+    ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget, SecurityEvent,
+    SecurityEventType, StateLimits, StopReason, TariffStore, Transaction, TransactionChargingState,
+    TransactionEventKind, TransactionEventOccurred, TransactionId, TransactionUpdateReason,
+    TriggeredMonitor, Variable, VariableAttributeType, VariableMonitorStore,
+    VariableMonitoringEvent,
 };
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
@@ -92,6 +93,13 @@ pub struct ChargePointState {
     /// Messages the CSMS has asked to be shown to the driver (OCPP `SetDisplayMessage`/
     /// `ClearDisplayMessage`). See [`crate::display_message`] and `docs/ROADMAP.md` §15.
     pub display_messages: DisplayMessageStore,
+    /// Every DER control setting the CSMS has installed (OCPP 2.1 `SetDERControl`) - the DER
+    /// Control functional block's state. See [`DERControlStore`] and
+    /// `docs/PRODUCTION-ROADMAP.md` B8.2.
+    pub der_controls: DERControlStore,
+    /// The most recent automatic frequency restoration reserve signal the CSMS pushed (OCPP 2.1
+    /// `AFRRSignal`). `None` until the first one arrives. See [`AfrrSignal`].
+    pub afrr_signal: Option<AfrrSignal>,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -147,6 +155,8 @@ impl ChargePointState {
             time_sync: None,
             variable_monitors: VariableMonitorStore::with_limit(limits.max_variable_monitors),
             display_messages: DisplayMessageStore::with_max_messages(limits.max_display_messages),
+            der_controls: DERControlStore::with_limit(limits.max_der_controls),
+            afrr_signal: None,
         }
     }
 
@@ -389,6 +399,27 @@ impl ChargePointState {
                 }
             }
             ChargePointEvent::TariffsCleared { criteria } => self.tariffs.clear(&criteria) > 0,
+            ChargePointEvent::DERControlSet(control) => {
+                let id = control.id.clone();
+                match self.der_controls.install(*control) {
+                    Ok(()) => true,
+                    Err(rejection) => {
+                        // Reached only if a caller dispatched this without asking the store first
+                        // (`crate::der_control::handle_set_der_control` does ask, so the CSMS
+                        // never sees an optimistic Accepted); logged rather than panicking, per
+                        // `apply`'s documented tolerance for events that don't apply.
+                        tracing::warn!(?id, ?rejection, "a DER control was refused by the store");
+                        false
+                    }
+                }
+            }
+            ChargePointEvent::DERControlsCleared { query } => {
+                !self.der_controls.clear(&query).is_empty()
+            }
+            ChargePointEvent::AfrrSignalReceived { signal, timestamp } => {
+                let new_signal = AfrrSignal { signal, timestamp };
+                set_if_changed(&mut self.afrr_signal, Some(new_signal))
+            }
             ChargePointEvent::DeviceModel(event) => match event {
                 DeviceModelEvent::VariableRegistered {
                     component,

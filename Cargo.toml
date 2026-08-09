@@ -117,7 +117,10 @@ payment = []
 # Gates nothing yet: ISO 15118 Plug & Charge (roadmap B4.5) has no implementation in this crate
 # yet.
 iso15118 = []
-# Gates nothing yet: 2.1 DER control (roadmap B8.2) has no implementation in this crate yet.
+# Gates `crate::der_control` (GetDERControl/SetDERControl/ClearDERControl/ReportDERControl,
+# NotifyDERAlarm/NotifyDERStartStop, AFRRSignal, NotifyAllowedEnergyTransfer - roadmap B8.2) and
+# `ChargePointBuilder::der_control`, which registers the CSMS-initiated handlers against it. 2.1
+# only - see the module's docs.
 der-control = []
 # Gates nothing yet: 2.1 battery swap (roadmap B8.3) has no implementation in this crate yet.
 battery-swap = []
