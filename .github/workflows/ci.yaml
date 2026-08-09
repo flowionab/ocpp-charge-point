@@ -126,14 +126,21 @@ jobs:
       - name: 'Capability set: no_std, every capability, every version'
         run: cargo check --no-default-features --features ocpp_1_6,ocpp_2_0_1,ocpp_2_1,battery-swap,certificate-management,certificates,der-control,diagnostics,display-message,firmware-management,firmware-publishing,iso15118,key-storage,local-auth-list,ocsp-checking,payment,periodic-event-stream,reservation,smart-charging,tariff-cost,variable-monitoring --lib
 
-  # H1.3: the target this crate exists for. `cargo check` (not build) because
-  # linking a bare-metal binary additionally needs a `critical-section` backend
-  # and an `Executor`/`Backoff`/`Clock`, all of which the integrator supplies -
-  # see CLAUDE.md. `getrandom_backend="custom"` is the equivalent contract for
-  # `getrandom` (reached via `ocpp-client` -> `uuid`'s `v4` feature): on a
-  # target it has no entropy source for, the final binary must register one.
-  # Setting it here proves the crate compiles for the target; it does not
-  # provide an actual entropy source.
+  # H1.3 / G1.1: the target this crate exists for.
+  #
+  # G1.1: this used to be `cargo check --lib`, not `build`. `check` stops after type checking - it
+  # never reaches codegen, so it cannot see a target-specific codegen failure. That is exactly the
+  # shape of bug this crate has shipped twice: an `AtomicI64` compiles fine under `cargo check` on
+  # any host or target (the type checker doesn't know or care that a target's atomic width is
+  # narrower than the type), and only fails when LLVM actually tries to lower the atomic op for
+  # `thumbv7em-none-eabihf`, which only happens during codegen. `cargo build --lib` runs full
+  # codegen for the rlib - it still does not *link* a final executable (that additionally needs a
+  # `critical-section` backend and an `Executor`/`Backoff`/`Clock`, which are the integrator's job
+  # per CLAUDE.md, not this crate's), but codegen is precisely the phase the AtomicI64 bugs needed
+  # to be caught in, and `build` reaches it while `check` does not. `getrandom_backend="custom"` is
+  # the equivalent contract for `getrandom` (reached via `ocpp-client` -> `uuid`'s `v4` feature): on
+  # a target it has no entropy source for, the final binary must register one; setting it here lets
+  # the crate build for the target without actually providing an entropy source.
   embedded:
     runs-on: ubuntu-latest
     steps:
@@ -142,15 +149,32 @@ jobs:
         with:
           targets: thumbv7em-none-eabihf
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --no-default-features --lib --target thumbv7em-none-eabihf
+      - name: Bare no_std build
+        run: cargo build --no-default-features --lib --target thumbv7em-none-eabihf
+        env:
+          RUSTFLAGS: -D warnings --cfg getrandom_backend="custom"
+      # G1.1: the bare build above only proves the version-independent core builds for the target.
+      # Both AtomicI64 regressions were in feature-gated capability code (`certificates`,
+      # `variable-monitoring`), and one sat broken on `main` for weeks because nothing built a
+      # capability feature *for this target* - `feature-matrix`'s equivalent step only runs on the
+      # host. This mirrors that step's feature list (every capability, every OCPP version, still
+      # `--no-default-features` so `tokio-runtime`/`std` stay off) but with `build` in place of
+      # `check`, for the same codegen-vs-typecheck reason as the step above. It does not attempt the
+      # capability powerset on-target - one comprehensive combination, traded for CI runtime, same
+      # trade `feature-matrix` already makes.
+      - name: Every capability, every version, no_std build
+        run: cargo build --no-default-features --features ocpp_1_6,ocpp_2_0_1,ocpp_2_1,battery-swap,certificate-management,certificates,der-control,diagnostics,display-message,firmware-management,firmware-publishing,iso15118,key-storage,local-auth-list,ocsp-checking,payment,periodic-event-stream,reservation,smart-charging,tariff-cost,variable-monitoring --lib --target thumbv7em-none-eabihf
         env:
           RUSTFLAGS: -D warnings --cfg getrandom_backend="custom"
       # G2.4: `tools/flash-probe` is the only thing in the repository that *links* a bare-metal
-      # image rather than just checking one, so it catches breakage `cargo check` cannot (a missing
-      # symbol, a `critical-section` backend gone stale). `--quick` builds only the core and
-      # all-features rows - enough to keep the probe honest without paying for the whole table on
-      # every push. Re-run `scripts/flash-cost.sh` (no flag) by hand when docs/MEMORY.md's flash
-      # figures need refreshing.
+      # image rather than just building the lib, so it additionally catches breakage a `build`
+      # above cannot (a missing symbol, a `critical-section` backend gone stale). `--quick` builds
+      # only the core and all-features rows - enough to keep the probe honest without paying for
+      # the whole table on every push. Re-run `scripts/flash-cost.sh` (no flag) by hand when
+      # docs/MEMORY.md's flash figures need refreshing. This is also this crate's build-artifact
+      # size signal: the script prints the flashable image size for each row, so a size regression
+      # is visible in the job log even though nothing here fails the build on a size threshold - see
+      # the accompanying report for why a hard threshold isn't added.
       - run: scripts/flash-cost.sh --quick
 
   # H1.4: enforces the `rust-version` declared in Cargo.toml, so bumping the
