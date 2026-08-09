@@ -22,6 +22,7 @@ mod fault_injection;
 mod file_transfer;
 mod firmware;
 mod firmware_publisher;
+mod iso15118;
 mod key_storage;
 mod ocsp;
 #[cfg(feature = "payment")]
@@ -57,6 +58,10 @@ pub use self::firmware::{
 };
 pub use self::firmware_publisher::{
     FirmwarePublisher, NoFirmwarePublisher, NoFirmwarePublisherError,
+};
+pub use self::iso15118::{
+    Iso15118CertificateAction, Iso15118CertificateRequest, Iso15118CertificateResult,
+    Iso15118CertificateStatus, Iso15118Controller, NoIso15118Controller, NoIso15118ControllerError,
 };
 pub use self::key_storage::{
     DEFAULT_MAX_KEYS, GeneratedKeyPair, KeyHandle, KeyStore, KeyStoreBacking, NoKeyStore,

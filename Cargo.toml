@@ -128,8 +128,12 @@ tariff-cost = []
 # `PaymentCtrlr`'s device-model variables. `SetDefaultTariff` is 2.1's tariff surface (B7.1,
 # `tariff-cost`), not this feature.
 payment = []
-# Gates nothing yet: ISO 15118 Plug & Charge (roadmap B4.5) has no implementation in this crate
-# yet.
+# Gates `crate::iso15118` (`Get15118EVCertificate`, roadmap B4.5, 2.x only), which uses
+# `crate::hardware::Iso15118Controller`/`NoIso15118Controller` (those hardware types themselves
+# are unconditional, like `hardware::OcspChecker`/`CertificateStore`). Charge-point-initiated - no
+# `ChargePointBuilder` registration, see that module's docs. Advertised via
+# `Capabilities::iso15118_support` (an `Iso15118SupportLevel`, not a bool - see
+# `hardware::capabilities`), already wired into `CAPABILITY_GATES`.
 iso15118 = []
 # Gates `crate::der_control` (GetDERControl/SetDERControl/ClearDERControl/ReportDERControl,
 # NotifyDERAlarm/NotifyDERStartStop, AFRRSignal, NotifyAllowedEnergyTransfer - roadmap B8.2) and
