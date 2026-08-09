@@ -239,13 +239,35 @@ The negotiated protocol version is the decision that dominates: the second and t
 
 ---
 
-## 🔌 Supported Protocols
+## 🔌 Supported Protocols and message coverage
 
-| Protocol   | Status         |
-| ---------- | -------------- |
-| OCPP 1.6J  | ✅ Supported    |
-| OCPP 2.0.1 | ✅ Supported    |
-| OCPP 2.1   | 🚧 In Progress |
+| Protocol   | Status      | Messages wired |
+| ---------- | ----------- | --------------- |
+| OCPP 1.6J  | ✅ Supported | 30 / 39 |
+| OCPP 2.0.1 | ✅ Supported | 63 / 64 |
+| OCPP 2.1   | ✅ Supported | 90 / 91 |
+
+"Messages wired" counts, for each protocol version, how many of `ocpp-client` 0.5.0's generated
+actions have a corresponding `.on_*(`/`.send_*(` call somewhere in this crate's per-version
+adapter code. It is **not** the same claim as "this build is certifiable for profile X" - a
+message being wired means an adapter exists for it, not that OCTT has been run against it or that
+every field/edge case in the spec's test cases is handled. See
+[H3](docs/PRODUCTION-ROADMAP.md#103-h3--compliance) for the compliance work (OCTT, the part-6
+test-case sweep, interoperability testing) that turns "wired" into "certifiable".
+
+**Regenerate this row before trusting an old copy of it** - the numbers move as adapters land:
+
+```sh
+python3 scripts/message-coverage.py
+```
+
+The script reads the actual `send_x`/`on_x` method names out of `ocpp-client`'s own generated
+`actions.rs` for each version (rather than guessing them by snake-casing the action name, which
+undercounts on acronyms like `GetDERControl` -> `on_get_der_control` or `AFRRSignal` ->
+`send_afrr_signal`), and self-checks that every wired call in `src/` is attributed to a known
+action - see the script's own docstring for the exact traps it accounts for. A handful of
+messages are deliberately not wired yet; run the script for the current list (it prints one per
+version) rather than trusting a hardcoded list here.
 
 ---
 
@@ -253,40 +275,90 @@ The negotiated protocol version is the decision that dominates: the second and t
 
 On top of the protocol-version features above (`ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1`), the crate has one Cargo feature per optional OCPP *functional block*. Both groups are orthogonal - any combination compiles (verified in CI's feature matrix, and via `cargo check --no-default-features --features ...` for representative combinations). All capability features are in `default`, so a plain `ocpp-charge-point = "0.x"` dependency behaves exactly as before this section existed; turning one off is an opt-in decision to shrink a firmware image that will never exercise that block, not a runtime behaviour change - see [`docs/PRODUCTION-ROADMAP.md`](docs/PRODUCTION-ROADMAP.md) §5 for the compile-time-vs-runtime split this is one half of.
 
-Two blocks that already have code today gate that code out entirely when their feature is disabled - the module, its re-exports, and the corresponding `ChargePointBuilder` registration method are all `#[cfg]`'d away, so the linked binary genuinely doesn't contain them:
+Eight blocks gate real code today - the module, its re-exports, and (where one exists) the
+corresponding `ChargePointBuilder` registration method are all `#[cfg]`'d away when the feature is
+disabled, so the linked binary genuinely doesn't contain them (see `src/lib.rs`/`src/builder.rs`
+for the exact `#[cfg(feature = "...")]` attributes this table is read off):
 
 | Feature      | Gates (today)                                                          |
 | ------------ | ----------------------------------------------------------------------- |
 | `reservation` | `ocpp_charge_point::reservation` (`ReserveNowHandler`/`CancelReservationHandler`), `ChargePointBuilder::reservation` |
 | `local-auth-list` | `ocpp_charge_point::local_authorization_list` (`SendLocalListHandler`/`GetLocalListVersionHandler`), `ChargePointBuilder::local_authorization_list` |
-| `tariff-cost` | `ocpp_charge_point::cost` (`CostUpdatedHandler`, OCPP `CostUpdated`), `ChargePointBuilder::cost` |
+| `tariff-cost` | `ocpp_charge_point::cost` (`CostUpdatedHandler`) + `ocpp_charge_point::tariff` (`SetDefaultTariffHandler`/`ChangeTransactionTariffHandler`/`ClearTariffsHandler`/`GetTariffsHandler`), `ChargePointBuilder::cost`/`ChargePointBuilder::tariffs` |
+| `display-message` | `ocpp_charge_point::display_message` (`SetDisplayMessageHandler`/`ClearDisplayMessageHandler`/`GetDisplayMessagesHandler`), `ChargePointBuilder::display_messages` |
+| `der-control` | `ocpp_charge_point::der_control` (`SetDERControlHandler`/`ClearDERControlHandler`/`GetDERControlHandler`/`AfrrSignalHandler`/`NotifyAllowedEnergyTransferHandler`), `ChargePointBuilder::der_control` |
+| `payment` | `ocpp_charge_point::payment`, `ChargePointBuilder::payment` |
+| `periodic-event-stream` | `ocpp_charge_point::periodic_event_stream` (`OpenPeriodicEventStreamHandler`/`ClosePeriodicEventStreamHandler`/`AdjustPeriodicEventStreamHandler`/`GetPeriodicEventStreamHandler`), `ChargePointBuilder::periodic_event_streams` |
+| `battery-swap` | `ocpp_charge_point::battery_swap` (`RequestBatterySwapHandler`), `ChargePointBuilder::battery_swap` |
 
-The remaining features are declared now, ready for their implementation to land behind them, and gate nothing yet: `smart-charging`, `firmware-management`, `diagnostics`, `variable-monitoring`, `display-message`, `payment`, `iso15118`, `der-control`, `battery-swap`, `periodic-event-stream`, `certificates`.
+The remaining declared features gate nothing at compile time today - their modules and
+`ChargePointBuilder` registration methods (where either exists) compile unconditionally, so
+toggling the feature currently has no effect on the linked binary: `smart-charging`
+(`crate::smart_charging` and `ChargePointBuilder::smart_charging` are fully implemented but
+unconditional), `firmware-management` (`ChargePointBuilder::firmware_updates`),
+`diagnostics` (`ChargePointBuilder::log_uploads`), `variable-monitoring`
+(`crate::variable_monitoring` is also fully implemented and unconditional), `certificate-management`
+(`ChargePointBuilder::certificates`), `ocsp-checking` (`ChargePointBuilder::ocsp_status`/
+`ocsp_chain_status`), `key-storage`, `iso15118`, `certificates`. In every one of these cases the
+Cargo feature only affects what [`hardware::Capabilities`](src/hardware/capabilities.rs)
+*advertises* through [`CAPABILITY_GATES`](src/hardware/capabilities.rs) (device-model
+`*Ctrlr.Available` variables, 1.6J `SupportedFeatureProfiles`) - it does not add or remove code
+from the binary. See `Cargo.toml`'s own per-feature doc comments for the current, authoritative
+statement of what each one does, since that's the file most likely to be updated the moment a
+feature's status changes.
 
-`setup()` and `connect_and_setup()` are this crate's "everything on" convenience wrappers - they bound their CSMS client type by every functional block's trait at once, so they only exist when `reservation`, `local-auth-list`, and `tariff-cost` are all enabled. Disabling any of those three (or wanting to skip a block outright, regardless of feature flags) means driving [`ChargePointBuilder`](src/builder.rs) directly instead, registering only the blocks you need.
+`setup()` and `connect_and_setup()` are this crate's "everything on" convenience wrappers - they bound their CSMS client type by every functional block's trait at once, so they only exist when `reservation`, `local-auth-list`, `tariff-cost`, and `periodic-event-stream` are all enabled. Disabling any of those (or wanting to skip a block outright, regardless of feature flags) means driving [`ChargePointBuilder`](src/builder.rs) directly instead, registering only the blocks you need.
 
 ### OCPP certification profile mapping
 
-The OCPP 2.1 and 2.0.1 "Part 5 - Certification Profiles" specifications (vendored under [`docs/OCPP-2.1/`](docs/OCPP-2.1/) and [`docs/OCPP-2.0.1/`](docs/OCPP-2.0.1/)) define independently-certifiable certification profiles on top of the mandatory "Core" profile. The table below maps each capability feature to the profile(s) it participates in, so a build can be described (and certified) as, for example, "Core + Reservation + Smart Charging":
+The OCPP 2.1 and 2.0.1 "Part 5 - Certification Profiles" specifications (vendored under [`docs/OCPP-2.1/`](docs/OCPP-2.1/) and [`docs/OCPP-2.0.1/`](docs/OCPP-2.0.1/)) define independently-certifiable certification profiles on top of the mandatory "Core" profile. The table below maps each [`CAPABILITY_GATES`](src/hardware/capabilities.rs) entry to the profile(s)/component(s) it participates in, so a build can be described as, for example, "Core + Reservation + Smart Charging" - **describing** it that way is not the same as being able to **certify** it that way; see [H3](docs/PRODUCTION-ROADMAP.md#103-h3--compliance) for the gap.
 
-| Feature | OCPP 2.1 profile(s) | OCPP 2.0.1 profile(s) | Notes |
-| --- | --- | --- | --- |
-| `smart-charging` | Smart Charging (2.0.1 / 2.1) | Smart Charging | `SetChargingProfile`, `GetCompositeSchedule`, `GetChargingProfile`, `ClearChargingProfile`; 2.1 adds priority/dynamic profiles and EMS Control. |
-| `firmware-management` | Core | Core | Secure Firmware Update is a Core-profile capability, not its own certification profile. |
-| `diagnostics` | Core | Core | `GetLog`/log retrieval, `GetTransactionStatus`, and `CustomerInformation` are all listed as Core-profile capabilities. |
-| `variable-monitoring` | Advanced Device Management | Advanced Device Management | `SetVariableMonitoring`, `SetMonitoringBase`/`Level`, `GetMonitoringReport`, `NotifyEvent` (feature id `DM-0`). |
-| `display-message` | Advanced User Interface | Advanced User Interface | `SetDisplayMessage`/`GetDisplayMessages`/`ClearDisplayMessage`/`NotifyDisplayMessages` (feature id `UI-0`). |
-| `reservation` | Reservation | Reservation | `ReserveNow`/`CancelReservation`/`ReservationStatusUpdate` (feature id `R-0`). |
-| `local-auth-list` | Local Authorization List Management | Local Authorization List Management | `SendLocalList`/`GetLocalListVersion` (feature id `LA-0`). |
-| `tariff-cost` | Advanced User Interface (display/tariff bullets) + Payment (2.1, tariff management messages) | Advanced User Interface | `CostUpdated` and driver-facing tariff/cost display are Advanced User Interface; 2.1's `SetDefaultTariff`/`ChangeTransactionTariff`/`GetTariffs` are listed under Payment (2.1). |
-| `payment` | Payment (2.1) | *(not part of 2.0.1)* | Integrated/standalone payment terminal, prepaid card, QR code, settlement (feature id `P-0`). 2.1-only. |
-| `iso15118` | ISO 15118 support (2.0.1 / 2.1) | ISO 15118 support | Requires a number of Advanced Security and Smart Charging test cases per the spec's own note; covers both ISO 15118-2 (2.0.1/2.1) and ISO 15118-20 (2.1). |
-| `der-control` | DER control (2.1) | *(not part of 2.0.1)* | `SetDERControl`/`GetDERControl`/`ClearDERControl`/`ReportDERControl`, `NotifyDERAlarm`/`NotifyDERStartStop`. 2.1-only. |
-| `battery-swap` | Core (feature id `C-76`) | *(not part of 2.0.1)* | `BatterySwap`/`RequestBatterySwap`; a Core-profile optional feature (`BatterySwapCtrlr`), not its own certification profile. 2.1-only. |
-| `periodic-event-stream` | Advanced Device Management | *(not modeled as PeriodicEventStream messages in 2.0.1)* | `Open`/`Close`/`Adjust`/`GetPeriodicEventStream`, `NotifyPeriodicEventStream` (feature id `DM-0`, test cases `TC_N_107`-`TC_N_109`). 2.1-only messages. |
-| `certificates` | Core (install/retrieve/delete certificates) + ISO 15118 support (EV-side contract/MO/V2G certificates) | Core + ISO 15118 support | `InstallCertificate`/`DeleteCertificate`/`GetInstalledCertificateIds`/`CertificateSigned`/`SignCertificate`/`GetCertificateStatus` are Core; `Get15118EVCertificate` and related ISO 15118 certificate management are under ISO 15118 support. |
+| Capability (`CAPABILITY_GATES` name) | Cargo feature | 2.x `*Ctrlr` component | 1.6J feature profile | OCPP 2.1 profile | OCPP 2.0.1 profile | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `reservation` | `reservation` | `ReservationCtrlr` | `Reservation` | Reservation | Reservation | `ReserveNow`/`CancelReservation`/`ReservationStatusUpdate` (feature id `R-0`). |
+| `local_auth_list` | `local-auth-list` | `LocalAuthListCtrlr` | `LocalAuthListManagement` | Local Authorization List Management | Local Authorization List Management | `SendLocalList`/`GetLocalListVersion` (feature id `LA-0`). |
+| `smart_charging` | `smart-charging` | `SmartChargingCtrlr` | `SmartCharging` | Smart Charging | Smart Charging | `SetChargingProfile`, `GetCompositeSchedule`, `GetChargingProfile`, `ClearChargingProfile`; 2.1 adds priority/dynamic profiles and EMS Control. Feature flag currently gates nothing (see above) - the code is real. |
+| `tariff_and_cost` | `tariff-cost` | `TariffCostCtrlr` | *(none)* | Advanced User Interface (display/cost) + Payment (2.1 tariff messages) | Advanced User Interface | `CostUpdated` and driver-facing cost display are Advanced User Interface; 2.1's `SetDefaultTariff`/`ChangeTransactionTariff`/`GetTariffs` are listed under Payment (2.1). |
+| `has_display` | `display-message` | `DisplayMessageCtrlr` | *(none)* | Advanced User Interface | Advanced User Interface | `SetDisplayMessage`/`GetDisplayMessages`/`ClearDisplayMessage`/`NotifyDisplayMessages` (feature id `UI-0`). 2.x only. |
+| `diagnostics` | `diagnostics` | *(none in 2.1 appendix)* | `FirmwareManagement` | Core | Core | `GetLog`/log retrieval, `GetTransactionStatus`, and `CustomerInformation` are all Core-profile capabilities. |
+| `firmware_management` | `firmware-management` | *(none in 2.1 appendix)* | `FirmwareManagement` | Core | Core | Secure Firmware Update is a Core-profile capability, not its own certification profile. |
+| `firmware_publishing` | `firmware-publishing` | *(none defined in 2.1 appendix)* | *(none - predates the local-controller concept)* | *(no dedicated profile - local-controller behaviour)* | *(not part of 2.0.1)* | `PublishFirmware`/`UnpublishFirmware`/`PublishFirmwareStatusNotification`. 2.x only. |
+| `certificate_management` | `certificate-management` | *(none - lives on `SecurityCtrlr`)* | *(none - Security Whitepaper, not a core feature profile)* | Core | Core | `InstallCertificate`/`DeleteCertificate`/`GetInstalledCertificateIds`/`CertificateSigned`/`SignCertificate` are Core-profile capabilities. |
+| `ocsp_checking` | `ocsp-checking` | *(none - lives on `SecurityCtrlr`)* | *(none)* | Core | Core | `GetCertificateStatus`/`GetCertificateChainStatus`. Deliberately its own gate, independent of `certificate_management` - see that field's doc comment in `src/hardware/capabilities.rs`. |
+| `key_storage` | `key-storage` | *(none - underpins `SecurityCtrlr` security profile 3)* | *(none)* | *(no messages consume this yet)* | *(no messages consume this yet)* | Backing for mutual-TLS signing and CSR generation; no OCPP message is gated on it today. |
+| `payment` | `payment` | `PaymentCtrlr` | *(none - 2.1 only)* | Payment | *(not part of 2.0.1)* | `NotifySettlement`/`NotifyWebPaymentStarted`/`VatNumberValidation` (feature id `P-0`). 2.1-only. |
+| `der_control` | `der-control` | *(not verified against the real appendix - recorded `None` rather than guessed)* | *(none - 2.1 only)* | DER control | *(not part of 2.0.1)* | `SetDERControl`/`GetDERControl`/`ClearDERControl`/`ReportDERControl`, `NotifyDERAlarm`/`NotifyDERStartStop`, `AFRRSignal`. 2.1-only. |
+| `battery_swap` | `battery-swap` | *(not verified against the real appendix - recorded `None` rather than guessed)* | *(none - 2.1 only)* | Core (feature id `C-76`) | *(not part of 2.0.1)* | `BatterySwap`/`RequestBatterySwap`; a Core-profile optional feature, not its own certification profile. 2.1-only. |
+| `periodic_event_stream` | `periodic-event-stream` | *(none defined in 2.1 appendix)* | *(none - 2.1 only)* | Advanced Device Management | *(no PeriodicEventStream concept in 2.0.1)* | `Open`/`Close`/`Adjust`/`GetPeriodicEventStream`, `NotifyPeriodicEventStream` (feature id `DM-0`, test cases `TC_N_107`-`TC_N_109`). 2.1-only. |
 
-Derived from `docs/OCPP-2.1/OCPP-2.1_edition2_part5_certification_profiles.pdf` (Table 1 "Certification profiles", p.4-7, and §3.1 "Optional feature list for charging station", p.8-13) and `docs/OCPP-2.0.1/OCPP-2.0.1_edition4_part5_certification_profiles.pdf` (the equivalent Table 1 and §3.1), read via `pdftotext -layout`.
+Not in `CAPABILITY_GATES` yet, so not part of [C3.5](docs/PRODUCTION-ROADMAP.md#53-c3--capability-propagation)'s cross-surface consistency check, even
+though real adapter code exists: `variable_monitoring` (`SetVariableMonitoring`/
+`SetMonitoringBase`/`Level`/`GetMonitoringReport`/`NotifyEvent`, Advanced Device Management /
+feature id `DM-0` on both 2.1 and 2.0.1) and `certificates`/`iso15118` (declared `Capabilities`
+fields and Cargo features with no `CAPABILITY_GATES` row or implementation behind them yet -
+`Get15118EVCertificate` is the one message this leaves unwired on 2.0.1 and 2.1, per the coverage
+table above).
+
+`*Ctrlr` component names are sourced from `docs/OCPP-2.1/Appendices_CSV_v2.1/dm_components_vars.csv`
+where that checkout is available; entries recorded `None` rather than guessed are exactly the ones
+`src/hardware/capabilities.rs` itself documents as unverified (see [`docs/OCPP-2.1/` and
+`docs/OCPP-2.0.1/` being gitignored](docs/INTEGRATORS.md)). 1.6J profile names are the standard
+`SupportedFeatureProfiles` values (Core, FirmwareManagement, LocalAuthListManagement, Reservation,
+SmartCharging, RemoteTrigger). Certification-profile columns derived from
+`docs/OCPP-2.1/OCPP-2.1_edition2_part5_certification_profiles.pdf` (Table 1 "Certification
+profiles", p.4-7, and §3.1 "Optional feature list for charging station", p.8-13) and
+`docs/OCPP-2.0.1/OCPP-2.0.1_edition4_part5_certification_profiles.pdf` (the equivalent Table 1 and
+§3.1), read via `pdftotext -layout` when those (gitignored) vendored copies are present locally -
+re-derive rather than trust a stale copy of this table if you don't have them.
+
+**To regenerate this table**: cross-reference `CAPABILITY_GATES` in
+[`src/hardware/capabilities.rs`](src/hardware/capabilities.rs) (capability name, Cargo feature,
+`ctrlr_component`, `feature_profile_1_6`) against the certification-profile PDFs above for the
+profile columns. [C3.5](docs/PRODUCTION-ROADMAP.md#53-c3--capability-propagation)'s test
+(`src/setup.rs`) guarantees the first four columns can't silently drift from the code; nothing
+currently guarantees the profile columns stay in sync with the PDFs, so treat them as best-effort
+until [H3.3](docs/PRODUCTION-ROADMAP.md#103-h3--compliance) formally decides which profiles this
+crate claims.
 
 ### Recommended feature set per hardware class
 
@@ -405,6 +477,15 @@ You can help by:
 * 📝 Improving documentation
 * 🔧 Adding hardware integrations
 * 🚀 Submitting pull requests
+
+---
+
+## 🔖 Versioning
+
+This crate is pre-1.0 and has been making breaking changes regularly. See
+[`docs/SEMVER.md`](docs/SEMVER.md) for what that means for code implementing `crate::hardware`
+traits specifically, the MSRV commitment, and what changes before the hardware trait surface
+freezes at 1.0. See [`CHANGELOG.md`](CHANGELOG.md) for what has actually broken so far.
 
 ---
 
