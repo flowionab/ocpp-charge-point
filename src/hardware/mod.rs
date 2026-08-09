@@ -22,6 +22,7 @@ mod fault_injection;
 mod file_transfer;
 mod firmware;
 mod firmware_publisher;
+mod key_storage;
 mod storage;
 mod watchdog;
 
@@ -52,6 +53,11 @@ pub use self::firmware::{
 };
 pub use self::firmware_publisher::{
     FirmwarePublisher, NoFirmwarePublisher, NoFirmwarePublisherError,
+};
+pub use self::key_storage::{
+    DEFAULT_MAX_KEYS, GeneratedKeyPair, KeyHandle, KeyStore, KeyStoreBacking, NoKeyStore,
+    NoKeyStoreError, PublicKey, SignatureAlgorithm, SoftKeyStore, SoftKeyStoreError,
+    SoftwareCrypto,
 };
 pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]

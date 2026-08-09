@@ -99,6 +99,12 @@ pub struct Capabilities {
     /// The hardware/integration supports certificate management (install/delete certificates,
     /// signing, ISO 15118 certificate exchange).
     pub certificates: bool,
+    /// The charge point has somewhere to keep private keys and sign with them - see
+    /// [`crate::hardware::KeyStore`]. `true` for either a real secure element or a software
+    /// fallback; [`crate::hardware::KeyStore::backing`] is how the two are told apart. Wanted by
+    /// security profile 3 (mutual TLS) and CSR generation/renewal, neither of which is wired to
+    /// this capability yet (F2.4 has no consumer until F1.3/B4.3 land).
+    pub key_storage: bool,
 }
 
 impl Default for Capabilities {
@@ -131,6 +137,7 @@ impl Default for Capabilities {
             battery_swap: false,
             periodic_event_stream: false,
             certificates: false,
+            key_storage: false,
         }
     }
 }
@@ -299,6 +306,20 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         // a `hardware::BatterySwapStation`, which `setup()`'s signature cannot receive.
         has_handler: false,
     },
+    CapabilityGate {
+        name: "key_storage",
+        cargo_feature: "key-storage",
+        enabled: |c| c.key_storage,
+        // No dedicated `*Ctrlr` component in the 2.1 appendix for key storage itself - it
+        // underpins `SecurityCtrlr`'s profile-3 support rather than being its own component.
+        ctrlr_component: None,
+        // Not part of any 1.6J `SupportedFeatureProfiles` value - key storage is a Security
+        // Whitepaper concern, not a core feature profile.
+        feature_profile_1_6: None,
+        // No OCPP messages at all yet (F2.4 has no consumer until F1.3/B4.3): nothing for
+        // `setup()`/`ChargePointBuilder` to register.
+        has_handler: false,
+    },
 ];
 
 /// One `(capability name, Cargo feature name, whether the capability is set)` row consulted by
@@ -307,7 +328,7 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
 /// mistakes early, so it deliberately checks more than C3 needs to propagate).
 fn all_capability_feature_pairs(
     capabilities: &Capabilities,
-) -> [(&'static str, &'static str, bool); 16] {
+) -> [(&'static str, &'static str, bool); 17] {
     [
         (
             "smart_charging",
@@ -361,6 +382,7 @@ fn all_capability_feature_pairs(
             capabilities.periodic_event_stream,
         ),
         ("certificates", "certificates", capabilities.certificates),
+        ("key_storage", "key-storage", capabilities.key_storage),
     ]
 }
 
@@ -434,6 +456,7 @@ fn feature_enabled(feature: &str) -> bool {
         "battery-swap" => cfg!(feature = "battery-swap"),
         "periodic-event-stream" => cfg!(feature = "periodic-event-stream"),
         "certificates" => cfg!(feature = "certificates"),
+        "key-storage" => cfg!(feature = "key-storage"),
         _ => false,
     }
 }
@@ -624,6 +647,13 @@ impl Capabilities {
         self.certificates = enabled;
         self
     }
+
+    /// Sets `key_storage` - see that field.
+    #[must_use]
+    pub fn with_key_storage(mut self, enabled: bool) -> Self {
+        self.key_storage = enabled;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -653,6 +683,7 @@ mod tests {
         assert!(!capabilities.battery_swap);
         assert!(!capabilities.periodic_event_stream);
         assert!(!capabilities.certificates);
+        assert!(!capabilities.key_storage);
     }
 
     #[test]
@@ -663,5 +694,20 @@ mod tests {
         };
         assert!(capabilities.has_display);
         assert!(!capabilities.supports_bidirectional_power);
+    }
+
+    #[test]
+    fn key_storage_is_registered_in_the_capability_gate_table() {
+        let gate = CAPABILITY_GATES
+            .iter()
+            .find(|gate| gate.name == "key_storage")
+            .expect("F2.4 must register a CAPABILITY_GATES row for key_storage");
+        assert_eq!(gate.cargo_feature, "key-storage");
+        // No OCPP messages exist for this capability yet (F2.4 has no consumer until F1.3/B4.3).
+        assert!(!gate.has_handler);
+
+        let capabilities = Capabilities::default().with_key_storage(true);
+        assert!((gate.enabled)(&capabilities));
+        assert!(!(gate.enabled)(&Capabilities::default()));
     }
 }
