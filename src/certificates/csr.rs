@@ -489,6 +489,82 @@ mod tests {
     }
 
     #[test]
+    fn sha256_matches_reference_digests_at_every_padding_boundary() {
+        // The three FIPS vectors above all happen to sit comfortably inside a block. A hand-rolled
+        // SHA-256's most likely bug is in *padding* - the 0x80 terminator, the zero fill, and the
+        // 64-bit big-endian length - which only misbehaves at specific input lengths: 55/56 (the
+        // length field no longer fits, forcing an extra block), 63/64/65 (block boundary), and the
+        // same again one block later. A wrong digest here would produce a CSR whose signature is
+        // silently invalid for *some* subject names and not others, which is close to the worst
+        // failure mode this module could have.
+        //
+        // Expected values generated with Python's `hashlib`, an independent implementation.
+        const CASES: &[(usize, &str)] = &[
+            (
+                0,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                1,
+                "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+            ),
+            (
+                55,
+                "463eb28e72f82e0a96c0a4cc53690c571281131f672aa229e0d45ae59b598b59",
+            ),
+            (
+                56,
+                "da2ae4d6b36748f2a318f23e7ab1dfdf45acdc9d049bd80e59de82a60895f562",
+            ),
+            (
+                63,
+                "29af2686fd53374a36b0846694cc342177e428d1647515f078784d69cdb9e488",
+            ),
+            (
+                64,
+                "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108",
+            ),
+            (
+                65,
+                "4bfd2c8b6f1eec7a2afeb48b934ee4b2694182027e6d0fc075074f2fabb31781",
+            ),
+            (
+                119,
+                "da18797ed7c3a777f0847f429724a2d8cd5138e6ed2895c3fa1a6d39d18f7ec6",
+            ),
+            (
+                120,
+                "f52b23db1fbb6ded89ef42a23ce0c8922c45f25c50b568a93bf1c075420bbb7c",
+            ),
+            (
+                127,
+                "92ca0fa6651ee2f97b884b7246a562fa71250fedefe5ebf270d31c546bfea976",
+            ),
+            (
+                128,
+                "471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5",
+            ),
+            (
+                129,
+                "5099c6a56203f9687f7d33f4bfdf576d31dc91f6b695ecea38b2770c87631135",
+            ),
+            (
+                200,
+                "1901da1c9f699b48f6b2636e65cbf73abf99d0441ef67f5c540a42f7051dec6f",
+            ),
+        ];
+
+        for (len, expected) in CASES {
+            let input: Vec<u8> = (0..*len).map(|i| (i % 251) as u8).collect();
+            assert_eq!(
+                hex(&sha256(&input)),
+                *expected,
+                "digest mismatch for a {len}-byte input"
+            );
+        }
+    }
+
+    #[test]
     fn base64_pads_correctly_for_every_remainder() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
