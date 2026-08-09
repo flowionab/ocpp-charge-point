@@ -68,8 +68,8 @@ see [Appendix A](#appendix-a--verified-message-inventory)):
 | Version | Wired | Available in `ocpp-client` 0.5.0 | Remaining |
 |---------|-------|---------------------------------|-----------|
 | **1.6J** | **28** | 39 | 11 — the whole security-whitepaper set ([D2.2](#62-d2--type-completeness-audit)) |
-| **2.0.1** | **60** | 64 | 4 — all certificates |
-| **2.1** | **83** | 91 | 8 — 5 certificates, 3 payment |
+| **2.0.1** | **62** | 64 | 2 — certificate status only |
+| **2.1** | **88** | 91 | 3 — certificate status only |
 
 Two things this table hides, both good news:
 
@@ -101,12 +101,12 @@ close — mostly missing one version each.
 | Area | Status | Note |
 |------|--------|------|
 | Actor model, version-independent state | ✅ | `ChargePointState` owns transactions, reservations, local auth list, cost, reset, device model — all mutated only via `ChargePointEvent`. |
-| Hardware abstraction | 🚧 | Eleven traits: `ChargePoint`/`Evse`/`Connector` (lock, unlock, contactor, reboot, `set_current_limit`), plus `Storage`, `FileTransfer`, `FirmwareInstaller`, `FirmwarePublisher`, `CertificateStore`, `Display`, `BatterySwapStation`, `Watchdog`. Every negative this row used to carry — no capability model, no current-limit hook, no file transfer, no display — is now false; `Capabilities` ([C2](#52-c2--runtime-capability-declaration)) is the model. Still 🚧 because the surface is **not frozen** ([H5.5](#105-h5--release)) and DER/V2X, ISO 15118 and payment hardware have no trait yet. Time is `crate::clock`, not a hardware trait — `Capabilities::has_rtc` is how hardware declares a real-time clock. |
+| Hardware abstraction | 🚧 | **Fourteen traits**: `ChargePoint`/`Evse`/`Connector` (mandatory) plus `Storage`, `FileTransfer`, `FirmwareInstaller`, `FirmwarePublisher`, `CertificateStore`, `KeyStore`, `SoftwareCrypto`, `Display`, `BatterySwapStation`, `PaymentTerminal`, `Watchdog` — each opt-in with a `No*` default. `Capabilities` ([C2](#52-c2--runtime-capability-declaration)) is the model; [`docs/INTEGRATORS.md`](INTEGRATORS.md) ([H5.2](#105-h5--release)) is the integrator-facing description. Still 🚧 because the surface is **not frozen** ([H5.5](#105-h5--release)) and DER actuation and ISO 15118 have no trait yet. Time is `crate::clock`, not a hardware trait. |
 | `no_std` | ✅ | Compiles for a real bare-metal target (`thumbv7em-none-eabihf`), not just with features off — that took dropping `tracing`'s default features and a `getrandom` backend cfg ([H1.3](#101-h1--ci-hardening)). `embassy-sync` channels, `tokio` fully optional. Until the [G3.1](#93-g3--time) follow-up, this held only for a build with *no version feature* — every OCPP adapter was `std`-gated dead code, so a bare-metal build could not actually speak OCPP. All three version adapters are now reachable without `std`. |
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the authorization cache, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: certificates, network profiles. |
-| Test suite | 🚧 | 1286 test functions in `src/`, nine integration test binaries. Strong unit coverage, end-to-end against the [H2.1](#102-h2--integration-testing) mock CSMS over a real socket, and — new with [G1.2](#91-g1--no_std-across-the-matrix) — 51 version × capability feature combinations verified to compile, which had silently not been true. |
+| Test suite | 🚧 | 1318 test functions in `src/`, 23 integration tests across 10 binaries, and 54 version × capability feature combinations verified to compile. [H4.1](#104-h4--longevity) adds a network-flapping soak with an opt-in long mode. |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too, plus a coverage floor on the protocol adapter files ([H1.6](#101-h1--ci-hardening)). Whole-crate coverage stays informational. |
 
 ### 2.4 The structural blocker — resolved
@@ -1040,8 +1040,38 @@ messages missing from 2.0.1 outside certificates. B2.8 gave them one.
       `ChargePointBuilder::certificates`. Chained through `CAPABILITY_GATES` with
       `has_handler: false`, since `setup()` cannot receive a store — C3.5's data-driven test
       enforced that rather than letting it slide.
-- [ ] **B4.3** CSR generation and `SignCertificate` → `CertificateSigned`
-      round trip, including automatic renewal before expiry.
+- [x] **B4.3** CSR generation and `SignCertificate` → `CertificateSigned`
+      round trip. (Automatic renewal before expiry stays with
+      [F3.2](#83-f3--credentials), which this now unblocks.)
+
+      **This closed the last gap in 2.0.1 message coverage outside certificate *status*.**
+      `src/certificates/csr.rs` hand-assembles a PKCS#10 `CertificationRequest` in DER (RFC 2986),
+      embedding `KeyStore`'s `SubjectPublicKeyInfo` bytes verbatim. The signature is produced by
+      `KeyStore::sign` over the digest of the DER-encoded `CertificationRequestInfo` — **the
+      private key is never in this crate's hands**, which is the invariant
+      [F2.4](#82-f2--tls) exists to protect and the thing to re-check in any future change here.
+
+      `PendingSignRequests` is a bounded two-slot correlation table (one per
+      `CertificateSigningPurpose`), so an **unsolicited `CertificateSigned` is refused** and
+      raises `InvalidChargingStationCertificate` rather than being installed blind. 2.1 generates
+      and threads a `requestId`; 2.0.1 has no such field and correlates on `certificateType`
+      alone. Signed chains land in the matching `CertificateStore` slot.
+
+      **SHA-256 is implemented in-crate** — the one deliberate exception to the crate's
+      zero-crypto-dependency stance, on the grounds that a hash needs no key material and no
+      secure element, and can be pinned down exactly. It shipped with three FIPS vectors that all
+      sit inside one block; a follow-up added 13 more at every padding boundary
+      (0/1/55/56/63/64/65/119/120/127/128/129/200 bytes) against reference digests, because a
+      padding bug would produce a CSR whose signature is silently invalid for *some* subject
+      names and not others. It is correct at all of them. **Asymmetric signing stays delegated**
+      to `KeyStore`; nothing was added to `Cargo.toml`.
+
+      **Not done:** SHA-384 (`EcdsaP384Sha384`) returns a typed `UnsupportedAlgorithm` rather
+      than a wrong digest — only the SHA-256 family can produce a CSR today. Remembering which
+      `KeyHandle` a stored certificate pairs with is [F3.2](#83-f3--credentials)'s job, and
+      presenting the installed certificate on the connection is [F1.3](#81-f1--security-profiles)'s.
+      Like [B4.2](#b4--certificates-and-iso-15118-r1-r13), this module is still not registered
+      through `ChargePointBuilder`.
 - [ ] **B4.4** OCSP status checking.
 - [ ] **B4.5** ISO 15118 Plug & Charge — gate behind a feature flag *and* a
       runtime capability; most chargers don't have it.
@@ -1444,9 +1474,34 @@ unblocked this block.
       the CSMS believes is still enforced - and a driver tariff never needed persisting in the
       first place, since the transaction it's scoped to already doesn't resume across a restart
       (E4.1 closes every recovered transaction out as `PowerLoss` instead).
-- [ ] **B7.2** Payment terminal integration surface (2.1) — feature-flagged;
+- [x] **B7.2** Payment terminal integration surface (2.1) — feature-flagged;
       `PaymentCtrlr` alone accounts for 22 of the 122 required device-model
       variables, so this is not a small block.
+
+      `NotifySettlement`, `NotifyWebPaymentStarted` and `VatNumberValidation`, all **2.1-only and
+      all charge-point-initiated** — verified against `ocpp-types` 0.3.0's generated shapes, none
+      has a CSMS-initiated counterpart. `src/payment.rs` holds the protocol-agnostic
+      `PaymentNotifier` (shaped like `Authorizer`'s call/response rather than a fire-and-forget
+      notifier, since all three carry data the caller may act on) with `payment/ocpp_2_1.rs` as
+      the adapter. `hardware::PaymentTerminal` is a deliberately one-method trait — there is no
+      inbound command in this block to dispatch to hardware — registered builder-only.
+
+      **All 22 required `PaymentCtrlr` variables landed**, and the roadmap's own count was
+      confirmed against the real 2.1 `dm_components_vars.csv` rather than taken on trust. The two
+      the CSV marks *optional* (`IncrementalAuthorizationAmount`/`Threshold`) are omitted, matching
+      this table's existing required-only convention.
+
+      Settlement amounts are stored as formatted strings, following `BatteryData`'s `soC`/`soH`
+      convention — note [B2.8](#b2--smart-charging-r11) has since dropped `Eq` from
+      `ChargePointEffect`, so that constraint is weaker than it was and both could be revisited
+      together. **No settlement identifier, VAT number or merchant address reaches a `tracing`
+      call**, which matters more here than in most blocks.
+
+      **Not done:** `PaymentCtrlr`'s live status variables (`Problem`, `Connected`) are registered
+      at fixed `false` placeholders and are not driven from real terminal state — a real
+      integration wants `PaymentTerminal` extended with a status hook. No `REFUSAL_GATES` row,
+      deliberately: that table is for a registered inbound handler that must refuse a CALL, which
+      does not apply to outbound-only messages.
 
 ### B8 — Reservation, DER/V2X, battery swap
 
@@ -3119,12 +3174,33 @@ nowhere. These five rows make it mechanical.
       aren't separable from the rest of their file without per-region
       tooling this doesn't attempt.
 - [x] **H1.7** Run on PRs, not just `push`.
-- [ ] **H1.8** **Make a red gate visible.** `feature-matrix` was failing on
+- [x] **H1.8** **Make a red gate visible.** `feature-matrix` was failing on
       `main` for at least three consecutive commits before anyone looked; the
-      other six jobs were green, so nothing surfaced it. The failure was real
-      (see [G3.1](#93-g3--time)) and is now fixed, but the process gap isn't:
-      a gating job can go red and stay red unnoticed. Branch protection on
-      `main`, or a notification on a failing `main` run, whichever fits.
+      other six jobs were green, so nothing surfaced it.
+
+      **The row recurred while it was open**, which is the best argument for it that exists:
+      [G1.2](#91-g1--no_std-across-the-matrix) found three feature configurations that had been
+      broken on `main` for some time — and `cargo hack --each-feature` was *already* expanding to
+      exactly those three commands. The matrix was never the problem. Nobody was reading the
+      result.
+
+      So the fix targets visibility, not coverage. `ci.yaml` gained a **`ci-required` aggregate
+      job** that `needs` all seven gating jobs and runs `if: always()`, failing if any of them
+      did — turning "six green, one red" into a single unambiguous red check. Plus a weekday
+      `schedule` trigger and `workflow_dispatch`, so a gate that breaks without a push still
+      surfaces. The feature matrix also gained a no_std/all-capabilities step.
+
+      **One part is not a file and could not be done from here.** Requiring `ci-required` as a
+      status check is a GitHub repository setting; the API confirmed `main` is **currently
+      unprotected**. The exact click-path is documented in the job's own comment: *Settings →
+      Branches → branch protection rules for `main` (or Rulesets) → add `ci-required` as the
+      required status check.* Until a maintainer does that, this row is a loud alarm rather than
+      a lock, and the difference is worth being clear about.
+
+      Two things stay unverified until it runs on GitHub: `if: always()` + `needs` semantics and
+      the `schedule` trigger, both validated only by YAML parsing and local simulation. And the
+      new no_std step is a coarse all-capabilities-on check, not a real combinatorial matrix — a
+      regression needing one capability *absent* alongside others would still slip through.
 
 ### 10.2 H2 — Integration testing
 
@@ -3188,7 +3264,28 @@ coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match 
 
 ### 10.4 H4 — Longevity
 
-- [ ] **H4.1** Multi-day soak with induced network flapping.
+- [x] **H4.1** Multi-day soak with induced network flapping —
+      [`tests/network_flapping_soak.rs`](../tests/network_flapping_soak.rs).
+
+      The literal row is unrunnable in CI, and a test nobody runs is worth nothing, so this split
+      in two: a **short deterministic mode** that gates on every push (~1–1.5 s) and a **long mode**
+      behind `#[ignore]` with a configurable `OCPP_SOAK_ROUNDS`. It is the connectivity stress
+      [H4.2](#104-h4--longevity)'s memory stress was missing — repeated disconnect/reconnect at
+      awkward moments, the offline queue filling and draining across cycles with ordering
+      preserved, the A5 backoff/jitter and A9 rollback paths, and resync-on-reconnect.
+
+      Assertions are on invariants (ordering, bounds, eventual convergence) rather than wall-clock
+      timings, deliberately: a soak test that flakes once a week gets deleted by whoever is on
+      call, which is worse than not having one.
+
+      **It found something.** At 400+ reconnect rounds there is a small but consistent memory
+      growth trend — a few hundred bytes per reconnect, well inside the 4 MB tolerance up to that
+      point, and **not root-caused**. It could be in `ocpp-client`'s reconnect path, in
+      `ConnectionTarget`, or benign allocator fragmentation from thousands of short-lived TCP
+      connections. Recorded here rather than chased: for a charge point expected to run for
+      months on flaky connectivity, a genuine per-reconnect leak would matter, so this deserves
+      its own investigation. That is exactly what a soak test is for, and it is worth noting the
+      short CI mode would never have surfaced it.
 - [x] **H4.2** Memory-growth assertion over thousands of transactions —
       [`tests/memory_growth.rs`](../tests/memory_growth.rs). `tests/memory_budget.rs` (G2.3)
       answers a different question: what a charge point retains *at* its configured bounds, a
@@ -3222,8 +3319,25 @@ coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match 
 
 - [ ] **H5.1** Complete rustdoc on every public item — `#![warn(missing_docs)]`
       is on; make it `deny`.
-- [ ] **H5.2** Integrator's guide: implement these traits, pick these
-      features, here's a working example.
+- [x] **H5.2** Integrator's guide: implement these traits, pick these
+      features, here's a working example — [`docs/INTEGRATORS.md`](INTEGRATORS.md), linked from
+      the README.
+
+      This is where `CLAUDE.md`'s central promise — *"integrators should only ever need to supply
+      hardware bindings"* — finally gets stated end to end. It covers which of the hardware traits
+      are mandatory (`ChargePoint`/`Evse`/`Connector`) versus opt-in with a `No*` default,
+      recommended Cargo-feature sets per hardware class, the distinction between a **Cargo feature**
+      (compiles code out) and a **runtime `Capabilities` flag** (declares what the hardware can do)
+      and why the two must agree, when to use `setup()` versus `ChargePointBuilder`, and the honest
+      edges: `no_std` needs a `critical-section` backend and your own
+      `Executor`/`Backoff`/`Clock`, durability is opt-in per concern, and some capability features
+      still gate nothing.
+
+      It points at the existing `examples/` rather than adding a fourth, and every example it
+      cites was compiled and run. **It also caught two stale numbers elsewhere**, both since
+      corrected: `src/setup.rs`'s own docstring still says "24-trait" (the real figure is 45), and
+      the README's capability-feature table undercounts which features now gate real code. The
+      guide carries a shell one-liner to re-derive the bound count so it does not drift again.
 - [ ] **H5.3** Per-version, per-profile support matrix in the README, kept
       honest by [C3.5](#53-c3--capability-propagation)'s test.
 - [ ] **H5.4** Semver and MSRV policy; changelog.
@@ -3382,30 +3496,29 @@ project. 2.1's setpoints, discharge limits and per-phase asymmetries are parsed 
 > log upload; variable monitoring. A field unit can be updated and
 > diagnosed remotely — without this, every fault is a truck roll.
 
-**Progress (2026-08-09).** Three of the four exit criteria are met: **log upload**
-([B5.1](#b5--diagnostics-and-monitoring-r14)), **variable monitoring** end to end
-([B5.2](#b5--diagnostics-and-monitoring-r14)/[B5.3](#b5--diagnostics-and-monitoring-r14)), and
-profiles **1 and 2** ([F1.1](#81-f1--security-profiles)/[F1.2](#81-f1--security-profiles)).
-[B3.4](#b3--firmware-management-r12), [F5.2](#85-f5--hardening),
-[F5.3](#85-f5--hardening) and [F2.4](#82-f2--tls) have all landed since.
+**Progress (2026-08-09), second update.** **All four exit criteria are now within one task.**
+Log upload, variable monitoring and profiles 1–2 were already met;
+[B4.3](#b4--certificates-and-iso-15118-r1-r13) has since landed the CSR round trip, which was the
+head of this milestone's dependency chain.
 
-What remains is **one chain and four independents**, and the chain is now unblocked at its head:
+What remains, and the chain is now two links shorter:
 
-> ~~[F2.4](#82-f2--tls) secure key storage~~ ✅ → [B4.3](#b4--certificates-and-iso-15118-r1-r13)
-> CSR / `SignCertificate` round trip → [F1.3](#81-f1--security-profiles) profile 3 (mutual TLS)
-> and [F3.2](#83-f3--credentials) renewal-before-expiry
+> ~~[F2.4](#82-f2--tls) key storage~~ ✅ → ~~[B4.3](#b4--certificates-and-iso-15118-r1-r13) CSR
+> round trip~~ ✅ → [F1.3](#81-f1--security-profiles) profile 3 (mutual TLS) ·
+> [F3.2](#83-f3--credentials) renewal · [B3.3](#b3--firmware-management-r12) signed firmware
 
-**[B4.3](#b4--certificates-and-iso-15118-r1-r13) is now the head, and it is the highest-value
-open task in the crate.** It is the last thing blocking profile 3 and renewal; it is
-[B3.3](#b3--firmware-management-r12)'s signature verification in all but name; and per
-[Appendix A](#appendix-a--verified-message-inventory) certificates are the *only* remaining gap in
-2.0.1 coverage and one of two in 2.1. Protocol completeness and production readiness want the
-same next task, which is not usually true.
+**[F1.3](#81-f1--security-profiles) and [B3.3](#b3--firmware-management-r12) are now the two
+that matter**, and both are unblocked. F1.3 is the last exit criterion (security profile 3) and
+needs only to present the installed client certificate on the connection — the certificate,
+the key and the signing round trip all exist now. B3.3 is signed firmware over the air, the
+criterion with the most product value, and it reuses the same machinery B4.3 built (note B4.3
+added an in-crate SHA-256, which is a large part of what B3.3 needs).
 
-The independents: [F2.2](#82-f2--tls) (trust store, unblocked since B4.1),
-[B4.4](#b4--certificates-and-iso-15118-r1-r13) (OCSP),
-[F4.3](#84-f4--security-events) (`GetLog` over the security log) and
-[F5.1](#85-f5--hardening)/[F5.4](#85-f5--hardening) (threat model, secure boot).
+The rest are independent and none blocks anything: [F2.2](#82-f2--tls) (trust store),
+[B4.4](#b4--certificates-and-iso-15118-r1-r13) (OCSP — also two of the last five missing
+messages), [F4.3](#84-f4--security-events) (`GetLog` over the security log),
+[F5.1](#85-f5--hardening)/[F5.4](#85-f5--hardening) (threat model, secure boot) and
+[E2.9](#72-e2--what-must-survive).
 
 ### M5 — Full coverage and certification
 
@@ -3420,30 +3533,28 @@ Everything in M5 is capability-gated and hardware-dependent — a given
 product ships the subset its hardware supports. M5 completes the *library*,
 not every deployment.
 
-**Progress (2026-08-09).** [B5.6](#b5--diagnostics-and-monitoring-r14) (periodic event streams),
-[B8.2](#b8--reservation-derv2x-battery-swap) (DER/V2X, eight messages) and
-[B8.3](#b8--reservation-derv2x-battery-swap) (battery swap) have all landed, alongside
-[B6](#b6--display-message-r15), [B7.1](#b7--tariff-cost-and-payment-r9) and
-[B2.8](#b2--smart-charging-r11) earlier. **M5's protocol half is nearly done**: only
-[B4.5](#b4--certificates-and-iso-15118-r1-r13) (ISO 15118) and
-[B7.2](#b7--tariff-cost-and-payment-r9) (payment) remain, three messages between them plus 15118's
-much larger non-message surface.
+**Progress (2026-08-09), second update.** [B7.2](#b7--tariff-cost-and-payment-r9) (payment)
+has landed alongside the earlier B5.6, B8.2, B8.3, B6, B7.1 and B2.8, and
+[H5.2](#105-h5--release)'s integrator guide with it. **M5's protocol half is effectively done**:
+[B4.5](#b4--certificates-and-iso-15118-r1-r13) (ISO 15118) is the only functional block left, and
+it accounts for one of the three remaining 2.1 messages.
 
-**What is left in M5 is overwhelmingly process, not protocol** — 13 of its 15 open tasks are
-[H3](#103-h3--compliance)–[H5](#105-h5--release): compliance runs, soak testing and release
-documentation. Two things gate that work and neither is a coding task:
+**What is left in M5 is now almost entirely process.** Of its open tasks,
+[H3](#103-h3--compliance)–[H5](#105-h5--release) — compliance runs, throughput testing, release
+documentation — are the bulk, and not one is a functional block. Two things to settle before
+scheduling that work:
 
-- [H3.2](#103-h3--compliance) and [H3.5](#103-h3--compliance) both read spec material that is
-  **gitignored** and absent from every clone — see
-  [B8.3](#b8--reservation-derv2x-battery-swap). Settle that before scheduling either.
-- [H1.8](#101-h1--ci-hardening) is still open, and [G1.2](#91-g1--no_std-across-the-matrix) just
-  demonstrated why it matters: three gating configurations were broken on `main` and the job that
-  covered them was reporting green to nobody's attention.
+- [H3.2](#103-h3--compliance) and [H3.5](#103-h3--compliance) read spec material that is
+  **gitignored** and absent from every clone (see
+  [B8.3](#b8--reservation-derv2x-battery-swap)). Either vendor it or say where to fetch it.
+- [H1.8](#101-h1--ci-hardening) landed the `ci-required` aggregate gate, but **`main` is still
+  unprotected** — the API confirmed it. Requiring that check is a repository setting a maintainer
+  must click; until then CI is an alarm, not a lock.
 
-A note on where DER actually stands, since the message count now says "done": B8.2 stores and
-reports DER controls but **cannot actuate them**, because no hardware trait can apply a curve or a
-setpoint. Full V2X support is a hardware-surface task, and a breaking one — hold it for
-[H5.5](#105-h5--release).
+Two caveats the message count hides, both breaking-change territory for
+[H5.5](#105-h5--release): **DER is wired but not actuated** (no hardware trait applies a curve or
+setpoint), and **`PaymentCtrlr`'s live status variables are placeholders** rather than driven
+from a real terminal.
 
 ---
 
@@ -3455,79 +3566,68 @@ plus files under a path of that name), matched against the action names
 `ocpp-client` **0.5.0** generates per version. Re-run it after any coverage
 work; it's the honest number.
 
-**Last re-counted 2026-08-09**, after B8.2, B2.8, B3.4, B5.3, B5.6 and B8.3.
+**Last re-counted 2026-08-09**, after B4.3 and B7.2.
 
 | Version | Wired | Total | Remaining |
 |---------|------:|------:|----------:|
 | 1.6J | 28 | 39 | 11 |
-| 2.0.1 | 60 | 64 | 4 |
-| 2.1 | 83 | 91 | 8 |
-| **All three** | **171** | **194** | **23** |
+| 2.0.1 | 62 | 64 | 2 |
+| 2.1 | 88 | 91 | 3 |
+| **All three** | **178** | **194** | **16** |
 
-**Three traps this sweep has hit, all of which silently *understate* coverage.**
-Anyone re-running it should handle all three or the number will be wrong again:
+**Three traps, all of which silently *understate* coverage.** Handle all three
+or the number will be wrong again — this sweep has hit every one of them:
 
 1. **Acronyms break naive snake_case.** `GetDERControl`'s generated method is
    `on_get_der_control`, not `on_get_d_e_r_control`; `AFRRSignal` is
-   `send_afrr_signal`; `NotifyEVChargingNeeds` is `notify_ev_charging_needs`.
-   A per-capital split reports every DER and EV message as unwired — it briefly
-   reported 12 wired messages as missing here. Split on lower→upper boundaries
-   *and* on the tail of an acronym run (`([A-Z]+)([A-Z][a-z])`).
-2. **One action's type name carries an `Action` suffix.**
-   `NotifyPeriodicEventStream` is generated as `NotifyPeriodicEventStreamAction`
-   because the bare name collides with its own payload type; the method keeps
-   the unsuffixed name.
-3. **The count goes stale silently.** Before 2026-08-08 this appendix had not
-   been re-run since before B5.2–B5.5, B6 and B7.1, and understated 2.x coverage
-   by 24 messages. Nothing failed — the number just stopped being true.
+   `send_afrr_signal`. A per-capital split reported 12 wired messages as missing.
+   Split on `([a-z0-9])([A-Z])` *and* `([A-Z]+)([A-Z][a-z])`.
+2. **One action's type carries an `Action` suffix.**
+   `NotifyPeriodicEventStream` is generated as `NotifyPeriodicEventStreamAction`;
+   the method keeps the unsuffixed name.
+3. **Module detection must be substring-based.** Adapters are named e.g.
+   `clear_cache_ocpp_2_1`, and some live in files under an `ocpp_2_1/` path.
 
-A good sanity check: the sweep should report **no** wired method that fails to
-match some generated action. An unmatched wired name means the matcher is wrong,
-not that the crate has a stray handler.
+The sanity check that catches all three: a correct sweep leaves **no wired
+method unmatched** by some generated action. An unmatched wired name means the
+matcher is wrong, not that the crate has a stray handler.
 
 ### A.1 OCPP 1.6J — 28 of 39 wired
 
-**The core profile is complete.** Every message OCPP 1.6J's core profile defines is handled; the
-denominator moved because `ocpp-client` 0.4.0 added the security whitepaper set to its 1.6 action
-list, raising it from 28 actions to 39. All 11 gaps are that set, and they are one decision —
-[D2.2](#62-d2--type-completeness-audit) — rather than eleven pieces of work.
+**The core profile is complete.** The denominator moved when `ocpp-client` 0.4.0 added the
+security whitepaper set, raising the 1.6 action list from 28 to 39. All 11 gaps are that set, and
+they are **one decision** — [D2.2](#62-d2--type-completeness-audit) — not eleven pieces of work.
 
 **Missing:** CertificateSigned, DeleteCertificate, ExtendedTriggerMessage,
 GetInstalledCertificateIds, GetLog, InstallCertificate, LogStatusNotification,
 SecurityEventNotification, SignCertificate, SignedFirmwareStatusNotification,
 SignedUpdateFirmware
 
-### A.2 OCPP 2.0.1 — 60 of 64 wired
+### A.2 OCPP 2.0.1 — 62 of 64 wired
 
-**Missing:** CertificateSigned, SignCertificate, GetCertificateStatus, Get15118EVCertificate.
+**Missing:** `GetCertificateStatus` ([B4.4](#b4--certificates-and-iso-15118-r1-r13), OCSP) and
+`Get15118EVCertificate` ([B4.5](#b4--certificates-and-iso-15118-r1-r13), Plug & Charge).
 
-That is the whole list, and it is one block:
-[B4.3](#b4--certificates-and-iso-15118-r1-r13)–[B4.5](#b4--certificates-and-iso-15118-r1-r13).
-Every other 2.0.1 message this crate can speak, it speaks.
+### A.3 OCPP 2.1 — 88 of 91 wired
 
-### A.3 OCPP 2.1 — 83 of 91 wired
+**Missing:** the same two, plus `GetCertificateChainStatus`
+([B4.4](#b4--certificates-and-iso-15118-r1-r13)).
 
-**Missing:**
+**Inventory reconciliation.** All three reconcile exactly — 28 + 11 = 39, 62 + 2 = 64,
+88 + 3 = 91 — with no wired method left unmatched.
 
-| Block | Messages | Owner |
-|-------|----------|-------|
-| Certificates / ISO 15118 | CertificateSigned, SignCertificate, GetCertificateStatus, Get15118EVCertificate, GetCertificateChainStatus | [B4.3](#b4--certificates-and-iso-15118-r1-r13)–[B4.5](#b4--certificates-and-iso-15118-r1-r13) |
-| Payment / settlement | NotifySettlement, NotifyWebPaymentStarted, VatNumberValidation | [B7.2](#b7--tariff-cost-and-payment-r9) |
+**What the remaining 16 are.** Two things, and nothing else:
 
-**Inventory reconciliation.** All three versions reconcile exactly: 28 + 11 = 39, 60 + 4 = 64,
-83 + 8 = 91, with no wired method left unmatched.
+- **11 are 1.6J's security whitepaper**, blocked on one upstream decision
+  ([D2.2](#62-d2--type-completeness-audit)): the *types* are absent from `ocpp-client`'s 1.6
+  module, so this is a contribution-or-decline call, not implementation work here.
+- **5 are certificate *status*** — OCSP ([B4.4](#b4--certificates-and-iso-15118-r1-r13)) and ISO
+  15118 ([B4.5](#b4--certificates-and-iso-15118-r1-r13)) — across the two 2.x versions.
 
-**What the remaining 23 are made of**, and it is now a very short story: **11** are 1.6J's single
-upstream decision ([D2.2](#62-d2--type-completeness-audit)), **9** are certificates and ISO 15118
-across both 2.x versions, and **3** are 2.1 payment. Nothing else is missing. DER/V2X, periodic
-event streams, monitoring reports, firmware publishing, battery swap, display messages, tariffs
-and the smart-charging notifications are all wired.
-
-The practical consequence: **certificates are now the only thing standing between this crate and
-complete 2.0.1 coverage**, and one of two things standing between it and complete 2.1 coverage.
-That agrees with [M4](#m4--security-and-remote-management)'s dependency chain, which puts the
-same work on the critical path for security profile 3 and signed firmware — this is the one
-place where protocol coverage and production readiness want exactly the same next task.
+Everything else OCPP defines, on all three versions, this crate speaks. Worth stating plainly
+because it changes what "remaining work" means: from here on, production readiness is almost
+entirely [Workstream H](#10-workstream-h--test-compliance-release) (compliance, soak, release)
+and the hardware surfaces that DER actuation and Plug & Charge still need — not message coverage.
 
 ### A.4 Other verified figures
 
@@ -3540,6 +3640,6 @@ place where protocol coverage and production readiness want exactly the same nex
 | Security event types in the appendix | 21 | `…/security_events.csv` |
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
-| Protocol trait bounds on `setup()`'s CSMS parameter | 48 (+ `Clone`/`Send`/`Sync`/`'static`) — was 28 two rounds ago. [B8.2](#b8--reservation-derv2x-battery-swap) declined to add eight more and registered builder-only instead — the first time this signature's size changed a design decision rather than merely being noted. That is the case for [C4.2](#54-c4--builder-refactor)/[C4.3](#54-c4--builder-refactor). | `src/setup.rs` |
-| Test functions in `src/` | 1286 | `#[test]` + `#[tokio::test]`, re-counted after merging the B8.2/B2.8/F2.4/F5.3/G1.2 worktrees (1227 before them, 1121 before the round that closed B3.4/B5.3/B5.6/B8.3/F5.2). **Trust the `cargo test` delta, not an agent's self-report** — in the first parallel round all five worktree agents overstated their new-test count by 20-50%; told explicitly to count from the diff and cross-check against the pass-count delta, all five in the second round reported exactly right. | `src/` |
-| Integration tests | 21 across 9 binaries, plus 2 runnable examples | `tests/` (`connect_2_1_websocket`, `lifecycle`, `get_charging_profiles`, `malformed_payload`, `memory_budget`, `memory_growth`, `network_profile_switch`, `payload_size_limit`, `power_cut_recovery`), sharing the H2.1 mock CSMS in `tests/common/` |
+| Protocol trait bounds on `setup()`'s CSMS parameter | **45** protocol traits, plus `Clone`/`Send`/`Sync`/`'static`. A previous revision of this row said 48, which double-counted: 48 is the number of `+ Bound` lines, four of which *are* the markers, and the leading `N: BootNotifier` carries no `+`. Caught by [H5.2](#105-h5--release)'s guide, which re-derived it. `src/setup.rs`'s own docstring still says 24 and is stale. [B8.2](#b8--reservation-derv2x-battery-swap) declined to add eight more bounds and registered builder-only instead — the first time this signature's size changed a design decision rather than being merely noted, and the case for [C4.2](#54-c4--builder-refactor)/[C4.3](#54-c4--builder-refactor). | `src/setup.rs` |
+| Test functions in `src/` | 1318 (1340 including integration tests) | `#[test]` + `#[tokio::test]`, after the B4.3/B7.2/H4.1/H1.8/H5.2 round (1286 before it, 1227 and 1121 before the two rounds prior). **Trust the `cargo test` delta, not an agent's self-report** — the first parallel round had all five agents overstate this by 20-50%; told to count from the diff and cross-check the pass-count delta, the next two rounds were exact ten times out of ten. | `src/` |
+| Integration tests | 23 across 10 binaries (one `#[ignore]`d long soak), plus 2 runnable examples | `tests/` — adds `network_flapping_soak` ([H4.1](#104-h4--longevity)) to the previous nine, sharing the H2.1 mock CSMS in `tests/common/` |
