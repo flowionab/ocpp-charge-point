@@ -260,9 +260,15 @@ and over-reporting is the recoverable direction.
   currently generate (D2.2, open upstream). A 1.6J-connected station still records every event
   in the durable log; it simply cannot notify the CSMS in real time. This is a version capability
   difference, not a defect in this crate's own logic.
-- **`GetLog`'s reader for the security log does not exist yet** (F4.3, partial) — the log itself
-  is durable and bounded, but a CSMS cannot yet pull it on demand; an operator today can only see
-  what already reached them as live `SecurityEventNotification`s.
+- **`GetLog`'s reader for the security log exists** (F4.3's security-log half is done): a
+  `GetLog`/`GetDiagnostics` with `logType = SecurityLog` renders the durable log
+  (`crate::diagnostics::render_security_log`) and uploads it through the same B5.1 machinery
+  `logType = DiagnosticsLog` uses, honouring `oldestTimestamp`/`latestTimestamp` and keeping
+  entries recorded before the clock was synchronized rather than dropping them. 1.6J's
+  `GetDiagnostics` has no log-type field at all, so a 1.6J CSMS still cannot ask for it by
+  that route — see `src/diagnostics/ocpp_1_6.rs`'s module docs. `SecurityLogWasCleared` is the
+  one thing this does not wire up: nothing calls `persistence::clear_security_log` yet, since
+  `GetLog` only reads the log and never clears it — see §5.
 
 ### 4.6 Data at rest
 
