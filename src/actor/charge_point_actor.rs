@@ -354,51 +354,268 @@ async fn run(
             acknowledged,
         } = mailbox.recv().await;
 
-        tracing::info!(event = ?event, "new charge point event");
-        for effect in state.apply(event) {
-            match effect {
-                ChargePointEffect::StateChanged => {
-                    tracing::info!(state = ?state, "charge point state updated");
-                    updates.send_replace(state.clone());
-                }
-                ChargePointEffect::HardwareCommand(command) => {
-                    effects.commands.send(command);
-                }
-                ChargePointEffect::StatusNotification(changed) => {
-                    effects.status_notifications.send(changed);
-                }
-                ChargePointEffect::TransactionEvent(occurred) => {
-                    effects.transaction_events.send(occurred);
-                }
-                ChargePointEffect::AuthorizationRequested(requested) => {
-                    effects.authorization_requests.send(requested);
-                }
-                ChargePointEffect::ReservationEnded(update) => {
-                    effects.reservation_updates.send(update);
-                }
-                ChargePointEffect::SecurityEventOccurred(event) => {
-                    effects.security_events.send(event);
-                }
-                ChargePointEffect::PriorityChargingChanged(change) => {
-                    effects.priority_charging_changes.send(change);
-                }
-                ChargePointEffect::VariableMonitorTriggered(triggered) => {
-                    effects.variable_monitor_events.send(triggered);
-                }
-                ChargePointEffect::BatterySwapEventOccurred(event) => {
-                    effects.battery_swap_events.send(event);
-                }
-                ChargePointEffect::SmartChargingNotification(notification) => {
-                    effects.smart_charging_notifications.send(notification);
+        // Everything from here to the watchdog is synchronous, so the span is entered around the
+        // whole apply rather than held across an `.await` - an entered guard spanning an await
+        // point attributes later work on this task to the wrong event.
+        let span = tracing::debug_span!(
+            "charge_point_event",
+            event = event.name(),
+            evse_id = event.evse_id(),
+            connector_id = event.connector_id(),
+        );
+        span.in_scope(|| {
+            let lifecycle_before = state.lifecycle;
+
+            // The name at DEBUG, the payload only at TRACE: `ChargePointState` and the fatter
+            // events render to kilobytes apiece, which is most of the cost of having logs at all
+            // on an MCU. See CLAUDE.md's logging levels.
+            // Also a field on the event, not only on the enclosing span: a minimal embedded
+            // subscriber that forwards events without rendering span context is a normal thing to
+            // run on an MCU, and the event's name is the one field that must survive it.
+            tracing::debug!(event = event.name(), "applying charge point event");
+            tracing::trace!(event = ?event, "charge point event payload");
+
+            for effect in state.apply(event) {
+                tracing::debug!(effect = effect.name(), "state machine effect");
+                match effect {
+                    ChargePointEffect::StateChanged => {
+                        tracing::trace!(state = ?state, "charge point state updated");
+                        updates.send_replace(state.clone());
+                    }
+                    ChargePointEffect::HardwareCommand(command) => {
+                        tracing::debug!(command = ?command, "dispatching hardware command");
+                        effects.commands.send(command);
+                    }
+                    ChargePointEffect::StatusNotification(changed) => {
+                        effects.status_notifications.send(changed);
+                    }
+                    ChargePointEffect::TransactionEvent(occurred) => {
+                        effects.transaction_events.send(occurred);
+                    }
+                    ChargePointEffect::AuthorizationRequested(requested) => {
+                        effects.authorization_requests.send(requested);
+                    }
+                    ChargePointEffect::ReservationEnded(update) => {
+                        effects.reservation_updates.send(update);
+                    }
+                    ChargePointEffect::SecurityEventOccurred(event) => {
+                        // A security event is the one effect that is newsworthy on its own, and
+                        // the OCPP security profile expects it to be recorded locally as well as
+                        // reported - see `crate::security`.
+                        tracing::info!(security_event = ?event, "security event occurred");
+                        effects.security_events.send(event);
+                    }
+                    ChargePointEffect::PriorityChargingChanged(change) => {
+                        effects.priority_charging_changes.send(change);
+                    }
+                    ChargePointEffect::VariableMonitorTriggered(triggered) => {
+                        effects.variable_monitor_events.send(triggered);
+                    }
+                    ChargePointEffect::BatterySwapEventOccurred(event) => {
+                        effects.battery_swap_events.send(event);
+                    }
+                    ChargePointEffect::SmartChargingNotification(notification) => {
+                        effects.smart_charging_notifications.send(notification);
+                    }
                 }
             }
-        }
+
+            // The one thing that belongs at INFO on a busy site: the charge point as a whole
+            // became available, went out of service, or faulted. Per-connector traffic stays at
+            // DEBUG so an operator can leave INFO on permanently.
+            if state.lifecycle != lifecycle_before {
+                tracing::info!(
+                    from = ?lifecycle_before,
+                    to = ?state.lifecycle,
+                    "charge point lifecycle changed"
+                );
+            }
+        });
         // G4.3: fed here and nowhere else. This is the one place that proves the property worth
         // proving - the actor is draining its mailbox and applying events - and it is fed *after*
         // the effects are dispatched, so an event that wedges mid-apply stops the feeding rather
         // than petting the dog on its way in. See `crate::hardware::Watchdog`.
         watchdog.pet().await;
         acknowledged.send(());
+    }
+}
+
+/// What the actor's run loop logged, captured for the tests below.
+///
+/// The loop is spawned onto an executor, so a thread-local scoped subscriber never sees it -
+/// these tests drive `run` directly on the current thread with `WithSubscriber` instead, which
+/// is why they assemble the channels by hand rather than going through `spawn`.
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use crate::state::{IdToken, IdTokenKind};
+    use crate::sync::{Chan, broadcast_channel, watch_channel};
+    use crate::tracing_test_support::{Capture, capture_from_future};
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+    use core::time::Duration;
+    use tracing::level_filters::LevelFilter;
+
+    /// Feeds `events` through the real run loop with a subscriber capturing at `max_level`.
+    async fn run_capturing(events: Vec<ChargePointEvent>, max_level: LevelFilter) -> Capture {
+        let state = ChargePointState::new([1]);
+        let mailbox = Chan::new();
+        let (updates, _state_rx) = watch_channel(state.clone());
+        let effects = EffectSenders {
+            commands: broadcast_channel(),
+            status_notifications: broadcast_channel(),
+            transaction_events: broadcast_channel(),
+            authorization_requests: broadcast_channel(),
+            security_events: broadcast_channel(),
+            reservation_updates: broadcast_channel(),
+            priority_charging_changes: broadcast_channel(),
+            variable_monitor_events: broadcast_channel(),
+            battery_swap_events: broadcast_channel(),
+            smart_charging_notifications: broadcast_channel(),
+        };
+
+        for event in events {
+            assert!(
+                mailbox.send(Command::Event {
+                    event,
+                    acknowledged: OneShot::new(),
+                }),
+                "the test mailbox should accept the event"
+            );
+        }
+
+        // `run` loops forever; it drains the pre-filled mailbox and then parks on `recv`, so a
+        // timeout is how the test gets control back.
+        let (capture, _) = capture_from_future(
+            max_level,
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                run(
+                    state,
+                    mailbox.clone(),
+                    updates,
+                    effects,
+                    Arc::new(crate::hardware::NoWatchdog),
+                ),
+            ),
+        )
+        .await;
+
+        capture
+    }
+
+    fn presented_card() -> ChargePointEvent {
+        ChargePointEvent::Evse {
+            evse_id: 0,
+            event: crate::state::EvseEvent::Connector {
+                connector_id: 0,
+                event: crate::state::ConnectorEvent::IdTokenPresented(IdToken {
+                    value: "04A1B2C3D4E5F6A7".to_string(),
+                    kind: IdTokenKind::ISO14443,
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn the_whole_charge_point_state_is_never_rendered_above_trace() {
+        // `ChargePointState` is the largest type in the crate. Rendering it on every applied
+        // event is most of the cost of having logs at all on an MCU, so it belongs at TRACE -
+        // where you opt into it deliberately - and nowhere else.
+        let capture =
+            run_capturing(vec![ChargePointEvent::BootCompleted], LevelFilter::DEBUG).await;
+
+        assert!(
+            !capture.all_text().contains("ChargePointState {"),
+            "the full state was rendered at DEBUG or above:\n{}",
+            capture.all_text()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_full_event_payload_is_never_rendered_above_trace() {
+        let capture = run_capturing(vec![presented_card()], LevelFilter::DEBUG).await;
+
+        assert!(
+            !capture.all_text().contains("IdToken {"),
+            "the full event payload was rendered at DEBUG or above:\n{}",
+            capture.all_text()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_routine_per_event_line_carries_the_variant_name_at_debug() {
+        let capture = run_capturing(vec![presented_card()], LevelFilter::DEBUG).await;
+
+        let debug_lines: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::DEBUG)
+            .collect();
+
+        assert!(
+            debug_lines
+                .iter()
+                .any(|e| e.rendered.contains("IdTokenPresented")),
+            "no DEBUG line named the event that was applied:\n{:#?}",
+            debug_lines
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_transition_is_reported_at_info() {
+        // The one thing an operator wants from a charge point at INFO: it booted, it went
+        // unavailable, it faulted.
+        let capture = run_capturing(vec![ChargePointEvent::BootCompleted], LevelFilter::INFO).await;
+
+        let info_lines: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::INFO)
+            .collect();
+
+        assert!(
+            info_lines
+                .iter()
+                .any(|e| e.rendered.contains("Booting") && e.rendered.contains("Available")),
+            "the Booting -> Available transition was not reported at INFO:\n{:#?}",
+            info_lines
+        );
+    }
+
+    #[tokio::test]
+    async fn a_routine_event_that_changes_no_lifecycle_stays_quiet_at_info() {
+        // Otherwise INFO is unreadable on a busy site and operators filter the whole level out.
+        let capture = run_capturing(vec![presented_card()], LevelFilter::INFO).await;
+
+        assert!(
+            capture.events().is_empty(),
+            "a card presentation logged at INFO or above:\n{:#?}",
+            capture.events()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_payload_is_still_available_to_someone_who_asks_for_trace() {
+        // Redaction and level discipline must not cost the ability to debug: at TRACE the full
+        // state and the full (redacted) event are both there.
+        // `BootCompleted` for a guaranteed state change, the card for a payload worth redacting.
+        let capture = run_capturing(
+            vec![ChargePointEvent::BootCompleted, presented_card()],
+            LevelFilter::TRACE,
+        )
+        .await;
+
+        assert!(
+            capture.all_text().contains("ChargePointState {"),
+            "TRACE did not carry the state:\n{}",
+            capture.all_text()
+        );
+        assert!(
+            capture.all_text().contains("IdToken {"),
+            "TRACE did not carry the event payload:\n{}",
+            capture.all_text()
+        );
     }
 }
 

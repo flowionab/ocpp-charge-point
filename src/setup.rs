@@ -166,6 +166,20 @@ where
     // by hardware that can't do the thing. `capabilities()` is the single source of truth every
     // other C3 surface (device model, `SupportedFeatureProfiles`, `*Ctrlr.Available`) also reads.
     let capabilities = builder.capabilities();
+    // The single most useful line in a commissioning log. "The CSMS answers NotImplemented for
+    // ReserveNow" is a support ticket this crate receives with some regularity, and the answer is
+    // almost always that the hardware's `Capabilities` never declared the block - which until now
+    // was invisible from the outside. Booleans rather than a `{:?}` of the whole set: this is
+    // INFO, and it runs once per session.
+    tracing::info!(
+        reservation = capabilities.reservation,
+        local_auth_list = capabilities.local_auth_list,
+        tariff_and_cost = capabilities.tariff_and_cost,
+        smart_charging = capabilities.smart_charging,
+        variable_monitoring = capabilities.variable_monitoring,
+        periodic_event_stream = capabilities.periodic_event_stream,
+        "registering the optional functional blocks the hardware declared"
+    );
     if capabilities.reservation {
         builder = builder
             .reservation(&csms)
@@ -214,7 +228,9 @@ where
     // A7: sweep every queue registered above on OCPP's own MessageAttemptInterval, so a charge
     // point that goes quiet mid-outage still retries what it queued. 60 s is the fallback when
     // the device model has no usable value.
-    Ok(builder.offline_queue_retries(backoff, 60).build())
+    let runtime = builder.offline_queue_retries(backoff, 60).build();
+    tracing::info!("the charge point session is up");
+    Ok(runtime)
 }
 
 #[cfg(test)]
@@ -803,6 +819,17 @@ mod tests {
                     },
                     "payment" => crate::hardware::Capabilities {
                         payment: enabled,
+                        ..Default::default()
+                    },
+                    // The one gate whose capability is an enum: `Iso15118_2` stands in for
+                    // "enabled" here, and `capabilities.rs`'s own gate test covers `Iso15118_20`
+                    // reaching the same answer.
+                    "iso15118_support" => crate::hardware::Capabilities {
+                        iso15118_support: if enabled {
+                            crate::hardware::Iso15118SupportLevel::Iso15118_2
+                        } else {
+                            crate::hardware::Iso15118SupportLevel::None
+                        },
                         ..Default::default()
                     },
                     other => panic!(

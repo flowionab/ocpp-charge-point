@@ -36,6 +36,35 @@ use crate::state::{Component, DeviceModel, Variable, VariableAttributeType};
 use core::fmt;
 use ocpp_client::{ConnectOptions, NegotiatedClient, OcppVersion};
 
+/// A CSMS address with any `user:password@` userinfo stripped, for logging.
+///
+/// OCPP carries security profile 1/2 credentials in an HTTP Basic header rather than the URL -
+/// see [`crate::security_profile::BasicAuthPassword`], whose `Debug` prints a placeholder for the
+/// same reason - but nothing stops an integrator passing `wss://cp001:secret@csms.example/` as
+/// `address`, and the first thing this crate would otherwise do with it is log it. Strips
+/// everything between `//` and the last `@` of the authority.
+fn redacted_endpoint(address: &str) -> alloc::string::String {
+    use alloc::string::{String, ToString};
+
+    let Some((scheme, rest)) = address.split_once("//") else {
+        return address.to_string();
+    };
+    // Only the authority can hold userinfo; a later `@` (in a path or query) must survive.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => {
+            let mut out = String::from(scheme);
+            out.push_str("//");
+            out.push_str("***@");
+            out.push_str(host);
+            out.push_str(path);
+            out
+        }
+        None => address.to_string(),
+    }
+}
+
 /// Failure from [`connect_and_setup`]: the initial WebSocket dial/handshake to the CSMS failed,
 /// the CSMS negotiated a version this crate can't yet drive a full session in, or the connection
 /// succeeded and [`setup`](crate::setup) itself then failed starting the hardware.
@@ -114,26 +143,49 @@ where
     // F5.2: configures the ceiling every redial through `target` is guarded with - see this
     // function's own docs for why the *initial* dial just below is not covered.
     target.set_max_inbound_frame_bytes(payload_limits.unwrap_or_default().max_inbound_frame_bytes);
-    let negotiated = ocpp_client::connect(address, versions, Some(target.install(options)))
-        .await
-        .map_err(ConnectAndSetupError::Connect)?;
+    tracing::info!(
+        endpoint = %redacted_endpoint(address),
+        offered_versions = ?versions,
+        "dialing the CSMS"
+    );
+    let negotiated =
+        match ocpp_client::connect(address, versions, Some(target.install(options))).await {
+            Ok(negotiated) => negotiated,
+            Err(error) => {
+                // The single most-asked question during commissioning is "why won't it connect", and
+                // until now this path answered it only by returning an error to a caller that
+                // typically just propagates it.
+                tracing::warn!(
+                    endpoint = %redacted_endpoint(address),
+                    %error,
+                    "the CSMS dial failed"
+                );
+                return Err(ConnectAndSetupError::Connect(error));
+            }
+        };
 
     // `SystemMonotonicClock`/`SystemClock` (std-backed) rather than caller-supplied parameters -
     // this function is already std/tokio-only "batteries included" (it dials a real WebSocket),
     // so there is no embedded-target caller for whom a different clock would matter, the same
     // reasoning `executor.spawn`'s tokio dependency here already follows.
+    // Which version the CSMS picked decides which functional blocks this session will have (see
+    // this module's docs - what each version gets is deliberately not identical), so it is the
+    // first thing to establish when a charge point misbehaves against one CSMS but not another.
     match negotiated {
         NegotiatedClient::V2_1(client) => {
+            tracing::info!(version = "2.1", "the CSMS negotiated an OCPP version");
             target.set_version(OcppVersion::V2_1);
             setup_ocpp_2_1(charge_point, client, executor, backoff, target).await
         }
         #[cfg(feature = "ocpp_2_0_1")]
         NegotiatedClient::V2_0_1(client) => {
+            tracing::info!(version = "2.0.1", "the CSMS negotiated an OCPP version");
             target.set_version(OcppVersion::V2_0_1);
             setup_ocpp_2_0_1(charge_point, client, executor, backoff, Some(target)).await
         }
         #[cfg(feature = "ocpp_1_6")]
         NegotiatedClient::V1_6(client) => {
+            tracing::info!(version = "1.6J", "the CSMS negotiated an OCPP version");
             target.set_version(OcppVersion::V1_6);
             setup_ocpp_1_6(charge_point, client, executor, backoff, target).await
         }
@@ -571,5 +623,52 @@ mod tests {
             matches!(options.keepalive, ocpp_client::KeepaliveBehavior::Disabled),
             "a registered WebSocketPingInterval of 0 must mean no unsolicited traffic"
         );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_redaction_tests {
+    use super::redacted_endpoint;
+
+    #[test]
+    fn userinfo_in_the_dial_address_never_reaches_the_log() {
+        assert_eq!(
+            redacted_endpoint("wss://cp001:hunter2@csms.example.com/ocpp"),
+            "wss://***@csms.example.com/ocpp"
+        );
+    }
+
+    #[test]
+    fn an_address_without_credentials_is_left_alone() {
+        // The endpoint is the single most useful field in a commissioning log; redacting it
+        // wholesale to be safe would defeat the point of logging it.
+        assert_eq!(
+            redacted_endpoint("wss://csms.example.com/ocpp/CP001"),
+            "wss://csms.example.com/ocpp/CP001"
+        );
+    }
+
+    #[test]
+    fn an_at_sign_after_the_authority_is_not_mistaken_for_userinfo() {
+        // A charge point id is free-form and may well contain one; treating the path's `@` as a
+        // credential boundary would eat the host and the id both.
+        assert_eq!(
+            redacted_endpoint("wss://csms.example.com/ocpp/cp@site"),
+            "wss://csms.example.com/ocpp/cp@site"
+        );
+    }
+
+    #[test]
+    fn a_password_containing_an_at_sign_is_still_removed_whole() {
+        // Splitting on the *last* `@` of the authority, not the first, is what makes this hold.
+        assert_eq!(
+            redacted_endpoint("wss://cp001:p@ss@csms.example.com/ocpp"),
+            "wss://***@csms.example.com/ocpp"
+        );
+    }
+
+    #[test]
+    fn an_address_with_no_scheme_separator_is_returned_unchanged() {
+        assert_eq!(redacted_endpoint("csms.example.com"), "csms.example.com");
     }
 }

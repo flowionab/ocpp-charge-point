@@ -604,23 +604,24 @@ Secures the OCPP connection and reports security-relevant events.
   and 2 are runnable today; profile 3 needs a client certificate and a key store,
   and `SecurityProfile::is_implemented` says so rather than letting a station
   behave as though it presents a certificate it has not got.
-- Status: 🚧 partial — `SecurityEventNotification` (outbound only) is
-  implemented on **both 2.1 and 2.0.1**; the certificate messages (`SignCertificate`,
-  `CertificateSigned`, `Get15118EVCertificate`, `GetCertificateStatus`,
-  `DeleteCertificate`, `InstallCertificate`, `GetInstalledCertificateIds`)
-  are not. A **certificate store** now exists (`hardware::CertificateStore`,
+- Status: 🚧 partial — every message in this block is wired on **2.1 and 2.0.1**
+  (`SecurityEventNotification` outbound, plus the certificate messages listed
+  below); what keeps it partial is 1.6J, which has none of them, and the
+  fail-safe no-op defaults (`NoFirmwareVerifier`, `NoOcspChecker`) an integrator
+  must replace before claiming Advanced Security - see `docs/CERTIFICATION.md`
+  §3. A **certificate store** now exists (`hardware::CertificateStore`,
   B4.1) - a trait the integrator implements, so it can sit behind a secure
   element, with `StoredCertificates` over `hardware::Storage` for hardware
   without one. The crate never sees a private key: the only question it asks is
   whether one exists, because security profile 3 needs to know whether a client
-  certificate can be presented and nothing above needs the key. What is still
-  missing is the crypto several of them need
-  (parsing X.509, computing hashes, signing) - which is why the store takes hash
-  data from whoever parsed the certificate rather than deriving it.
+  certificate can be presented and nothing above needs the key. Signing arrived
+  with `hardware::KeyStore` (F2.4); what is still missing is X.509 parsing and
+  the hashing that depends on it - which is why the store takes hash data from
+  whoever parsed the certificate rather than deriving it.
   `InstallCertificate`, `DeleteCertificate` and `GetInstalledCertificateIds` are
-  wired on 2.0.1 and 2.1 (B4.2); `SignCertificate`/`CertificateSigned`,
-  `GetCertificateStatus` and `Get15118EVCertificate` are not, and need the
-  signing and OCSP work B4.3/B4.4 cover. 1.6J has none of them - they are
+  wired on 2.0.1 and 2.1 (B4.2), as are `SignCertificate`/`CertificateSigned`
+  (B4.3), `GetCertificateStatus` (B4.4, behind `hardware::OcspChecker`) and
+  `Get15118EVCertificate` (B4.5, see §13). 1.6J has none of them - they are
   Security Whitepaper messages, which `ocpp-types` does not generate. A
   `SecurityEvent` (`event_type: SecurityEventType`, `tech_info: Option<
   String>`) is reported via a new `src/security.rs` module, wired the same
@@ -1512,8 +1513,24 @@ Plug-and-charge certificate handling for EVs.
   `InstallCertificate`, certificate exchange during charging.
 - Internal state needed: EV certificate relay hook, dependent on ISO
   15118 support at the hardware/communication controller level.
-- Status: ⬜ not started; likely depends on hardware capability detection
-  (not all chargers have an ISO 15118 PLC modem).
+- Status: ✅ **as far as OCPP reaches** - `Get15118EVCertificate` is wired on
+  2.0.1 and 2.1 (B4.5, `crate::iso15118`), and `GetCertificateStatus` (B4.4) and
+  `InstallCertificate` (B4.2) came with the certificate block. The hardware
+  capability detection this entry anticipated is `Capabilities::iso15118_support`
+  (`Iso15118SupportLevel::None`/`Iso15118_2`/`Iso15118_20`): a station with no PLC
+  modem never sends the message and reports `ISO15118Ctrlr` unavailable, and one
+  that declares a level brings that component's required
+  `ContractValidationOffline` with it, through the same `CAPABILITY_GATES` row
+  every other block advertises itself with.
+
+  What this crate deliberately does **not** do is speak ISO 15118 itself: the EXI
+  request and response are carried opaquely, with no codec, no session state
+  machine and nothing deciding when a certificate is due. That is the integrator's
+  high-level-communication stack, reached through
+  `hardware::Iso15118Controller` - see `crate::iso15118`'s module docs for where
+  the boundary sits and `docs/RELEASE-1.0.md` §3 for the one open question about
+  it (that trait has never been implemented by anything but this crate's own test
+  doubles, which is a 1.0 freeze prerequisite rather than a missing feature).
 - Version notes: not applicable to 1.6J.
 
 ## 14. Diagnostics

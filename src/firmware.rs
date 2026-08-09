@@ -333,6 +333,7 @@ impl Default for FirmwareUpdateQueue {
 }
 
 /// Decides what to answer an `UpdateFirmware` with, and queues the update if accepted.
+#[tracing::instrument(skip_all)]
 pub async fn handle_update_firmware(
     actor: &ChargePointActor,
     updates: &FirmwareUpdateQueue,

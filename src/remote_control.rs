@@ -38,6 +38,7 @@ pub enum UnlockOutcome {
 /// transaction in progress is refused rather than interrupted. When the request is valid, this
 /// drives the connector through to hardware confirmation before answering - the OCPP `Unlocked`
 /// status must reflect an unlock that actually happened, not merely one that was requested.
+#[tracing::instrument(skip_all, fields(evse_id, connector_id))]
 pub async fn handle_unlock_request(
     actor: &ChargePointActor,
     evse_id: usize,
@@ -49,6 +50,7 @@ pub async fn handle_unlock_request(
         .get(evse_id)
         .and_then(|evse| evse.connectors.get(connector_id).copied())
     else {
+        tracing::warn!("UnlockConnector named a connector this charge point does not have");
         return UnlockOutcome::UnknownConnector;
     };
 
@@ -147,12 +149,16 @@ pub enum RequestStartTransactionOutcome {
 /// decision; see `ConnectorEvent::RemoteStartRequested`). `id_token` is the identifier the CSMS
 /// supplied, recorded on the started `Transaction`. Rejects if `evse_id` is out of range, or no
 /// matching connector is currently `Locked`.
+#[tracing::instrument(skip_all, fields(evse_id))]
 pub async fn handle_request_start_transaction(
     actor: &ChargePointActor,
     evse_id: Option<usize>,
     id_token: IdToken,
 ) -> RequestStartTransactionOutcome {
     let Some((evse_id, connector_id)) = find_locked_connector(&actor.state(), evse_id) else {
+        // The usual cause of a refused RemoteStart, and invisible until now: the CSMS asked to
+        // start a transaction on a connector with no cable latched.
+        tracing::warn!("refusing RequestStartTransaction: no locked connector is available");
         return RequestStartTransactionOutcome::Rejected;
     };
 
@@ -223,15 +229,21 @@ pub enum RequestStopTransactionOutcome {
 /// unknown `transaction_id`, or one that isn't currently `Charging` - the connector state
 /// machine's only stop path is `Charging` -> `Stopping`, so e.g. a transaction still `Starting`
 /// (contactor not yet confirmed closed) can't be stopped this way yet.
+#[tracing::instrument(skip_all, fields(transaction_id = transaction_id.0))]
 pub async fn handle_request_stop_transaction(
     actor: &ChargePointActor,
     transaction_id: TransactionId,
 ) -> RequestStopTransactionOutcome {
     let state = actor.state();
     let Some((evse_id, connector_id)) = find_transaction(&state, transaction_id) else {
+        tracing::warn!("refusing RequestStopTransaction: no such transaction is running here");
         return RequestStopTransactionOutcome::Rejected;
     };
     if state.evses[evse_id].connectors[connector_id] != ConnectorState::Charging {
+        tracing::warn!(
+            connector_state = ?state.evses[evse_id].connectors[connector_id],
+            "refusing RequestStopTransaction: the connector is not charging"
+        );
         return RequestStopTransactionOutcome::Rejected;
     }
 
@@ -267,6 +279,7 @@ fn find_transaction(
 /// [`crate::replay_protection`] for why `TransactionId` is the one CSMS-initiated remote-control
 /// key this crate currently treats as strong enough evidence of a replay, and why the report
 /// never changes the returned outcome.
+#[tracing::instrument(skip_all)]
 pub async fn handle_request_stop_transaction_with_replay_guard(
     actor: &ChargePointActor,
     guard: &ReplayGuard<TransactionId>,
@@ -342,6 +355,7 @@ pub enum TriggerMessageOutcome {
 /// `Rejected` - `Accepted` reflects that the charge point attempted the trigger, the same way
 /// e.g. [`crate::availability::run_status_notifications`] logs and continues on a failed report
 /// rather than treating it as a rejection of the underlying event.
+#[tracing::instrument(skip_all)]
 pub async fn handle_trigger_message<N>(
     actor: &ChargePointActor,
     notifier: &N,

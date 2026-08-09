@@ -43,6 +43,7 @@ pub enum ResetOutcome {
 /// [`crate::state::HardwareCommand::Reboot`] - see
 /// `docs/PRODUCTION-ROADMAP.md` §7.2/§7.4 (the boot-reason row of E2, and E4.2). No recorder
 /// installed (the default) makes this a no-op, exactly as if this hook didn't exist.
+#[tracing::instrument(skip_all)]
 pub async fn handle_reset(
     actor: &ChargePointActor,
     target: ResetTarget,

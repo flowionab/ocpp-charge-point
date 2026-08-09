@@ -77,6 +77,7 @@ pub enum ReserveNowOutcome {
 /// `parse_expiry_date_time` (private to this module). `None` means a reservation that never expires, per
 /// [`Reservation`]'s docs; it no longer doubles as "the CSMS sent something unparseable", which
 /// the wire types now rule out.
+#[tracing::instrument(skip_all, fields(reservation_id = reservation_id.0, evse_id))]
 pub async fn handle_reserve_now(
     actor: &ChargePointActor,
     evse_id: Option<usize>,
@@ -199,6 +200,7 @@ pub enum CancelReservationOutcome {
 /// Handles a CSMS-initiated `CancelReservation` request against `actor`: finds the connector
 /// whose active reservation is `reservation_id` and, if found, cancels it. Rejects an unknown
 /// `reservation_id`.
+#[tracing::instrument(skip_all, fields(reservation_id = reservation_id.0))]
 pub async fn handle_cancel_reservation(
     actor: &ChargePointActor,
     reservation_id: ReservationId,
@@ -210,6 +212,7 @@ pub async fn handle_cancel_reservation(
         return CancelReservationOutcome::Rejected;
     }
     let Some((evse_id, connector_id)) = find_reservation(&state, reservation_id) else {
+        tracing::warn!("refusing CancelReservation: no such reservation is held here");
         return CancelReservationOutcome::Rejected;
     };
 

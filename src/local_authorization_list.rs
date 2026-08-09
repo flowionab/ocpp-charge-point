@@ -64,6 +64,7 @@ pub enum SendLocalListOutcome {
 /// CSMS believes are cached, which is worse for a driver at an offline charge point than a `Failed`
 /// the CSMS can see and act on. A differential update that only replaces or removes entries stays
 /// within the bound and is accepted even on a full list.
+#[tracing::instrument(skip_all)]
 pub async fn handle_send_local_list(
     actor: &ChargePointActor,
     version: i64,

@@ -462,7 +462,13 @@ version.
 
       **56 of the 122 belong to blocks that do not exist here** — `PaymentCtrlr` (22),
       `DCDERCtrlr` (16), `NetworkConfiguration` (9), `WebPaymentsCtrlr` (5), `V2XChargingCtrlr`
-      (3), `ISO15118Ctrlr`, `ACDERCtrlr` — and are registered nowhere. That is
+      (3), `ISO15118Ctrlr`, `ACDERCtrlr` — and are registered nowhere. *(As written at B1.7. Two
+      of those blocks have since arrived and taken their rows with them: `PaymentCtrlr`'s 22 with
+      [B7.2](#b7--payment-and-web-payments) and `ISO15118Ctrlr`'s one
+      (`ContractValidationOffline`) with [B4.5](#b4--certificates-and-iso-15118-r1-r13), so
+      `CAPABILITY_GATED_VARIABLES` now holds 35 entries and 34 required rows remain unregistered —
+      `DCDERCtrlr`, `NetworkConfiguration`, `WebPaymentsCtrlr`, `V2XChargingCtrlr`, `ACDERCtrlr`.
+      The rule below is unchanged; only which blocks it applies to.)* That is
       [C3](#53-c3--capability-propagation)'s rule applied consistently rather than an omission:
       those capabilities are `false`, the component reports `Available: false`, and a charge point
       that cannot run a block owes no configuration for it. Two tests hold the line: a capability
@@ -1118,10 +1124,34 @@ messages missing from 2.0.1 outside certificates. B2.8 gave them one.
       `OcspClient`/`CertificateStore`.
 
       Uses the **existing** `Capabilities::iso15118_support` (`Iso15118SupportLevel`:
-      `None`/`Iso15118_2`/`Iso15118_20`) rather than adding a parallel bool — that enum was
-      already in `CAPABILITY_GATES` via the `iso15118` feature and is richer than a flag. No
+      `None`/`Iso15118_2`/`Iso15118_20`) rather than adding a parallel bool — that enum is richer
+      than a flag. No
       builder method, because there is no inbound CSMS handler to register: the integrator calls
       `request_ev_certificate` on their client, as with `SignCertificate`.
+
+      **Follow-up (this pass): the capability now propagates.** B4.5 wired the message but left
+      `iso15118_support` out of `CAPABILITY_GATES` — so a station with a real PLC modem declared
+      the capability, sent the message, and still told the CSMS nothing about `ISO15118Ctrlr`,
+      while one without a modem left the component *unknown* rather than honestly unavailable.
+      There is now a gate row (`ctrlr_component: Some("ISO15118Ctrlr")`, `feature_profile_1_6:
+      None` — 1.6J predates Plug & Charge — and `has_handler: false` for the same reason
+      `payment` has it: the message is charge-point-initiated), plus the component's single
+      required variable, `ContractValidationOffline`, in `CAPABILITY_GATED_VARIABLES`. It
+      registers `false`: validating a contract certificate offline needs local X.509 path
+      checking against a V2G trust chain, which is exactly the HLC work living behind
+      `Iso15118Controller`. Its spec `ReadWrite` mutability is kept rather than narrowed, so a
+      CSMS can still configure it for an integrator stack that *can* — refusing the write would
+      report a stack limitation as a spec deviation.
+
+      This is the only gate whose capability is an enum rather than a `bool`, and both non-`None`
+      levels count as support: the level changes what a caller may populate in an
+      `Iso15118CertificateRequest`, not whether the station speaks the message. The keystone C3.5
+      test in `setup.rs` is data-driven over `CAPABILITY_GATES`, so it now covers this row too.
+
+      **Still open, and not code**: `Iso15118Controller` has never been implemented by anything
+      but this crate's own test doubles — see [`docs/RELEASE-1.0.md`](RELEASE-1.0.md) §3 item 3,
+      where that is a hardware-trait-freeze prerequisite, resolvable either by a real HLC
+      integration or by an explicit documented decision that the narrow relay-only scope is final.
 
 ### B5 — Diagnostics and monitoring (R§14)
 
@@ -1471,13 +1501,30 @@ unblocked this block.
       `NotSupportedMessageFormat` up front rather than accepted and failing
       silently on the driver's own screen.
 
+      **Follow-up (this pass): the CSMS can now find that refusal out in advance.**
+      `DisplayMessageCtrlr` owes five required variables and only `DisplayMessages` was
+      registered, so a CSMS had no way to read the format list the paragraph above enforces —
+      it learned the hardware's limits by having a message refused. `SupportedFormats`,
+      `SupportedPriorities`, `SupportedStates` and `Language` now come with the capability.
+      Two of them are software facts this crate can state outright (all three priorities; the
+      four `MessageState` values it models, `Suspended`/`Discharging` deliberately absent because
+      `SetDisplayMessage` refuses them with `NotSupportedState`) and are kept in step with
+      `MessagePriority::ALL`/`MessageState::ALL` by a test rather than by hand.
+      `SupportedFormats` is a hardware fact, so it follows [B7.2](#b7--payment-and-web-payments)'s
+      pattern: registered empty with the capability, overwritten by
+      `ChargePointBuilder::display_messages` from `Display::supported_formats` — the same list
+      the handler enforces, which is the point. `Language` stays empty like
+      `TariffCostCtrlr.Currency`; this crate renders nothing itself and cannot know it.
+      `SupportedStates`/`Language` are 2.1 additions, registered regardless of negotiated version
+      because the device model is version-independent.
+
 ### B7 — Tariff, cost and payment (R§9)
 
 | Message | 2.0.1 | 2.1 |
 |---------|:-----:|:---:|
 | CostUpdated | ✅ | ✅ |
 | SetDefaultTariff / ChangeTransactionTariff / ClearTariffs / GetTariffs | — | ✅ |
-| NotifySettlement / NotifyWebPaymentStarted / VatNumberValidation | — | ⬜ |
+| NotifySettlement / NotifyWebPaymentStarted / VatNumberValidation | — | ✅ |
 
 - [x] **B7.1** Tariff store and per-transaction tariff assignment (2.1).
 

@@ -168,16 +168,45 @@ where
     C: CertificateStore + Sync,
     K: KeyStore + Send + Sync + 'static,
 {
-    let pem = certificate_store
+    // Each of the three failures below surfaces to an integrator as a bare TLS handshake refusal
+    // from the CSMS, with nothing on either side saying which one it was. They are the whole
+    // reason security profile 3 bring-up is painful, so each says so on the way out.
+    let pem = match certificate_store
         .certificate_chain_pem(CertificateUse::ChargingStation)
         .await
-        .map_err(MutualTlsError::Store)?
-        .ok_or(MutualTlsError::NoChargingStationCertificate)?;
+    {
+        Err(error) => {
+            tracing::warn!("the certificate store failed to yield the charging station chain");
+            return Err(MutualTlsError::Store(error));
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "no charging station certificate is installed; mutual TLS (security profile 3) \
+                 cannot be configured until one is"
+            );
+            return Err(MutualTlsError::NoChargingStationCertificate);
+        }
+        Ok(Some(pem)) => pem,
+    };
 
-    let chain = decode_pem_certificates(&pem).ok_or(MutualTlsError::InvalidPem)?;
+    let Some(chain) = decode_pem_certificates(&pem) else {
+        tracing::warn!("the installed charging station certificate chain is not valid PEM");
+        return Err(MutualTlsError::InvalidPem);
+    };
 
-    let scheme = signature_scheme(public_key.algorithm)
-        .ok_or(MutualTlsError::UnsupportedAlgorithm(public_key.algorithm))?;
+    let Some(scheme) = signature_scheme(public_key.algorithm) else {
+        tracing::warn!(
+            algorithm = ?public_key.algorithm,
+            "the key's signature algorithm has no digest implementation in this crate"
+        );
+        return Err(MutualTlsError::UnsupportedAlgorithm(public_key.algorithm));
+    };
+
+    // Captured before `chain` is moved into the resolver below. Worth a field of its own: a chain
+    // of one is the usual sign that the intermediate was never installed, which fails later and
+    // less legibly, at the CSMS.
+    let chain_length = chain.len();
+    let algorithm = public_key.algorithm;
 
     let signing_key: Arc<dyn SigningKey> = Arc::new(KeyStoreSigningKey {
         key_store,
@@ -194,6 +223,11 @@ where
         .with_root_certificates(root_store)
         .with_client_cert_resolver(resolver);
 
+    tracing::info!(
+        chain_length,
+        ?algorithm,
+        "configured mutual TLS from the installed charging station certificate"
+    );
     Ok(Arc::new(config))
 }
 

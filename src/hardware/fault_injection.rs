@@ -286,6 +286,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failing_binding_says_which_call_failed_and_why() {
+        // Faulting the connector is the correct response and was always happening - but the
+        // binding's own error used to be dropped on the floor here, so an integrator chasing a
+        // sticky contactor saw a connector go `Faulted` with nothing anywhere naming the call or
+        // the cause. The state transition is the safety property; this is the diagnosability one.
+        use crate::tracing_test_support::capture_from_future;
+        use tracing::level_filters::LevelFilter;
+
+        let (hardware, _calls) = evses(Fault::CloseContactor);
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let events = HardwareEventSender::new(actor.clone());
+
+        let (capture, ()) = capture_from_future(
+            LevelFilter::WARN,
+            execute_hardware_command(
+                &hardware,
+                HardwareCommand::CloseContactor {
+                    evse_id: 0,
+                    connector_id: 0,
+                },
+                &events,
+            ),
+        )
+        .await;
+
+        let logged = capture.all_text();
+        assert!(
+            logged.contains("CloseContactor"),
+            "the log did not name the failing command: {logged}"
+        );
+        assert!(
+            logged.contains("close_contactor"),
+            "the log did not carry the binding's own error: {logged}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_command_addressed_to_hardware_that_does_not_exist_does_not_panic() {
         // Reachable from a malformed or stale CSMS request, so it must degrade rather than take the
         // process down (G4.1/G4.2).

@@ -49,6 +49,7 @@ pub enum RequestBatterySwapOutcome {
 /// rolls the store entry back - per `CLAUDE.md`, every hardware call is fallible, and a swap
 /// this crate cannot actually help the driver start should not be accepted just because the
 /// bookkeeping succeeded, nor should the store keep an entry the CSMS was just told is rejected.
+#[tracing::instrument(skip_all)]
 pub async fn handle_request_battery_swap<S: BatterySwapStation>(
     actor: &ChargePointActor,
     station: &S,

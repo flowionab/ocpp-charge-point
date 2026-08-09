@@ -182,6 +182,7 @@ pub enum ChangeAvailabilityOutcome {
 /// (charge-point-wide, EVSE, or connector) and accepts. Availability changes apply
 /// synchronously within the actor (unlike e.g. `UnlockConnector`, no hardware round-trip is
 /// needed), so this doesn't need to wait for a confirming state change.
+#[tracing::instrument(skip_all, fields(?target, available))]
 pub async fn handle_change_availability_request(
     actor: &ChargePointActor,
     target: AvailabilityTarget,
@@ -191,6 +192,7 @@ pub async fn handle_change_availability_request(
         AvailabilityTarget::ChargePoint => availability_event(available),
         AvailabilityTarget::Evse { evse_id } => {
             if actor.state().evses.get(evse_id).is_none() {
+                tracing::warn!("refusing ChangeAvailability: no such EVSE");
                 return ChangeAvailabilityOutcome::Rejected;
             }
             ChargePointEvent::Evse {

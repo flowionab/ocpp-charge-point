@@ -100,16 +100,24 @@ either today; see §3 for why.
 | **Advanced User Interface** | **Product** | `display-message`, `tariff-cost` | `hardware::` display surface implied by integrator UX (no dedicated trait beyond message handling — the message handlers exist, but *presenting* a message is the integrator's device) | `SetDisplayMessage`/`GetDisplayMessages`/`ClearDisplayMessage`/`CostUpdated` are wired, but this profile is fundamentally about the driver-visible result, which lives in hardware this crate cannot see. Claimable by a product with a real display; not by the library alone. |
 | **Payment** | **Product** | `payment` | integrator's payment terminal integration (no formal `PaymentTerminal` status-reporting trait yet — `ChargePointBuilder::payment` only seeds identity variables) | 2.1-only. `PaymentCtrlr`'s **live status variables are placeholders**, not driven from a real terminal (confirmed current: `src/payment.rs`'s module docs point at `PaymentCtrlr`'s 22 required variables in `CAPABILITY_GATED_VARIABLES`, and no code path updates them from a live device). A product cannot honestly claim this profile until it wires a real terminal's status into those variables — this is squarely a **blocker**, not a "Product can claim it today" row; see §3. |
 | **DER control** | **Blocked** | `der-control` | *no trait exists that can apply a curve or setpoint* | 2.1-only. The messages (`SetDERControl`/`GetDERControl`/`ClearDERControl`/`ReportDERControl`, `NotifyDERAlarm`/`NotifyDERStartStop`, `AFRRSignal`) are all wired and a CSMS can install a control — but nothing in `crate::hardware` can *act* on it. A charge point running this code faithfully stores and reports a curve it never applies. This is not a "Product" row (an integrator cannot bridge the gap themselves without this crate first exposing a trait to implement) — it is a genuine capability gap. See §3. |
-| **Advanced Device Management** (periodic event streams, variable monitoring) | **Product**, partially **Library** | `periodic-event-stream`, `variable-monitoring` | none beyond base for variable monitoring; `hardware::` telemetry source for periodic streams' actual sampled values | `Open`/`Close`/`Adjust`/`GetPeriodicEventStream`/`NotifyPeriodicEventStream` and `SetVariableMonitoring`/`SetMonitoringBase`/`Level`/`GetMonitoringReport`/`NotifyEvent` are all wired. Variable monitoring is pure device-model bookkeeping this crate owns end to end — **Library**. Periodic event streams report values sourced from wherever the integrator's telemetry lives — **Product**, though the plumbing (the stream lifecycle itself) is this crate's. Note neither is in `CAPABILITY_GATES` yet, so neither is covered by C3.5's cross-surface consistency test — a gap worth closing before claiming either formally. |
+| **Advanced Device Management** (periodic event streams, variable monitoring) | **Product**, partially **Library** | `periodic-event-stream`, `variable-monitoring` | none beyond base for variable monitoring; `hardware::` telemetry source for periodic streams' actual sampled values | `Open`/`Close`/`Adjust`/`GetPeriodicEventStream`/`NotifyPeriodicEventStream` and `SetVariableMonitoring`/`SetMonitoringBase`/`Level`/`GetMonitoringReport`/`NotifyEvent` are all wired. Variable monitoring is pure device-model bookkeeping this crate owns end to end — **Library**. Periodic event streams report values sourced from wherever the integrator's telemetry lives — **Product**, though the plumbing (the stream lifecycle itself) is this crate's. Both now have `CAPABILITY_GATES` rows and are therefore covered by C3.5's cross-surface consistency test (an earlier revision of this document said neither was — that was already stale when written): `variable_monitoring` gates `MonitoringCtrlr` and its handler registration; `periodic_event_stream` gates handler registration only, with `ctrlr_component: None`, because the 2.1 appendix names no component for streams — `MonitoringCtrlr.Available` governs variable monitoring itself, and inventing a second component to advertise would be a claim the spec does not define. |
 | **Advanced Security** (2.x's security profile, the closest 2.x equivalent to 1.6J's Security Whitepaper) | **Blocked as a whole; several sub-claims are Library or Product** | `certificate-management`, `ocsp-checking`, `key-storage` | `hardware::CertificateStore`, `hardware::KeyStore`, `hardware::FirmwareVerifier`, `hardware::OcspChecker` | See §3 — this is the profile with the most moving parts and the most honest caveats. Security profiles 1–3 (transport) are done (F1.1–F1.3, all three modelled and profile 3 — mutual TLS — implemented). Certificate lifecycle messages (`InstallCertificate`/`DeleteCertificate`/`GetInstalledCertificateIds`/`CertificateSigned`/`SignCertificate`) are wired. But firmware signature verification and OCSP both have fail-safe *no-op* defaults (`NoFirmwareVerifier`, `NoOcspChecker`) that an audit would immediately notice unless a real integrator implementation is substituted — see §3. |
 | **Core's optional feature list — Battery Swap** (feature id C-76) | **Product** | `battery-swap` | `hardware::BatterySwapStation` | 2.1-only, not a standalone certification profile — an optional item within Core's feature list per the README's citation. `RequestBatterySwap` is wired; the swap sequencing depends entirely on the station having a real swap mechanism, so this is squarely a **Product** claim, and a niche one (battery-swap stations only). |
 
 ### Not in `CAPABILITY_GATES`, not evaluated as a profile claim
 
-`certificates` and `iso15118` are declared `Capabilities` fields and Cargo features with no
-`CAPABILITY_GATES` row and (for `iso15118`) an admittedly incomplete implementation — see §3's
-ISO 15118 entry. They are not omitted from the tables above by accident; they are omitted because
-there is not yet enough there to evaluate a claim against.
+`certificates` is a declared `Capabilities` field and Cargo feature with no `CAPABILITY_GATES`
+row — not omitted from the tables above by accident, but because there is not yet enough there to
+evaluate a claim against.
+
+`iso15118` **does** have a gate row now (`ISO15118Ctrlr`, `has_handler: false` because every
+message in the block is charge-point-initiated), so its capability propagates to the device model
+like every other block's: a station declaring `Iso15118SupportLevel::Iso15118_2`/`_20` reports
+`ISO15118Ctrlr.Available: true` and the component's one required variable
+(`ContractValidationOffline`, registered `false`), and one declaring `None` reports
+`Available: false` and nothing else. That closes the *advertisement* half of the gap. It does not
+close §3's ISO 15118 entry, which is about the HLC stack this crate does not ship — the reason
+Plug & Charge still isn't ranked as a claim below.
 
 ---
 
@@ -199,10 +207,11 @@ class table) the claim unlocks.
    does. Cheap for a product that already has firmware-signing infrastructure (most do, for
    non-OCPP reasons); expensive for one that doesn't.
 5. **Variable Monitoring** (the Library-claimable half of Advanced Device Management). Fully
-   wired and self-contained, but currently outside `CAPABILITY_GATES` and therefore outside
-   C3.5's consistency test — recommend closing that gap (a small, additive `CAPABILITY_GATES` row
-   and test coverage) before including it in a formal claim, so the claim rests on the same
-   verified-consistency footing as Reservation/Smart Charging/Local Auth List do.
+   wired and self-contained. The prerequisite this entry originally named — a `CAPABILITY_GATES`
+   row so the claim rests on C3.5's verified-consistency footing rather than on inspection — is
+   **already met**: `variable_monitoring` gates `MonitoringCtrlr` and its handler registration,
+   and C4.3 made that registration runtime-gated to match. On the evidence, this belongs with the
+   "pursue first" group above; it is left here only because nothing has re-ranked the list since.
 
 ### Do not claim yet — and why
 

@@ -148,6 +148,7 @@ pub enum ClearCacheOutcome {
 /// Accepted even when the cache was already empty - the CSMS asked for "no cached decisions", and
 /// that is the resulting state either way. Rejected only when caching is switched off entirely,
 /// where accepting would imply this charge point has a cache it is keeping clear.
+#[tracing::instrument(skip_all)]
 pub async fn handle_clear_cache(actor: &ChargePointActor) -> ClearCacheOutcome {
     let state = actor.state();
     if !boolean_variable(&state, "AuthCacheCtrlr", "Enabled", true) {

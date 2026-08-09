@@ -31,8 +31,20 @@ pub async fn execute_hardware_command<E: Evse<C>, C: Connector>(
 ) {
     if let HardwareCommand::Reboot { evse_id } = command {
         let failed = match evses.get(evse_id) {
-            Some(evse) => evse.reboot().await.is_err(),
-            None => true,
+            Some(evse) => match evse.reboot().await {
+                Ok(()) => false,
+                Err(error) => {
+                    tracing::warn!(evse_id, %error, "the EVSE failed to reboot; faulting it");
+                    true
+                }
+            },
+            None => {
+                tracing::error!(
+                    evse_id,
+                    "the state machine asked to reboot an EVSE the hardware does not have"
+                );
+                true
+            }
         };
         if failed {
             let _ = events
@@ -48,35 +60,70 @@ pub async fn execute_hardware_command<E: Evse<C>, C: Connector>(
     let (evse_id, connector_id) = command_address(command);
     let event = match evses.get(evse_id) {
         Some(evse) => match evse.connectors().await.get(connector_id) {
-            Some(connector) => match command {
-                HardwareCommand::LockConnector { .. } => connector
-                    .lock()
-                    .await
-                    .map(|()| ConnectorEvent::LockConfirmed),
-                HardwareCommand::UnlockConnector { .. } => connector
-                    .unlock()
-                    .await
-                    .map(|()| ConnectorEvent::UnlockConfirmed),
-                HardwareCommand::CloseContactor { .. } => connector
-                    .close_contactor()
-                    .await
-                    .map(|()| ConnectorEvent::ContactorClosed),
-                HardwareCommand::OpenContactor { .. } => connector
-                    .open_contactor()
-                    .await
-                    .map(|()| ConnectorEvent::ContactorOpened),
-                HardwareCommand::SetCurrentLimit { limit_ma, .. } => connector
-                    .set_current_limit(limit_ma)
-                    .await
-                    .map(|()| ConnectorEvent::CurrentLimitConfirmed(limit_ma)),
-                HardwareCommand::Reboot { .. } => {
-                    unreachable!("Reboot is handled and returned above")
+            Some(connector) => {
+                let outcome = match command {
+                    HardwareCommand::LockConnector { .. } => connector
+                        .lock()
+                        .await
+                        .map(|()| ConnectorEvent::LockConfirmed),
+                    HardwareCommand::UnlockConnector { .. } => connector
+                        .unlock()
+                        .await
+                        .map(|()| ConnectorEvent::UnlockConfirmed),
+                    HardwareCommand::CloseContactor { .. } => connector
+                        .close_contactor()
+                        .await
+                        .map(|()| ConnectorEvent::ContactorClosed),
+                    HardwareCommand::OpenContactor { .. } => connector
+                        .open_contactor()
+                        .await
+                        .map(|()| ConnectorEvent::ContactorOpened),
+                    HardwareCommand::SetCurrentLimit { limit_ma, .. } => connector
+                        .set_current_limit(limit_ma)
+                        .await
+                        .map(|()| ConnectorEvent::CurrentLimitConfirmed(limit_ma)),
+                    HardwareCommand::Reboot { .. } => {
+                        unreachable!("Reboot is handled and returned above")
+                    }
+                };
+                match outcome {
+                    Ok(event) => event,
+                    Err(error) => {
+                        // Faulting the connector is the right response and was already happening;
+                        // what was missing is *why*. The binding's error was dropped on the floor
+                        // here, so an integrator debugging a sticky contactor saw a connector go
+                        // `Faulted` with nothing anywhere saying which call failed.
+                        tracing::warn!(
+                            evse_id,
+                            connector_id,
+                            command = ?command,
+                            %error,
+                            "a hardware binding call failed; faulting the connector"
+                        );
+                        ConnectorEvent::FaultDetected
+                    }
                 }
             }
-            .unwrap_or(ConnectorEvent::FaultDetected),
-            None => ConnectorEvent::FaultDetected,
+            // Not a hardware fault but a firmware one: the state machine's topology and the
+            // hardware's disagree, and every command addressed here will keep failing.
+            None => {
+                tracing::error!(
+                    evse_id,
+                    connector_id,
+                    command = ?command,
+                    "the state machine addressed a connector this EVSE does not have"
+                );
+                ConnectorEvent::FaultDetected
+            }
         },
-        None => ConnectorEvent::FaultDetected,
+        None => {
+            tracing::error!(
+                evse_id,
+                command = ?command,
+                "the state machine addressed an EVSE the hardware does not have"
+            );
+            ConnectorEvent::FaultDetected
+        }
     };
 
     let _ = events

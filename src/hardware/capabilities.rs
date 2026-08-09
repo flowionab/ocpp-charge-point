@@ -397,6 +397,27 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         has_handler: false,
     },
     CapabilityGate {
+        name: "iso15118_support",
+        cargo_feature: "iso15118",
+        // The only row whose capability is an enum rather than a bool: both levels are support.
+        // Which one is declared changes what an `Iso15118CertificateRequest`'s caller may
+        // populate, not whether this charge point sends `Get15118EVCertificate` at all - see
+        // `crate::iso15118`'s capability-gating docs.
+        enabled: |c| c.iso15118_support != Iso15118SupportLevel::None,
+        // `ISO15118Ctrlr` is a real, spec-named component (2.1 Part 2 §2.15,
+        // `docs/OCPP-2.1/Appendices_CSV_v2.1/dm_components_vars.csv`) with exactly one required
+        // variable - see `crate::device_model`'s `CAPABILITY_GATED_VARIABLES`.
+        ctrlr_component: Some("ISO15118Ctrlr"),
+        // 1.6J predates ISO 15118 Plug & Charge entirely, so there is no profile to advertise -
+        // not merely a differently-named one.
+        feature_profile_1_6: None,
+        // `false`, and for the same reason as `payment`: every message in this block is sent *by*
+        // the charge point. There is no `ChargePointBuilder` registration either - the
+        // integrator's HLC stack calls `Iso15118CertificateRequester::request_ev_certificate`
+        // directly, passing its own `hardware::Iso15118Controller` per call.
+        has_handler: false,
+    },
+    CapabilityGate {
         name: "ocsp_checking",
         cargo_feature: "ocsp-checking",
         enabled: |c| c.ocsp_checking,
@@ -863,5 +884,35 @@ mod tests {
         assert!(!(gate.enabled)(&cert_store_only));
         let ocsp_only = Capabilities::default().with_ocsp_checking(true);
         assert!(!ocsp_only.certificate_management);
+    }
+
+    #[test]
+    fn iso15118_is_registered_in_the_capability_gate_table() {
+        let gate = CAPABILITY_GATES
+            .iter()
+            .find(|gate| gate.name == "iso15118_support")
+            .expect("B4.5 must register a CAPABILITY_GATES row for iso15118_support");
+        assert_eq!(gate.cargo_feature, "iso15118");
+        assert_eq!(gate.ctrlr_component, Some("ISO15118Ctrlr"));
+        // 1.6J predates ISO 15118 Plug & Charge entirely - there is no feature profile to list.
+        assert_eq!(gate.feature_profile_1_6, None);
+        // Charge-point-initiated, like `payment`: `Get15118EVCertificate` is sent *by* this
+        // charge point, so there is no inbound handler for the capability to gate.
+        assert!(!gate.has_handler);
+
+        // The only gate whose capability is an enum rather than a bool: *both* support levels
+        // are support. Which one is declared changes what the caller populates in an
+        // `Iso15118CertificateRequest`, not whether this charge point speaks the message at all
+        // (see `crate::iso15118`'s module docs).
+        for level in [
+            Iso15118SupportLevel::Iso15118_2,
+            Iso15118SupportLevel::Iso15118_20,
+        ] {
+            assert!(
+                (gate.enabled)(&Capabilities::default().with_iso15118_support(level)),
+                "{level:?} is ISO 15118 support"
+            );
+        }
+        assert!(!(gate.enabled)(&Capabilities::default()));
     }
 }

@@ -2456,6 +2456,34 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         D: crate::hardware::Display + Send + Sync + 'static,
     {
         let supported_formats = display.supported_formats().to_vec();
+        // The same list the handler enforces, told to the CSMS: `DisplayMessageCtrlr.
+        // SupportedFormats` was registered empty with the capability (see
+        // `crate::device_model`'s `CAPABILITY_GATED_VARIABLES`) because only the hardware knows
+        // what it can render. A CSMS reading the placeholder would compose messages that
+        // `handle_set_display_message` then refuses with `NotSupportedMessageFormat`.
+        let _ = self
+            .runtime
+            .actor()
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: Component {
+                        name: "DisplayMessageCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: Variable {
+                        name: "SupportedFormats".into(),
+                        instance: None,
+                    },
+                    attribute_type: VariableAttributeType::Actual,
+                    value: supported_formats
+                        .iter()
+                        .map(|format| format.name())
+                        .collect::<alloc::vec::Vec<_>>()
+                        .join(","),
+                },
+            ))
+            .await;
         csms.register_set_display_message_handler(self.runtime.actor(), supported_formats)
             .await;
         csms.register_get_display_messages_handler(self.runtime.actor())
@@ -3032,6 +3060,119 @@ mod tests {
         assert_eq!(
             runtime.state().registration,
             Some(RegistrationStatus::Accepted)
+        );
+    }
+
+    /// A CSMS implementing only the Display Message block's three registration traits, all no-ops:
+    /// this fixture exists to reach [`ChargePointBuilder::display_messages`], whose device-model
+    /// side effect is what the test below observes, not to exercise any inbound handling.
+    #[cfg(feature = "display-message")]
+    #[derive(Clone)]
+    struct DisplayOnlyCsms;
+
+    #[cfg(feature = "display-message")]
+    #[async_trait::async_trait]
+    impl crate::display_message::SetDisplayMessageHandler for DisplayOnlyCsms {
+        async fn register_set_display_message_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+            _supported_formats: alloc::vec::Vec<crate::state::MessageFormat>,
+        ) {
+        }
+    }
+
+    #[cfg(feature = "display-message")]
+    #[async_trait::async_trait]
+    impl crate::display_message::GetDisplayMessagesHandler for DisplayOnlyCsms {
+        async fn register_get_display_messages_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    #[cfg(feature = "display-message")]
+    #[async_trait::async_trait]
+    impl crate::display_message::ClearDisplayMessageHandler for DisplayOnlyCsms {
+        async fn register_clear_display_message_handler(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+        ) {
+        }
+    }
+
+    /// A [`crate::hardware::Display`] that renders nothing but reports a real, restricted format
+    /// list - the case that matters, since a screen that can do plain text but not HTML is the
+    /// normal one.
+    #[cfg(feature = "display-message")]
+    struct TwoFormatDisplay;
+
+    #[cfg(feature = "display-message")]
+    #[async_trait::async_trait]
+    impl crate::hardware::Display for TwoFormatDisplay {
+        type Error = core::convert::Infallible;
+
+        async fn show(
+            &self,
+            _message: Option<&crate::state::DisplayedMessage>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn supported_formats(&self) -> &[crate::state::MessageFormat] {
+            &[
+                crate::state::MessageFormat::Ascii,
+                crate::state::MessageFormat::Utf8,
+            ]
+        }
+    }
+
+    /// `DisplayMessageCtrlr.SupportedFormats` is a *hardware* fact, so - like `PaymentCtrlr`'s
+    /// identity variables - the empty placeholder registered with the capability is overwritten
+    /// from the real `Display` when one is registered. A CSMS that reads it must learn the same
+    /// list `handle_set_display_message` will enforce, or it composes messages that are then
+    /// refused with `NotSupportedMessageFormat`.
+    #[cfg(feature = "display-message")]
+    #[tokio::test]
+    async fn registering_a_display_advertises_the_formats_it_can_actually_render() {
+        let (charge_point, _locked) = test_charge_point(true);
+        let charge_point = super::test_support::WithCapabilities {
+            inner: charge_point,
+            capabilities: crate::hardware::Capabilities {
+                has_display: true,
+                ..Default::default()
+            },
+        };
+
+        let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap()
+            .display_messages(&DisplayOnlyCsms, TwoFormatDisplay)
+            .await
+            .build();
+
+        let state = runtime.state();
+        let definition = state
+            .device_model
+            .get(
+                &crate::state::Component {
+                    name: "DisplayMessageCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                &crate::state::Variable {
+                    name: "SupportedFormats".into(),
+                    instance: None,
+                },
+            )
+            .expect("DisplayMessageCtrlr.SupportedFormats should be registered with `has_display`");
+
+        assert_eq!(
+            definition
+                .attribute(crate::state::VariableAttributeType::Actual)
+                .unwrap()
+                .value,
+            "ASCII,UTF8",
         );
     }
 

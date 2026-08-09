@@ -52,6 +52,7 @@ pub enum SetDefaultTariffOutcome {
 /// the outcome is decided against the real state (via a trial install on a clone of the store)
 /// before anything is dispatched, so the status the CSMS receives is what actually happened -
 /// mirrors `crate::smart_charging::handle_set_charging_profile`.
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_default_tariff(
     actor: &ChargePointActor,
     scope: TariffScope,
@@ -115,6 +116,7 @@ fn find_transaction(
 
 /// Handles a CSMS-initiated `ChangeTransactionTariff` against `actor`: finds the connector whose
 /// active transaction is `transaction_id` and assigns `tariff` to it as a driver tariff.
+#[tracing::instrument(skip_all)]
 pub async fn handle_change_transaction_tariff(
     actor: &ChargePointActor,
     transaction_id: TransactionId,
@@ -173,6 +175,7 @@ pub struct TariffClearOutcome {
 /// [`crate::refusal::capability_present`] itself - `ClearTariffsResponse` has no top-level status
 /// field to refuse through, so that check belongs to the wire adapter, which answers a CALLERROR
 /// instead (mirrors `crate::cost::ocpp_2_1::handle`).
+#[tracing::instrument(skip_all)]
 pub async fn handle_clear_tariffs(
     actor: &ChargePointActor,
     scope: Option<TariffScope>,

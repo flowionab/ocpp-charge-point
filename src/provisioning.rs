@@ -189,8 +189,18 @@ pub async fn register_until_accepted<N: BootNotifier, B: Backoff, M: MonotonicCl
                     sync_time(actor, monotonic, csms_time).await;
                 }
                 if outcome.status == RegistrationStatus::Accepted {
+                    tracing::info!("the CSMS accepted this charge point's registration");
                     return outcome;
                 }
+                // A CSMS that answers `Pending` or `Rejected` indefinitely - because the station
+                // was never provisioned in it, or was provisioned under a different identity - is
+                // one of the most common commissioning dead ends, and this loop used to sit in it
+                // silently: only a *transport* failure said anything.
+                tracing::warn!(
+                    status = ?outcome.status,
+                    retry_in_secs = outcome.interval_secs,
+                    "the CSMS has not accepted this charge point's registration; retrying"
+                );
                 backoff.wait(outcome.interval_secs).await;
             }
             Err(err) => {

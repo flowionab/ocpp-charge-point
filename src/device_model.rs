@@ -56,11 +56,13 @@ struct CapabilityGatedVariable {
 /// configuration for a block it cannot run.
 ///
 /// `PaymentCtrlr` (B7.2) owns 22 of those required rows and is registered below, gated by
-/// [`crate::hardware::Capabilities::payment`]. Components whose blocks still don't exist at all -
-/// `WebPaymentsCtrlr`, `DCDERCtrlr`/`ACDERCtrlr`, `V2XChargingCtrlr`, `ISO15118Ctrlr`,
-/// `NetworkConfiguration` - own the remaining 34 of the appendix's 122 required rows between them
-/// and appear nowhere here. That is the same rule applied consistently, not an omission: their
-/// capabilities are `false`, so nothing is owed.
+/// [`crate::hardware::Capabilities::payment`]; `ISO15118Ctrlr` owns exactly one (B4.5), gated by
+/// [`crate::hardware::Capabilities::iso15118_support`] being anything but
+/// [`Iso15118SupportLevel::None`](crate::hardware::Iso15118SupportLevel::None). Components whose
+/// blocks still don't exist at all - `WebPaymentsCtrlr`, `DCDERCtrlr`/`ACDERCtrlr`,
+/// `V2XChargingCtrlr`, `NetworkConfiguration` - own the remaining 34 of the appendix's 122
+/// required rows between them and appear nowhere here. That is the same rule applied
+/// consistently, not an omission: their capabilities are `false`, so nothing is owed.
 const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
     CapabilityGatedVariable {
         component: "LocalAuthListCtrlr",
@@ -147,6 +149,58 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // known gap; see `docs/PRODUCTION-ROADMAP.md`.
         value: "0",
         mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DisplayMessageCtrlr",
+        variable: "SupportedFormats",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        // Empty until a `hardware::Display` is registered, then overwritten with what that screen
+        // can really render - `ChargePointBuilder::display_messages` does it, the same way
+        // `ChargePointBuilder::payment` fills `PaymentCtrlr`'s identity. Empty is also the honest
+        // answer for a charge point that never registers one: `NoDisplay::supported_formats` is
+        // empty too, and `handle_set_display_message` refuses every format against it.
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DisplayMessageCtrlr",
+        variable: "SupportedPriorities",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        // All three, and unlike `SupportedFormats` this is a *software* fact:
+        // `crate::display_message::current_message` implements the whole priority ordering
+        // itself, with no help from the screen. Kept in step with `MessagePriority::ALL` by a
+        // test in this module.
+        value: "AlwaysFront,InFront,NormalCycle",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DisplayMessageCtrlr",
+        variable: "SupportedStates",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        // `SupportedStates` and `Language` below are new in 2.1 and not required by 2.0.1; both
+        // are registered unconditionally because the device model is protocol-version-independent
+        // (`CLAUDE.md`) and a 2.0.1 CSMS simply sees a variable it did not ask about.
+        //
+        // The four states `MessageState` models. 2.1's `Suspended`/`Discharging` are absent
+        // because a `SetDisplayMessage` naming one is refused with `NotSupportedState` - saying
+        // so here is what lets a CSMS find that out before sending it. Kept in step with
+        // `MessageState::ALL` by a test in this module.
+        value: "Charging,Faulted,Idle,Unavailable",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DisplayMessageCtrlr",
+        variable: "Language",
+        instance: None,
+        data_type: VariableDataType::OptionList,
+        // Empty rather than guessed, exactly like `TariffCostCtrlr.Currency` below: this crate
+        // renders nothing itself and has no way to know what language the integrator's screen is
+        // set to. `ReadWrite` per the spec, so a CSMS can configure the default.
+        value: "",
+        mutability: VariableMutability::ReadWrite,
     },
     CapabilityGatedVariable {
         component: "TariffCostCtrlr",
@@ -364,6 +418,27 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Boolean,
         value: "false",
         mutability: VariableMutability::ReadOnly,
+    },
+    // `ISO15118Ctrlr`'s single required variable (B4.5), gated by
+    // `Capabilities::iso15118_support`. The appendix lists sixteen more for this component
+    // (`SeccId`, `PnCEnabled`, `ProtocolSupported`, ...) and every one of them is optional and
+    // describes the *HLC stack*, which lives behind `hardware::Iso15118Controller` rather than in
+    // this crate - registering guesses at them would advertise a session state machine this crate
+    // does not own (see `crate::iso15118`'s "what this crate does and does not do").
+    CapabilityGatedVariable {
+        component: "ISO15118Ctrlr",
+        variable: "ContractValidationOffline",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        // `false`, and defensibly so: validating a contract certificate while offline means
+        // parsing and path-checking it locally, which needs the HLC stack and a V2G trust chain
+        // this crate has neither of - it forwards the EXI blob to the CSMS and relays the answer
+        // back. An integrator whose controller *can* do it has the CSMS flip this on, which is
+        // why the spec's `ReadWrite` mutability is kept rather than narrowed to `ReadOnly`:
+        // OCPP 2.1 Part 2 §2.15.3 defines it as a configuration variable, and a station that
+        // refused the write would misreport a stack limitation as a spec deviation.
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
     },
 ];
 
@@ -584,6 +659,7 @@ pub enum SetVariableOutcome {
 /// [`crate::state::DeviceModelEvent::AttributeValueSet`]) before moving on to the next, so a
 /// later item in the same batch already observes an earlier one's effect (e.g. writing the same
 /// attribute twice in one request applies both, in order).
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_variables(
     actor: &ChargePointActor,
     requests: Vec<SetVariableRequest>,
@@ -722,6 +798,126 @@ mod tests {
             1,
             "only TariffCostCtrlr.Available - a build without tariff support owes no tariff \
              configuration"
+        );
+    }
+
+    /// `DisplayMessageCtrlr` owes five required variables, not one: B1.7 registered
+    /// `DisplayMessages` and 2.1 added `SupportedStates`/`Language` to the three
+    /// `Supported*` lists a CSMS needs before it can compose a `SetDisplayMessage` this charge
+    /// point will accept.
+    #[test]
+    fn every_required_display_message_variable_arrives_with_the_capability() {
+        use super::capability_gate_events;
+        use crate::hardware::Capabilities;
+        use crate::state::{ChargePointEvent, DeviceModelEvent};
+
+        let registered: alloc::vec::Vec<String> = capability_gate_events(&Capabilities {
+            has_display: true,
+            ..Capabilities::default()
+        })
+        .into_iter()
+        .filter_map(|event| match event {
+            ChargePointEvent::DeviceModel(DeviceModelEvent::VariableRegistered {
+                component,
+                variable,
+                ..
+            }) if component.name == "DisplayMessageCtrlr" => Some(variable.name),
+            _ => None,
+        })
+        .collect();
+
+        for required in [
+            "DisplayMessages",
+            "SupportedFormats",
+            "SupportedPriorities",
+            "SupportedStates",
+            "Language",
+        ] {
+            assert!(
+                registered.iter().any(|name| name == required),
+                "DisplayMessageCtrlr.{required} is required by the 2.1 appendix and should \
+                 arrive with `has_display`, got {registered:?}"
+            );
+        }
+    }
+
+    /// The `Supported*` member lists must name exactly what this crate models - a hand-written
+    /// string that drifts from the enum would advertise a state or priority a
+    /// `SetDisplayMessage` is then refused for (or, worse, hide one that works).
+    #[test]
+    fn the_supported_member_lists_match_what_this_crate_models() {
+        use crate::state::{MessagePriority, MessageState};
+
+        let value = |variable: &str| {
+            super::CAPABILITY_GATED_VARIABLES
+                .iter()
+                .find(|entry| {
+                    entry.component == "DisplayMessageCtrlr" && entry.variable == variable
+                })
+                .unwrap_or_else(|| panic!("DisplayMessageCtrlr.{variable} should be registered"))
+                .value
+        };
+
+        assert_eq!(
+            value("SupportedPriorities"),
+            MessagePriority::ALL
+                .iter()
+                .map(|priority| priority.name())
+                .collect::<alloc::vec::Vec<_>>()
+                .join(","),
+        );
+        assert_eq!(
+            value("SupportedStates"),
+            MessageState::ALL
+                .iter()
+                .map(|state| state.name())
+                .collect::<alloc::vec::Vec<_>>()
+                .join(","),
+        );
+    }
+
+    /// B1.7's rule applied to the one capability that is an *enum* rather than a bool: either
+    /// ISO 15118 support level brings `ISO15118Ctrlr`'s required configuration,
+    /// `Iso15118SupportLevel::None` brings none of it - see `crate::iso15118`'s capability-gating
+    /// docs for why the level does not change the answer.
+    #[test]
+    fn iso15118_required_variables_arrive_with_either_support_level() {
+        use super::capability_gate_events;
+        use crate::hardware::{Capabilities, Iso15118SupportLevel};
+        use crate::state::{ChargePointEvent, DeviceModelEvent};
+
+        let registered = |level: Iso15118SupportLevel| -> alloc::vec::Vec<(String, String)> {
+            capability_gate_events(&Capabilities::default().with_iso15118_support(level))
+                .into_iter()
+                .filter_map(|event| match event {
+                    ChargePointEvent::DeviceModel(DeviceModelEvent::VariableRegistered {
+                        component,
+                        variable,
+                        ..
+                    }) => Some((component.name, variable.name)),
+                    _ => None,
+                })
+                .filter(|(component, _)| component == "ISO15118Ctrlr")
+                .collect()
+        };
+
+        for level in [
+            Iso15118SupportLevel::Iso15118_2,
+            Iso15118SupportLevel::Iso15118_20,
+        ] {
+            assert!(
+                registered(level)
+                    .iter()
+                    .any(|(_, name)| name == "ContractValidationOffline"),
+                "ISO15118Ctrlr.ContractValidationOffline should arrive with {level:?}"
+            );
+        }
+
+        // No support declared: `Available: false` and nothing else - a charge point with no PLC
+        // modem owes no ISO 15118 configuration.
+        assert_eq!(
+            registered(Iso15118SupportLevel::None),
+            alloc::vec![("ISO15118Ctrlr".to_string(), "Available".to_string())],
         );
     }
 

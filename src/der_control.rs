@@ -113,6 +113,7 @@ pub enum SetDERControlOutcome {
 /// Validation happens against a copy of the live store, so the CSMS's status reflects the real
 /// [`max_der_controls`](crate::state::StateLimits::max_der_controls) bound. Only a control that
 /// would actually install is dispatched.
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_der_control(
     actor: &ChargePointActor,
     control: InstalledDERControl,
@@ -148,6 +149,7 @@ pub enum QueryOutcome {
 
 /// Handles a CSMS-initiated `ClearDERControl` against `actor`. Reports [`QueryOutcome::NotFound`]
 /// when the query matches nothing, so a CSMS can tell "cleared" from "there was nothing to clear".
+#[tracing::instrument(skip_all)]
 pub async fn handle_clear_der_control(
     actor: &ChargePointActor,
     query: DERControlQuery,
@@ -226,6 +228,7 @@ pub enum AfrrSignalOutcome {
 
 /// Handles a CSMS-initiated `AFRRSignal` against `actor`, recording it as the charge point's
 /// latest known signal - see [`crate::state::AfrrSignal`].
+#[tracing::instrument(skip_all)]
 pub async fn handle_afrr_signal(
     actor: &ChargePointActor,
     signal: i64,
@@ -259,6 +262,7 @@ pub enum NotifyAllowedEnergyTransferOutcome {
 /// shape of the request: the named transaction id must at least parse. A future negotiation layer
 /// is the right place to remember *which* modes were allowed for *which* transaction; this handler
 /// only answers honestly that the message arrived.
+#[tracing::instrument(skip_all)]
 pub async fn handle_notify_allowed_energy_transfer(
     actor: &ChargePointActor,
     transaction_id: &str,

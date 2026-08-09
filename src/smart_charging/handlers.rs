@@ -59,6 +59,7 @@ pub struct SetChargingProfileRejection {
 /// `Absolute` schedule with no start means "from when you received this", and the receiving
 /// adapter is the only place that knows when that was - see
 /// [`schedule_anchor`](crate::smart_charging) for what happens without it.
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_charging_profile(
     actor: &ChargePointActor,
     scope: ChargingProfileScope,
@@ -154,6 +155,7 @@ pub enum ClearChargingProfileOutcome {
 
 /// Handles a CSMS-initiated `ClearChargingProfile` against `actor`. Reports `Unknown` when the
 /// criteria match nothing, so a CSMS can tell "cleared" from "there was nothing to clear".
+#[tracing::instrument(skip_all)]
 pub async fn handle_clear_charging_profile(
     actor: &ChargePointActor,
     criteria: ChargingProfileCriteria,
@@ -189,6 +191,7 @@ pub enum GetCompositeScheduleOutcome {
 /// OCPP addresses this at EVSE granularity, so the composite is computed for that EVSE's first
 /// connector; on a multi-connector EVSE the connectors share the EVSE's profiles, and what differs
 /// between them (which transaction is running) is a distinction OCPP's request cannot express.
+#[tracing::instrument(skip_all)]
 pub async fn handle_get_composite_schedule<C: Clock>(
     actor: &ChargePointActor,
     projection: &ChargingLimitProjection,
@@ -266,6 +269,7 @@ pub enum UsePriorityChargingOutcome {
 /// priority profile is still installed - the profile may have been cleared while the grant stood -
 /// and answering `NoProfile` would leave the CSMS believing a transaction still holds a priority
 /// it does not.
+#[tracing::instrument(skip_all)]
 pub async fn handle_use_priority_charging(
     actor: &ChargePointActor,
     transaction_id: crate::state::TransactionId,
@@ -347,6 +351,7 @@ pub enum UpdateDynamicScheduleOutcome {
 /// Shared by both directions on purpose: a limit the CSMS pushed and a limit the charge point
 /// pulled are the same change to the same profile, and OCPP requires the same immediate
 /// application of both. Only the message that carried it differs.
+#[tracing::instrument(skip_all)]
 pub async fn handle_update_dynamic_schedule(
     actor: &ChargePointActor,
     profile_id: crate::state::ChargingProfileId,

@@ -417,6 +417,157 @@ pub enum ChargePointEvent {
     BatterySwapReported(BatterySwapEvent),
 }
 
+impl ChargePointEvent {
+    /// The event's variant name, as a low-cardinality `&'static str` suitable for a `tracing`
+    /// field.
+    ///
+    /// Logging `event = %event.name()` rather than `event = ?event` is the difference between a
+    /// log a field engineer can filter and aggregate and one that dumps a full payload - which on
+    /// an MCU is most of the cost of having logs at all. Use this for the routine per-event line
+    /// and reserve `{:?}` for `TRACE`, where the payload is the point.
+    ///
+    /// The match is exhaustive with no wildcard arm on purpose: a new variant is a compile error
+    /// here, so an event cannot start flowing through the actor while logging as something else.
+    ///
+    /// [`Self::Evse`] delegates to the EVSE's - and in turn the connector's - own name, because
+    /// almost everything worth reading in a charge point's log is nested inside it: a log full of
+    /// `event=Evse` would name the envelope and hide the cable, the card and the contactor. Pair
+    /// this with [`evse_id`](Self::evse_id)/[`connector_id`](Self::connector_id) to say which
+    /// connector it happened on.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Evse { event, .. } => event.name(),
+            Self::BootCompleted { .. } => "BootCompleted",
+            Self::SetAvailable { .. } => "SetAvailable",
+            Self::SetUnavailable { .. } => "SetUnavailable",
+            Self::HardwareFault { .. } => "HardwareFault",
+            Self::FaultCleared { .. } => "FaultCleared",
+            Self::RegistrationStatusReceived { .. } => "RegistrationStatusReceived",
+            Self::LocalListUpdated { .. } => "LocalListUpdated",
+            Self::SecurityEventOccurred { .. } => "SecurityEventOccurred",
+            Self::ResetRequested { .. } => "ResetRequested",
+            Self::NetworkProfileSet { .. } => "NetworkProfileSet",
+            Self::PersistedNetworkProfilesRestored { .. } => "PersistedNetworkProfilesRestored",
+            Self::AuthorizationCached { .. } => "AuthorizationCached",
+            Self::AuthorizationCacheCleared { .. } => "AuthorizationCacheCleared",
+            Self::PersistedAuthorizationCacheRestored { .. } => {
+                "PersistedAuthorizationCacheRestored"
+            }
+            Self::ChargingProfileSet { .. } => "ChargingProfileSet",
+            Self::ChargingProfilesCleared { .. } => "ChargingProfilesCleared",
+            Self::DefaultTariffSet { .. } => "DefaultTariffSet",
+            Self::TariffsCleared { .. } => "TariffsCleared",
+            Self::PeriodicEventStreamOpened { .. } => "PeriodicEventStreamOpened",
+            Self::PeriodicEventStreamClosed { .. } => "PeriodicEventStreamClosed",
+            Self::PeriodicEventStreamAdjusted { .. } => "PeriodicEventStreamAdjusted",
+            Self::DynamicScheduleUpdated { .. } => "DynamicScheduleUpdated",
+            Self::PriorityChargingSet { .. } => "PriorityChargingSet",
+            Self::DeviceModel { .. } => "DeviceModel",
+            Self::DERControlSet { .. } => "DERControlSet",
+            Self::DERControlsCleared { .. } => "DERControlsCleared",
+            Self::AfrrSignalReceived { .. } => "AfrrSignalReceived",
+            Self::CapabilitiesDeclared { .. } => "CapabilitiesDeclared",
+            Self::PersistedTransactionsRestored { .. } => "PersistedTransactionsRestored",
+            Self::TimeSynced { .. } => "TimeSynced",
+            Self::PersistedLocalAuthorizationListRestored { .. } => {
+                "PersistedLocalAuthorizationListRestored"
+            }
+            Self::PersistedReservationsRestored { .. } => "PersistedReservationsRestored",
+            Self::PersistedDeviceModelAttributesRestored { .. } => {
+                "PersistedDeviceModelAttributesRestored"
+            }
+            Self::PersistedChargingProfilesRestored { .. } => "PersistedChargingProfilesRestored",
+            Self::CustomerInformationErased { .. } => "CustomerInformationErased",
+            Self::DisplayMessageSet { .. } => "DisplayMessageSet",
+            Self::DisplayMessageCleared { .. } => "DisplayMessageCleared",
+            Self::ExternalChargingLimitSet { .. } => "ExternalChargingLimitSet",
+            Self::ExternalChargingLimitCleared { .. } => "ExternalChargingLimitCleared",
+            Self::VariableMonitoring { .. } => "VariableMonitoring",
+            Self::BatterySwapRequested { .. } => "BatterySwapRequested",
+            Self::BatterySwapCancelled { .. } => "BatterySwapCancelled",
+            Self::BatterySwapReported { .. } => "BatterySwapReported",
+        }
+    }
+
+    /// The EVSE this event addresses, if it addresses one. `None` for charge-point-wide events.
+    ///
+    /// Logged alongside [`name`](Self::name) so a site with several EVSEs can be read one EVSE at
+    /// a time.
+    pub fn evse_id(&self) -> Option<usize> {
+        match self {
+            Self::Evse { evse_id, .. } => Some(*evse_id),
+            _ => None,
+        }
+    }
+
+    /// The connector this event addresses, if it addresses one. `None` for EVSE-wide and
+    /// charge-point-wide events.
+    pub fn connector_id(&self) -> Option<usize> {
+        match self {
+            Self::Evse {
+                event: EvseEvent::Connector { connector_id, .. },
+                ..
+            } => Some(*connector_id),
+            _ => None,
+        }
+    }
+}
+
+impl EvseEvent {
+    /// The event's variant name for `tracing`, delegating to the connector's own name for
+    /// [`Self::Connector`]. See [`ChargePointEvent::name`].
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Connector { event, .. } => event.name(),
+            Self::SetAvailable { .. } => "EvseSetAvailable",
+            Self::SetUnavailable { .. } => "EvseSetUnavailable",
+            Self::FaultDetected { .. } => "EvseFaultDetected",
+            Self::FaultCleared { .. } => "EvseFaultCleared",
+            Self::EVChargingNeedsReported { .. } => "EVChargingNeedsReported",
+            Self::EVChargingScheduleReported { .. } => "EVChargingScheduleReported",
+        }
+    }
+}
+
+impl ConnectorEvent {
+    /// The event's variant name for `tracing`. See [`ChargePointEvent::name`].
+    ///
+    /// These are the events a charge point's log is mostly made of - a cable going in, a card
+    /// being presented, a contactor closing - so this is the name that matters most.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::CableConnected { .. } => "CableConnected",
+            Self::CableDisconnected { .. } => "CableDisconnected",
+            Self::LockConfirmed { .. } => "LockConfirmed",
+            Self::UnlockConfirmed { .. } => "UnlockConfirmed",
+            Self::IdTokenPresented { .. } => "IdTokenPresented",
+            Self::ChargingAuthorized { .. } => "ChargingAuthorized",
+            Self::AuthorizationDenied { .. } => "AuthorizationDenied",
+            Self::ContactorClosed { .. } => "ContactorClosed",
+            Self::ContactorOpened { .. } => "ContactorOpened",
+            Self::RemoteUnlockRequested { .. } => "RemoteUnlockRequested",
+            Self::RemoteStartRequested { .. } => "RemoteStartRequested",
+            Self::ChargingStopped { .. } => "ChargingStopped",
+            Self::ChargingSuspendedByEv { .. } => "ChargingSuspendedByEv",
+            Self::ChargingSuspendedByEvse { .. } => "ChargingSuspendedByEvse",
+            Self::ChargingResumed { .. } => "ChargingResumed",
+            Self::MeterValueSampled { .. } => "MeterValueSampled",
+            Self::Reserved { .. } => "Reserved",
+            Self::ReservationCancelled { .. } => "ReservationCancelled",
+            Self::ReservationExpired { .. } => "ReservationExpired",
+            Self::CostUpdated { .. } => "CostUpdated",
+            Self::TariffAssigned { .. } => "TariffAssigned",
+            Self::ResetRequested { .. } => "ConnectorResetRequested",
+            Self::SetAvailable { .. } => "ConnectorSetAvailable",
+            Self::SetUnavailable { .. } => "ConnectorSetUnavailable",
+            Self::FaultDetected { .. } => "ConnectorFaultDetected",
+            Self::FaultCleared { .. } => "ConnectorFaultCleared",
+            Self::CurrentLimitConfirmed { .. } => "CurrentLimitConfirmed",
+            Self::CurrentLimitComputed { .. } => "CurrentLimitComputed",
+        }
+    }
+}
+
 /// An event addressed to one EVSE, either changing the EVSE's own availability/fault status or
 /// (via [`Connector`](EvseEvent::Connector)) addressing one of its connectors.
 #[derive(Debug, Clone, PartialEq)]
@@ -614,6 +765,29 @@ pub enum ChargePointEffect {
     /// `NotifyChargingLimit`/`ClearedChargingLimit`/`NotifyEVChargingNeeds`/
     /// `NotifyEVChargingSchedule` (2.0.1/2.1 only). See `docs/PRODUCTION-ROADMAP.md` B2.8.
     SmartChargingNotification(SmartChargingNotification),
+}
+
+impl ChargePointEffect {
+    /// The effect's variant name, as a low-cardinality `&'static str` suitable for a `tracing`
+    /// field. See [`ChargePointEvent::name`] for why the routine log line carries this rather
+    /// than a `{:?}` of the payload.
+    ///
+    /// Exhaustive with no wildcard arm on purpose: a new effect is a compile error here.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::StateChanged { .. } => "StateChanged",
+            Self::HardwareCommand { .. } => "HardwareCommand",
+            Self::StatusNotification { .. } => "StatusNotification",
+            Self::TransactionEvent { .. } => "TransactionEvent",
+            Self::AuthorizationRequested { .. } => "AuthorizationRequested",
+            Self::SecurityEventOccurred { .. } => "SecurityEventOccurred",
+            Self::ReservationEnded { .. } => "ReservationEnded",
+            Self::PriorityChargingChanged { .. } => "PriorityChargingChanged",
+            Self::VariableMonitorTriggered { .. } => "VariableMonitorTriggered",
+            Self::BatterySwapEventOccurred { .. } => "BatterySwapEventOccurred",
+            Self::SmartChargingNotification { .. } => "SmartChargingNotification",
+        }
+    }
 }
 
 /// A priority-charging grant the charge point made on its own, reported to the CSMS as

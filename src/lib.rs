@@ -157,6 +157,8 @@ pub mod sync;
 pub mod tariff;
 #[cfg(feature = "ocpp_1_6")]
 mod topology;
+#[cfg(test)]
+mod tracing_test_support;
 pub mod transaction_status;
 pub mod transactions;
 /// Trust store management (F2.2): builds a `rustls::RootCertStore` from the CSMS roots this

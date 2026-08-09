@@ -180,6 +180,18 @@ periodic-event-stream = []
 # Gates nothing yet: certificate store/install/CSR (roadmap B4.1-B4.4) has no implementation in
 # this crate yet.
 certificates = []
+
+# --- Diagnostics escape hatch (deliberately NOT in `default`) ---
+#
+# Restores the full `IdToken` value in `Debug`/`tracing` output. Off by default because an
+# `IdToken` value is the number on the card in a driver's wallet: personal data, and the charge
+# point actor formats a `ChargePointEvent` (which carries one) on every applied event. Redacting
+# in `IdToken`'s own `Debug` impl rather than at each call site means a new log line cannot
+# reintroduce the leak by forgetting about it - see `crate::state::IdToken`.
+#
+# Turn this on for local bring-up against a bench CSMS when you need to correlate a specific card
+# with a specific `Authorize`. Never ship an image with it on.
+unredacted-logs = []
 # Declares the key-storage capability - `crate::hardware::KeyStore` (roadmap F2.4), a home for
 # private keys (secure-element-backed or a `Storage`-backed software fallback via
 # `crate::hardware::SoftKeyStore`) that never gives up key material. No OCPP messages consume

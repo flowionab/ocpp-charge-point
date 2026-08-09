@@ -22,6 +22,31 @@ pub enum MessagePriority {
     AlwaysFront,
 }
 
+impl MessagePriority {
+    /// Every priority this crate models, most attention-grabbing first - the order OCPP's own
+    /// `MessagePriorityEnumType` lists them in, and the order
+    /// `DisplayMessageCtrlr.SupportedPriorities` advertises (see
+    /// `crate::device_model`'s `CAPABILITY_GATED_VARIABLES`).
+    ///
+    /// All three exist here because the derivation in [`crate::display_message::current_message`]
+    /// really does honour all three; a value missing from this list would be one a
+    /// `SetDisplayMessage` gets refused for.
+    pub const ALL: &'static [Self] = &[Self::AlwaysFront, Self::InFront, Self::NormalCycle];
+
+    /// This priority's OCPP `MessagePriorityEnumType` name, for the device model and for logs.
+    ///
+    /// Exhaustive with no wildcard arm on purpose (`CLAUDE.md`): a new priority must be a compile
+    /// error here rather than a variant silently missing from what this charge point advertises.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NormalCycle => "NormalCycle",
+            Self::InFront => "InFront",
+            Self::AlwaysFront => "AlwaysFront",
+        }
+    }
+}
+
 /// Which charge-point condition a display message applies to (OCPP `MessageStateEnum`), collapsed
 /// to the four values every OCPP version this crate targets shares. 2.1 additionally defines
 /// `Suspended`/`Discharging` for V2X/bidirectional power, which this crate does not yet model
@@ -40,6 +65,32 @@ pub enum MessageState {
     Unavailable,
 }
 
+impl MessageState {
+    /// Every state this crate models, in OCPP's own `MessageStateEnumType` order - and exactly
+    /// what `DisplayMessageCtrlr.SupportedStates` advertises (see `crate::device_model`'s
+    /// `CAPABILITY_GATED_VARIABLES`).
+    ///
+    /// 2.1's `Suspended`/`Discharging` are deliberately absent, matching this type's own docs: a
+    /// `SetDisplayMessage` naming one is refused with `NotSupportedState`, and a CSMS that reads
+    /// this variable learns that before composing one.
+    pub const ALL: &'static [Self] =
+        &[Self::Charging, Self::Faulted, Self::Idle, Self::Unavailable];
+
+    /// This state's OCPP `MessageStateEnumType` name, for the device model and for logs.
+    ///
+    /// Exhaustive with no wildcard arm on purpose (`CLAUDE.md`), for the same reason as
+    /// [`MessagePriority::name`].
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Charging => "Charging",
+            Self::Faulted => "Faulted",
+            Self::Idle => "Idle",
+            Self::Unavailable => "Unavailable",
+        }
+    }
+}
+
 /// A display message's rendering format (OCPP `MessageFormatEnum`) - what a hardware binding must
 /// be able to render for [`crate::display_message::handle_set_display_message`] to accept a
 /// message using it. See [`crate::hardware::Display::supported_formats`].
@@ -55,6 +106,26 @@ pub enum MessageFormat {
     Utf8,
     /// A QR code encoding the content.
     QrCode,
+}
+
+impl MessageFormat {
+    /// This format's OCPP `MessageFormatEnumType` name, as
+    /// [`crate::builder::ChargePointBuilder::display_messages`] writes it into
+    /// `DisplayMessageCtrlr.SupportedFormats`.
+    ///
+    /// Note the wire spelling is not the Rust one: OCPP writes `ASCII`/`UTF8`/`QRCODE`, so this
+    /// cannot be derived from the variant name. Exhaustive with no wildcard arm on purpose
+    /// (`CLAUDE.md`) - a new format must be a compile error rather than an unadvertised one.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Ascii => "ASCII",
+            Self::Html => "HTML",
+            Self::Uri => "URI",
+            Self::Utf8 => "UTF8",
+            Self::QrCode => "QRCODE",
+        }
+    }
 }
 
 /// One message's renderable content (OCPP `MessageContent`, collapsed to the fields this crate

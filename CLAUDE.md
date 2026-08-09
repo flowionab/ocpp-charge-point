@@ -67,6 +67,85 @@ it can fail, time out, or report an inconsistent state at any point.
 - Prefer fail-safe transitions (e.g. open the contactor, then unlock) over
   fail-open ones when recovering from a fault.
 
+## Logging and tracing
+
+A charge point is a box on a wall that nobody can attach a debugger to. The
+log is the only diagnostic instrument the field engineer has, and it competes
+for flash, bandwidth and battery with the job the device is actually doing.
+Both facts drive the rules below.
+
+### Levels
+
+The level is a promise about *who reads it*, not about how the author felt.
+
+- `error!` — a bug in this firmware, or a fault that lost data. Someone should
+  open an issue. Never use it for a hardware fault the state machine already
+  handles: that is what `ConnectorState::Faulted` and `SecurityEventNotification`
+  are for.
+- `warn!` — degraded but handled: a CSMS value was rejected or clamped, a
+  persisted record failed to decode, a retry was needed. The charge point kept
+  working and the operator should know why it is behaving oddly.
+- `info!` — station-wide lifecycle only: booted, registered, went available or
+  unavailable, faulted, connected to or lost the CSMS, a security event. An
+  operator must be able to leave a site running at `INFO` indefinitely, so
+  nothing per-connector, per-message or per-meter-sample belongs here.
+- `debug!` — one line per event applied, per OCPP message handled, per
+  hardware command dispatched. Names *what* happened, never the payload.
+- `trace!` — the payload: full request/response bodies, the whole
+  `ChargePointState`, decoded certificates. Assume nobody runs this in
+  production and that every line is expensive.
+
+The single sharpest rule: **a `{:?}` of a large type belongs at `trace!`.**
+`ChargePointState` renders to roughly eight kilobytes. Logging it per event, as
+the actor once did at `INFO`, is most of the cost of having logs at all on an
+MCU.
+
+### Fields over prose
+
+Prefer a low-cardinality `&'static str` field to an interpolated message, so a
+log can be filtered and aggregated rather than grepped:
+
+```rust
+tracing::debug!(event = event.name(), "applying charge point event");   // yes
+tracing::debug!("applying {:?}", event);                                // no
+```
+
+`ChargePointEvent::name`/`evse_id`/`connector_id` and `ChargePointEffect::name`
+exist for exactly this. Their matches are exhaustive with no wildcard arm on
+purpose — a new variant must be a compile error, not a mislabelled log line.
+
+### `#[instrument]`
+
+Always `#[instrument(skip_all, ...)]`, then add back the few fields worth
+recording. The bare attribute records *every* argument via `Debug`, which
+re-creates both problems above at once: kilobyte payloads and personal data.
+
+```rust
+#[instrument(skip_all, fields(evse_id, connector_id))]   // yes
+#[instrument]                                            // no
+```
+
+Never hold a span guard (`.entered()`) across an `.await`. Either use
+`span.in_scope(..)` around the synchronous part, or attach the span to the
+future with `.instrument(span)`.
+
+### Personal data
+
+An `IdToken` value is the number on the card in a driver's wallet. `IdToken`'s
+`Debug` is hand-written to redact it (see `crate::state::IdToken`), so anything
+containing one is safe to log by construction; do not undo that by logging
+`id_token.value` directly. The same applies to anything else that identifies a
+driver — settlement identifiers, VAT numbers, `CustomerInformation` payloads.
+The off-by-default `unredacted-logs` feature restores full values for local
+bring-up only.
+
+### `no_std`
+
+`tracing` is a dependency with `default-features = false`; keep it that way.
+Macros and `#[instrument]` both work under `no_std`, and a callsite with no
+subscriber installed costs an atomic load, so instrumenting a path is cheap —
+*formatting* it is what is not. That is what the level rules are protecting.
+
 ## Documentation
 
 All public (external) APIs — anything exported from `lib.rs`, the

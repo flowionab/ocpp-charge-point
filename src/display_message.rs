@@ -73,6 +73,7 @@ fn transaction_in_progress(state: &ChargePointState, id: TransactionId) -> bool 
 /// `supported_formats` comes from the registered [`crate::hardware::Display::supported_formats`],
 /// reported honestly per that trait's docs, so a format the hardware truly cannot render is
 /// refused here rather than accepted and silently failing on the driver's own screen.
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_display_message(
     actor: &ChargePointActor,
     message: DisplayedMessage,
@@ -133,6 +134,7 @@ pub enum ClearDisplayMessageOutcome {
 
 /// Handles a CSMS-initiated `ClearDisplayMessage` request against `actor`: removes the message
 /// named by `id`, if this charge point can honour it.
+#[tracing::instrument(skip_all)]
 pub async fn handle_clear_display_message(
     actor: &ChargePointActor,
     id: DisplayMessageId,

@@ -316,7 +316,18 @@ pub fn gate(message: &str) -> Option<&'static RefusalGate> {
 /// any message with no [`RefusalGate`] row - only messages this crate actually knows to be
 /// capability-gated can be refused.
 pub fn capability_present(capabilities: &Capabilities, message: &str) -> bool {
-    gate(message).is_none_or(|g| (g.capability)(capabilities))
+    let present = gate(message).is_none_or(|g| (g.capability)(capabilities));
+    if !present {
+        // The other half of the answer `crate::setup` logs at startup. A CSMS operator sees only
+        // `NotSupported`/`Rejected` on the wire and cannot tell a message this crate never
+        // implemented from one the hardware simply didn't declare - this line is the difference,
+        // and it is the single most common OCPP integration question there is.
+        tracing::warn!(
+            message,
+            "refusing an OCPP message: its gating hardware capability is not present"
+        );
+    }
+    present
 }
 
 /// Builds the OCPP 2.1 CALLERROR a [`RefusalShape::CallError`] message must answer with when its

@@ -96,6 +96,7 @@ pub enum SetMonitorOutcome {
 /// [`crate::device_model::handle_set_variables`]'s batch semantics. Each accepted item is applied
 /// to the store (via [`VariableMonitoringEvent::MonitorSet`]) before moving on to the next, so a
 /// later item in the same batch already observes an earlier one's effect.
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_variable_monitoring(
     actor: &ChargePointActor,
     requests: Vec<SetMonitorRequest>,
@@ -191,6 +192,7 @@ pub enum ClearMonitorOutcome {
 /// independently, in the order given - mirroring [`handle_set_variable_monitoring`]'s batch
 /// semantics. Returns each id paired with its outcome, in request order, so the wire adapter can
 /// zip them straight into `ClearMonitoringResult`s.
+#[tracing::instrument(skip_all)]
 pub async fn handle_clear_variable_monitoring(
     actor: &ChargePointActor,
     ids: Vec<VariableMonitorId>,
@@ -219,6 +221,7 @@ pub async fn handle_clear_variable_monitoring(
 /// for what this actually does to the installed monitor set - critically, `FactoryDefault`/
 /// `HardWiredOnly` clear every CSMS-installed monitor rather than leaving them running under a new
 /// name.
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_monitoring_base(actor: &ChargePointActor, base: MonitoringBase) {
     let _ = actor
         .send(ChargePointEvent::VariableMonitoring(
@@ -243,6 +246,7 @@ pub enum SetMonitoringLevelOutcome {
 /// consulted by [`run_variable_monitor_events`]/[`run_periodic_variable_monitors`] before every
 /// report, so tightening it actually suppresses lower-urgency reports rather than being a value
 /// this crate stores but never acts on.
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_monitoring_level(
     actor: &ChargePointActor,
     severity: i64,

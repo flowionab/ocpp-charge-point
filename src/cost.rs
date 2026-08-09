@@ -20,6 +20,7 @@ pub enum CostUpdateOutcome {
 
 /// Handles a CSMS-initiated `CostUpdated` request against `actor`: finds the connector whose
 /// active transaction is `transaction_id` and records `total_cost` against it.
+#[tracing::instrument(skip_all)]
 pub async fn handle_cost_updated(
     actor: &ChargePointActor,
     transaction_id: TransactionId,

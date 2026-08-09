@@ -49,6 +49,7 @@ pub enum SetNetworkProfileOutcome {
 /// the charge point is not being asked to connect right now, and the CSMS is entitled to stage a
 /// profile for a firmware that will support it. What this crate will not do is pretend to have
 /// applied it - see the module docs.
+#[tracing::instrument(skip_all)]
 pub async fn handle_set_network_profile(
     actor: &ChargePointActor,
     slot: i32,

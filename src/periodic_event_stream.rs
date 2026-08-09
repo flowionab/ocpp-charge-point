@@ -50,6 +50,7 @@ pub enum OpenPeriodicEventStreamOutcome {
 /// crate, the outcome is decided against the real state (via a trial open on a clone of the
 /// store) before anything is dispatched, so the status the CSMS receives is what actually
 /// happened - mirrors `crate::tariff::handle_set_default_tariff`.
+#[tracing::instrument(skip_all)]
 pub async fn handle_open_periodic_event_stream(
     actor: &ChargePointActor,
     id: PeriodicEventStreamId,
@@ -99,6 +100,7 @@ pub enum AdjustPeriodicEventStreamOutcome {
 }
 
 /// Handles a CSMS-initiated `AdjustPeriodicEventStream` against `actor`.
+#[tracing::instrument(skip_all)]
 pub async fn handle_adjust_periodic_event_stream(
     actor: &ChargePointActor,
     id: PeriodicEventStreamId,
@@ -125,6 +127,7 @@ pub async fn handle_adjust_periodic_event_stream(
 /// **not** check [`crate::refusal::capability_present`] itself - `ClosePeriodicEventStreamResponse`
 /// has no status field to refuse through, so that check belongs to the wire adapter, which answers
 /// a CALLERROR instead (mirrors `crate::tariff::handle_clear_tariffs`).
+#[tracing::instrument(skip_all)]
 pub async fn handle_close_periodic_event_stream(
     actor: &ChargePointActor,
     id: PeriodicEventStreamId,

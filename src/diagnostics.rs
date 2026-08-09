@@ -297,6 +297,7 @@ pub trait GetLogHandler {
 /// Synchronous and immediate by design - see the module docs. The only thing that can make this
 /// `Rejected` is the log genuinely not being available (N01.FR.05): no file-transfer capability
 /// declared, or a log kind this charge point does not keep.
+#[tracing::instrument(skip_all)]
 pub async fn handle_get_log<C: Clock>(
     actor: &ChargePointActor,
     uploads: &LogUploadQueue,

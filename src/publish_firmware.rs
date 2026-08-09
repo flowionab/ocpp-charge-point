@@ -369,6 +369,7 @@ impl Default for PublishFirmwareQueue {
 }
 
 /// Decides what to answer a `PublishFirmware` with, and queues the publish if accepted.
+#[tracing::instrument(skip_all)]
 pub async fn handle_publish_firmware(
     actor: &ChargePointActor,
     publishes: &PublishFirmwareQueue,
@@ -398,6 +399,7 @@ pub async fn handle_publish_firmware(
 
 /// Decides what to answer an `UnpublishFirmware` with, and takes the publication down against
 /// `publisher` if one exists.
+#[tracing::instrument(skip_all)]
 pub async fn handle_unpublish_firmware<F: FirmwarePublisher>(
     actor: &ChargePointActor,
     publisher: &F,

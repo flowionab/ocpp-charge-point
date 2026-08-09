@@ -85,6 +85,10 @@ pub async fn reregister_on_reconnect<N, B, M>(
             let vendor_name = vendor_name.clone();
             let model_name = model_name.clone();
             async move {
+                // A reconnect is a station-wide connectivity event, and the count of them over a
+                // shift is the first thing anyone looks at when a site is flapping - so INFO,
+                // even though `register_until_accepted` logs the outcome itself.
+                tracing::info!("the CSMS connection came back; re-registering");
                 register_until_accepted(
                     &actor,
                     &boot_notifier,

@@ -224,6 +224,7 @@ pub fn record_sign_certificate_sent(
 /// "our own certificate, and it's unusable" (OCPP's security-events list has no
 /// V2G-certificate-specific variant, so both purposes report through this one; see
 /// `state::security_event`).
+#[tracing::instrument(skip_all)]
 pub async fn handle_certificate_signed<S: CertificateStore>(
     actor: &ChargePointActor,
     store: &S,
@@ -291,6 +292,7 @@ pub async fn handle_certificate_signed<S: CertificateStore>(
 /// Refuses before touching the store when the capability is absent (C5) or the use is one OCPP
 /// does not allow to be installed - the charge point's own certificates, which arrive by
 /// `CertificateSigned` in answer to a CSR rather than by this message.
+#[tracing::instrument(skip_all)]
 pub async fn handle_install_certificate<S: CertificateStore>(
     actor: &ChargePointActor,
     store: &S,
@@ -324,6 +326,7 @@ pub async fn handle_install_certificate<S: CertificateStore>(
 /// An absent capability answers `NotFound` rather than `Failed`: a charge point with no
 /// certificate store genuinely does not have the certificate, and `Failed` would send an operator
 /// looking for a fault.
+#[tracing::instrument(skip_all)]
 pub async fn handle_delete_certificate<S: CertificateStore>(
     actor: &ChargePointActor,
     store: &S,
@@ -346,6 +349,7 @@ pub async fn handle_delete_certificate<S: CertificateStore>(
 /// An empty `uses` means every use - OCPP's absent-means-all rule, the same one
 /// `GetChargingProfiles` follows. An empty *result* is reported by the caller as `NotFound`, which
 /// is OCPP's way of saying "none installed" rather than an error.
+#[tracing::instrument(skip_all)]
 pub async fn handle_get_installed_certificate_ids<S: CertificateStore>(
     actor: &ChargePointActor,
     store: &S,

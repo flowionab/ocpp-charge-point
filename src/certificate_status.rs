@@ -85,6 +85,7 @@ pub enum CertificateStatusOutcome {
 /// [`crate::hardware::Capabilities::ocsp_checking`] is absent (C5). Raises
 /// [`SecurityEventType::InvalidChargingStationCertificate`] when the verdict is
 /// [`OcspVerdict::Revoked`] - see the module docs.
+#[tracing::instrument(skip_all)]
 pub async fn handle_get_certificate_status<O: OcspChecker>(
     actor: &ChargePointActor,
     checker: &O,
@@ -187,6 +188,7 @@ pub struct ChainCertificateStatus {
 /// current reading when the checker did not supply one. Raises
 /// [`SecurityEventType::InvalidChargingStationCertificate`] once per entry whose verdict is
 /// [`OcspVerdict::Revoked`].
+#[tracing::instrument(skip_all)]
 pub async fn handle_get_certificate_chain_status<O: OcspChecker, C: Clock>(
     actor: &ChargePointActor,
     checker: &O,
