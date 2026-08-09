@@ -77,6 +77,10 @@
 //! capability to refuse - an absent `certificate_management`/`key_storage` capability instead
 //! means this crate simply does not attempt to send one.
 //!
+//! `Get15118EVCertificate` (B4.5) has no row here for the identical reason: it too is
+//! charge-point-initiated. A charge point with `Capabilities::iso15118_support ==
+//! Iso15118SupportLevel::None` never sends it - see `crate::iso15118`'s module docs.
+//!
 //! Nothing here needed to fall back on assumption where the vendored spec/generated types didn't
 //! settle it - every response type above either has a documented status enum or documented-empty
 //! body in the generated `ocpp-types` source.

@@ -73,6 +73,11 @@ pub mod firmware;
 pub mod hardware;
 #[cfg(feature = "ocpp_1_6")]
 mod id_tag;
+/// ISO 15118 Plug & Charge: `Get15118EVCertificate` (2.0.1/2.1 only, `docs/PRODUCTION-ROADMAP.md`
+/// B4.5). See [`iso15118`]'s own docs for the hardware boundary and why this is
+/// charge-point-initiated with no `ChargePointBuilder` registration.
+#[cfg(feature = "iso15118")]
+pub mod iso15118;
 pub mod keepalive;
 #[cfg(feature = "local-auth-list")]
 pub mod local_authorization_list;
