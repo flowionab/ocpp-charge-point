@@ -299,16 +299,25 @@ async fn bare_reconnect_churn_grows_without_any_transaction_traffic() {
         "bare reconnect churn: after warm-up, {after_warm_up_boots} reconnects -> {after_warm_up} B"
     );
 
-    assert!(
-        wait_until(Duration::from_secs(300), || csms.boot_count() >= rounds).await,
-        "follow-up did not reach {rounds} reconnects (stuck at {})",
-        csms.boot_count()
-    );
+    // Deliberately NOT `assert!(reached `rounds` within the deadline)`. This is a diagnostic that
+    // measures *bytes per reconnect*, so it does not need an exact reconnect count - and demanding
+    // one inside a wall-clock deadline is precisely the flake mode H4.1's brief warns about. On a
+    // loaded machine this loop reached 2,590 of 4,000 in 300 s and the assertion hard-failed after
+    // ten minutes, reporting nothing at all: the measurement was thrown away because the *count*
+    // fell short, even though the ratio it exists to compute was perfectly well-defined. Wait for
+    // what we can get, then require only enough additional reconnects for the ratio to mean
+    // something.
+    wait_until(Duration::from_secs(300), || csms.boot_count() >= rounds).await;
     let after_follow_up = live();
     let after_follow_up_boots = csms.boot_count();
 
     let grown = after_follow_up.saturating_sub(after_warm_up);
     let reconnects = after_follow_up_boots.saturating_sub(after_warm_up_boots);
+    assert!(
+        reconnects >= warm_up / 4,
+        "only {reconnects} further reconnects completed - too few for a meaningful \
+         bytes-per-reconnect figure. Re-run on a less loaded machine, or lower OCPP_SOAK_ROUNDS."
+    );
     println!(
         "bare reconnect churn: {after_warm_up_boots} reconnects -> {after_warm_up} B, \
          {after_follow_up_boots} reconnects -> {after_follow_up} B ({grown} B grown over \

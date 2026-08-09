@@ -1959,11 +1959,24 @@ mod ocpp_2_1 {
     /// `struct`. A `static` gives every [`Ocpp2_1VariableMonitorEventNotifier`] (and the bare
     /// [`OCPP2_1Client`] convenience `impl` below, which - unlike a `with_clock` wrapper - has
     /// nowhere else to keep counter state) the same shared sequence.
-    static NEXT_EVENT_ID: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(1);
+    // A `BlockingMutex<Cell<i64>>` rather than an `AtomicI64`: `AtomicI64` does not exist on
+    // 32-bit targets without native 64-bit atomics, and `thumbv7em-none-eabihf` - the MCU target
+    // CI builds for - is one of them, so this file would not compile there with the
+    // `variable-monitoring` feature on. The wire field is `i64`, so narrowing to `AtomicI32` would
+    // silently shrink the range. Same primitive the rest of the crate uses for shared interior
+    // mutability under `no_std` (see `crate::certificates::PendingSignRequests`).
+    static NEXT_EVENT_ID: embassy_sync::blocking_mutex::Mutex<
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+        core::cell::Cell<i64>,
+    > = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(1));
 
     /// Consumes and returns the next value from [`NEXT_EVENT_ID`].
     fn next_event_id() -> i64 {
-        NEXT_EVENT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        NEXT_EVENT_ID.lock(|id| {
+            let current = id.get();
+            id.set(current.wrapping_add(1));
+            current
+        })
     }
 
     /// Wraps an [`OCPP2_1Client`] with the [`Clock`] that stamps every `NotifyEvent` - the same
@@ -2691,11 +2704,24 @@ mod ocpp_2_0_1 {
     /// Mirrors [`super::ocpp_2_1::NEXT_EVENT_ID`] - a separate process-wide sequence for a 2.0.1
     /// connection's own `NotifyEvent` stream. See that constant's docs for why a `static` rather
     /// than per-instance state.
-    static NEXT_EVENT_ID: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(1);
+    // A `BlockingMutex<Cell<i64>>` rather than an `AtomicI64`: `AtomicI64` does not exist on
+    // 32-bit targets without native 64-bit atomics, and `thumbv7em-none-eabihf` - the MCU target
+    // CI builds for - is one of them, so this file would not compile there with the
+    // `variable-monitoring` feature on. The wire field is `i64`, so narrowing to `AtomicI32` would
+    // silently shrink the range. Same primitive the rest of the crate uses for shared interior
+    // mutability under `no_std` (see `crate::certificates::PendingSignRequests`).
+    static NEXT_EVENT_ID: embassy_sync::blocking_mutex::Mutex<
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+        core::cell::Cell<i64>,
+    > = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(1));
 
     /// Consumes and returns the next value from [`NEXT_EVENT_ID`].
     fn next_event_id() -> i64 {
-        NEXT_EVENT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        NEXT_EVENT_ID.lock(|id| {
+            let current = id.get();
+            id.set(current.wrapping_add(1));
+            current
+        })
     }
 
     /// Wraps an [`OCPP2_0_1Client`] with the [`Clock`] that stamps every `NotifyEvent` - mirrors

@@ -335,7 +335,7 @@ hold a small number of specific lines a CSMS may not cross regardless of what it
 ## 5. Security event coverage: raised vs. modelled only
 
 All 21 standardized types plus `Other` are modelled in `SecurityEventType`
-(`src/state/security_event.rs`). As of this document, exactly **8** are ever raised by this
+(`src/state/security_event.rs`). As of this document, exactly **7** are ever raised by this
 crate's own production code (not test fixtures):
 
 | Event | Raised from |
@@ -346,8 +346,14 @@ crate's own production code (not test fixtures):
 | `MemoryExhaustion` | `src/payload_limit.rs` (oversized inbound frame refused) and `src/builder.rs` (offline queue overflow) |
 | `ReconfigurationOfSecurityParameters` | `src/network_profile.rs`, on an accepted `SetNetworkProfile` |
 | `AttemptedReplayAttacks` | `src/remote_control.rs`, on a `RequestStopTransaction` replay (§4.4) |
-| `SecurityLogWasCleared` | `src/persistence.rs`, when the security log is durably cleared |
 | `InvalidChargingStationCertificate` | `src/certificates.rs`, on an unsolicited or store-refused `CertificateSigned` (§4.2) |
+
+An eighth, **`SecurityLogWasCleared`, is implemented but never fires.**
+`persistence::clear_security_log` raises it correctly, but nothing in this crate calls that
+function — clearing is a CSMS-initiated or maintenance action, and neither path exists yet. It is
+listed separately rather than among the seven above deliberately: a threat model that counts a
+mitigation which cannot currently trigger is exactly the kind of overclaim that makes an auditor
+discount the rest of the document. Treat it as wired-but-unreachable until a caller exists.
 
 The remaining 13 (`FirmwareUpdated`, `FailedToAuthenticateAtCsms`, `CsmsFailedToAuthenticate`,
 `InvalidFirmwareSignature`, `InvalidFirmwareSigningCertificate`, `InvalidCsmsCertificate`,

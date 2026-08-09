@@ -319,29 +319,48 @@ none of this crate's reconnect-adjacent code in the loop. Reading
 handful of fixed-size fields (`String`s replaced in place, a `u64` counter, an
 `Option<ChargePointActor>`) with no collection that grows with dial count.
 
-**Conclusion.** The leak is real (not fragmentation), scales with reconnect
-count (not transaction or message volume), and lives in `ocpp-client` 0.5.0
-itself — either its `Client`'s reconnect loop (`src/client.rs`) or the
-per-connection transport/handshake plumbing `websocket_transport` shares with
-it (`tokio-tungstenite`'s WebSocket handshake, most likely, since plain `ws://`
-with keepalive disabled and a client with no handlers beyond one `on_reconnect`
-callback still reproduces it — ruling out TLS setup, keepalive bookkeeping, and
-this crate's own handler registration as contributors). Tracing through
-`ocpp-client`'s own state (`pending_responses`, `pong_waiters`,
-`BroadcastRegistry`) by inspection did not turn up an unbounded per-reconnect
-collection: `pending_responses` entries are removed on both the success and
-timeout paths (confirmed in `src/client.rs`, and every `BootNotification` in
-this reproduction succeeds, so that path isn't even exercised here),
-`pong_waiters` is cleared on every reconnect, and both broadcast registries are
-subscribed to exactly once per client lifetime. The remaining, uninstrumented
-candidate is `tokio-tungstenite`'s own per-handshake allocation (HTTP upgrade
-parsing, frame buffers) — line-level confirmation there was outside this
-investigation's budget. At 100–400 B/reconnect this stays well under any
-tolerance a soak test would fail on for thousands of reconnects, but it is
-linear and genuine, so a station reconnecting on a very flaky link for months
-would eventually notice it. **Recommended next step:** file this against
-`ocpp-client` 0.5.0 with `tests/reconnect_leak_bisect.rs`'s second test as the
-minimal reproduction — it needs nothing from this crate to show the growth.
+**Conclusion — and how far it can actually be trusted.** Growth scaling with reconnect count is
+real and has been observed independently, but **the magnitude does not reproduce reliably, and
+the figure above should not be quoted as settled.** Three measurements of the same test on the
+same commit:
+
+| Run | Result |
+|-----|--------|
+| H4.3's own run | ~176 B/reconnect |
+| Independent verification, 4 runs at 40 / 1,200 / 1,200 / 3,000 rounds | **0 B/reconnect, every time** |
+| A third run, 600 → 1,200 reconnects | 125.3 B/reconnect |
+
+Two of three runs show linear growth of the same order; one careful re-run at four different
+scales shows none at all. That spread is the finding. It means the effect is real but
+**conditional on something not yet identified** — machine load, allocator behaviour under
+concurrency, or timing of the redial loop are all live candidates — and that any single number
+here is an artefact of one run.
+
+What *is* established, and holds regardless:
+
+- **Not fragmentation.** `live()` counts allocated-minus-freed bytes, so fragmentation cannot
+  produce a climb in this metric (see above).
+- **Not this crate's `ConnectionTarget`.** It holds a handful of fixed-size fields with no
+  collection that grows with dial count, and the bare-`ocpp-client` reproduction excludes it
+  entirely.
+- **Not `ocpp-client`'s obvious per-reconnect state.** `pending_responses` is removed on both the
+  success and timeout paths, `pong_waiters` is cleared on every reconnect, and both broadcast
+  registries are subscribed once per client lifetime — all confirmed by inspection.
+
+The remaining uninstrumented candidate is `tokio-tungstenite`'s per-handshake allocation.
+
+**Next step — reproduce it reliably before doing anything else.** An earlier revision of this
+section recommended filing an upstream bug against `ocpp-client` 0.5.0 with this test as a
+"minimal reproduction". That recommendation is withdrawn: a reproduction that yields zero on
+four consecutive independent runs is not one, and filing it would cost an upstream maintainer
+real time chasing a result they cannot see. Establish what makes the growth appear and disappear
+first; only then is there something worth reporting.
+
+Note also that `bare_reconnect_churn_grows_without_any_transaction_traffic` originally *asserted*
+it would reach its full reconnect target inside a 300 s deadline, and hard-failed after ten
+minutes on a loaded machine — discarding a perfectly well-defined bytes-per-reconnect ratio
+because the count fell short. It now measures the ratio over whatever reconnects it achieves and
+only requires enough of them to be meaningful.
 
 ## What is not measured or bounded yet
 
