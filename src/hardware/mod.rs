@@ -51,7 +51,8 @@ pub use self::file_transfer::{
     UploadSource,
 };
 pub use self::firmware::{
-    FirmwareInstallOutcome, FirmwareInstaller, NoFirmwareInstaller, NoFirmwareInstallerError,
+    FirmwareInstallOutcome, FirmwareInstaller, FirmwareVerificationOutcome, FirmwareVerifier,
+    NoFirmwareInstaller, NoFirmwareInstallerError, NoFirmwareVerifier, NoFirmwareVerifierError,
 };
 pub use self::firmware_publisher::{
     FirmwarePublisher, NoFirmwarePublisher, NoFirmwarePublisherError,
