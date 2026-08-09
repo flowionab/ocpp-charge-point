@@ -106,7 +106,7 @@ close — mostly missing one version each.
 | Offline queueing | ✅ | `OfflineQueue` is used by Availability / Transactions / Security, bounded ([G2.1](#92-g2--bounded-memory)) with a per-queue overflow policy, and durable across a reboot ([E2.8](#72-e2--what-must-survive)/[E4.3](#74-e4--recovery)). Every other growable collection is audited and bounded too ([G2.2](#92-g2--bounded-memory)), with measured figures in [`docs/MEMORY.md`](MEMORY.md). |
 | Reconnect resync | ✅ | Fresh BootNotification on every reconnect, all three versions. |
 | Persistence | 🚧 | `hardware::Storage` plus `crate::persistence`: the in-flight transaction and its id counter, all three offline queues, the local auth list, reservations, `persistent` device model attributes, charging profiles, the authorization cache, the boot reason and the security log all survive a restart, each registered per concern on `ChargePointBuilder` (opt-in — `setup()` wires none of them, having no `Storage`). Power-cut recovery is swept at every point of a session ([E4.4](#74-e4--recovery)). Still RAM-only, each blocked on a block that doesn't exist yet: certificates, network profiles. |
-| Test suite | 🚧 | 1405 lib tests, 24 integration tests across 12 binaries, and the version × capability feature matrix verified on `thumbv7em-none-eabihf` as well as the host — a distinction that has caught two `AtomicI64` breaks the host check passed. |
+| Test suite | 🚧 | 1432 lib tests, 24 integration tests across 12 binaries, and the version × capability feature matrix verified on `thumbv7em-none-eabihf` as well as the host. |
 | CI | ✅ | Gating: clippy + fmt + rustdoc, feature matrix, `thumbv7em-none-eabihf`, MSRV 1.88, `cargo-deny`, on PRs too, plus a coverage floor on the protocol adapter files ([H1.6](#101-h1--ci-hardening)). Whole-crate coverage stays informational. |
 
 ### 2.4 The structural blocker — resolved
@@ -1937,17 +1937,32 @@ exists).
       `NotImplemented`. **These two are the only unwired messages left in the crate.**
 
       All seven are builder-only, matching the 2.0.1/2.1 certificate adapters they mirror.
-- [ ] **D2.3** `ocpp-types` v21's `ChargingProfile` is **56 KB by value** (`ChargingSchedule`
-      alone is 18.6 KB, and a profile inlines three of them); 2.0.1's equivalent is 2.6 KB. The
-      cause is `ChargingSchedule` inlining `AbsolutePriceSchedule`, `PriceLevelSchedule` and
-      `SalesTariff` at their `heapless` capacities rather than behind a `Box`, in a build that
-      has `alloc` anyway. Measured, not estimated, while wiring
-      [B2.7](#b2--smart-charging-r11): constructing one to send overflows an unoptimised 2 MB
-      worker stack (`tests/get_charging_profiles.rs` raises it and says why), and a release build
-      is fine only because the temporaries are elided. This is a genuine obstacle to the no_std
-      goal - an MCU whose entire stack is 64 KB cannot build a single one of these - and the fix
-      is upstream: box the optional price/tariff sub-structures. Affects every 2.1 outbound
-      message carrying a profile, not just this one.
+- [x] **D2.3** 2.1's `ChargingProfile` is large by value — **re-measured, and the roadmap's
+      stated cause was wrong.**
+
+      Measured against the pinned `ocpp-types` 0.3.0 rather than trusted. The headline holds:
+      2.1's `ChargingProfile` is **50,584 bytes**, against 2,616 for 2.0.1 and 176 for 1.6J. But
+      the named mechanism — `heapless` capacities in `AbsolutePriceSchedule`/`PriceLevelSchedule`/
+      `SalesTariff` — **is not even compiled here**: `ocpp-client` 0.5.0 always requests
+      `ocpp-types`' `alloc` feature, and feature unification applies that to this crate's no_std
+      MCU builds too, so those sub-schedules are already `Option<Vec>`.
+
+      Substituting `NoCustomData` drops the profile from 50,584 to **11,240 bytes**, so **~78% of
+      the cost is this crate's own `wire.rs` binding every nested `CustomDataType` generic to a
+      concrete ~256-byte `CustomData`**, cascaded through the whole tree by `ocpp-client`'s
+      generated signatures. That is a different problem, in a different place, than the row
+      described.
+
+      **The reassuring half:** `ChargingProfileStore` holds a reduced internal representation —
+      measured at **96 bytes**, not the wire type. The feared 16 × 56 KB resident cost was never
+      real. What remains is genuinely transient: one inbound `SetChargingProfile` deserialises
+      ~50 KB before this crate's code runs, inside `ocpp-client`, where
+      [F5.2](#85-f5--hardening)'s guard already documents having no earlier hook.
+
+      **No local mitigation was available and none was invented.** An upstream report is *drafted*
+      in [`docs/MEMORY.md`](MEMORY.md) with reproducible before/after figures and a named test —
+      deliberately not filed, since the last upstream recommendation this project made had to be
+      withdrawn for resting on a measurement that did not reproduce.
 
 ### 6.3 D3 — Dependency policy
 
@@ -2243,15 +2258,21 @@ mid-transaction currently loses the transaction.
       the blocks that would (`GetLog`, customer-information erasure) are [B5.1](#b5--diagnostics-and-monitoring-r14)/[B5.5](#b5--diagnostics-and-monitoring-r14) - which is
       the honest remaining half of [F4.3](#84-f4--security-events): the durable log exists, the `GetLog` reader
       does not.
-- [ ] **E2.9** Certificates — **no longer blocked, and the durability half is done**:
-      [B4.1](#b4--certificates-and-iso-15118-r1-r13)'s `StoredCertificates` is `Storage`-backed
-      and survives a reboot, so the CSMS-installed certificate set is already as durable as every
-      other E2 row. (The sentence that stood here — "Formerly blocked on … which does not exist"
-      — lost its subject in an edit; the blocker it named was B4.1, which has since landed.)
-      What remains is narrower than the row title suggests: once [F2.4](#82-f2--tls) introduces a
-      secure element, a *private key* must live there rather than in `Storage`, and this row
-      becomes "the key handle persists and the key itself never leaves the element". Blocked on
-      F2.4 for that reason, not on B4.
+- [x] **E2.9** Certificates and keys with a secure element — **the durability half was already
+      done; this closed the key half.**
+
+      [F2.4](#82-f2--tls) had already given `KeyHandle` the right shape (opaque, `sign` takes a
+      handle), and the CSMS-installed certificate set was already `Storage`-backed. What this
+      added is the invariant that matters when hardware changes underneath a station: **a handle
+      that persists but no longer resolves fails closed**, so a station whose secure element was
+      replaced — or whose storage was restored onto different hardware — re-requests a
+      certificate rather than proceeding as though it still holds a key. Failing open there would
+      be a security defect.
+
+      Deliberately left the certificate↔`KeyHandle` association to
+      [F3.2](#83-f3--credentials), which built it in the same round, and kept out of
+      `certificates.rs` entirely to avoid colliding with it.
+
 - [x] **E2.11** Network profiles — `persistence::NetworkProfileSnapshotStore`/
       `restore_network_profiles`/`run_network_profile_persistence`, wired via
       `ChargePointBuilder::network_profile_persistence`. One whole-store JSON snapshot per change,
@@ -2632,8 +2653,35 @@ certificates.**
 - [x] **F3.1** Basic-auth password storage and rotation — `BasicAuthPassword` is the validated
       holder (see F1.1). Rotation is a `SetVariables` write to `SecurityCtrlr.BasicAuthPassword`,
       which F3.3 reports.
-- [ ] **F3.2** Certificate renewal ahead of expiry
-      ([B4.3](#b4--certificates-and-iso-15118-r1-r13)). **Blocked on B4.**
+- [x] **F3.2** Certificate renewal ahead of expiry — `src/certificate_renewal.rs`.
+
+      **This closes what [B4.3](#b4--certificates-and-iso-15118-r1-r13) explicitly deferred.**
+      `build_signed_csr` persists nothing, so a renewal had no way to sign with the *same* key as
+      the certificate it replaces. `RenewalStore` (persisted over `Storage`) remembers the key pair
+      per `CertificateSigningPurpose` — keyed by purpose, since those slots are single by
+      construction — and stores only the opaque `KeyHandle` and public key, never private material.
+
+      **Expiry has to come from the integrator**, because this crate does no X.509 parsing: a new
+      default-provided `CertificateStore::expires_at` returns `Ok(None)` meaning *"cannot say"*
+      rather than *"never expires"*. Additive, so existing implementors are unaffected.
+      `RenewalPolicy` makes the threshold configurable (OCPP names none), defaulting to 30 days.
+      `run_certificate_renewal` **skips entirely while the clock is unsynchronized**, following
+      `run_reservation_expiry` — a station that does not know the date must not decide a
+      certificate has expired.
+
+      **Fail-safe throughout**, which was the property most worth getting right: a CSMS rejection
+      or a request that never gets an answer touches the certificate store not at all, because
+      nothing installs until a correlated `CertificateSigned` arrives. And
+      `discard_certificate_renewal` restores a stashed backup and reports
+      `DiscardedRenewedClientCertificate` when a renewed certificate installs but then cannot
+      connect.
+
+      **Not wired into `ChargePointBuilder`** — consistent with B4.3's own handlers, which are
+      also unregistered. `confirm_certificate_renewal`/`discard_certificate_renewal` are hooks an
+      integrator's connection logic must call; nothing detects a TLS failure caused specifically
+      by the new certificate. Until a caller exists, a renewal's outcome is never resolved and the
+      backup stays stashed (bounded to two slots, so a correctness gap rather than a leak).
+
 - [x] **F3.3** `ReconfigurationOfSecurityParameters` on every change — raised by
       [F4.2](#84-f4--security-events) on an accepted `SetNetworkProfile`, which is where a security
       profile and endpoint change.
@@ -2683,25 +2731,31 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
       `MaintenanceLogin*` types are the integrator's to raise — only the hardware knows a case was
       opened or who logged in, and OCPP's recommended `techInfo` format for a login
       (`{'user': ..., 'origin': ...}`) is theirs to fill in.
-- [ ] **F4.3** Durable, size-bounded security log ([E2](#72-e2--what-must-survive)), readable via
-      `GetLog`. *Partial* - the log itself is done ([E2.10](#72-e2--what-must-survive)): bounded,
-      durable, restored at boot, and clearable with a `SecurityLogWasCleared` report. What's left
-      was the `GetLog` reader that uploads it — **which [B5.1](#b5--diagnostics-and-monitoring-r14)
-      now provides**: a `GetLog` with `logType = SecurityLog` renders the durable log and uploads
-      it. This row stays open only for the parts of `GetLog` that are not the security log
-      (monitoring reports, and 2.1's data-collector log), so the security-log half of F4.3 is
-      done.
-- [x] **F4.4** `SecurityEventNotification` for 2.0.1 — **done**, and the "after D1" caveat was
-      stale: D1 landed and the pinned `ocpp-client` generates the 2.0.1 action (from 0.2.2 on). The wire
-      request is field-for-field identical to 2.1's, so the adapter shares `wire_type` exactly as
-      that function's docs anticipated, and `connect_and_setup`'s 2.0.1 path registers the block.
+- [x] **F4.3** Durable, size-bounded security log ([E2.10](#72-e2--what-must-survive)), readable
+      via `GetLog` — **already complete; this row and the threat model were stale.**
 
-      **1.6J: decided, and the answer is no.** 1.6J has no `SecurityEventNotification` in the core
-      specification — it arrives only with the OCPP 1.6 Security Whitepaper, whose message set
-      `ocpp-types` does not generate ([D2.2](#62-d2--type-completeness-audit)). A 1.6J connection
-      records events in the durable log and reports none. That is a version difference, not a gap
-      here; closing it means contributing the whitepaper types upstream first, which is D2.2's
-      still-open decision.
+      The task set out to build the `GetLog` reader and found it already exists:
+      `crate::diagnostics::render_security_log`, `LogKind::Security` mapped from
+      `LogEnum::SecurityLog` on both 2.x adapters, `oldestTimestamp`/`latestTimestamp` filtering,
+      and upload through the same [B5.1](#b5--diagnostics-and-monitoring-r14) machinery
+      `DiagnosticsLog` uses. Verified independently against `main` before accepting the claim. The
+      right outcome was to correct `docs/THREAT-MODEL.md`, which still told readers a CSMS could
+      not pull the log, rather than manufacture a second path.
+
+      Two real limits remain, both recorded rather than papered over: **1.6J's `GetDiagnostics`
+      has no log-type field at all**, so a 1.6J CSMS cannot ask for the security log by that route;
+      and `SecurityLogWasCleared` still has no caller, because `GetLog` reads and never clears.
+
+- [x] **F4.4** `SecurityEventNotification` for 2.0.1 — **done**, and the "after D1" caveat was
+      stale: D1 landed and the pinned `ocpp-client` generates the 2.0.1 action (from 0.2.2 on). The
+      wire request is field-for-field identical to 2.1's, so the adapter shares `wire_type` exactly
+      as that function's docs anticipated, and `connect_and_setup`'s 2.0.1 path registers the block.
+
+      **1.6J: this row's "decided, and the answer is no" is now itself stale.** It reasoned that
+      1.6J has `SecurityEventNotification` only in the Security Whitepaper, whose types
+      `ocpp-types` did not generate — true when written, false since `ocpp-client` 0.4.0.
+      [D2.2](#62-d2--type-completeness-audit) wired it for 1.6J. A 1.6J station now reports
+      security events like any other.
 
 ### 8.5 F5 — Hardening
 
@@ -2774,7 +2828,21 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
       commands, so guarding them would produce a stream of false `AttemptedReplayAttacks` rather
       than a signal. Message-id-level duplicate detection stays upstream in `ocpp-client`, which
       owns CALL/CALLRESULT correlation. All of this is stated in the module docs.
-- [ ] **F5.4** Secure-boot integration points for integrators that have it.
+- [x] **F5.4** Secure-boot integration points — **hooks and an honest boundary, not an
+      implementation.**
+
+      Secure boot is a property of the bootloader and the silicon; this crate cannot implement it.
+      What it can do is make an integrator who *has* it able to connect it, and the honest
+      observation is that **a secure-boot chain and OTA firmware verification are the same trust
+      chain seen from two ends** — so this points at `hardware::FirmwareVerifier`
+      ([B3.3](#b3--firmware-management-r12)) rather than inventing a parallel mechanism, and gives
+      the integrator a route to raise the OCPP security events that genuinely apply.
+
+      **No new `SecurityEventType` was invented**: OCPP's standardized list has no secure-boot
+      entry, and `TamperDetectionActivated`/`InvalidFirmwareSignature` already cover what a
+      station would report. Resisting the urge to add one is the right call — a vendor-specific
+      event no CSMS understands would be worse than none. `docs/THREAT-MODEL.md`'s physical-access
+      section is updated to match.
 
 ---
 
@@ -3369,13 +3437,35 @@ coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match 
 - [ ] **H3.1** OCTT (OCA Compliance Test Tool) runs for 1.6J, 2.0.1, 2.1.
 - [ ] **H3.2** Work through `…part6-testcases.pdf` for 2.0.1 and 2.1 — both
       vendored — as a checklist, and track pass/fail per case.
-- [ ] **H3.3** Decide which certification profiles to claim per feature set
-      ([C1.2](#51-c1--cargo-feature-per-functional-block)) and pass them.
+- [x] **H3.3** Decide which certification profiles to claim per feature set —
+      [`docs/CERTIFICATION.md`](CERTIFICATION.md), linked from the README. **This was the gate on
+      the rest of [H3](#103-h3--compliance)**: you cannot run a compliance suite until you know
+      what you are claiming.
+
+      Enumerates 1.6J's feature profiles and 2.x's certification profiles, and for each says
+      whether it is claimable and under which Cargo features and hardware traits. The most useful
+      line it draws is **library versus product**: a profile needing hardware the integrator
+      supplies is claimable by a *product*, never by this crate on its own.
+
+      It names the **wired-but-not-functional** blockers explicitly, which is the whole point —
+      each would fail an audit: DER control cannot actuate, ISO 15118 carries EXI opaquely and
+      needs an integrator HLC stack, `PaymentCtrlr`'s live status variables are placeholders, and
+      firmware-signature verification and OCSP are delegated to traits whose `No*` defaults do
+      nothing.
+
+      **The decision itself is the maintainer's.** The document recommends a claim set and ranks
+      it by effort-to-value; it does not commit the project to one. It also found drift in
+      `docs/THREAT-MODEL.md`'s prose on mutual TLS and firmware verification and flagged rather
+      than edited it, since that file was another task's this round.
+
 - [ ] **H3.4** Interoperability against at least two independent CSMS
       implementations per version.
 - [ ] **H3.5** Re-verify everything in `ROADMAP.md` marked
       "(verify vs 2.1 spec)" against the now-vendored 2.1 specification —
-      that caveat predates the PDFs being added.
+      that caveat predates the PDFs being added. **Note the caveat is doubly stale**: the spec
+      directories it refers to are gitignored and absent from every clone
+      ([B8.3](#b8--reservation-derv2x-battery-swap)), so this row is blocked on that being
+      settled first.
 
 ### 10.4 H4 — Longevity
 
@@ -3685,39 +3775,39 @@ Everything in M5 is capability-gated and hardware-dependent — a given
 product ships the subset its hardware supports. M5 completes the *library*,
 not every deployment.
 
-**Progress (2026-08-09), fourth update.** [B4.5](#b4--certificates-and-iso-15118-r1-r13) wired
-`Get15118EVCertificate`, **completing OCPP 2.0.1 and 2.1 message coverage outright** — 64/64 and
-91/91. [D2.2](#62-d2--type-completeness-audit) took 1.6J to 37/39. [F2.2](#82-f2--tls),
-[C4.2/C4.3](#54-c4--builder-refactor) and [H5.3/H5.4](#105-h5--release) landed with them.
+**Progress (2026-08-09), fifth update.** [F3.2](#83-f3--credentials) (renewal),
+[F4.3](#84-f4--security-events), [D2.3](#62-d2--type-completeness-audit),
+[H3.3](#103-h3--compliance), [E2.9](#72-e2--what-must-survive) and [F5.4](#85-f5--hardening) all
+landed. **Workstreams B, C, D, E, F and G are now closed** — every remaining open row is in
+[Workstream H](#10-workstream-h--test-compliance-release) bar `D3.2` and `G1.1`.
 
-**M5's protocol half is done.** Every functional block in
-[Workstream B](#4-workstream-b--message-coverage) is closed, and every one has a hardware trait
-behind it. What is left of M5 is [H3](#103-h3--compliance)–[H5](#105-h5--release) — compliance,
-release process, the 1.0 freeze — and none of it is a functional block.
+**Eight rows remain, and only two are code:** [H5.1](#105-h5--release) (turn `missing_docs` from
+warn to deny) and [G1.1](#91-g1--no_std-across-the-matrix) (an MCU *build* job in CI, not just a
+check). The rest are process or decisions:
 
-Four things gate that work. None is coding, and three are decisions someone has to make:
+- [H3.3](#103-h3--compliance) has now produced [`docs/CERTIFICATION.md`](CERTIFICATION.md) with a
+  recommended claim set — **that recommendation needs a human decision**, and
+  [H3.1](#103-h3--compliance)/[H3.2](#103-h3--compliance)/[H3.4](#103-h3--compliance) all follow
+  from it. This is the single highest-leverage thing left.
+- [H3.2](#103-h3--compliance)/[H3.5](#103-h3--compliance) additionally need the **gitignored spec
+  material** settled — vendor it or say where to fetch it.
+- **`main` is still unprotected.** [H1.8](#101-h1--ci-hardening) built the `ci-required` gate;
+  requiring it is a repository setting.
+- [H5.5](#105-h5--release) is the 1.0 trait freeze, and it should be taken *after* the caveats
+  below, not before.
 
-- **`main` is still unprotected.** [H1.8](#101-h1--ci-hardening) built the `ci-required` aggregate
-  gate; requiring it is a repository setting. Until then CI is an alarm, not a lock.
-- **The spec material [H3.2](#103-h3--compliance)/[H3.5](#103-h3--compliance) read is
-  gitignored** and absent from every clone. Vendor it or say where to fetch it.
-- **[H3.3](#103-h3--compliance): decide which certification profiles to claim.** Everything else
-  in H3 depends on that answer, and the support matrix ([H5.3](#105-h5--release)) now gives the
-  data to make it.
-- **1.6J's last two messages** are one design decision about `GetLog` versus `GetDiagnostics`, not
-  a backlog item — see [D2.2](#62-d2--type-completeness-audit).
+**Wired is not functional, and this is what H5.5 has to weigh.** Each of these has a working
+message path and no working implementation behind it, which is fine for a library and fatal for a
+certification claim: **DER control cannot actuate** (no hardware trait applies a curve or
+setpoint), **ISO 15118 carries EXI opaquely** and needs an integrator HLC stack,
+**`PaymentCtrlr`'s live status variables are placeholders**, and **firmware-signature verification
+and OCSP are delegated** to traits whose `No*` defaults do nothing.
+[`docs/CERTIFICATION.md`](CERTIFICATION.md) enumerates these against specific profiles.
 
-Three caveats the message count hides, all breaking-change territory for
-[H5.5](#105-h5--release)'s trait freeze — **wired is not the same as functional**:
-
-- **DER control is wired but cannot actuate.** No hardware trait applies a curve or setpoint, so a
-  CSMS can install controls the station faithfully reports and never acts on.
-- **ISO 15118 carries EXI opaquely.** The message works; Plug & Charge needs an integrator's HLC
-  stack behind `Iso15118Controller`.
-- **`PaymentCtrlr`'s live status variables are placeholders**, not driven from a real terminal.
-
-And one unresolved defect: a reconnect-scaled memory growth that reproduces on some runs and not
-others ([`docs/MEMORY.md`](MEMORY.md)).
+Two loose threads worth naming: a **reconnect-scaled memory growth** that reproduces on some runs
+and not others ([`docs/MEMORY.md`](MEMORY.md)), and **certificate renewal is not builder-wired** —
+`confirm_certificate_renewal`/`discard_certificate_renewal` need an integrator caller or a
+renewal's outcome is never resolved.
 
 ---
 
@@ -3809,5 +3899,5 @@ same as a profile being certifiable.**
 | …modelled in `SecurityEventType` | 21 (F4.1) | `src/state/security_event.rs` |
 | …this crate raises itself | 6 | `StartupOfTheDevice`, `ResetOrReboot`, `SettingSystemTime`, `MemoryExhaustion`, `SecurityLogWasCleared`, `ReconfigurationOfSecurityParameters` |
 | Protocol trait bounds on `setup()`'s CSMS parameter | **45** protocol traits, plus `Clone`/`Send`/`Sync`/`'static`. A previous revision of this row said 48, which double-counted: 48 is the number of `+ Bound` lines, four of which *are* the markers, and the leading `N: BootNotifier` carries no `+`. Caught by [H5.2](#105-h5--release)'s guide, which re-derived it. `src/setup.rs`'s own docstring still says 24 and is stale. [B8.2](#b8--reservation-derv2x-battery-swap) declined to add eight more bounds and registered builder-only instead — the first time this signature's size changed a design decision rather than being merely noted, and the case for [C4.2](#54-c4--builder-refactor)/[C4.3](#54-c4--builder-refactor). | `src/setup.rs` |
-| Test functions in `src/` | **1405** lib tests (1429 including integration) | Take this from `cargo test --lib`, **not** from grepping `#[test]` — the grep undercounts by ~6 (macro-expanded and multi-attribute cases) and this table carried the grep figure for several rounds before two agents independently caught it. Progression: 1121 → 1227 → 1286 → 1318 → 1361 → 1405. | `cargo test --lib` |
+| Test functions in `src/` | **1432** lib tests (1456 including integration) | From `cargo test --lib`, **not** a grep of `#[test]` — the grep undercounts by ~6 and this table carried the grep figure for several rounds. Progression: 1121 → 1227 → 1286 → 1318 → 1361 → 1405 → 1432. | `cargo test --lib` |
 | Integration tests | 24 across 12 binaries (three `#[ignore]`d diagnostics), plus 2 runnable examples | `tests/` |

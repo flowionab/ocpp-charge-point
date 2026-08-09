@@ -392,7 +392,7 @@ sub-schedules already use plain `Option<T>` over `alloc::vec::Vec`-backed lists 
 const-generic `heapless` capacities — so the *specific* mechanism D2.3 originally named (a fixed
 `heapless` cap on the top-level lists) is not what's compiled here at all.
 
-Isolating the actual cost (`probe_no_custom_data_sizes`, same test module) by re-measuring with
+Isolating the actual cost (`most_of_the_size_is_custom_data_not_array_capacity`, same test module) by re-measuring with
 `CustomDataType = NoCustomData` instead of this crate's actual `CustomData` binding:
 
 | Type | with `CustomData` (this crate) | with `NoCustomData` |
@@ -459,7 +459,7 @@ before this crate's code runs.
 round's upstream report was withdrawn for resting on an unreproduced number — this one is
 reproduced twice, with and without the `CustomData` substitution, via
 `cargo test --lib -p ocpp-charge-point size_measurements -- --nocapture` and
-`probe_no_custom_data_sizes` in `src/state/charging_profile.rs`):
+`most_of_the_size_is_custom_data_not_array_capacity` in `src/state/charging_profile.rs`):
 
 - **Title:** `ocpp-types` 0.3.0: OCPP 2.1 `ChargingProfile` is ~50 KB by value, ~78% of which is
   one `Option<CustomData>` field (`heapless::String<255>`, ~256 bytes) repeated at every nesting

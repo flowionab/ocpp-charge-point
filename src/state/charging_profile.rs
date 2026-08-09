@@ -672,7 +672,7 @@ impl ChargingProfileStore {
 /// mechanism the roadmap named (a `heapless` cap on those top-level fields) is not what is
 /// compiled here.
 ///
-/// The dominant cost (~78%, see `probe_no_custom_data_sizes` below) is this crate's own
+/// The dominant cost (~78%, see `most_of_the_size_is_custom_data_not_array_capacity` below) is this crate's own
 /// `wire.rs` binding every nested `CustomDataType` generic to the concrete, ~256-byte
 /// `CustomData` struct (`ocpp-client`'s generated methods require it at the top level, and one
 /// type parameter cascades through the whole tree) rather than `ocpp-types`' own zero-sized
