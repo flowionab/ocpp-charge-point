@@ -92,7 +92,6 @@ pub struct ConnectionTarget {
     origin: String,
     username: Option<String>,
     password: Option<String>,
-    tls_config: Option<Arc<ocpp_client::rustls::ClientConfig>>,
     timeout: Option<Duration>,
     inner: Mutex<Inner>,
 }
@@ -105,6 +104,19 @@ struct Inner {
     fallback: Option<String>,
     /// Consecutive failed attempts on `active` since it was switched to.
     failures: u32,
+    /// The confirmed TLS client configuration every redial uses, unless [`Self::pending_tls_config`]
+    /// is set. `None` means "whatever `ocpp-client`'s own default is" - the same meaning
+    /// `ConnectOptions::tls_config: None` already carries - rather than an empty/no-trust config.
+    tls_config: Option<Arc<ocpp_client::rustls::ClientConfig>>,
+    /// A TLS configuration staged by [`ConnectionTarget::stage_tls_config`] (F2.2) after the
+    /// installed `CsmsRoot` set changed, not yet proven by a successful dial. See that method's
+    /// docs and the module docs, "the CSMS just told us something that might brick us".
+    pending_tls_config: Option<Arc<ocpp_client::rustls::ClientConfig>>,
+    /// Consecutive dial failures since `pending_tls_config` was staged. Independent of
+    /// `failures` (the address counter): a redial can fail for either reason, or both, and each
+    /// candidate change - a switched address, a staged trust config - is judged on its own count
+    /// against the same `attempts_before_rollback` threshold.
+    tls_config_failures: u32,
     /// How many of those failures trigger a rollback.
     attempts_before_rollback: u32,
     /// The negotiated OCPP version, which a redial has to keep speaking. `None` only before the
@@ -137,12 +149,14 @@ impl ConnectionTarget {
             origin: address.to_string(),
             username: options.username.map(ToString::to_string),
             password: options.password.map(ToString::to_string),
-            tls_config: options.tls_config.clone(),
             timeout: options.timeout,
             inner: Mutex::new(Inner {
                 active: address.to_string(),
                 fallback: None,
                 failures: 0,
+                tls_config: options.tls_config.clone(),
+                pending_tls_config: None,
+                tls_config_failures: 0,
                 attempts_before_rollback: DEFAULT_CONNECTION_ATTEMPTS,
                 version: None,
                 jitter_range_secs: 0,
@@ -307,6 +321,13 @@ impl ConnectionTarget {
         let mut inner = self.inner.lock().expect("target lock");
         inner.fallback = None;
         inner.failures = 0;
+        // F2.2: a redial that succeeds while a staged TLS config was in force has proven it -
+        // commit it as the confirmed configuration future redials use, the same "proven by a
+        // successful dial" rule `switch_to`'s fallback follows for an address.
+        if let Some(config) = inner.pending_tls_config.take() {
+            inner.tls_config = Some(config);
+        }
+        inner.tls_config_failures = 0;
     }
 
     /// Counts a failed attempt on the active address and rolls back once there have been enough
@@ -314,6 +335,19 @@ impl ConnectionTarget {
     fn record_failure(&self) -> Option<String> {
         let mut inner = self.inner.lock().expect("target lock");
         inner.failures = inner.failures.saturating_add(1);
+        // F2.2: a staged TLS config gets the same number of chances an address switch does before
+        // being abandoned - see `stage_tls_config`'s docs for why this must not tear down a live
+        // connection to find out, only give up on the candidate once redials keep failing anyway.
+        if inner.pending_tls_config.is_some() {
+            inner.tls_config_failures = inner.tls_config_failures.saturating_add(1);
+            if inner.tls_config_failures >= inner.attempts_before_rollback {
+                inner.pending_tls_config = None;
+                inner.tls_config_failures = 0;
+                tracing::warn!(
+                    "reverting a staged TLS trust configuration after repeated connection failures"
+                );
+            }
+        }
         if inner.failures < inner.attempts_before_rollback {
             return None;
         }
@@ -321,6 +355,47 @@ impl ConnectionTarget {
         inner.active = fallback.clone();
         inner.failures = 0;
         Some(fallback)
+    }
+
+    /// Stages a new TLS client configuration - typically rebuilt from
+    /// [`crate::trust_store::build_root_cert_store`] (plus, on security profile 3,
+    /// [`crate::mutual_tls::client_config`]) after the installed `CsmsRoot` set changes - to take
+    /// effect from the *next* dial, without disturbing the connection that is currently up.
+    ///
+    /// **Not adopted immediately.** A CSMS `InstallCertificate`/`DeleteCertificate` write can be a
+    /// mistake - a root deleted before its replacement is actually being served, a new root
+    /// installed for a certificate the CSMS's TLS endpoint isn't presenting yet - and applying it
+    /// to the live connection on the spot has the same failure mode
+    /// [`crate::network_switch`]'s module docs describe for a network-profile write (A9): the
+    /// station locks itself out of the only CSMS that could push a correction. So the staged
+    /// configuration is only *exercised*, never forced - nothing here closes the current
+    /// connection to go test it, unlike [`run_network_profile_switching`]'s deliberate address
+    /// move, because there is no address to "arrive at"; the existing connection keeps working
+    /// under its confirmed configuration until it would have redialled anyway (a keepalive
+    /// timeout, a network blip, an address switch). Only then does [`Self::dial`] try the staged
+    /// configuration, [`Self::record_success`] commits it once a redial actually succeeds under
+    /// it, and [`Self::record_failure`] discards it - reverting to the configuration proven
+    /// before it - after `attempts_before_rollback` consecutive failures while it is staged, the
+    /// same threshold [`Self::switch_to`]'s address rollback uses
+    /// (`OCPPCommCtrlr`/`NetworkProfileConnectionAttempts`).
+    ///
+    /// Staging again before the previous stage resolved simply replaces it and resets the failure
+    /// count - only the most recent candidate configuration is judged.
+    pub fn stage_tls_config(&self, config: Arc<ocpp_client::rustls::ClientConfig>) {
+        let mut inner = self.inner.lock().expect("target lock");
+        inner.pending_tls_config = Some(config);
+        inner.tls_config_failures = 0;
+    }
+
+    /// The TLS configuration the next dial should use: the staged one if there is an unproven
+    /// candidate, otherwise the confirmed one. `None` means "whatever `ocpp-client`'s own default
+    /// is" - see [`Inner::tls_config`].
+    fn dial_tls_config(&self) -> Option<Arc<ocpp_client::rustls::ClientConfig>> {
+        let inner = self.inner.lock().expect("target lock");
+        inner
+            .pending_tls_config
+            .clone()
+            .or_else(|| inner.tls_config.clone())
     }
 
     /// The address and version for one dial attempt.
@@ -360,7 +435,7 @@ impl ConnectionTarget {
             username: is_origin.then_some(self.username.as_deref()).flatten(),
             password: is_origin.then_some(self.password.as_deref()).flatten(),
             timeout: self.timeout,
-            tls_config: self.tls_config.clone(),
+            tls_config: self.dial_tls_config(),
             ..Default::default()
         };
 
@@ -709,6 +784,119 @@ mod tests {
 
         assert_eq!(target.record_failure(), None);
         assert_eq!(target.address(), "wss://new");
+    }
+
+    fn fake_client_config() -> Arc<ocpp_client::rustls::ClientConfig> {
+        Arc::new(
+            ocpp_client::rustls::ClientConfig::builder()
+                .with_root_certificates(ocpp_client::rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )
+    }
+
+    #[test]
+    fn a_staged_tls_config_is_used_for_the_next_dial_but_is_not_yet_confirmed() {
+        let target = target("wss://origin");
+        assert!(target.dial_tls_config().is_none());
+
+        let staged = fake_client_config();
+        target.stage_tls_config(staged.clone());
+
+        // Used for the next dial...
+        assert!(Arc::ptr_eq(&target.dial_tls_config().unwrap(), &staged));
+        // ...but not yet the confirmed configuration - only a successful dial makes it that.
+        assert!(
+            target
+                .inner
+                .lock()
+                .expect("target lock")
+                .tls_config
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_successful_dial_confirms_a_staged_tls_config() {
+        let target = target("wss://origin");
+        let staged = fake_client_config();
+        target.stage_tls_config(staged.clone());
+
+        target.record_success();
+
+        assert!(Arc::ptr_eq(&target.dial_tls_config().unwrap(), &staged));
+        assert!(
+            Arc::ptr_eq(
+                &target
+                    .inner
+                    .lock()
+                    .expect("target lock")
+                    .tls_config
+                    .clone()
+                    .unwrap(),
+                &staged
+            ),
+            "a proven configuration should become the confirmed one, not merely stay staged"
+        );
+    }
+
+    #[test]
+    fn repeated_dial_failures_revert_a_staged_tls_config_to_the_one_proven_before_it() {
+        // F2.2's rollback: a CSMS `InstallCertificate`/`DeleteCertificate` write that breaks
+        // trust must not brick the station - it must fall back to what worked, the same
+        // `attempts_before_rollback` threshold an address switch uses.
+        let target = target("wss://origin");
+        target.set_connection_attempts(3);
+        let original = fake_client_config();
+        target.stage_tls_config(original.clone());
+        target.record_success(); // confirm the original as "last known good"
+
+        let broken = fake_client_config();
+        target.stage_tls_config(broken.clone());
+        assert!(Arc::ptr_eq(&target.dial_tls_config().unwrap(), &broken));
+
+        target.record_failure();
+        target.record_failure();
+        assert!(
+            Arc::ptr_eq(&target.dial_tls_config().unwrap(), &broken),
+            "fewer than the threshold should not give up on the staged config yet"
+        );
+
+        target.record_failure();
+        assert!(
+            Arc::ptr_eq(&target.dial_tls_config().unwrap(), &original),
+            "the third failure should revert to the configuration proven before the staged one"
+        );
+    }
+
+    #[test]
+    fn a_success_in_between_resets_the_tls_config_failure_count() {
+        let target = target("wss://origin");
+        target.set_connection_attempts(3);
+        let staged = fake_client_config();
+        target.stage_tls_config(staged.clone());
+
+        target.record_failure();
+        target.record_failure();
+        target.record_success(); // e.g. a redial for an unrelated reason (address, keepalive)
+        // Success without an address switch commits the staged config too - it was exercised and
+        // it worked.
+        assert!(Arc::ptr_eq(&target.dial_tls_config().unwrap(), &staged));
+    }
+
+    #[test]
+    fn staging_again_replaces_the_previous_candidate_and_resets_its_failure_count() {
+        let target = target("wss://origin");
+        target.set_connection_attempts(2);
+        target.stage_tls_config(fake_client_config());
+        target.record_failure();
+
+        let newer = fake_client_config();
+        target.stage_tls_config(newer.clone());
+        target.record_failure();
+
+        // Only one failure recorded against the newer candidate, not two carried over from the
+        // one it replaced.
+        assert!(Arc::ptr_eq(&target.dial_tls_config().unwrap(), &newer));
     }
 
     #[test]

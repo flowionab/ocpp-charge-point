@@ -314,7 +314,10 @@ impl<K: KeyStore + Send + Sync + 'static> Signer for KeyStoreSigner<K> {
 /// No X.509 parsing happens here - only PEM's own framing (a fixed textual marker) and base64,
 /// consistent with this crate carrying no crypto dependency (see `crate::certificates::csr`'s
 /// module docs for the same stance applied to CSR assembly).
-fn decode_pem_certificates(pem: &str) -> Option<Vec<CertificateDer<'static>>> {
+///
+/// `pub(crate)` so [`crate::trust_store`] can decode installed `CsmsRoot` chains with the same
+/// framing logic rather than a second copy of it - see that module's docs.
+pub(crate) fn decode_pem_certificates(pem: &str) -> Option<Vec<CertificateDer<'static>>> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
 
@@ -442,12 +445,13 @@ mod tests {
         ))
     }
 
-    /// A minimal [`CertificateStore`] that actually holds a `ChargingStation` chain -
-    /// `StoredCertificates` cannot (see `certificate_chain_pem`'s docs on
-    /// `impl CertificateStore for StoredCertificates`: both its write paths refuse a
-    /// non-installable use, a pre-existing B4.3 limitation), so these tests stand in for "an
-    /// integrator's own store that can parse X.509 and installed its own signed certificate",
-    /// the same escape hatch `crate::certificates`'s module docs describe for roots.
+    /// A minimal [`CertificateStore`] that holds a `ChargingStation` chain without going through
+    /// [`StoredCertificates`]'s real persistence - stands in for "an integrator's own store" in
+    /// the tests below that only care about `client_config`'s handling of the PEM/algorithm it
+    /// gets back, not about how a store persists it.
+    /// `client_config_succeeds_against_the_real_stored_certificates_store`, further down, proves
+    /// the same success path against the real [`StoredCertificates`] (F2.2's fix to
+    /// `install`/`install_with_hash` - see `crate::hardware::certificate`'s module docs).
     #[derive(Default)]
     struct FakeChargingStationStore {
         chain_pem: Option<String>,
@@ -706,6 +710,44 @@ mod tests {
         )
         .await
         .expect("a config should build from an installed chain and a supported algorithm");
+
+        assert!(config.client_auth_cert_resolver.has_certs());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_config_succeeds_against_the_real_stored_certificates_store() {
+        // F2.2: proves `client_config`'s success path against `StoredCertificates` itself, not a
+        // fake - the concrete gap F1.3's own report flagged ("a station using the built-in store
+        // cannot run profile 3, no matter what else is configured"). Installed the same way
+        // `crate::certificates::handle_certificate_signed` does in production: the plain `install`
+        // trait method, with only a raw PEM and no hash data.
+        let leaf = base64_encode_for_test(b"leaf-der-bytes");
+        let certificate_store = StoredCertificates::new(Arc::new(InMemoryStorage::new()));
+        assert_eq!(
+            certificate_store
+                .install(
+                    CertificateUse::ChargingStation,
+                    &format!("-----BEGIN CERTIFICATE-----\n{leaf}\n-----END CERTIFICATE-----\n"),
+                )
+                .await,
+            Ok(crate::hardware::InstallCertificateOutcome::Accepted)
+        );
+
+        let store = key_store();
+        let generated: GeneratedKeyPair = store
+            .generate_key_pair(KeySignatureAlgorithm::EcdsaP256Sha256)
+            .await
+            .unwrap();
+
+        let config = client_config(
+            &certificate_store,
+            store,
+            generated.public_key,
+            generated.handle,
+            RootCertStore::empty(),
+        )
+        .await
+        .expect("a config should build against the real StoredCertificates store");
 
         assert!(config.client_auth_cert_resolver.has_certs());
     }

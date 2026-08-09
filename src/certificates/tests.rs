@@ -7,6 +7,7 @@ use crate::hardware::{
 };
 use crate::state::ChargePointEvent;
 use alloc::boxed::Box;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -342,9 +343,50 @@ async fn a_missing_request_id_still_matches_a_pending_one_since_2_0_1_has_none()
 }
 
 #[tokio::test]
-async fn a_chain_the_store_refuses_is_reported_as_rejected() {
+async fn a_signed_charging_station_certificate_is_installed_into_the_real_store() {
+    // F2.2: `StoredCertificates::install` used to refuse a `ChargingStation`/
+    // `V2gCertificateChain` certificate unconditionally, which made this the one B4.3 outcome a
+    // charge point using the built-in store could ever reach - security profile 3 was
+    // undemonstrable end to end as a result. This is the fixed, intended outcome: the plain
+    // trait method `handle_certificate_signed` calls now accepts the charge point's own
+    // certificate via a self-computed stand-in hash - see
+    // `crate::hardware::certificate::StoredCertificates::install_own_certificate`'s docs for what
+    // that hash is and is not.
     let actor = actor_with_certificates().await;
-    let store = store(); // `StoredCertificates` refuses every bare `install`.
+    let store = store();
+    let pending = PendingSignRequests::new();
+    pending.record_sent(CertificateSigningPurpose::ChargingStationCertificate, None);
+
+    let outcome = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----",
+    )
+    .await;
+
+    assert_eq!(outcome, CertificateSignedOutcome::Accepted);
+    assert_eq!(
+        store
+            .certificate_chain_pem(CertificateUse::ChargingStation)
+            .await
+            .unwrap(),
+        Some("-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_chain_the_store_refuses_is_reported_as_rejected() {
+    // A store that is genuinely full (rather than one that refuses this use categorically, which
+    // is no longer true - see the test above) is still a real refusal `handle_certificate_signed`
+    // must surface as `Rejected`.
+    let actor = actor_with_certificates().await;
+    let store = StoredCertificates::with_limit(Arc::new(InMemoryStorage::new()), 1);
+    store
+        .install_with_hash(CertificateUse::CsmsRoot, "-----BEGIN-----", hash("01"))
+        .await;
     let pending = PendingSignRequests::new();
     pending.record_sent(CertificateSigningPurpose::ChargingStationCertificate, None);
 

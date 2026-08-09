@@ -192,6 +192,35 @@ pub trait CertificateStore {
         let _ = use_for;
         Ok(None)
     }
+
+    /// Every PEM-encoded certificate chain currently installed for `use_for`, in no particular
+    /// order.
+    ///
+    /// The multi-valued counterpart to [`Self::certificate_chain_pem`] - right for a *trust
+    /// store* like [`CertificateUse::CsmsRoot`], which typically holds several roots side by
+    /// side (multiple CAs, or an old and new root during a rotation), where
+    /// [`Self::certificate_chain_pem`]'s "the one entry this use holds" assumption - correct for
+    /// the charge point's own single-slotted certificate - would silently drop every root after
+    /// the first. [`crate::trust_store`] ([F2.2](crate)) is why this exists: building a
+    /// `rustls::RootCertStore` from only one of several installed roots would make this charge
+    /// point unable to verify a CSMS whose current certificate happens to chain to any of the
+    /// others.
+    ///
+    /// Additive (default delegates to [`Self::certificate_chain_pem`]) so existing implementors
+    /// keep compiling. The default is safe even though it can be incomplete: at worst a caller
+    /// building a trust store sees one root instead of several, never zero out of some that
+    /// exist and never a wrong one. [`StoredCertificates`] overrides it to return every matching
+    /// entry; an implementation that can hold more than one certificate per use should too.
+    async fn all_certificate_chain_pems(
+        &self,
+        use_for: CertificateUse,
+    ) -> Result<Vec<String>, Self::Error> {
+        Ok(self
+            .certificate_chain_pem(use_for)
+            .await?
+            .into_iter()
+            .collect())
+    }
 }
 
 #[async_trait::async_trait]
@@ -229,6 +258,13 @@ impl<T: CertificateStore + Send + Sync + ?Sized> CertificateStore for alloc::syn
         use_for: CertificateUse,
     ) -> Result<Option<String>, Self::Error> {
         (**self).certificate_chain_pem(use_for).await
+    }
+
+    async fn all_certificate_chain_pems(
+        &self,
+        use_for: CertificateUse,
+    ) -> Result<Vec<String>, Self::Error> {
+        (**self).all_certificate_chain_pems(use_for).await
     }
 }
 
@@ -464,15 +500,26 @@ impl<S: crate::hardware::Storage + Send + Sync> CertificateStore for StoredCerti
         use_for: CertificateUse,
         certificate: &str,
     ) -> Result<InstallCertificateOutcome, Self::Error> {
-        if !use_for.is_installable() {
+        if use_for.is_installable() {
+            // A CSMS-pushed root (`InstallCertificate`). This store does no X.509 parsing - it
+            // has no crypto - so it cannot compute the hashes a CSMS would later address the
+            // certificate by. `install_with_hash` is the entry point for an integrator that can;
+            // through this plain trait method, a certificate with no hash data would be
+            // unaddressable and therefore undeletable, which is worse than refusing it. This is a
+            // real, honest limitation of *this* store - see the module docs.
+            let _ = certificate;
             return Ok(InstallCertificateOutcome::Rejected);
         }
-        // This store does no X.509 parsing - it has no crypto - so it cannot compute the hashes a
-        // CSMS addresses a certificate by. `install_with_hash` is the entry point for an
-        // integrator that can; through the plain trait method, a certificate with no hash data
-        // would be unaddressable and therefore undeletable, which is worse than refusing it.
-        let _ = certificate;
-        Ok(InstallCertificateOutcome::Rejected)
+        // The charge point's *own* certificate (`ChargingStation`/`V2gCertificateChain`),
+        // arriving via `CertificateSigned` rather than `InstallCertificate` - see
+        // `crate::certificates::handle_certificate_signed`, the only caller that reaches this
+        // branch in practice. Unlike a CSMS-pushed root, nothing needs this slot's hash to match a
+        // value some other party (the CSMS) computed independently by parsing the same
+        // certificate: it is self-issued and single-slotted (`certificate_chain_pem`'s docs), so
+        // this store can give it a self-computed, honestly-labelled stand-in identity instead of
+        // refusing outright. See `install_own_certificate` for exactly what that identity is and
+        // is not.
+        Ok(self.install_own_certificate(use_for, certificate).await)
     }
 
     async fn delete(
@@ -527,15 +574,9 @@ impl<S: crate::hardware::Storage + Send + Sync> CertificateStore for StoredCerti
         &self,
         use_for: CertificateUse,
     ) -> Result<Option<String>, Self::Error> {
-        // Correct but, today, empty for `CertificateUse::ChargingStation`/`V2gCertificateChain`:
-        // neither `install` (always `Rejected` - no hashes to compute) nor `install_with_hash`
-        // (refuses a non-installable use, by the same `is_installable` gate `InstallCertificate`
-        // itself uses) can ever put an entry in either slot. That is a pre-existing B4.3
-        // limitation of *this* store, not something F1.3 changes - a charge point wanting
-        // security profile 3's `crate::mutual_tls` with `StoredCertificates` needs either that
-        // gap closed or its own `CertificateStore` implementation that can hold its own signed
-        // certificate (the same "an integrator who can parse X.509 implements the trait" escape
-        // hatch this module's own docs describe for roots).
+        // `CertificateUse::ChargingStation`/`V2gCertificateChain` *can* hold an entry here -
+        // `install`'s own-certificate branch (`install_own_certificate`) puts one there, which is
+        // what lets `crate::mutual_tls::client_config` retrieve it against this store for real.
         //
         // Each use holds exactly one entry (`install_with_hash` replaces rather than
         // duplicates), and `install`/`install_with_hash` both take the caller's certificate
@@ -549,6 +590,20 @@ impl<S: crate::hardware::Storage + Send + Sync> CertificateStore for StoredCerti
             .find(|entry| CertificateUse::from(entry.use_for) == use_for)
             .map(|entry| entry.pem))
     }
+
+    async fn all_certificate_chain_pems(
+        &self,
+        use_for: CertificateUse,
+    ) -> Result<Vec<String>, Self::Error> {
+        Ok(self
+            .load()
+            .await
+            .entries
+            .into_iter()
+            .filter(|entry| CertificateUse::from(entry.use_for) == use_for)
+            .map(|entry| entry.pem)
+            .collect())
+    }
 }
 
 impl<S: crate::hardware::Storage + Send + Sync> StoredCertificates<S> {
@@ -558,15 +613,25 @@ impl<S: crate::hardware::Storage + Send + Sync> StoredCertificates<S> {
     /// the hash data, this store keeps it. Separate from
     /// [`CertificateStore::install`] because the trait method takes only a PEM, and this store
     /// cannot derive the hashes from one.
+    ///
+    /// **No `is_installable` gate.** That check exists to stop a *CSMS* from pushing the charge
+    /// point's own certificate through `InstallCertificate` - and it is enforced there, at the
+    /// only call site that message reaches
+    /// (`crate::certificates::handle_install_certificate`, which checks it before ever touching a
+    /// `CertificateStore`). This method is never on that path: it is only ever called directly, by
+    /// an integrator or by this crate's own `CertificateSigned` handling
+    /// (`crate::certificates::handle_certificate_signed`, via [`CertificateStore::install`]'s
+    /// `StoredCertificates` impl above), both of which already know the certificate's provenance
+    /// is legitimate by the time they call it. Re-applying the CSMS-provenance gate here blocked
+    /// exactly that legitimate caller - the charge point storing its own signed certificate -
+    /// which is what made security profile 3 impossible to run against this store at all; see the
+    /// module docs.
     pub async fn install_with_hash(
         &self,
         use_for: CertificateUse,
         certificate: &str,
         hash_data: CertificateHashData,
     ) -> InstallCertificateOutcome {
-        if !use_for.is_installable() {
-            return InstallCertificateOutcome::Rejected;
-        }
         let mut certificates = self.load().await;
         // Reinstalling the same certificate replaces it rather than duplicating - the CSMS is
         // addressing one slot, the same rule the charging-profile store follows.
@@ -594,6 +659,43 @@ impl<S: crate::hardware::Storage + Send + Sync> StoredCertificates<S> {
             InstallCertificateOutcome::Failed
         }
     }
+
+    /// Stores the charge point's own certificate (`ChargingStation`/`V2gCertificateChain`) - the
+    /// branch of [`CertificateStore::install`] that is not a CSMS-pushed root, reached from
+    /// [`crate::certificates::handle_certificate_signed`] answering a `CertificateSigned`.
+    ///
+    /// **The hash this reports is not a real X.509 issuer hash.** This store has no X.509 parser
+    /// (see the module docs), so it cannot derive `issuerNameHash`/`issuerKeyHash` from
+    /// `certificate` the way a CSMS would from parsing the same bytes. What it *can* do - the one
+    /// hashing exception this crate makes, the same one `crate::certificates::csr` (CSR digests)
+    /// and `crate::mutual_tls` (TLS handshake digests) already rely on - is hash the PEM bytes
+    /// with SHA-256 and use that as a stable stand-in identity for
+    /// [`CertificateStore::installed`]/[`CertificateStore::delete`]. That is sound for *this* slot
+    /// specifically, in a way it would not be for a CSMS-pushed root: nothing else ever computes
+    /// this certificate's hash independently and expects a match - it is self-issued and
+    /// single-slotted (`certificate_chain_pem`'s docs), so the only party that will ever ask "is
+    /// this the one I mean" is this same charge point, comparing against a value it produced
+    /// itself. A CSMS listing it via `GetInstalledCertificateIds` sees this stand-in, not a
+    /// spec-compliant issuer hash - a genuinely compliant one still needs the X.509 parser this
+    /// crate does not carry, the same honest limitation `install`'s root branch documents.
+    async fn install_own_certificate(
+        &self,
+        use_for: CertificateUse,
+        certificate: &str,
+    ) -> InstallCertificateOutcome {
+        let digest = hex_encode(&crate::certificates::csr::sha256(certificate.as_bytes()));
+        self.install_with_hash(
+            use_for,
+            certificate,
+            CertificateHashData {
+                hash_algorithm: HashAlgorithm::Sha256,
+                issuer_name_hash: digest.clone(),
+                issuer_key_hash: digest.clone(),
+                serial_number: digest,
+            },
+        )
+        .await
+    }
 }
 
 /// Whether `entry` is the certificate `hash_data` addresses. All four fields must match: the
@@ -602,6 +704,19 @@ fn matches_hash(entry: &PersistedCertificate, hash_data: &CertificateHashData) -
     entry.serial_number == hash_data.serial_number
         && entry.issuer_name_hash == hash_data.issuer_name_hash
         && entry.issuer_key_hash == hash_data.issuer_key_hash
+}
+
+/// Hex-encodes `bytes`, lowercase - just enough formatting for
+/// [`StoredCertificates::install_own_certificate`]'s stand-in hash to be readable; no dependency
+/// worth pulling in for it.
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0F) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -751,12 +866,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_charge_points_own_certificate_cannot_be_installed_into_the_store_either() {
+    async fn install_with_hash_stores_the_charge_points_own_certificate_when_the_caller_supplies_a_hash()
+     {
+        // F2.2: `install_with_hash`'s `is_installable` gate was over-broad - it exists to stop a
+        // *CSMS* pushing this slot via `InstallCertificate`, a path this method is never reached
+        // from. A caller who already has hash data (an integrator, or this crate's own
+        // `CertificateSigned` handling) can use it for the charge point's own certificate too.
+        let store = store();
         assert_eq!(
-            store()
+            store
                 .install_with_hash(CertificateUse::ChargingStation, "a", hash("01"))
                 .await,
-            InstallCertificateOutcome::Rejected
+            InstallCertificateOutcome::Accepted
+        );
+        let installed = store.installed(&[]).await.unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].use_for, CertificateUse::ChargingStation);
+    }
+
+    #[tokio::test]
+    async fn install_stores_the_charge_points_own_certificate_with_a_self_computed_stand_in_hash() {
+        // The plain trait method, as `crate::certificates::handle_certificate_signed` calls it -
+        // no hash data available at all, only the raw PEM from `CertificateSigned`. Unlike a
+        // CSMS-pushed root (still `Rejected`: no crypto to compute the hash a CSMS would expect),
+        // the charge point's own certificate gets a self-computed stand-in instead of a refusal -
+        // see `install_own_certificate`'s docs for exactly what that stand-in is and is not.
+        let store = store();
+
+        assert_eq!(
+            store
+                .install(
+                    CertificateUse::ChargingStation,
+                    "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----",
+                )
+                .await,
+            Ok(InstallCertificateOutcome::Accepted)
+        );
+
+        assert_eq!(
+            store
+                .certificate_chain_pem(CertificateUse::ChargingStation)
+                .await
+                .unwrap(),
+            Some("-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----".to_string())
+        );
+        let installed = store
+            .installed(&[CertificateUse::ChargingStation])
+            .await
+            .unwrap();
+        assert_eq!(installed.len(), 1);
+        // Deterministic (same PEM hashes the same way twice), which is what lets a repeat
+        // `CertificateSigned` for the same certificate replace rather than duplicate the entry.
+        assert_eq!(
+            installed[0].hash_data.serial_number,
+            installed[0].hash_data.issuer_name_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn a_csms_pushed_root_is_still_refused_through_the_plain_install_method() {
+        // The genuinely honest limitation this fix must not erase: `install` still cannot compute
+        // a spec-compliant hash for a certificate a CSMS pushed, so a root still needs
+        // `install_with_hash` (an integrator that can parse X.509) rather than silently
+        // succeeding with a stand-in a CSMS never asked for and would not recognise.
+        assert_eq!(
+            store()
+                .install(CertificateUse::CsmsRoot, "-----BEGIN CERTIFICATE-----")
+                .await,
+            Ok(InstallCertificateOutcome::Rejected)
         );
     }
 
@@ -803,11 +980,8 @@ mod tests {
 
     #[tokio::test]
     async fn certificate_chain_pem_returns_the_installed_pem_for_the_matching_use() {
-        // `CertificateUse::ChargingStation` cannot be exercised through `StoredCertificates`
-        // here: `install_with_hash` refuses it too (see
-        // `the_charge_points_own_certificate_cannot_be_installed_into_the_store_either`), a
-        // pre-existing B4.3 limitation this method does not change - see
-        // `certificate_chain_pem`'s own docs. `CsmsRoot` proves the same lookup plumbing.
+        // `CsmsRoot` proves the lookup plumbing; the own-certificate slots have their own
+        // dedicated tests above now that they can hold an entry at all.
         let store = store();
         store
             .install_with_hash(
@@ -843,6 +1017,58 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn all_certificate_chain_pems_returns_every_root_not_just_the_first() {
+        // F2.2: `certificate_chain_pem`'s "one entry" assumption is right for the charge point's
+        // own certificate but wrong for a trust store, which typically holds several roots at
+        // once - `crate::trust_store` needs all of them, not whichever happened to load first.
+        let store = store();
+        store
+            .install_with_hash(CertificateUse::CsmsRoot, "root-a", hash("01"))
+            .await;
+        store
+            .install_with_hash(CertificateUse::CsmsRoot, "root-b", hash("02"))
+            .await;
+        store
+            .install_with_hash(CertificateUse::V2gRoot, "not-a-csms-root", hash("03"))
+            .await;
+
+        let mut pems = store
+            .all_certificate_chain_pems(CertificateUse::CsmsRoot)
+            .await
+            .unwrap();
+        pems.sort();
+        assert_eq!(
+            pems,
+            alloc::vec!["root-a".to_string(), "root-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_certificate_chain_pems_is_empty_rather_than_erroring_when_nothing_is_installed() {
+        assert!(
+            store()
+                .all_certificate_chain_pems(CertificateUse::CsmsRoot)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_all_certificate_chain_pems_delegates_to_the_single_valued_method() {
+        // Proves the default implementation on the trait itself (`NoCertificateStore` never
+        // overrides it), so a `CertificateStore` that only implements the older single-valued
+        // method still answers sensibly through the newer multi-valued one.
+        assert!(
+            NoCertificateStore
+                .all_certificate_chain_pems(CertificateUse::CsmsRoot)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }
