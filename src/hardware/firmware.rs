@@ -135,6 +135,44 @@ pub enum FirmwareVerificationOutcome {
 /// refused rather than installed unchecked. An `Err` from [`Self::verify`] is treated exactly the
 /// same way by [`crate::firmware`]'s worker as [`FirmwareVerificationOutcome::InvalidSignature`] -
 /// "could not verify" and "verified and failed" both mean the image does not get installed.
+///
+/// # How this relates to secure boot (F5.4)
+///
+/// Secure boot and this trait verify **the same trust chain from its two ends**, not two separate
+/// mechanisms. Secure boot - a property of the bootloader and the silicon, which this crate cannot
+/// implement and does not attempt to - checks, at power-on, that the firmware image *already
+/// running* was legitimately signed before the bootloader would jump to it. [`FirmwareVerifier`]
+/// checks, before an OTA update takes effect, that the *next* image about to replace it is
+/// legitimately signed too. Together they close the loop: secure boot vouches for how the current
+/// image got here, this trait vouches for how the next one will. Neither can stand in for the
+/// other - a charge point with a real secure-boot chain but [`NoFirmwareVerifier`] would let a
+/// malicious OTA image through even though every boot re-verifies whatever most recently landed;
+/// one with a real [`FirmwareVerifier`] but no secure boot has no defence against firmware flashed
+/// by a route that skips the OTA path entirely (a debug/JTAG port, a manufacturing tool left
+/// reachable). An integrator with secure-boot hardware should wire *both*: this trait for the OTA
+/// half (the only half this crate can call into), and their bootloader's own chain for the
+/// power-on half, which this crate has no hook into and no visibility of.
+///
+/// This crate's part of the boundary is honest, not partial: there is no `SecureBootVerifier`
+/// trait alongside this one, because this crate genuinely cannot observe or influence what the
+/// bootloader decided before its own `main` ever ran - inventing an API for that would be
+/// decoration, not a capability. What an integrator whose bootloader *does* detect a chain-of-trust
+/// failure (a boot signature that did not verify, a rollback below the anti-rollback counter) needs
+/// instead is a way to tell this crate's CSMS-facing side about it after the fact, and that already
+/// exists: [`crate::security::report_security_event`] takes any
+/// [`SecurityEvent`](crate::state::SecurityEvent) from integrator code exactly as it does from this
+/// crate's own. The closest standardized fits are
+/// [`SecurityEventType::TamperDetectionActivated`](crate::state::SecurityEventType::TamperDetectionActivated)
+/// (OCPP's physical-tamper category, the nearest standardized description of "something below the
+/// application layer was interfered with") and
+/// [`SecurityEventType::InvalidFirmwareSigningCertificate`](crate::state::SecurityEventType::InvalidFirmwareSigningCertificate)/
+/// [`SecurityEventType::InvalidFirmwareSignature`](crate::state::SecurityEventType::InvalidFirmwareSignature)
+/// (if the boot failure was specifically a bad signature or an untrusted signer, mirroring what
+/// this trait itself reports for the OTA half); `SecurityEventType::Other` covers a vendor-specific
+/// distinction the standardized list does not draw (e.g. separating "bad signature" from "rollback
+/// counter violation"). This crate does not pick one of these for the integrator - which fits
+/// depends on what the bootloader actually detected, and only the integrator's bootloader
+/// integration knows that.
 #[async_trait::async_trait]
 pub trait FirmwareVerifier {
     /// The error type returned when verification could not even be attempted.

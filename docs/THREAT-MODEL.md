@@ -146,9 +146,35 @@ a forged CSMS/charging-station certificate.
   either** — see the full list in §5. These require either upstream `ocpp-client` TLS
   introspection this crate does not currently receive, or functional blocks (certificate renewal,
   F3.2) that are not yet built.
-- **Secure boot is entirely out of scope (F5.4, open).** This crate has no way to verify, and does
+- **Secure boot itself is entirely out of scope (F5.4).** This crate has no way to verify, and does
   not attempt to verify, that the firmware it is running inside was itself loaded by a trusted
-  bootloader. That is squarely the integrator's hardware/bootloader responsibility.
+  bootloader - that is squarely the integrator's hardware/bootloader responsibility, and no API in
+  this crate pretends otherwise. What this crate does provide are the two integration points an
+  integrator with a secure-boot chain needs to connect it to the OCPP-facing side: `FirmwareVerifier`
+  (above) is the *other end of the same trust chain* - secure boot vouches for the image already
+  running, `FirmwareVerifier` vouches for the next one before an OTA update installs it - see that
+  trait's own docs (`src/hardware/firmware.rs`) for how the two relate. And when a bootloader
+  itself detects a chain-of-trust failure (a boot signature that doesn't verify, a rollback below an
+  anti-rollback counter), `crate::security::report_security_event` is the existing, general entry
+  point for the integrator to surface it to the CSMS - most naturally as
+  `TamperDetectionActivated` or, for a specifically bad signature/signer, the same
+  `InvalidFirmwareSignature`/`InvalidFirmwareSigningCertificate` types §4.2 already models for the
+  OTA half. No new trait was added for this: this crate has no hook into, and no visibility of,
+  anything that happens before its own code starts running, and inventing an API to paper over that
+  boundary would be decoration rather than a real capability.
+- **Key-handle durability across a secure-element replacement (E2.9).** A `KeyHandle` (F2.4) is
+  designed to survive a reboot and keep naming the same key - see `src/hardware/key_storage.rs`'s
+  module docs. The case that needs an explicit answer is a handle surviving *longer than the key
+  does* - a secure element physically swapped during service, or a `Storage` backup restored onto
+  different hardware than it was taken from. `KeyStore::sign` must fail closed in that situation
+  (return `Err`, never silently sign with whatever unrelated key now occupies that slot); this
+  crate cannot verify that on an implementor's behalf without the asymmetric-verification math it
+  deliberately does not carry, so it is a documented obligation on every `KeyStore` implementation
+  rather than a checked invariant. `SoftKeyStore` upholds it by deriving each handle from a hash of
+  the key it names (rather than a per-store sequence number, which could otherwise collide across
+  two independently-initialized stores) - see
+  `a_handle_from_a_replaced_key_store_fails_closed_rather_than_signing_with_a_different_key` in that
+  module's tests.
 - **`SoftKeyStore` (the software fallback) stores private keys in `Storage` in whatever encoding
   the `SoftwareCrypto` backend produces, with no encryption layer of its own.** Its own module
   docs say so directly: "a key in flash is a key an attacker with the flash has." Confidentiality
