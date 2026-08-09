@@ -2,9 +2,14 @@
 //! `GetInstalledCertificateIds` (`docs/ROADMAP.md` §1/§13, `docs/PRODUCTION-ROADMAP.md` B4.2), and
 //! the `SignCertificate`/`CertificateSigned` CSR round trip (B4.3).
 //!
-//! **2.x only.** 1.6J has no certificate messages in its core specification - they arrive with the
-//! Security Whitepaper, whose message set `ocpp-types` does not generate (D2.2), the same reason
-//! `SecurityEventNotification` is 2.x-only here.
+//! **1.6J too, since D2.2.** 1.6J has no certificate messages in its core specification - they
+//! arrive with the Security Whitepaper - but the pinned `ocpp-client` 0.5.0 generates all five
+//! (verified against `ocpp_1_6::actions`), so `ocpp_1_6` below wires them. 1.6J's shapes are
+//! narrower than 2.x's throughout: `CertificateType` names only two roots
+//! (`CentralSystemRootCertificate`/`ManufacturerRootCertificate`, no V2G/MO/OEM roots or the
+//! charge point's own chain), `GetInstalledCertificateIds` takes exactly one type rather than an
+//! optional list, and `SignCertificate`/`CertificateSigned` carry no `certificateType` at all - see
+//! `ocpp_1_6`'s module docs for what each of those narrowings means for the projection.
 //!
 //! Every handler is a thin decision over [`crate::hardware::CertificateStore`], which is where the
 //! actual work lives: parsing X.509, computing hashes and holding keys all belong to the
@@ -389,6 +394,13 @@ pub enum SignCertificateError<K, C> {
     Csr(CsrBuildError<K>),
     /// Sending the `SignCertificate` request failed at the transport/protocol level.
     Client(C),
+    /// The requested [`CertificateSigningPurpose`] has no representation on this connection's
+    /// wire protocol - added for D2.2's 1.6J adapter, whose `SignCertificateRequest` carries no
+    /// `certificateType` field at all (unlike 2.x's), so it can only ever mean
+    /// [`CertificateSigningPurpose::ChargingStationCertificate`]. Returned before anything is
+    /// sent, so a caller asking a 1.6J connection to sign a V2G certificate gets a clear local
+    /// error rather than a CSR silently sent and misinterpreted by the CSMS as the wrong purpose.
+    UnsupportedPurpose,
 }
 
 impl<K: core::fmt::Display, C: core::fmt::Display> core::fmt::Display
@@ -398,6 +410,12 @@ impl<K: core::fmt::Display, C: core::fmt::Display> core::fmt::Display
         match self {
             Self::Csr(error) => write!(f, "{error}"),
             Self::Client(error) => write!(f, "sending SignCertificate failed: {error}"),
+            Self::UnsupportedPurpose => {
+                write!(
+                    f,
+                    "this connection's SignCertificate cannot express that purpose"
+                )
+            }
         }
     }
 }
@@ -433,6 +451,8 @@ pub trait CertificateSigningRequester<ClientErr> {
         K: crate::hardware::KeyStore + Send + Sync;
 }
 
+#[cfg(feature = "ocpp_1_6")]
+mod ocpp_1_6;
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1;
 #[cfg(feature = "ocpp_2_1")]

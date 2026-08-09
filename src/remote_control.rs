@@ -107,6 +107,26 @@ pub trait TriggerMessageHandler {
     async fn register_trigger_message_handler(&self, actor: ChargePointActor);
 }
 
+/// Registers this charge point's inbound `ExtendedTriggerMessage` handling (D2.2) - 1.6J's
+/// Security Whitepaper counterpart to [`TriggerMessageHandler`]'s `TriggerMessage`.
+///
+/// A separate trait, not a variant of [`TriggerMessageHandler`]: the two are distinct wire
+/// actions, on distinct `MessageTriggerEnumType`-shaped enums
+/// (`ExtendedTriggerMessageRequestRequestedMessage` adds `LogStatusNotification` and
+/// `SignChargePointCertificate` where `TriggerMessageRequestRequestedMessage` has
+/// `DiagnosticsStatusNotification`, and is missing from that enum in 2.x entirely - see
+/// `docs/PRODUCTION-ROADMAP.md` D2.2), registered against a different `on_*` callback on
+/// `OCPP1_6Client`. They share [`TriggerableMessage`]/[`handle_trigger_message`] rather than
+/// forking them: both wire enums still only name two things this crate can actually resend
+/// (`Heartbeat`, `StatusNotification`), and each wire enum's own type keeps a value valid for one
+/// action from ever being accepted by the other - there is no shared "trigger code" a mismatched
+/// value could slip through.
+#[async_trait::async_trait]
+pub trait ExtendedTriggerMessageHandler {
+    /// Registers an `ExtendedTriggerMessage` handler dispatching against `actor`.
+    async fn register_extended_trigger_message_handler(&self, actor: ChargePointActor);
+}
+
 /// The outcome of a CSMS-initiated `RequestStartTransaction` request, matching (a subset of)
 /// OCPP's `RequestStartStopStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1951,9 +1971,10 @@ pub(crate) mod ocpp_2_0_1 {
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
     use super::{
-        RequestStartTransactionHandler, RequestStartTransactionOutcome,
-        RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
-        TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
+        ExtendedTriggerMessageHandler, RequestStartTransactionHandler,
+        RequestStartTransactionOutcome, RequestStopTransactionHandler,
+        RequestStopTransactionOutcome, TriggerMessageHandler, TriggerMessageOutcome,
+        TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
         handle_request_start_transaction, handle_request_stop_transaction_with_replay_guard,
         handle_trigger_message, handle_unlock_request,
     };
@@ -1964,6 +1985,8 @@ mod ocpp_1_6 {
     use crate::state::TransactionId;
     use crate::topology::unflatten_ocpp_1_6_connector_id;
     use crate::wire::v16::common::{
+        ExtendedTriggerMessageRequestRequestedMessage as ExtendedRequestedMessage,
+        ExtendedTriggerMessageResponseStatus,
         RemoteStartTransactionResponseStatus,
         RemoteStopTransactionResponseStatus,
         // Renamed upstream in `ocpp-types` 0.2.0 to make room for
@@ -1973,6 +1996,7 @@ mod ocpp_1_6 {
         UnlockConnectorResponseStatus,
     };
     use crate::wire::v16::{
+        ExtendedTriggerMessageRequest, ExtendedTriggerMessageResponse,
         RemoteStartTransactionRequest, RemoteStartTransactionResponse,
         RemoteStopTransactionResponse, TriggerMessageRequest, TriggerMessageResponse,
         UnlockConnectorResponse,
@@ -2018,6 +2042,28 @@ mod ocpp_1_6 {
         match requested {
             RequestedMessage::Heartbeat => Some(TriggerableMessage::Heartbeat),
             RequestedMessage::StatusNotification => {
+                Some(TriggerableMessage::StatusNotification(target))
+            }
+            _ => None,
+        }
+    }
+
+    /// 1.6J's `ExtendedTriggerMessage.requestedMessage` onto this crate's [`TriggerableMessage`],
+    /// or `None` for one no functional block here can fulfil (D2.2) - reported as
+    /// `NotImplemented`, exactly like [`triggerable_message`]'s handling of plain
+    /// `TriggerMessage`. `ExtendedTriggerMessageRequestRequestedMessage` is a different wire enum
+    /// from `TriggerMessageRequestRequestedMessage` (it adds `LogStatusNotification` and
+    /// `SignChargePointCertificate`, and drops `DiagnosticsStatusNotification`), so this is its
+    /// own match rather than a shared one - but the two values this crate can actually fulfil are
+    /// the same two, and the Rust type system already keeps a value valid for one action from
+    /// ever reaching the other's handler.
+    fn extended_triggerable_message(
+        requested: &ExtendedRequestedMessage,
+        target: AvailabilityTarget,
+    ) -> Option<TriggerableMessage> {
+        match requested {
+            ExtendedRequestedMessage::Heartbeat => Some(TriggerableMessage::Heartbeat),
+            ExtendedRequestedMessage::StatusNotification => {
                 Some(TriggerableMessage::StatusNotification(target))
             }
             _ => None,
@@ -2132,6 +2178,57 @@ mod ocpp_1_6 {
         }
     }
 
+    // --- ExtendedTriggerMessage (D2.2) ---
+
+    #[async_trait::async_trait]
+    impl ExtendedTriggerMessageHandler for Ocpp1_6TriggerMessageHandler {
+        async fn register_extended_trigger_message_handler(&self, actor: ChargePointActor) {
+            let client = self.client.clone();
+            let connector_counts = self.connector_counts.clone();
+            let notifier = Arc::new(Ocpp1_6TriggerMessageHandler::new(
+                self.client.clone(),
+                self.connector_counts.clone(),
+            ));
+            client
+                .on_extended_trigger_message(
+                    move |request: ExtendedTriggerMessageRequest, _client| {
+                        let actor = actor.clone();
+                        let notifier = notifier.clone();
+                        let connector_counts = connector_counts.clone();
+                        async move {
+                            let Ok(target) =
+                                trigger_target(&connector_counts, request.connector_id)
+                            else {
+                                return Ok(ExtendedTriggerMessageResponse {
+                                    status: ExtendedTriggerMessageResponseStatus::Rejected,
+                                });
+                            };
+                            let Some(message) =
+                                extended_triggerable_message(&request.requested_message, target)
+                            else {
+                                return Ok(ExtendedTriggerMessageResponse {
+                                    status: ExtendedTriggerMessageResponseStatus::NotImplemented,
+                                });
+                            };
+                            let outcome =
+                                handle_trigger_message(&actor, notifier.as_ref(), message).await;
+                            Ok(ExtendedTriggerMessageResponse {
+                                status: match outcome {
+                                    TriggerMessageOutcome::Accepted => {
+                                        ExtendedTriggerMessageResponseStatus::Accepted
+                                    }
+                                    TriggerMessageOutcome::Rejected => {
+                                        ExtendedTriggerMessageResponseStatus::Rejected
+                                    }
+                                },
+                            })
+                        }
+                    },
+                )
+                .await;
+        }
+    }
+
     #[cfg(test)]
     mod trigger_message_tests {
         use super::*;
@@ -2201,6 +2298,42 @@ mod ocpp_1_6 {
             ] {
                 assert_eq!(
                     triggerable_message(&requested, AvailabilityTarget::ChargePoint),
+                    None
+                );
+            }
+        }
+
+        #[test]
+        fn extended_trigger_message_maps_the_same_two_messages_and_rejects_the_rest() {
+            assert_eq!(
+                extended_triggerable_message(
+                    &ExtendedRequestedMessage::Heartbeat,
+                    AvailabilityTarget::ChargePoint
+                ),
+                Some(TriggerableMessage::Heartbeat)
+            );
+            assert_eq!(
+                extended_triggerable_message(
+                    &ExtendedRequestedMessage::StatusNotification,
+                    AvailabilityTarget::ChargePoint
+                ),
+                Some(TriggerableMessage::StatusNotification(
+                    AvailabilityTarget::ChargePoint
+                ))
+            );
+            // Distinct from `TriggerMessage`'s unsupported set: `ExtendedTriggerMessage` adds
+            // `LogStatusNotification` and `SignChargePointCertificate`, and has no
+            // `DiagnosticsStatusNotification` value at all - the two wire enums are different
+            // types.
+            for requested in [
+                ExtendedRequestedMessage::BootNotification,
+                ExtendedRequestedMessage::LogStatusNotification,
+                ExtendedRequestedMessage::FirmwareStatusNotification,
+                ExtendedRequestedMessage::MeterValues,
+                ExtendedRequestedMessage::SignChargePointCertificate,
+            ] {
+                assert_eq!(
+                    extended_triggerable_message(&requested, AvailabilityTarget::ChargePoint),
                     None
                 );
             }

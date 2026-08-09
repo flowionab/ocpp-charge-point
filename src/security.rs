@@ -15,6 +15,8 @@ use core::cell::RefCell;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
+#[cfg(feature = "ocpp_1_6")]
+pub use self::ocpp_1_6::Ocpp1_6SecurityEventNotifier;
 #[cfg(feature = "ocpp_2_0_1")]
 pub use self::ocpp_2_0_1::Ocpp2_0_1SecurityEventNotifier;
 #[cfg(feature = "ocpp_2_1")]
@@ -27,7 +29,7 @@ pub use self::ocpp_2_1::Ocpp2_1SecurityEventNotifier;
 /// level for: the wire shape is a free-form string (unlike e.g. `IdToken.type`, which 2.0.1 keeps
 /// as a closed enum), so it was never 2.1-specific. When `ocpp-client` gained the 2.0.1 action
 /// (D1), the adapter below reused this rather than needing a second copy.
-#[cfg(any(feature = "ocpp_2_1", feature = "ocpp_2_0_1"))]
+#[cfg(any(feature = "ocpp_2_1", feature = "ocpp_2_0_1", feature = "ocpp_1_6"))]
 fn wire_type(event_type: &SecurityEventType) -> alloc::string::String {
     use alloc::string::ToString;
     match event_type {
@@ -869,8 +871,158 @@ mod ocpp_2_0_1 {
     }
 }
 
-// 1.6J has no `SecurityEventNotification` in the core specification at all - it arrives only with
-// the OCPP 1.6 Security Whitepaper, whose message set `ocpp-types` does not generate (D2.2). So a
-// 1.6J connection records security events in the durable log and reports none of them, which is a
-// version difference rather than a gap here. Closing it means contributing the whitepaper types
-// upstream first; see `docs/PRODUCTION-ROADMAP.md` D2.2, where that decision is still open.
+/// OCPP 1.6J adapter for `SecurityEventNotification` (D2.2).
+///
+/// `SecurityEventNotification` isn't in 1.6's core specification - it arrives with the Security
+/// Whitepaper, but the pinned `ocpp-client` 0.5.0 generates it (verified against
+/// `ocpp_1_6::actions`), so this is an ordinary wire adapter rather than a gap: the request shape
+/// is field-for-field identical to 2.x's (`techInfo`, `timestamp`, `type`), so the builder below
+/// is the same one 2.0.1/2.1 use, just against `crate::wire::v16`'s type.
+#[cfg(feature = "ocpp_1_6")]
+mod ocpp_1_6 {
+    use super::{SecurityEventNotifier, SecurityEventType, wire_type};
+    use crate::clock::{Clock, is_synchronized};
+    use crate::wire::v16::SecurityEventNotificationRequest;
+    use alloc::boxed::Box;
+    use ocpp_client::ClientError;
+    use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
+
+    /// The 1.6J counterpart of the 2.x builders - same fields, same bounds, same fallbacks.
+    fn build_security_event_notification_request<C: Clock>(
+        clock: &C,
+        event_type: &SecurityEventType,
+        tech_info: Option<&str>,
+    ) -> SecurityEventNotificationRequest {
+        let now = clock.now();
+        if !is_synchronized(&now) {
+            tracing::warn!(
+                timestamp = %now,
+                "SecurityEventNotification timestamp sourced from an unsynchronized clock"
+            );
+        }
+        SecurityEventNotificationRequest {
+            tech_info: tech_info.and_then(|info| heapless::String::try_from(info).ok()),
+            timestamp: now.into(),
+            // 1.6J's `type` is bounded to 255 bytes, not 2.x's 50 - every standardized value and
+            // most vendor `Other` strings fit, but the fallback still needs its own
+            // (differently-sized) literal rather than `crate::security::oversized_event_type()`,
+            // which is fixed at `heapless::String<50>`.
+            r#type: heapless::String::try_from(wire_type(event_type).as_str()).unwrap_or_else(
+                |_| {
+                    const OVERSIZED_EVENT_TYPE: &str = "Other";
+                    const _: () = assert!(OVERSIZED_EVENT_TYPE.len() <= 255);
+                    heapless::String::try_from(OVERSIZED_EVENT_TYPE).unwrap_or_default()
+                },
+            ),
+        }
+    }
+
+    /// Wraps an `OCPP1_6Client` with a caller-supplied [`Clock`], mirroring
+    /// [`super::Ocpp2_1SecurityEventNotifier`]/[`super::Ocpp2_0_1SecurityEventNotifier`].
+    pub struct Ocpp1_6SecurityEventNotifier<C> {
+        client: OCPP1_6Client,
+        clock: C,
+    }
+
+    impl<C: Clock> Ocpp1_6SecurityEventNotifier<C> {
+        /// Wraps `client`, sourcing every SecurityEventNotification timestamp from `clock`.
+        pub fn with_clock(client: OCPP1_6Client, clock: C) -> Self {
+            Self { client, clock }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl Ocpp1_6SecurityEventNotifier<crate::clock::SystemClock> {
+        /// Wraps `client`, sourcing every timestamp from [`crate::clock::SystemClock`].
+        pub fn new(client: OCPP1_6Client) -> Self {
+            Self::with_clock(client, crate::clock::SystemClock)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<C: Clock + Send + Sync> SecurityEventNotifier for Ocpp1_6SecurityEventNotifier<C> {
+        type Error = ClientError<OCPP1_6Error>;
+
+        async fn notify_security_event(
+            &self,
+            event_type: &SecurityEventType,
+            tech_info: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            let request =
+                build_security_event_notification_request(&self.clock, event_type, tech_info);
+            self.client
+                .send_security_event_notification(request)
+                .await?;
+            Ok(())
+        }
+    }
+
+    /// The `std` convenience, matching the 2.x sides: a bare `OCPP1_6Client` reports directly.
+    #[cfg(feature = "std")]
+    #[async_trait::async_trait]
+    impl SecurityEventNotifier for OCPP1_6Client {
+        type Error = ClientError<OCPP1_6Error>;
+
+        async fn notify_security_event(
+            &self,
+            event_type: &SecurityEventType,
+            tech_info: Option<&str>,
+        ) -> Result<(), Self::Error> {
+            let request = build_security_event_notification_request(
+                &crate::clock::SystemClock,
+                event_type,
+                tech_info,
+            );
+            self.send_security_event_notification(request).await?;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use chrono::{DateTime, Utc};
+
+        struct FixedClock(DateTime<Utc>);
+
+        impl Clock for FixedClock {
+            fn now(&self) -> DateTime<Utc> {
+                self.0
+            }
+        }
+
+        #[test]
+        fn a_1_6_request_carries_the_same_type_string_as_2_x() {
+            let fixed = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+            let request = build_security_event_notification_request(
+                &FixedClock(fixed),
+                &SecurityEventType::InvalidCsmsCertificate,
+                Some("chain does not verify"),
+            );
+
+            assert_eq!(request.r#type, "InvalidCSMSCertificate");
+            assert_eq!(request.tech_info.as_deref(), Some("chain does not verify"));
+            assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
+        }
+
+        #[test]
+        fn an_unsynchronized_clocks_reading_is_still_sent_not_substituted_or_dropped() {
+            let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+            assert!(!is_synchronized(&unset_rtc.now()));
+
+            let request = build_security_event_notification_request(
+                &unset_rtc,
+                &SecurityEventType::TamperDetectionActivated,
+                None,
+            );
+
+            assert_eq!(
+                request.timestamp,
+                crate::wire::OcppTimestamp::from(unset_rtc.0)
+            );
+        }
+    }
+}
