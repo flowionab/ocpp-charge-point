@@ -4,8 +4,8 @@ All notable changes to this crate are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows the pre-1.0 reading
 of [Semantic Versioning](https://semver.org/) described in [`docs/SEMVER.md`](docs/SEMVER.md).
 
-This crate has not made a tagged release yet - everything below is still `0.1.0`, unreleased.
-It is grouped by development milestone (see [`docs/PRODUCTION-ROADMAP.md`](docs/PRODUCTION-ROADMAP.md))
+`0.1.0` is this crate's first release, so everything below is the history that led to it rather
+than a delta against a previous version. It is grouped by development milestone (see [`docs/PRODUCTION-ROADMAP.md`](docs/PRODUCTION-ROADMAP.md))
 rather than by date, since milestones are the unit this project actually plans and completes in.
 **Breaking** entries are the ones that change what an integrator's existing code must do to keep
 compiling or behaving the same way (see [`docs/SEMVER.md`](docs/SEMVER.md) for exactly what that
@@ -15,7 +15,22 @@ ones that would break or surprise an integrator, or that materially describe wha
 now do; purely internal refactors, test additions, and documentation-only commits are omitted
 unless they're the easiest way to explain a milestone's scope.
 
-## [Unreleased] — 0.1.0
+## [0.1.0] — 2026-08-09
+
+First published release. The **Breaking** entries below are pre-release history — changes made
+while the crate was unpublished, listed because anyone who tracked `main` lived through them.
+Nothing here breaks an earlier *release*, because there was none.
+
+### Packaging
+
+- **`certificate-management` joined the `default` feature set.** It gates
+  `ChargePointBuilder::certificates` (`InstallCertificate`/`DeleteCertificate`/
+  `GetInstalledCertificateIds`), and was the one capability feature left out of `default` — which
+  made that builder method invisible to anyone building with default features. A test
+  (`every_capability_gate_feature_is_in_the_default_feature_set`) now fails if a gate drifts back
+  out.
+- **docs.rs builds with `--all-features`**, and editor-local `.idea/` no longer ships in the
+  published tarball.
 
 ### Breaking
 
@@ -119,4 +134,4 @@ unless they're the easiest way to explain a milestone's scope.
 
 ---
 
-[Unreleased]: https://github.com/flowionab/ocpp-charge-point/commits/main
+[0.1.0]: https://github.com/flowionab/ocpp-charge-point/releases/tag/v0.1.0

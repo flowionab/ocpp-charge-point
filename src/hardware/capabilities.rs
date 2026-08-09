@@ -760,6 +760,37 @@ impl Capabilities {
 mod tests {
     use super::*;
 
+    /// Every capability Cargo feature must be in this crate's `default` feature set.
+    ///
+    /// The capability features are a *flash-size* knob, not a behaviour knob (see each feature's
+    /// docs in `Cargo.toml`): they all start on so that gaining the ability to turn a block off
+    /// changes nothing for an integrator who never asks for that. A gate whose feature is missing
+    /// from `default` inverts that - its `ChargePointBuilder` registration method silently does
+    /// not exist for anyone building with default features, and docs.rs (which builds defaults)
+    /// never renders it. That is exactly how `certificate-management` shipped: gating
+    /// `ChargePointBuilder::certificates` while absent from `default`, so `InstallCertificate`/
+    /// `DeleteCertificate`/`GetInstalledCertificateIds` were unregisterable out of the box.
+    ///
+    /// Only meaningful in a default-features build - a deliberate `--no-default-features` or
+    /// `--features` run has no `default` cfg and skips it, rather than failing for doing the
+    /// thing the features exist to allow.
+    #[cfg(feature = "default")]
+    #[test]
+    fn every_capability_gate_feature_is_in_the_default_feature_set() {
+        let missing: alloc::vec::Vec<&str> = CAPABILITY_GATES
+            .iter()
+            .map(|gate| gate.cargo_feature)
+            .filter(|feature| !feature_enabled(feature))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "capability features missing from `default` in Cargo.toml: {missing:?} - a gated \
+             builder method that is off by default is unreachable for default-features users \
+             and invisible on docs.rs"
+        );
+    }
+
     #[test]
     fn default_is_fully_conservative() {
         let capabilities = Capabilities::default();

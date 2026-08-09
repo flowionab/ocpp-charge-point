@@ -12,6 +12,17 @@ keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
 # already require 1.86/1.87. CI enforces this on every push - see the `msrv`
 # job in `.github/workflows/ci.yaml`.
 rust-version = "1.88"
+# Editor-local settings carry nothing a consumer of the published crate needs, and `.idea/`
+# shipped in the 0.1.0 packaging dry-run. Everything else in the tarball (docs/, examples/,
+# tests/, scripts/) is deliberate: the docs are the integrator's guide and the roadmap they are
+# told to read, and the spec PDFs under `docs/OCPP-2.*` are gitignored so they never reach it.
+exclude = [".idea/"]
+
+# docs.rs builds default features unless told otherwise. Every capability feature is now in
+# `default`, so this changes nothing today - it is here so that a future non-default feature
+# (and its gated public items) cannot go missing from the rendered docs without anyone noticing.
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 # Forwards to ocpp-client's own `std` feature (validator/regex-based payload validation), to
@@ -49,6 +60,7 @@ default = [
     "battery-swap",
     "periodic-event-stream",
     "certificates",
+    "certificate-management",
     "key-storage",
     "ocsp-checking",
 ]
@@ -103,9 +115,13 @@ firmware-publishing = []
 # unimplemented in this block is 2.1's periodic event streams, which have their own
 # `periodic-event-stream` feature.
 diagnostics = []
-# Declares the certificate-management capability - Install/Delete/GetInstalledCertificateIds
-# (roadmap B4.2), registered through `ChargePointBuilder::certificates` with a
-# `hardware::CertificateStore`.
+# Gates `ChargePointBuilder::certificates` - Install/Delete/GetInstalledCertificateIds (roadmap
+# B4.2), registered with a `hardware::CertificateStore`. In `default` like every other capability
+# feature: these flags exist to let an image drop a block it will never exercise, not to make a
+# block opt-in. It was the one gate missing from `default` until 0.1.0, which made its builder
+# method unreachable for default-features users and invisible on docs.rs;
+# `every_capability_gate_feature_is_in_the_default_feature_set` in `src/hardware/capabilities.rs`
+# now fails if any gate drifts back out.
 certificate-management = []
 # Gates the CSMS-facing Variable Monitoring registration methods
 # (SetVariableMonitoring/ClearVariableMonitoring/monitoring reports/monitor-event notification,
