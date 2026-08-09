@@ -121,8 +121,11 @@ local-auth-list = []
 # `ChargePointBuilder::cost`, which registers it. 2.1's richer tariff/`SetDefaultTariff` surface
 # (roadmap B7.1) isn't implemented yet and gates nothing additional today.
 tariff-cost = []
-# Gates nothing yet: the 2.1 Payment functional block (SetDefaultTariff, payment-terminal
-# integration, roadmap B7.2) has no implementation in this crate yet.
+# Gates `crate::payment` (2.1-only: NotifySettlement/NotifyWebPaymentStarted/
+# VatNumberValidation, roadmap B7.2) and `crate::hardware::PaymentTerminal`/
+# `ChargePointBuilder::payment`, which registers a payment terminal's identity against
+# `PaymentCtrlr`'s device-model variables. `SetDefaultTariff` is 2.1's tariff surface (B7.1,
+# `tariff-cost`), not this feature.
 payment = []
 # Gates nothing yet: ISO 15118 Plug & Charge (roadmap B4.5) has no implementation in this crate
 # yet.

@@ -23,6 +23,8 @@ mod file_transfer;
 mod firmware;
 mod firmware_publisher;
 mod key_storage;
+#[cfg(feature = "payment")]
+mod payment_terminal;
 mod storage;
 mod watchdog;
 
@@ -58,6 +60,10 @@ pub use self::key_storage::{
     DEFAULT_MAX_KEYS, GeneratedKeyPair, KeyHandle, KeyStore, KeyStoreBacking, NoKeyStore,
     NoKeyStoreError, PublicKey, SignatureAlgorithm, SoftKeyStore, SoftKeyStoreError,
     SoftwareCrypto,
+};
+#[cfg(feature = "payment")]
+pub use self::payment_terminal::{
+    NoPaymentTerminal, NoPaymentTerminalError, PaymentTerminal, PaymentTerminalInfo,
 };
 pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]

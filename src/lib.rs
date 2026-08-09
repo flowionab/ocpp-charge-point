@@ -78,6 +78,11 @@ pub mod offline_queue;
 /// A configurable ceiling on inbound OCPP-J WebSocket frame size, and the transport-level guard
 /// that enforces it (F5.2). See [`payload_limit`]'s own docs for exactly what "enforces" covers.
 pub mod payload_limit;
+/// Payment functional block (OCPP 2.1 only, `docs/PRODUCTION-ROADMAP.md` B7.2):
+/// `NotifySettlement`/`NotifyWebPaymentStarted`/`VatNumberValidation`, all sent by this charge
+/// point. Behind the `payment` Cargo feature - see [`payment`]'s own docs for why.
+#[cfg(feature = "payment")]
+pub mod payment;
 /// Periodic event streams functional block: `OpenPeriodicEventStream`/
 /// `ClosePeriodicEventStream`/`AdjustPeriodicEventStream`/`GetPeriodicEventStream` inbound,
 /// `NotifyPeriodicEventStream` outbound. See [`periodic_event_stream`]'s own docs for why this is

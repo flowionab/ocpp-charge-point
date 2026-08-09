@@ -2248,6 +2248,76 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers a physical payment terminal's identity against `PaymentCtrlr`'s device-model
+    /// variables (`docs/PRODUCTION-ROADMAP.md` B7.2).
+    ///
+    /// **2.1 only** - `PaymentCtrlr` and the messages built on it
+    /// (`NotifySettlement`/`NotifyWebPaymentStarted`/`VatNumberValidation`, see
+    /// [`crate::payment`]) do not exist before 2.1. Unlike [`Self::battery_swap`]/
+    /// [`Self::certificates`], this registers no CSMS handler at all - the Payment block has none
+    /// (see [`crate::payment`]'s module docs) - only `terminal`'s identity, overwriting the empty
+    /// placeholder [`crate::device_model::capability_gate_events`] already registered for
+    /// `VendorName`/`Model`/`SerialNumber`/`FirmwareVersion`/`TerminalID`/
+    /// `PaymentServiceProvider` at `start`/`start_with_limits` time (see [`Capabilities::payment`]).
+    ///
+    /// A failed [`PaymentTerminal::info`](crate::hardware::PaymentTerminal::info) is logged and
+    /// leaves those placeholders in place rather than failing registration outright - the same
+    /// reasoning as every other hardware read this crate treats as fallible (`CLAUDE.md`): a
+    /// terminal identity this crate briefly can't read is not a reason to refuse starting up.
+    ///
+    /// Sending the block's own messages
+    /// ([`crate::payment::report_settlement`]/[`crate::payment::report_web_payment_started`]/
+    /// [`crate::payment::validate_vat_number`]) is a separate call this method does not make:
+    /// unlike a render loop or a reconnect handler, there is no charge-point-state-derived trigger
+    /// to spawn here, only real payment-terminal events an integrator's own code already has to be
+    /// watching for.
+    #[cfg(feature = "payment")]
+    pub async fn payment<P>(self, terminal: P) -> Self
+    where
+        P: crate::hardware::PaymentTerminal + Send + Sync + 'static,
+    {
+        match terminal.info().await {
+            Ok(info) => {
+                let actor = self.runtime.actor();
+                let component = || Component {
+                    name: "PaymentCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                };
+                let fields = [
+                    ("VendorName", info.vendor_name),
+                    ("Model", info.model),
+                    ("SerialNumber", info.serial_number),
+                    ("FirmwareVersion", info.firmware_version),
+                    ("TerminalID", info.terminal_id),
+                    ("PaymentServiceProvider", info.payment_service_provider),
+                ];
+                for (name, value) in fields {
+                    let _ = actor
+                        .send(ChargePointEvent::DeviceModel(
+                            DeviceModelEvent::AttributeValueSet {
+                                component: component(),
+                                variable: Variable {
+                                    name: name.into(),
+                                    instance: None,
+                                },
+                                attribute_type: VariableAttributeType::Actual,
+                                value,
+                            },
+                        ))
+                        .await;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read payment terminal identity - PaymentCtrlr keeps its placeholder values"
+                );
+            }
+        }
+        self
+    }
+
     /// Registers the Display Message functional block (`docs/PRODUCTION-ROADMAP.md` B6):
     /// `SetDisplayMessage`, `GetDisplayMessages`, `ClearDisplayMessage` inbound handling, plus the
     /// worker that renders whichever message
