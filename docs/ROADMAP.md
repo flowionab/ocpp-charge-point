@@ -7,13 +7,62 @@ internal state/model it needs, the key OCPP messages it drives, current
 status in this repo, and notes on projecting it down to OCPP 2.0.1 and
 1.6J.
 
-~~Only the OCPP 2.0.1 spec PDFs are currently vendored under `docs/`.~~
-**Stale as of 2026-08-06:** `docs/OCPP-2.1/` now holds the full 2.1
-edition-2 spec set (parts 0–6, plus the CSV appendices), and
-`docs/UPSTREAM-GAPS.md` audits against it directly. Items below still
-marked **(verify vs 2.1 spec)** were written before that and have not yet
-been re-checked against the real text — the material to do so is now
-present, so those markers are a to-do, not a blocker.
+**Spec PDFs are never committed to this repo, and that is deliberate — read
+this before assuming `docs/OCPP-2.1/`/`docs/OCPP-2.0.1/` exist.** An earlier
+revision of this note said "`docs/OCPP-2.1/` now holds the full 2.1
+edition-2 spec set" and `docs/UPSTREAM-GAPS.md` still says the same. That
+was true only of the one machine an earlier agent happened to be running
+on; it is not true of a fresh clone, a CI job, or any other worktree —
+including the one this correction was written from, where the directory
+does not exist either. That mismatch is exactly what caused a later agent
+building the battery-swap block to conclude the specs were never vendored
+at all.
+
+**License check (2026-08-09):** the Open Charge Alliance publishes at
+least some OCPP documents under **Creative Commons
+Attribution-NoDerivatives 4.0** — confirmed by reading the license page
+printed inside one such PDF ("Copyright © Open Charge Alliance. All rights
+reserved", with an explicit CC BY-ND 4.0 grant and legalcode link). CC
+BY-ND permits redistributing the *unmodified* file with attribution, which
+would in principle allow vendoring it here. However, that was only
+confirmed for one supplementary whitepaper, not for the core Part 0–6
+edition-2 specification set this crate actually needs, and the download
+page (`openchargealliance.org/my-oca/ocpp/`) presents a sign-in gate whose
+account terms could differ from the license printed on the PDF itself.
+**That is not confident enough to act on, so the conservative option
+stands: do not commit the PDFs.** `.gitignore:17-18` already excludes
+`docs/OCPP-2.0.1/` and `docs/OCPP-2.1/` — that exclusion was already
+correct, just undocumented, which is what let both directories silently
+vanish across clones while this file kept asserting they were present.
+
+**To work from the real spec text, fetch it yourself, once, into your own
+checkout — it will not travel with git:**
+
+1. Download the OCPP 2.1 Edition 2 (all files) and OCPP 2.0.1 (all files)
+   archives from `https://openchargealliance.org/my-oca/ocpp/` (no payment
+   was found gated behind it; an OCA account may be required to reach the
+   download itself).
+2. Unpack them to `docs/OCPP-2.1/` and `docs/OCPP-2.0.1/`, keeping the
+   part-numbered file names other docs in this repo already cite (e.g.
+   `OCPP-2.1_edition2_part2_specification.pdf`,
+   `Appendices_CSV_v1.5/dm_components_vars.csv`). Both paths are already
+   gitignored, so nothing placed there can be committed by accident.
+3. Any citation elsewhere in this repo that names a row number, section
+   number, or exact phrase from those trees (this file, `dm_components_vars.csv`
+   references, `docs/UPSTREAM-GAPS.md`) was measured against a local copy
+   fetched this way by whichever agent wrote it — it is not independently
+   re-checkable without repeating steps 1–2 yourself, and no clone, CI job,
+   or worktree starts with it in place.
+
+Items below marked **(verify vs 2.1 spec)** fall into two categories.
+Most are settled *without* the PDFs at all, because the generated
+`ocpp-types` 0.3.0 source is schema-derived and authoritative for message
+shape, field presence, and enum values — this pass resolved those directly
+against that source (see each marker's resolution, below, for the exact
+evidence). What schema source cannot settle is prose semantics and
+device-model component *naming/description text* — those markers remain
+genuinely open, blocked on steps 1–2 above, and are called out as such
+rather than guessed at.
 
 Status legend: ✅ done · 🚧 partial · ⬜ not started
 
@@ -28,9 +77,12 @@ Not a functional block, but a prerequisite for all of them.
   transactions (§5), reservations (§8), the local authorization list (§4),
   running cost (§9), a pending `Reset` (§2), and the Component/Variable
   device model (§2) - all mutated only through `ChargePointEvent`, none of
-  it shared mutable state. Still open: persistence (nothing in the state
-  model survives a restart today - see `VariableAttribute::persistent`,
-  recorded but not acted on), and the `spawn` bound choices noted below.
+  it shared mutable state. Persistence across a restart is no longer
+  open for the device model (E2.3): `VariableAttribute::persistent` is
+  acted on, not just recorded — `src/persistence.rs` writes through every
+  attribute flagged `persistent` and restores them at the next boot (see
+  §2). What's still genuinely open here is the `spawn` bound choices
+  noted below.
 - 🚧 Hardware abstraction (`crate::hardware`: `ChargePoint`, `Evse`,
   `Connector`) — lock/unlock/contactor, plus metering pushed in by the
   integrator (`ConnectorEvent::MeterValueSampled`, §10) and `Evse::reboot`
@@ -59,18 +111,19 @@ Not a functional block, but a prerequisite for all of them.
   `CancelReservation` (§8), `SendLocalList`, `GetLocalListVersion` (§4),
   `CostUpdated` (§9), and `GetVariables`, `SetVariables`, `GetBaseReport`,
   `GetReport`, `Reset` (§2) are all wired end-to-end through `setup()`.
-  What's still unwired is listed per block below - chiefly `SetNetworkProfile`
-  (§2), the certificate messages (§1), and everything in §11-§18.
-  `TriggerMessage` is a special case
-  worth calling out here too: it has a protocol-agnostic internal handler
-  (§6) but no 2.1 wire adapter is possible yet - the OCPP 2.1 message
-  types don't exist upstream in `rust-ocpp`/`ocpp-client` at all (unlike
-  every other action in this list). Note this blocker is narrower than it
-  used to read: `OCPP2_0_1Client` and `OCPP1_6Client` *do* have real
-  `on_trigger_message`/`send_trigger_message` methods in `ocpp-client`
-  0.2.0 (re-verified against the vendored source), so 2.0.1 and 1.6J
-  adapters are buildable today - see §6. `connect_and_setup` only covers
-  OCPP 2.1 (the crate's primary target per `CLAUDE.md`), not 1.6J/2.0.1.
+  **Corrected 2026-08-09 — this paragraph was stale.** What's still
+  unwired is listed per block below, but it is no longer "chiefly
+  `SetNetworkProfile` and everything in §11-§18": `SetNetworkProfile` is
+  wired for 2.0.1/2.1 (§2), and §11 (smart charging), §17 (DER control)
+  and §18 (battery swap) are each substantially or fully wired now, not
+  untouched — see those sections for what remains open in each. The
+  remaining gaps are per-message, not per-block: the certificate messages
+  still missing in §1, a few individual §11/§12/§14 messages, and the
+  hardware-capability-gated blocks (§13, §15) noted throughout.
+  `TriggerMessage` used to be listed here as blocked on missing OCPP 2.1
+  wire types; that blocker is gone (see §6) - it is wired end-to-end on
+  all three versions today, for the subset of `MessageTriggerEnumType`
+  this crate can actually fulfil (`Heartbeat`, `StatusNotification`).
 - 🚧 Protocol-version-independent core → version adapters. The pattern
   itself already existed implicitly - every functional block already
   defines a protocol-agnostic trait (`BootNotifier`, `StatusNotifier`,
@@ -597,9 +650,15 @@ Secures the OCPP connection and reports security-relevant events.
   certificate handling (the rest of this block), no firmware update flow (§12),
   and no TLS-layer visibility (that lives in `ocpp-client`, not here); the
   tamper and maintenance-login events are the integrator's to raise, since only
-  the hardware knows a case was opened or who logged in. **1.6J reports none of
-  them** - `SecurityEventNotification` is a Security Whitepaper message, not a
-  core 1.6J one, and `ocpp-types` does not generate that message set. A durable, size-bounded **security log** now sits alongside
+  the hardware knows a case was opened or who logged in. **Corrected
+  2026-08-09**: this used to say "1.6J reports none of them" because
+  `ocpp-types` didn't generate the Security Whitepaper message set - that
+  was true at `ocpp-types` 0.1.x but no longer holds. `src/security.rs`
+  now has a real `SecurityEventNotifier` impl for `OCPP1_6Client`
+  (`Ocpp1_6SecurityEventNotifier`, plus the bare-client `std` convenience
+  impl, verified directly against current code, not assumed), so 1.6J
+  reports the same event set as 2.x through the whitepaper action once
+  `ocpp-client` wraps it. A durable, size-bounded **security log** now sits alongside
   the reporting pipeline (`security::SecurityEventLog` plus
   `persistence::SecurityLogStore`, wired via
   `ChargePointBuilder::security_log_persisted`): every raised event is recorded
@@ -612,17 +671,21 @@ Secures the OCPP connection and reports security-relevant events.
   switch, the same way `MeterValueSampled` is pushed in) or by future
   functional blocks once they exist, but nothing calls it today. Version
   notes below on the certificate messages still apply for the eventual rest
-  of this block. **2.0.1 is blocked upstream, not by this crate**: unlike
-  every other block ported to 2.0.1 in §0's "protocol-version-independent
-  core" writeup, `SecurityEventNotifier` has no `OCPP2_0_1Client` impl,
-  because `ocpp-client` 0.2.0 doesn't implement the `SecurityEventNotification`
-  action for OCPP 2.0.1 at all (verified directly against its
-  `ocpp_2_0_1::actions` list, not assumed) - there's no `Action`
-  type/`send_*`/`on_*` method to wrap. Fixing this needs an `ocpp-client`
-  release, not a change here.
-- Version notes: OCPP 1.6J only has basic auth / TLS via security
-  whitepaper extensions, no in-band certificate messages — this block
-  mostly collapses to "not applicable" under 1.6J.
+  of this block. **Corrected 2026-08-09**: this used to say "2.0.1 is
+  blocked upstream" because `ocpp-client` 0.2.0 had no `OCPP2_0_1Client`
+  impl of `SecurityEventNotifier` - current `src/security.rs` has one
+  (`Ocpp2_0_1SecurityEventNotifier` plus the bare-client `std`
+  convenience impl, verified directly), matching the "implemented on both
+  2.1 and 2.0.1" claim already made earlier in this same status line. The
+  upstream gap this paragraph described is closed on both counts; treat
+  any other file's comment claiming otherwise (e.g. a stale doc-comment
+  citing "`OCPP2_0_1Client`, which has no `SecurityEventNotifier`") as
+  itself needing the same correction, not as evidence.
+- Version notes: 1.6J has no in-band certificate messages - the
+  certificate half of this block collapses to "not applicable" under
+  1.6J - but `SecurityEventNotification` itself (the Security Whitepaper
+  extension) is not "not applicable" to 1.6J the way it once was; see
+  above.
 
 ## 2. Provisioning
 
@@ -1226,9 +1289,17 @@ Communicating price/cost to the driver.
   without a consumer for it yet. B7.1's tariff store doesn't change that:
   it stores and reports tariffs, it does not compute a cost from one -
   see that item's own paragraph in `docs/PRODUCTION-ROADMAP.md`.
-- Version notes: **(verify vs 2.1 spec)** — tariff/cost was extended
-  significantly across 2.0.1 → 2.1; not present in 1.6J at all (block is
-  a no-op under that adapter).
+- Version notes: **(verify vs 2.1 spec) discharged 2026-08-09, schema-only —
+  no PDF needed.** Confirmed directly against `ocpp-types` 0.3.0: `src/v201/`
+  has no tariff message types at all, while `src/v21/` has eight
+  (`SetDefaultTariffRequest`/`Response`, `GetTariffsRequest`/`Response`,
+  `ClearTariffsRequest`/`Response`, `ChangeTransactionTariffRequest`/`Response`)
+  - so "tariff/cost was extended significantly across 2.0.1 → 2.1" undersells
+  it: the tariff *messages* are 2.1-only, not merely richer. `cost_details`
+  on `TransactionEventRequest` is likewise present only in `src/v21/`, absent
+  from `src/v201/`. 1.6J has none of this either (no tariff files under
+  `src/v16/`) - not present in 1.6J at all (block is a no-op under that
+  adapter) is confirmed correct.
 
 ## 10. Meter values
 
@@ -1374,8 +1445,16 @@ Charging profiles and schedule negotiation.
   evaluation, so a restart cannot silently un-limit a load-managed charge
   point.
 - Version notes: 2.1 adds richer profile purposes and DER-linked limits
-  **(verify vs 2.1 spec)**; 1.6J smart charging is optional-profile and a
-  strict subset.
+  **(verify vs 2.1 spec) discharged 2026-08-09, schema-only.** Confirmed
+  against `ocpp-types` 0.3.0: `ChargingProfilePurposeEnum` is
+  `{ChargingStationExternalConstraints, ChargingStationMaxProfile,
+  TxDefaultProfile, TxProfile}` in `src/v201/common.rs` and adds
+  `PriorityCharging`/`LocalGeneration` in `src/v21/common.rs` - exactly the
+  "richer profile purposes" claim. `ChargingSchedulePeriod` in `src/v21/`
+  adds `discharge_limit`(`_l2`/`_l3`), `evse_sleep`, and V2X
+  frequency/signal-watt curve fields absent from `src/v201/`'s version -
+  the "DER-linked limits" claim. 1.6J smart charging is optional-profile
+  and a strict subset.
 
 ## 12. Firmware management
 
@@ -1665,24 +1744,29 @@ that can actually hold a session with a CSMS. Everything else (§1, §4,
 §6, §8, §9, §11–18) layers on top once that spine exists.
 
 That spine is now in place: every block on it is at least 🚧 with its core
-flow wired end-to-end through `setup()`, across 1.6J/2.0.1/2.1. The most
-useful next chunks, roughly in order of value per unit of work:
+flow wired end-to-end through `setup()`, across 1.6J/2.0.1/2.1.
 
-1. **§11 Smart charging** — the largest genuinely-missing block, and the
-   one a real deployment is most likely to demand next (load management).
-   Needs a charging-profile store, schedule composition, and a schedule →
-   hardware current-limit projection, which in turn needs a new hardware
-   hook (nothing in `crate::hardware` can express "limit to N amps" today).
-2. **§2's leftovers** — `SetNetworkProfile`, device-model persistence, and
-   sampled-data configuration actually driving §10's sampling (see the
-   inert-variable note there).
-3. **`TriggerMessage` for 2.0.1 and 1.6J** (§6) — cheap: the
-   protocol-agnostic handler already exists and the upstream types turn out
-   to be present for both versions; only 2.1 is blocked.
-4. **§12 Firmware management / §14 Diagnostics** — both need a file-transfer
-   abstraction this crate doesn't have yet, so doing them together and
-   sharing that abstraction is worth more than doing either alone.
+**Corrected 2026-08-09 — the four items below are stale and are removed
+rather than left to mislead the next reader.** All four described work
+that has since landed: §11 Smart charging is now a substantial,
+mostly-complete block (charging-profile store, schedule composition,
+current-limit projection, priority charging, dynamic profiles — see §11's
+own status), not "the largest genuinely-missing block"; §2's
+`SetNetworkProfile` is wired and device-model persistence is done (E2.3 —
+see §0/§2); `TriggerMessage` is wired end-to-end on all three versions,
+not blocked on 2.1 (see §6); and §12/§14 already share a working
+`FileTransfer` abstraction, not one still to be built. Re-deriving "what's
+most valuable next" from current per-block status (above) rather than
+trusting this section is exactly the kind of drift this pass exists to
+stop — the per-block sections are kept current in real time by whoever
+last touched that block; this summary was not, and is not a substitute
+for reading them.
 
-§13 (ISO 15118), §17 (DER/V2X) and §18 (battery swap) all depend on
-hardware capabilities most chargers don't have, and want the
-capability-model gap noted in §0's hardware bullet closed first.
+What genuinely still needs hardware capability this crate doesn't have
+today, per the sections above: certificate signing/OCSP (§1's remaining
+messages, B4.3/B4.4 — needs crypto this crate deliberately doesn't carry),
+firmware signature verification (§12, B3.3 — same crypto gap), and §13
+(ISO 15118), §17 (DER/V2X — partial, but *acting* on a control needs
+bidirectional power electronics) and §18 (battery swap), which all want
+the capability-model gap noted in §0's hardware bullet closed first so a
+build without the hardware can say so rather than silently no-op.
