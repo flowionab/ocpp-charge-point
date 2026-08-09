@@ -37,6 +37,7 @@ mod builder;
 /// [`certificate_status`]'s own docs for why this is a separate capability from
 /// [`certificates`]. Unconditional like [`certificates`] itself - the `ocsp-checking` Cargo
 /// feature governs advertisement (`hardware::capabilities::CAPABILITY_GATES`), not compilation.
+pub mod certificate_renewal;
 pub mod certificate_status;
 pub mod certificates;
 pub mod clock;

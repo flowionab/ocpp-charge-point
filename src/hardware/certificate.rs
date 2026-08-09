@@ -23,6 +23,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use chrono::{DateTime, Utc};
 
 /// What a certificate is *for*, spanning OCPP's two overlapping enums
 /// (`InstallCertificateUseEnum` for what may be installed, `GetCertificateIdUseEnum` for what may
@@ -221,6 +222,30 @@ pub trait CertificateStore {
             .into_iter()
             .collect())
     }
+
+    /// When the certificate currently installed for `use_for` expires, if this store (or
+    /// whatever parses certificates on its behalf) knows.
+    ///
+    /// Additive (default `Ok(None)`), for the same reason [`Self::certificate_chain_pem`] is:
+    /// this crate does no X.509 parsing (see the module docs), so it cannot compute an expiry
+    /// from PEM bytes on its own - only an implementor that parses the certificate (or that
+    /// learned the expiry out of band, e.g. alongside the CSMS's `CertificateSigned`) can answer
+    /// this honestly. [`StoredCertificates`] does not override it, for exactly that reason: it
+    /// has no parser either.
+    ///
+    /// **`None` here does not mean "never expires" or "far away".** It means "this store cannot
+    /// say", and [`crate::certificate_renewal`] (F3.2) treats it exactly that way - skipping the
+    /// slot's renewal check entirely rather than guessing one way or the other. That is the
+    /// hook this crate has for expiry: an integrator who wants ahead-of-expiry renewal must
+    /// override this method (or otherwise feed [`crate::certificate_renewal`]'s policy) with a
+    /// real value.
+    async fn expires_at(
+        &self,
+        use_for: CertificateUse,
+    ) -> Result<Option<DateTime<Utc>>, Self::Error> {
+        let _ = use_for;
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]
@@ -265,6 +290,13 @@ impl<T: CertificateStore + Send + Sync + ?Sized> CertificateStore for alloc::syn
         use_for: CertificateUse,
     ) -> Result<Vec<String>, Self::Error> {
         (**self).all_certificate_chain_pems(use_for).await
+    }
+
+    async fn expires_at(
+        &self,
+        use_for: CertificateUse,
+    ) -> Result<Option<DateTime<Utc>>, Self::Error> {
+        (**self).expires_at(use_for).await
     }
 }
 
@@ -1055,6 +1087,24 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_expires_at_honestly_reports_that_it_does_not_know() {
+        // F3.2: no store here can parse X.509, so `None` (not a fabricated far-future date) is
+        // the only honest answer - `crate::certificate_renewal` relies on this to skip a slot it
+        // has no expiry for rather than guessing.
+        assert_eq!(
+            store().expires_at(CertificateUse::CsmsRoot).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            NoCertificateStore
+                .expires_at(CertificateUse::ChargingStation)
+                .await
+                .unwrap(),
+            None
         );
     }
 
