@@ -362,6 +362,129 @@ minutes on a loaded machine — discarding a perfectly well-defined bytes-per-re
 because the count fell short. It now measures the ratio over whatever reconnects it achieves and
 only requires enough of them to be meaningful.
 
+## D2.3 — 2.1 `ChargingProfile`'s by-value size, re-measured
+
+The roadmap row and `docs/UPSTREAM-GAPS.md`'s D2.3 note were last measured against `ocpp-types`
+0.2.0. Re-measured directly against the pinned **0.3.0** (`cargo test --lib size_measurements --
+--nocapture`, `src/state/charging_profile.rs`):
+
+| Type (this crate's actual binding, `CustomDataType = CustomData`) | 0.3.0 size |
+|---|---|
+| 2.1 `ChargingProfile` | **50,584 bytes** |
+| 2.1 `ChargingSchedule` | 16,616 bytes |
+| 2.1 `AbsolutePriceSchedule` | 15,064 bytes |
+| 2.1 `PriceLevelSchedule` | 376 bytes |
+| 2.1 `SalesTariff` | 368 bytes |
+| 2.0.1 `ChargingProfile` | 2,616 bytes |
+| 2.0.1 `ChargingSchedule` | 736 bytes |
+| 1.6J `ChargingProfile` | 176 bytes |
+| 1.6J `ChargingSchedule` | 88 bytes |
+| This crate's internal `ChargingProfile` (`state::charging_profile`) | 96 bytes |
+| This crate's internal `ChargingSchedule` | 72 bytes |
+
+**The headline number has not gone stale — 50.6 KB is still in the same range as the roadmap's
+"56 KB" — but the roadmap's stated *cause* is incomplete.** `ocpp-client` 0.5.0 requests
+`ocpp-types`'s `alloc` feature unconditionally (`default-features = false, features = ["serde",
+"alloc"]`), and Cargo feature unification means that request applies everywhere this crate is
+built, including its own `--no-default-features`/MCU configuration (which is no_std **+ alloc**,
+never allocator-free — see `CLAUDE.md`). Under `alloc`, `ChargingSchedule`'s three inlined
+sub-schedules already use plain `Option<T>` over `alloc::vec::Vec`-backed lists rather than
+const-generic `heapless` capacities — so the *specific* mechanism D2.3 originally named (a fixed
+`heapless` cap on the top-level lists) is not what's compiled here at all.
+
+Isolating the actual cost (`probe_no_custom_data_sizes`, same test module) by re-measuring with
+`CustomDataType = NoCustomData` instead of this crate's actual `CustomData` binding:
+
+| Type | with `CustomData` (this crate) | with `NoCustomData` |
+|---|---|---|
+| `ChargingProfile` | 50,584 | 11,240 |
+| `ChargingSchedule` | 16,616 | 3,592 |
+| `AbsolutePriceSchedule` | 15,064 | 3,104 |
+
+Swapping only the `customData` binding accounts for **~78% of the size** (50,584 → 11,240). The
+reason: `ocpp-types`' `CustomData` is `{ vendor_id: heapless::String<255> }`, about 256 bytes,
+versus the zero-sized `NoCustomData` `ocpp-types` itself defaults every struct's
+`CustomDataType` generic to. `AbsolutePriceSchedule` (and everything it reaches — `RationalNumber`,
+`PriceRule`, `PriceRuleStack`, `TaxRule`, `OverstayRule`, `OverstayRuleList`,
+`AdditionalSelectedServices`) carries a `customData: Option<CustomDataType>` field per the OCPP
+schema, and because `ocpp-client`'s action macro parameterizes a whole request tree by one
+`CustomDataType` (`SetChargingProfileRequest<CustomData>` forces every nested struct's generic to
+the same concrete `CustomData`, not independently choosable), that ~256-byte cost is paid at
+**every** nesting site. Several of those sites sit inside spec-bounded `heapless` arrays that are
+`heapless` regardless of the `alloc` feature (`TaxRule` × 10, `AdditionalSelectedServices` × 5,
+`OverstayRule` × 5, `PriceRule` × 8 inside each `PriceRuleStack`) — so the ~256-byte `CustomData`
+cost multiplies by each array's fixed capacity rather than being paid once. That compounding,
+not the alloc/heapless question the roadmap row named, is what actually produces a five-digit
+byte count.
+
+The remaining ~11 KB with `NoCustomData` is the genuine "spec-bounded arrays are `heapless`
+regardless of `alloc`" cost (`TaxRule`/`AdditionalSelectedServices`/`OverstayRule`/`PriceRule`
+capacities) — real, but an order of magnitude smaller than the headline figure, and not what a
+`Box` around the three inlined schedules (D2.3's originally proposed fix) would address on its
+own, since `Option<AbsolutePriceSchedule<CustomData>>` is already indirection-free-by-value only
+at the top level; boxing it would remove `ChargingSchedule`'s ~15 KB `AbsolutePriceSchedule`
+inline cost but not the same compounding inside `PriceRuleStack`'s heap-allocated `Vec` elements
+(each individually still ~9 KB with the current `CustomData` binding, ~2 KB with `NoCustomData`,
+paid per-element on the heap rather than inline — real but not part of this static `size_of`
+number).
+
+**Where the cost actually lands at runtime — confirmed, not assumed:**
+
+- `crate::state::ChargingProfileStore` (bounded by `StateLimits::max_charging_profiles`, default
+  16) **does not hold the wire type**. It holds this crate's own
+  `state::charging_profile::ChargingProfile`/`ChargingSchedule` (96 / 72 bytes, see table above)
+  — a protocol-independent model that a version adapter reduces the wire type into on the way in
+  (`crate::smart_charging::ocpp_2_1` and siblings), dropping `AbsolutePriceSchedule`/
+  `PriceLevelSchedule`/`SalesTariff`/`digestValue` entirely, since this crate does not implement
+  ISO 15118-20 price-schedule relay. 16 installed profiles therefore cost on the order of 2.7 KB
+  retained, not ~900 KB — the store was never exposed to D2.3's cost.
+- The real exposure is **transient**: `ocpp-client`'s inbound handler deserializes one
+  `SetChargingProfileRequest<CustomData>` by value (`serde_json::from_value::<A::Request>`)
+  before this crate's handler ever runs (`src/payload_limit.rs`, F5.2, documents this same
+  boundary and already cites D2.3 by the pre-existing 56 KB figure — now confirmed accurate to
+  within the same order of magnitude, ~50.6 KB, even though the mechanism it names needs the
+  correction above). One inbound frame therefore costs one ~50.6 KB stack/heap value regardless
+  of how small the actual JSON was, for the fraction of a millisecond between deserialization and
+  this crate's adapter reducing it to the ~96-byte internal shape and dropping the rest.
+
+**Mitigation landed this round:** none beyond what F5.2 already provides
+(`crate::payload_limit`'s frame-size ceiling, which bounds the wire bytes but not the decoded
+struct's fixed cost) — this crate has no hook earlier than `ocpp-client`'s own deserialization
+(same conclusion `src/payload_limit.rs`'s module docs already reach, independently, for the
+general case). There is no local, in-crate representation change available: the store already
+uses the minimal shape, and the transient cost is entirely inside `ocpp-client`/`ocpp-types`
+before this crate's code runs.
+
+**Upstream report prepared, not filed** (this round has no issue-filing access, and a previous
+round's upstream report was withdrawn for resting on an unreproduced number — this one is
+reproduced twice, with and without the `CustomData` substitution, via
+`cargo test --lib -p ocpp-charge-point size_measurements -- --nocapture` and
+`probe_no_custom_data_sizes` in `src/state/charging_profile.rs`):
+
+- **Title:** `ocpp-types` 0.3.0: OCPP 2.1 `ChargingProfile` is ~50 KB by value, ~78% of which is
+  one `Option<CustomData>` field (`heapless::String<255>`, ~256 bytes) repeated at every nesting
+  site inside the ISO 15118-20 price-schedule subtree, multiplied by that subtree's own
+  `heapless`-capacity arrays.
+- **Repro:** `cargo test` a crate depending on `ocpp-types = { version = "0.3.0", features =
+  ["alloc"] }` with `core::mem::size_of::<ocpp_types::v21::common::ChargingProfile<ocpp_types::v21::common::CustomData>>()`
+  vs. the same with `NoCustomData` substituted for the generic parameter — 50,584 vs. 11,240 for
+  `ChargingProfile`; 15,064 vs. 3,104 for `AbsolutePriceSchedule` alone.
+- **Suggested fixes, either would help, upstream is free to choose:** (a) box the `customData`
+  field on struct definitions nested inside spec-bounded `heapless` arrays that are themselves
+  nested inside other structs' fields (`RationalNumber`, `PriceRule`, `TaxRule`, `OverstayRule`,
+  `AdditionalSelectedServices` — the sites that get multiplied by a surrounding array capacity),
+  so the ~256-byte cost is paid once per allocation rather than once per array slot; or (b)
+  reduce `AbsolutePriceSchedule`/`PriceLevelSchedule`/`SalesTariff`'s own `heapless` array
+  capacities (`TaxRule` × 10, `AdditionalSelectedServices` × 5, `OverstayRule` × 5, `PriceRule` ×
+  8) to whatever ISO 15118-20 actually bounds them at in practice, if lower than the current
+  defaults; or (c), most directly addressing the roadmap row as originally written, box
+  `ChargingSchedule`'s three `Option<T>` inlined schedules
+  (`absolute_price_schedule`/`price_level_schedule`/`sales_tariff`) so a `ChargingSchedule` that
+  carries none of them (the common case for a plain limit-only profile) pays only a pointer,
+  which would remove `ChargingSchedule`'s ~15 KB `AbsolutePriceSchedule` inline cost even before
+  (a) or (b). This crate's own adapters never populate any of the three, so a boxed
+  representation costs it nothing on the send path either.
+
 ## What is not measured or bounded yet
 
 - **Transient allocation during deserialization.** An over-long CSMS payload or
