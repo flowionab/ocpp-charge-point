@@ -38,8 +38,8 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicI64, Ordering};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
@@ -120,7 +120,13 @@ struct PendingSignRequest {
 /// memory" rule) rather than needing a runtime limit.
 pub struct PendingSignRequests {
     slots: BlockingMutex<CriticalSectionRawMutex, RefCell<[Option<PendingSignRequest>; 2]>>,
-    next_request_id: AtomicI64,
+    // A `BlockingMutex<Cell<i64>>` rather than an `AtomicI64`, deliberately: `AtomicI64` does not
+    // exist on 32-bit targets without native 64-bit atomics, and `thumbv7em-none-eabihf` - the MCU
+    // target CI builds for - is one of them. The wire field is `Option<i64>` (`ocpp-types` 0.3.0),
+    // so narrowing this to `AtomicI32` would silently change the range this crate can represent.
+    // `CriticalSectionRawMutex` is the same primitive the rest of the crate uses for shared
+    // interior mutability under `no_std` (see `ChargePointActor::boot_reason_recorder`).
+    next_request_id: BlockingMutex<CriticalSectionRawMutex, Cell<i64>>,
 }
 
 impl PendingSignRequests {
@@ -128,7 +134,7 @@ impl PendingSignRequests {
     pub fn new() -> Self {
         Self {
             slots: BlockingMutex::new(RefCell::new([None, None])),
-            next_request_id: AtomicI64::new(1),
+            next_request_id: BlockingMutex::new(Cell::new(1)),
         }
     }
 
@@ -136,7 +142,11 @@ impl PendingSignRequests {
     /// increasing, so two CSRs sent close together (e.g. one per [`CertificateSigningPurpose`])
     /// never collide. 2.0.1 has no such field and never calls this.
     pub fn next_request_id(&self) -> i64 {
-        self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        self.next_request_id.lock(|id| {
+            let current = id.get();
+            id.set(current.wrapping_add(1));
+            current
+        })
     }
 
     /// Records that a `SignCertificate` for `purpose` was accepted by the CSMS, so a later
