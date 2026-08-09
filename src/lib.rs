@@ -41,8 +41,7 @@ pub mod certificate_status;
 pub mod certificates;
 pub mod clock;
 // `connect_and_setup` hands its negotiated client straight to `setup()`, so it needs the same
-// `reservation`/`local-auth-list`/`tariff-cost` features `setup()` itself does - see the `setup`
-// module gate below.
+// feature list `setup()` itself does - see the `setup` module gate below.
 #[cfg(all(
     feature = "std",
     feature = "websocket",
@@ -50,7 +49,9 @@ pub mod clock;
     feature = "reservation",
     feature = "local-auth-list",
     feature = "tariff-cost",
-    feature = "periodic-event-stream"
+    feature = "periodic-event-stream",
+    feature = "smart-charging",
+    feature = "variable-monitoring"
 ))]
 mod connect;
 pub mod connection;
@@ -121,17 +122,22 @@ pub mod security;
 pub mod security_profile;
 pub mod smart_charging;
 // `setup()` is the "everything on" wrapper (see its module docs): it bounds its CSMS type by
-// every functional block's traits at once, including the three that are genuinely gated behind
-// Cargo features today (reservation, local-auth-list, tariff-cost). Compiling it with any of
-// those off would mean calling handler methods on modules that no longer exist, so the whole
-// module - and the `setup` re-export below - only exists when all three are enabled.
+// every functional block's traits at once, including the ones genuinely gated behind Cargo
+// features today (reservation, local-auth-list, tariff-cost, periodic-event-stream,
+// smart-charging, variable-monitoring - C4.2/C4.3). Compiling it with any of those off would mean
+// calling handler/registration methods on `ChargePointBuilder` that C4.2 made disappear along
+// with their feature, so the whole module - and the `setup` re-export below - only exists when
+// all six are enabled (all six are also in this crate's `default` feature list, so no existing
+// caller who hasn't opted out of a block sees any change).
 // `ChargePointBuilder` is unaffected: each of its registration methods is independently gated
 // (see `builder.rs`), so callers who disable a capability feature simply skip that method.
 #[cfg(all(
     feature = "reservation",
     feature = "local-auth-list",
     feature = "tariff-cost",
-    feature = "periodic-event-stream"
+    feature = "periodic-event-stream",
+    feature = "smart-charging",
+    feature = "variable-monitoring"
 ))]
 mod setup;
 /// The protocol-version-independent internal state model: [`state::ChargePointState`], its
@@ -158,7 +164,9 @@ pub use self::builder::ChargePointBuilder;
     feature = "reservation",
     feature = "local-auth-list",
     feature = "tariff-cost",
-    feature = "periodic-event-stream"
+    feature = "periodic-event-stream",
+    feature = "smart-charging",
+    feature = "variable-monitoring"
 ))]
 pub use self::connect::{ConnectAndSetupError, connect_and_setup};
 pub use self::runtime::ChargePointRuntime;
@@ -166,7 +174,9 @@ pub use self::runtime::ChargePointRuntime;
     feature = "reservation",
     feature = "local-auth-list",
     feature = "tariff-cost",
-    feature = "periodic-event-stream"
+    feature = "periodic-event-stream",
+    feature = "smart-charging",
+    feature = "variable-monitoring"
 ))]
 pub use self::setup::setup;
 /// The OCPP versions [`connect_and_setup`] can be asked to offer.

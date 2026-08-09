@@ -79,8 +79,13 @@ websocket = ["tokio-runtime", "ocpp-client/websocket"]
 # Blocks with no code yet are declared now, ready for their implementation to land behind the
 # flag, and gate nothing today - each says so below.
 
-# Gates nothing yet: OCPP 2.0.1/2.1 Smart Charging (SetChargingProfile, GetCompositeSchedule, and
-# related messages, roadmap workstream B2/B8.2) has no implementation in this crate yet.
+# Gates the CSMS-facing Smart Charging registration methods (SetChargingProfile,
+# GetCompositeSchedule, dynamic/priority charging profiles and their persistence and
+# notifications, roadmap workstream B2/B8.2) via `ChargePointBuilder::smart_charging` and its
+# siblings, plus `crate::setup::setup`'s own runtime capability check (C4.2/C4.3). Does **not**
+# gate `crate::smart_charging` itself - that module's types are load-bearing for
+# `crate::tariff`/`crate::device_model`/`crate::provisioning` regardless of this feature, so it
+# stays compiled in even with this feature off; only the registration entry points disappear.
 smart-charging = []
 # Declares the Firmware Management capability. The block itself (roadmap B3.2) is registered
 # through `ChargePointBuilder::firmware_updates`, which needs hardware bindings the feature flag
@@ -102,8 +107,13 @@ diagnostics = []
 # (roadmap B4.2), registered through `ChargePointBuilder::certificates` with a
 # `hardware::CertificateStore`.
 certificate-management = []
-# Gates nothing yet: SetVariableMonitoring/NotifyEvent and the rest of the 2.x monitoring engine
-# (roadmap B5.2/B5.3) have no implementation in this crate yet.
+# Gates the CSMS-facing Variable Monitoring registration methods
+# (SetVariableMonitoring/ClearVariableMonitoring/monitoring reports/monitor-event notification,
+# roadmap B5.2/B5.3) via `ChargePointBuilder::variable_monitoring` and its siblings, plus
+# `crate::setup::setup`'s own runtime capability check (C4.2/C4.3;
+# `crate::hardware::CAPABILITY_GATES`'s `variable_monitoring` row). Does not gate
+# `crate::variable_monitoring` itself, for the same reason `smart-charging` doesn't gate
+# `crate::smart_charging` - see that feature's docs.
 variable-monitoring = []
 # Gates `crate::display_message` (SetDisplayMessage/GetDisplayMessages/ClearDisplayMessage,
 # answered via NotifyDisplayMessages - roadmap B6) and

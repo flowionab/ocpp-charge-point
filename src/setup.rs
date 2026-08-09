@@ -57,8 +57,14 @@ use crate::variable_monitoring::{
 /// This is a thin "everything on" wrapper around [`ChargePointBuilder`], registering every
 /// functional block it exposes in the same order this function has always used. Callers whose
 /// CSMS client only implements a subset of blocks - or who want to skip a block outright - should
-/// use [`ChargePointBuilder`] directly instead; `N`'s single 24-trait bound below is exactly the
-/// limitation the builder exists to remove.
+/// use [`ChargePointBuilder`] directly instead; `N`'s single 45-trait bound below (C4.2/C4.3,
+/// `docs/PRODUCTION-ROADMAP.md` §5.1/§5.2 - up from 24 traits when this function was first
+/// written) is exactly the limitation the builder exists to remove. This function itself only
+/// exists when every block it wires unconditionally is compiled in - see the `mod setup` gate in
+/// `src/lib.rs` - so its bound never needs to shrink to match a Cargo feature; the harder problem
+/// this round closes is that its *body* used to register the Variable Monitoring block regardless
+/// of what hardware declared, unlike every other optional block below it (see the
+/// `if capabilities.variable_monitoring` branch added by this change).
 pub async fn setup<T, E, C, N, X, B, M, K>(
     charge_point: T,
     csms: N,
@@ -152,15 +158,7 @@ where
         .device_model(&csms)
         .await
         .meter_values(&csms, backoff.clone(), clock.clone())
-        .await
-        .variable_monitoring(&csms)
-        .await
-        .monitoring_reports(&csms)
-        .await
-        // B5.2: 60 s between periodic-monitor sweeps - fine-grained enough against monitors
-        // configured in the tens of seconds and up (see `run_periodic_variable_monitors`'s docs),
-        // and the same cadence `reservation_status_updates` already sweeps expiry at.
-        .variable_monitor_events(&csms, backoff.clone(), clock.clone(), 60);
+        .await;
 
     // C3.1 (docs/PRODUCTION-ROADMAP.md §5.3): each of these blocks is only registered when the
     // hardware actually declares the matching capability - an absent capability means the CSMS
@@ -193,6 +191,17 @@ where
             .await
             .charging_profile_reports(&csms)
             .await;
+    }
+    if capabilities.variable_monitoring {
+        builder = builder
+            .variable_monitoring(&csms)
+            .await
+            .monitoring_reports(&csms)
+            .await
+            // B5.2: 60 s between periodic-monitor sweeps - fine-grained enough against monitors
+            // configured in the tens of seconds and up (see `run_periodic_variable_monitors`'s
+            // docs), and the same cadence `reservation_status_updates` already sweeps expiry at.
+            .variable_monitor_events(&csms, backoff.clone(), clock.clone(), 60);
     }
     if capabilities.periodic_event_stream {
         // B5.6: a few seconds between sweeps is ample against streams configured in the tens of
@@ -301,6 +310,7 @@ mod tests {
         cost_registered: Arc<AtomicBool>,
         smart_charging_registered: Arc<AtomicBool>,
         periodic_event_stream_registered: Arc<AtomicBool>,
+        variable_monitoring_registered: Arc<AtomicBool>,
     }
 
     impl RecordingCsms {
@@ -312,6 +322,7 @@ mod tests {
                 cost_registered: Arc::new(AtomicBool::new(false)),
                 smart_charging_registered: Arc::new(AtomicBool::new(false)),
                 periodic_event_stream_registered: Arc::new(AtomicBool::new(false)),
+                variable_monitoring_registered: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -476,6 +487,8 @@ mod tests {
             &self,
             _actor: crate::actor::ChargePointActor,
         ) {
+            self.variable_monitoring_registered
+                .store(true, Ordering::SeqCst);
         }
     }
 
@@ -744,6 +757,10 @@ mod tests {
                         smart_charging: enabled,
                         ..Default::default()
                     },
+                    "variable_monitoring" => crate::hardware::Capabilities {
+                        variable_monitoring: enabled,
+                        ..Default::default()
+                    },
                     "has_display" => crate::hardware::Capabilities {
                         has_display: enabled,
                         ..Default::default()
@@ -827,6 +844,9 @@ mod tests {
                         "smart_charging" => csms.smart_charging_registered.load(Ordering::SeqCst),
                         "periodic_event_stream" => {
                             csms.periodic_event_stream_registered.load(Ordering::SeqCst)
+                        }
+                        "variable_monitoring" => {
+                            csms.variable_monitoring_registered.load(Ordering::SeqCst)
                         }
                         other => panic!("gate `{other}` claims has_handler but isn't wired here"),
                     };
