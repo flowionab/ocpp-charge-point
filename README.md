@@ -353,6 +353,16 @@ charger.run().await?;
 
 ---
 
+## 🛡️ Security
+
+[`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) is this crate's threat model: the assets worth
+protecting, the trust boundaries, the threat actors, and — for each threat — what mitigates it
+today, what does not, and which roadmap task tracks the gap. Written for a certification auditor
+or an integrator's security reviewer, and grounded in the actual code rather than general
+EV-charging security advice.
+
+---
+
 ## 🧪 Testing
 
 OCPP Charge Point is designed to support:
