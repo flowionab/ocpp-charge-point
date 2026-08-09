@@ -1,7 +1,7 @@
 //! OCPP 2.1 wire adapter for the Firmware Publishing block (B3.4).
 
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 
 use crate::wire::v21::common::{

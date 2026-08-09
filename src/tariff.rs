@@ -601,6 +601,7 @@ pub mod ocpp_2_1 {
     };
     use crate::actor::ChargePointActor;
     use crate::state::{Tariff, TariffId, TariffScope, TransactionId};
+    use alloc::boxed::Box;
     use alloc::vec::Vec;
 
     use crate::wire::v21::common::{

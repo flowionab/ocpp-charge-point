@@ -353,6 +353,7 @@ pub mod ocpp_2_1 {
         DERCurveSettings, DERUnit, EnterServiceSettings, FixedPfSettings, FixedVarSettings,
         FreqDroopSettings, GradientSettings, InstalledDERControl, LimitMaxDischargeSettings,
     };
+    use alloc::boxed::Box;
     use alloc::vec::Vec;
 
     use crate::wire::v21::common::{

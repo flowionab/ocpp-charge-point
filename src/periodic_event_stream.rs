@@ -703,6 +703,7 @@ pub mod ocpp_2_1 {
         OpenPeriodicEventStream, PeriodicEventStreamId, PeriodicEventStreamParams,
         VariableMonitorId,
     };
+    use alloc::boxed::Box;
     use alloc::vec::Vec;
 
     use crate::wire::v21::common::{ConstantStreamData, GenericStatusEnum, StreamDataElement};

@@ -28,6 +28,7 @@ use crate::state::{
     BatterySwapEvent, BatterySwapRequestId, ChargePointEvent, IdToken, PendingBatterySwap,
 };
 use crate::sync::BroadcastReceiver;
+use alloc::boxed::Box;
 
 /// The outcome of a CSMS-initiated `RequestBatterySwap`, matching OCPP's `GenericStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
