@@ -151,8 +151,8 @@ impl Default for Capabilities {
 /// forgotten in another.
 ///
 /// Deliberately limited to the capabilities that map onto a real, spec-named OCPP surface today.
-/// Blocks with no implementation yet (payment, DER control, battery swap, ...) aren't listed -
-/// there's nothing for them to be inconsistent about yet; extend this table as they grow one.
+/// Blocks with no implementation yet (DER control, battery swap, ...) aren't listed - there's
+/// nothing for them to be inconsistent about yet; extend this table as they grow one.
 pub struct CapabilityGate {
     /// A short, stable, snake_case identifier for the capability (matches the [`Capabilities`]
     /// field name).
@@ -337,6 +337,26 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         // through `ChargePointBuilder::der_control` rather than `setup()`, which only bounds
         // itself by `reservation`/`local-auth-list`/`tariff-cost` today - see that method's docs
         // for the scope decision.
+        has_handler: false,
+    },
+    CapabilityGate {
+        name: "payment",
+        cargo_feature: "payment",
+        enabled: |c| c.payment,
+        // Verified against the real 2.1 `dm_components_vars.csv` (see
+        // `docs/PRODUCTION-ROADMAP.md` B7.2's task notes on where a checkout of it can be found):
+        // `PaymentCtrlr` is a real, spec-named component with 22 required variables - see
+        // `crate::device_model`'s `CAPABILITY_GATED_VARIABLES`.
+        ctrlr_component: Some("PaymentCtrlr"),
+        // 2.1-only - none of `NotifySettlement`/`NotifyWebPaymentStarted`/`VatNumberValidation`
+        // exist before 2.1, so there is no 1.6J feature profile for this block.
+        feature_profile_1_6: None,
+        // `false`: unlike every other row here, this block has no CSMS-initiated handler to
+        // register at all - `NotifySettlement`/`NotifyWebPaymentStarted`/`VatNumberValidation`
+        // are all sent *by* this charge point (see `crate::payment`'s module docs). Builder-only
+        // for a different reason than the rest of this table's `false` rows: `ChargePointBuilder::
+        // payment` seeds `PaymentCtrlr`'s identity variables from a `hardware::PaymentTerminal`,
+        // which `setup()`'s signature cannot receive.
         has_handler: false,
     },
 ];

@@ -55,10 +55,12 @@ struct CapabilityGatedVariable {
 /// the component unavailable and registers nothing beyond that, rather than advertising
 /// configuration for a block it cannot run.
 ///
-/// Components whose blocks do not exist here at all - `PaymentCtrlr`, `WebPaymentsCtrlr`,
-/// `DCDERCtrlr`/`ACDERCtrlr`, `V2XChargingCtrlr`, `ISO15118Ctrlr`, `NetworkConfiguration` - own
-/// 56 of the appendix's 122 required rows between them and appear nowhere here. That is the same
-/// rule applied consistently, not an omission: their capabilities are `false`, so nothing is owed.
+/// `PaymentCtrlr` (B7.2) owns 22 of those required rows and is registered below, gated by
+/// [`crate::hardware::Capabilities::payment`]. Components whose blocks still don't exist at all -
+/// `WebPaymentsCtrlr`, `DCDERCtrlr`/`ACDERCtrlr`, `V2XChargingCtrlr`, `ISO15118Ctrlr`,
+/// `NetworkConfiguration` - own the remaining 34 of the appendix's 122 required rows between them
+/// and appear nowhere here. That is the same rule applied consistently, not an omission: their
+/// capabilities are `false`, so nothing is owed.
 const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
     CapabilityGatedVariable {
         component: "LocalAuthListCtrlr",
@@ -171,6 +173,197 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+    },
+    // `PaymentCtrlr`'s 22 required variables (B7.2), gated by `Capabilities::payment` - see
+    // `docs/PRODUCTION-ROADMAP.md` B7.2's task notes for where the source CSV rows this mirrors
+    // can be found (this checkout's `docs/OCPP-2.1/` is gitignored). Identity fields
+    // (`VendorName`/`Model`/`SerialNumber`/`FirmwareVersion`/`TerminalID`/
+    // `PaymentServiceProvider`) start as empty placeholders here, same convention as
+    // `TariffCostCtrlr.Currency` above; `ChargePointBuilder::payment` overwrites them with real
+    // values from a `hardware::PaymentTerminal` when one is registered.
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Enabled",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        value: "true",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Problem",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        value: "false",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "AuthorizeDirectPayment",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        // Conservative default, like every other `Capabilities`-gated default (see
+        // `Capabilities::default`'s docs): a direct payment does not require an extra
+        // `AuthorizeRequest` round trip unless configured to.
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "AuthorizationAmount",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "PaymentDetails",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        // Unknown until the integrator configures which `idToken.additionalInfo` details their
+        // terminal can actually supply - empty rather than guessed, mirroring
+        // `TariffCostCtrlr.Currency` above.
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "SettlementByCSMS",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        // Conservative default: the terminal/charge point handles settlement itself unless told
+        // otherwise.
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "ReceiptServerUrl",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "ReceiptByCSMS",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Merchant",
+        instance: Some("Id"),
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Merchant",
+        instance: Some("TaxId"),
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Merchant",
+        instance: Some("Name"),
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Merchant",
+        instance: Some("Address"),
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Merchant",
+        instance: Some("City"),
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "TerminalID",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "PaymentServiceProvider",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "VendorName",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Model",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "SerialNumber",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "FirmwareVersion",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "IMSI",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "ICCID",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "PaymentCtrlr",
+        variable: "Connected",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        value: "false",
+        mutability: VariableMutability::ReadOnly,
     },
 ];
 
