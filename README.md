@@ -253,7 +253,10 @@ adapter code. It is **not** the same claim as "this build is certifiable for pro
 message being wired means an adapter exists for it, not that OCTT has been run against it or that
 every field/edge case in the spec's test cases is handled. See
 [H3](docs/PRODUCTION-ROADMAP.md#103-h3--compliance) for the compliance work (OCTT, the part-6
-test-case sweep, interoperability testing) that turns "wired" into "certifiable".
+test-case sweep, interoperability testing) that turns "wired" into "certifiable", and
+[`docs/CERTIFICATION.md`](docs/CERTIFICATION.md) (H3.3) for which certification profiles this
+crate can honestly claim today, per feature set, and which ones need either an OCTT run or
+integrator hardware this crate cannot supply on its own.
 
 **Regenerate this row before trusting an old copy of it** - the numbers move as adapters land:
 
