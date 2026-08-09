@@ -19,6 +19,7 @@ mod evse;
 mod fault_injection;
 mod file_transfer;
 mod firmware;
+mod key_storage;
 mod storage;
 mod watchdog;
 
@@ -44,6 +45,11 @@ pub use self::file_transfer::{
 };
 pub use self::firmware::{
     FirmwareInstallOutcome, FirmwareInstaller, NoFirmwareInstaller, NoFirmwareInstallerError,
+};
+pub use self::key_storage::{
+    DEFAULT_MAX_KEYS, GeneratedKeyPair, KeyHandle, KeyStore, KeyStoreBacking, NoKeyStore,
+    NoKeyStoreError, PublicKey, SignatureAlgorithm, SoftKeyStore, SoftKeyStoreError,
+    SoftwareCrypto,
 };
 pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]

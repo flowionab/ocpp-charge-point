@@ -48,6 +48,7 @@ default = [
     "battery-swap",
     "periodic-event-stream",
     "certificates",
+    "key-storage",
 ]
 ocpp_1_6 = ["ocpp-client/ocpp_1_6"]
 ocpp_2_0_1 = ["ocpp-client/ocpp_2_0_1"]
@@ -127,6 +128,11 @@ periodic-event-stream = []
 # Gates nothing yet: certificate store/install/CSR (roadmap B4.1-B4.4) has no implementation in
 # this crate yet.
 certificates = []
+# Declares the key-storage capability - `crate::hardware::KeyStore` (roadmap F2.4), a home for
+# private keys (secure-element-backed or a `Storage`-backed software fallback via
+# `crate::hardware::SoftKeyStore`) that never gives up key material. No OCPP messages consume
+# this yet: it exists for F1.3 (mutual TLS) and B4.3 (CSR generation/renewal) to build on.
+key-storage = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
