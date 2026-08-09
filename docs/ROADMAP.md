@@ -1577,7 +1577,15 @@ V2X/V2G power export and distributed energy resource control.
   DER components, DER curve configuration.
 - Internal state needed: energy transfer mode negotiation
   (import/export), DER capability model.
-- Status: ⬜ not started. **(verify vs 2.1 spec)**
+- Status: 🚧 partial (`docs/PRODUCTION-ROADMAP.md` B8.2) — **all eight 2.1 messages are wired**
+  (`GetDERControl`, `SetDERControl`, `ClearDERControl`, `ReportDERControl`, `NotifyDERAlarm`,
+  `NotifyDERStartStop`, `AFRRSignal`, `NotifyAllowedEnergyTransfer`), behind the `der-control`
+  Cargo feature and the `der_control` runtime capability, with a bounded `DERControlStore` in the
+  state model. **Partial, not done, and the gap is the important half**: nothing in
+  `crate::hardware` can *apply* a DER curve, a power-factor or reactive-power setpoint, or a
+  discharge limit — `Connector::set_current_limit` is a single import limit. So a CSMS can install
+  controls and read them back faithfully, and the charge point will not act on them. Closing that
+  needs a bidirectional-power hardware surface, which is a breaking change held for H5.5.
 - Version notes: 2.1-only; not applicable to 1.6J/2.0.1. Depends on
   hardware supporting bidirectional power electronics — likely needs a
   capability flag so non-V2X hardware simply reports the block as
