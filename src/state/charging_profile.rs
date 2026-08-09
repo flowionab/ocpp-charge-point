@@ -657,6 +657,135 @@ impl ChargingProfileStore {
     }
 }
 
+/// D2.3 re-measurement: the wire types' by-value size against `ocpp-types` 0.3.0, the version
+/// actually pinned by this crate's `Cargo.lock`.
+///
+/// The roadmap row's headline number ("2.1 `ChargingProfile` is 56 KB by value") **does
+/// reproduce** here (measured 50,584 bytes - see `docs/MEMORY.md`'s D2.3 section for the full
+/// table), but its stated mechanism is only part of the story. This crate (via `ocpp-client`)
+/// always builds `ocpp-types` with its `alloc` feature on (`ocpp-client`'s `Cargo.toml` requests
+/// `features = ["serde", "alloc"]` unconditionally, `default-features = false`), and Cargo
+/// feature unification means that applies everywhere this crate is built, including
+/// `--no-default-features` MCU builds (no_std **+ alloc**, never allocator-free per `CLAUDE.md`).
+/// Under `alloc`, `ChargingSchedule`'s three inlined sub-schedules are already `Option<T>` over
+/// `alloc::Vec`-backed lists rather than fixed-capacity `heapless` ones - so the *specific*
+/// mechanism the roadmap named (a `heapless` cap on those top-level fields) is not what is
+/// compiled here.
+///
+/// The dominant cost (~78%, see `probe_no_custom_data_sizes` below) is this crate's own
+/// `wire.rs` binding every nested `CustomDataType` generic to the concrete, ~256-byte
+/// `CustomData` struct (`ocpp-client`'s generated methods require it at the top level, and one
+/// type parameter cascades through the whole tree) rather than `ocpp-types`' own zero-sized
+/// `NoCustomData` default - multiplied by every spec-bounded `heapless` array the ISO 15118-20
+/// price-schedule subtree still carries regardless of the `alloc` feature (`TaxRule` x 10,
+/// `AdditionalSelectedServices` x 5, `OverstayRule` x 5, `PriceRule` x 8). Full writeup and a
+/// drafted (not filed) upstream report: `docs/MEMORY.md`, "D2.3".
+#[cfg(test)]
+mod size_measurements {
+    use crate::wire::{v16, v21, v201};
+
+    #[test]
+    fn print_charging_profile_and_schedule_sizes_for_every_protocol_version() {
+        // 2.1.
+        let profile_21 = core::mem::size_of::<v21::common::ChargingProfile>();
+        let schedule_21 = core::mem::size_of::<v21::common::ChargingSchedule>();
+        let absolute_price_21 = core::mem::size_of::<v21::common::AbsolutePriceSchedule>();
+        let price_level_21 = core::mem::size_of::<v21::common::PriceLevelSchedule>();
+        let sales_tariff_21 = core::mem::size_of::<v21::common::SalesTariff>();
+        // 2.0.1.
+        let profile_201 = core::mem::size_of::<v201::common::ChargingProfile>();
+        let schedule_201 = core::mem::size_of::<v201::common::ChargingSchedule>();
+        // 1.6J.
+        let profile_16 = core::mem::size_of::<v16::common::ChargingProfile>();
+        let schedule_16 = core::mem::size_of::<v16::common::ChargingSchedule>();
+        // This crate's own protocol-independent internal representation (`ChargingProfile` /
+        // `ChargingSchedule` in this module) - what `ChargingProfileStore` actually retains.
+        let internal_profile = core::mem::size_of::<super::ChargingProfile>();
+        let internal_schedule = core::mem::size_of::<super::ChargingSchedule>();
+
+        std::eprintln!(
+            "D2.3 measured sizes (ocpp-types 0.3.0, alloc feature on, as this crate always \
+             builds it):\n\
+             \x20 2.1  ChargingProfile          = {profile_21} bytes\n\
+             \x20 2.1  ChargingSchedule         = {schedule_21} bytes\n\
+             \x20 2.1  AbsolutePriceSchedule    = {absolute_price_21} bytes\n\
+             \x20 2.1  PriceLevelSchedule       = {price_level_21} bytes\n\
+             \x20 2.1  SalesTariff              = {sales_tariff_21} bytes\n\
+             \x20 2.0.1 ChargingProfile         = {profile_201} bytes\n\
+             \x20 2.0.1 ChargingSchedule        = {schedule_201} bytes\n\
+             \x20 1.6J ChargingProfile          = {profile_16} bytes\n\
+             \x20 1.6J ChargingSchedule         = {schedule_16} bytes\n\
+             \x20 internal ChargingProfile      = {internal_profile} bytes\n\
+             \x20 internal ChargingSchedule     = {internal_schedule} bytes"
+        );
+
+        // The roadmap row's headline claim reproduces: 2.1's ChargingProfile is still tens of
+        // kilobytes by value under the pinned 0.3.0. This is a regression guard in the other
+        // direction from what might be expected - it fails if the type unexpectedly *shrinks*
+        // far below its current cost, which would mean either this crate's `wire.rs` stopped
+        // binding `CustomData` (worth knowing - it changes what D2.3's mitigation options are)
+        // or a future `ocpp-types` upgrade already fixed the upstream shape (worth knowing, so
+        // the docs/MEMORY.md writeup and the drafted upstream report can be retired). It also
+        // fails on further *growth*, which would make the transient cost in `payload_limit.rs`'s
+        // documented boundary worse than measured.
+        assert!(
+            (30_000..80_000).contains(&profile_21),
+            "2.1 ChargingProfile is {profile_21} bytes, outside the last-measured 30-80 KB \
+             range - re-run the D2.3 writeup in docs/MEMORY.md, the cause may have changed"
+        );
+        assert!(
+            (10_000..25_000).contains(&schedule_21),
+            "2.1 ChargingSchedule is {schedule_21} bytes, outside the last-measured range"
+        );
+
+        // This crate's own internal model is what `ChargingProfileStore` actually retains
+        // (`StateLimits::max_charging_profiles`, default 16) - and it is unaffected by whatever
+        // ocpp-types does, because it never stores the wire type at all (D2.3's central finding:
+        // the store was never exposed to this cost). This bound is the one that matters for this
+        // crate's own retained-memory budget.
+        assert!(
+            internal_profile < 500,
+            "internal ChargingProfile ballooned to {internal_profile} bytes - the store's \
+             retained-memory budget (docs/MEMORY.md) assumes this stays small"
+        );
+    }
+
+    /// Isolates how much of D2.3's cost is `CustomData`'s ~256-byte `vendor_id` propagating
+    /// through every nested `customData` field, versus `ocpp-types`' own array-capacity
+    /// choices, by re-measuring the same 2.1 types with the generic bound to `NoCustomData`
+    /// (a zero-sized type) instead of this crate's actual `wire.rs` binding.
+    ///
+    /// This is what most of D2.3's cost actually is: swapping only the `customData` binding
+    /// should shrink `ChargingProfile` by well over half, because `CustomData` is repeated at
+    /// dozens of nesting sites inside the ISO 15118-20 price-schedule subtree (see
+    /// `docs/MEMORY.md`'s D2.3 section for the full breakdown and the drafted upstream report).
+    #[test]
+    fn most_of_the_size_is_custom_data_not_array_capacity() {
+        use ocpp_client::ocpp_types::NoCustomData;
+        use ocpp_client::ocpp_types::v21::common::{AbsolutePriceSchedule, ChargingProfile};
+
+        let profile_with_custom_data = core::mem::size_of::<v21::common::ChargingProfile>();
+        let profile_without = core::mem::size_of::<ChargingProfile<NoCustomData>>();
+        let schedule_without = core::mem::size_of::<AbsolutePriceSchedule<NoCustomData>>();
+
+        std::eprintln!(
+            "ChargingProfile: {profile_with_custom_data} bytes with CustomData, \
+             {profile_without} bytes with NoCustomData; AbsolutePriceSchedule<NoCustomData> = \
+             {schedule_without} bytes"
+        );
+
+        // Removing only the CustomData binding should cut ChargingProfile by more than half -
+        // last measured at ~78% (50,584 -> 11,240). A weaker-than-2x reduction here would mean
+        // the compounding this crate's docs describe no longer applies and the writeup needs
+        // re-checking.
+        assert!(
+            profile_without * 2 < profile_with_custom_data,
+            "expected NoCustomData to at least halve ChargingProfile's size: \
+             {profile_with_custom_data} bytes with CustomData vs {profile_without} without"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

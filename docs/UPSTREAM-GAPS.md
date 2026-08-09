@@ -14,10 +14,18 @@
 > - **`DataTransfer`.** A new upstream defect applies from 0.4.0 - see
 >   [`MIGRATION-ocpp-client-0.4.md`](./MIGRATION-ocpp-client-0.4.md) §"DataTransfer".
 >
-> **Unchanged:** D2.3 (`ChargingProfile` 56 KB by value). Verified directly against `ocpp-types`
-> 0.2.0: `ChargingSchedule` still holds `AbsolutePriceSchedule`/`PriceLevelSchedule` inline
-> rather than boxed. Some structures did shrink, because 48 2.x fields moved from
-> `heapless::String<N>` to `String`, but the cause D2.3 names is untouched.
+> **Unchanged in headline size, corrected in cause:** D2.3 (`ChargingProfile` 56 KB by value).
+> Re-verified directly against the pinned `ocpp-types` 0.3.0 — the number holds (measured 50,584
+> bytes, same order of magnitude) but the mechanism this note previously named
+> (`ChargingSchedule` inlining `AbsolutePriceSchedule`/`PriceLevelSchedule` rather than boxing
+> them) is only part of the story: `ocpp-client` 0.5.0 always builds `ocpp-types` with `alloc`
+> on, under which those three fields are already `Option<T>` over `alloc::Vec`-backed lists, not
+> fixed `heapless` capacities. The dominant cost (~78%) is instead this crate's own `wire.rs`
+> binding every nested generic `CustomDataType` to the concrete, ~256-byte `CustomData` struct
+> rather than `ocpp-types`' own zero-sized `NoCustomData` default, multiplied by every
+> spec-bounded `heapless` array the ISO 15118-20 price-schedule subtree still carries regardless
+> of the `alloc` feature. Full measured before/after numbers, the isolated cause, and a drafted
+> (not filed) upstream report are in [`docs/MEMORY.md`](MEMORY.md#d23--21-chargingprofiles-by-value-size-re-measured).
 >
 > `ocpp-types` 0.3.0 changed none of this again - that release is purely additive, with the same
 > 39 / 64 / 91 actions and no type reshaped - so the corrections above are current.
