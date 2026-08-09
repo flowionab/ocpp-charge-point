@@ -326,6 +326,9 @@ Add the dependency:
 ocpp-charge-point = "0.x"
 ```
 
+For a full walkthrough of what to implement, which Cargo features to pick, and how the
+provided examples demonstrate each, see [`docs/INTEGRATORS.md`](docs/INTEGRATORS.md).
+
 ---
 
 ## 🚀 Getting Started
