@@ -2,10 +2,25 @@ name: CI
 
 # H1.7: PRs as well as pushes - previously `push` only, so a PR's first signal
 # arrived after merge.
+#
+# H1.8: also run on a schedule, independent of push/PR activity. The
+# `feature-matrix` incident wasn't a missing trigger - it ran, and failed, on
+# every push for three-plus commits. The gap was that a red run on `main`
+# produced no signal anyone was still watching once the pushes that caused it
+# stopped landing. A scheduled run gives GitHub a push-independent reason to
+# re-check `main` and re-notify (GitHub emails the last person to edit this
+# workflow file when a scheduled run fails) even during a quiet week where
+# nobody's push would have re-surfaced the failure. Weekday mornings, off the
+# hour to dodge the top-of-hour scheduling crunch other repos pile onto.
+# `workflow_dispatch` lets a maintainer re-run the same check by hand from the
+# Actions tab without needing an empty commit.
 on:
   push:
     branches: [main]
   pull_request: {}
+  schedule:
+    - cron: '17 6 * * 1-5'
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,15 +64,18 @@ jobs:
   # and the named configurations below cover the runtime axis (no_std / std
   # without tokio / everything).
   #
-  # C1.3: the 14 capability features (`reservation`, `smart-charging`, ...) are
+  # C1.3: the 17 capability features (`reservation`, `smart-charging`, ...) are
   # a third axis, and it must be orthogonal to the version axis - any
   # combination has to compile. `--each-feature` already builds each capability
   # feature *alone*; the `Capability set:` steps below cover the combinations
-  # that axis actually ships in, rather than its 2^14 powerset: everything off
-  # (the smallest real build), a Core-only charger, and Core + Smart Charging
-  # (the first profile a real deployment adds). `--all-features` above is the
-  # everything-on end. `--lib` because `examples/` and `tests/` assume default
-  # features and are not part of the capability contract.
+  # that axis actually ships in, rather than its 2^17 powerset: everything off
+  # (the smallest real build), a Core-only charger, Core + Smart Charging
+  # (the first profile a real deployment adds), and (H1.8) every capability at
+  # once under true no_std - see that step's comment for why the last one
+  # earns its keep. `--all-features` above is the everything-on end (with
+  # `tokio-runtime`/`std` present, unlike the no_std step). `--lib` because
+  # `examples/` and `tests/` assume default features and are not part of the
+  # capability contract.
   feature-matrix:
     runs-on: ubuntu-latest
     steps:
@@ -88,6 +106,25 @@ jobs:
         run: cargo check --no-default-features --features tokio-runtime,ocpp_2_1,local-auth-list,reservation --lib
       - name: 'Capability set: Core + Smart Charging'
         run: cargo check --no-default-features --features tokio-runtime,ocpp_2_1,local-auth-list,reservation,smart-charging --lib
+      # H1.8: closes the gap the version x capability axes leave open. Every
+      # step above enables capability features either alone (`--each-feature`)
+      # or with `tokio-runtime`/`std` present; none of them enable a
+      # capability feature under true `--no-default-features` together with
+      # more than one or two others. That combination is exactly where five
+      # capability modules broke last round: `async_trait` expands to a
+      # `Box<dyn ...>` inside an inline `ocpp_2_*` adapter module, and without
+      # that module's own `use alloc::boxed::Box;` it only fails to compile
+      # once `std`'s prelude re-export of `Box` is gone *and* the capability
+      # feature gating that module is on. Running every capability feature at
+      # once under no_std, rather than a full 2^17 powerset, is the traded-off
+      # middle ground: it can't localize *which* capability combination
+      # broke, only that no_std + "everything a full deployment turns on"
+      # still compiles, which is the combination CLAUDE.md's no_std goal
+      # actually cares about. All three version features included since the
+      # 2.1-only capabilities (der-control, battery-swap,
+      # periodic-event-stream) need one to gate any code in.
+      - name: 'Capability set: no_std, every capability, every version'
+        run: cargo check --no-default-features --features ocpp_1_6,ocpp_2_0_1,ocpp_2_1,battery-swap,certificate-management,certificates,der-control,diagnostics,display-message,firmware-management,firmware-publishing,iso15118,key-storage,local-auth-list,payment,periodic-event-stream,reservation,smart-charging,tariff-cost,variable-monitoring --lib
 
   # H1.3: the target this crate exists for. `cargo check` (not build) because
   # linking a bare-metal binary additionally needs a `critical-section` backend
@@ -204,3 +241,57 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check bans licenses sources advisories
+
+  # H1.8: make a red gate visible.
+  #
+  # Before this job, "six green, one red" produced six green check marks and
+  # one red one on the commit - a real signal, but one every job before this
+  # one already gave, and that's exactly what went unread for three-plus
+  # commits. This job is the one check a human (or a branch-protection rule)
+  # needs to look at: it depends on every gating job above, so it is green
+  # only when all of them are, and red - with the specific failed/cancelled
+  # job named in both the job summary and an `::error::` annotation on this
+  # run - the instant any one of them isn't. `if: always()` is required
+  # because a job's default `if` skips it when an upstream `needs` dependency
+  # fails, which would make this job silently skip (a grey check) instead of
+  # failing (a red one) on exactly the runs it exists to catch.
+  #
+  # This job is necessary but not sufficient - it makes the aggregate status
+  # legible, but nothing in this repository can force `main` to stay green.
+  # That requires a maintainer to open Settings -> Branches -> Branch
+  # protection rules for `main` (or Rulesets) and add `ci-required` as the
+  # only required status check ("Require status checks to pass before
+  # merging"). `gh api repos/:owner/:repo/branches/main/protection` from this
+  # worktree returns "Branch not protected" (404) as of this change, so that
+  # step has not been taken - it is a repository setting, not a file, and is
+  # outside what this agent can configure from a checked-out worktree even if
+  # it had write access to GitHub's API for it (see the accompanying report).
+  ci-required:
+    if: always()
+    needs: [lint, test, feature-matrix, embedded, msrv, coverage, deny]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every gating job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "## CI gate summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for job in $(echo "$RESULTS" | jq -r 'keys[]'); do
+            result=$(echo "$RESULTS" | jq -r --arg j "$job" '.[$j].result')
+            echo "| $job | $result |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$result" != "success" ]; then
+              echo "::error::Gating job '$job' finished with result '$result', not 'success'"
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**One or more gating jobs did not succeed - see the \`::error::\` annotations on this run.**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "All gating jobs succeeded." >> "$GITHUB_STEP_SUMMARY"
