@@ -68,6 +68,12 @@
 //! | `ClearDERControl`            | n/a (2.1-only) | n/a | CALLRESULT `DERControlStatusEnum::NotSupported` |
 //! | `AFRRSignal`                 | n/a (2.1-only) | n/a | CALLRESULT `GenericStatusEnum::Rejected` (no `NotSupported` in this enum) |
 //! | `NotifyAllowedEnergyTransfer`| n/a (2.1-only) | n/a | CALLRESULT `NotifyAllowedEnergyTransferStatusEnum::Rejected` (no `NotSupported` in this enum) |
+//! | `CertificateSigned`          | n/a (2.x-only) | CALLRESULT `CertificateSignedStatusEnum::Rejected` | same as 2.0.1 |
+//!
+//! `SignCertificate` (B4.3) has no row here: it is charge-point-initiated (this crate sends it,
+//! rather than answering a CSMS call), so there is no inbound message for a runtime-absent
+//! capability to refuse - an absent `certificate_management`/`key_storage` capability instead
+//! means this crate simply does not attempt to send one.
 //!
 //! Nothing here needed to fall back on assumption where the vendored spec/generated types didn't
 //! settle it - every response type above either has a documented status enum or documented-empty
@@ -276,6 +282,11 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
     RefusalGate {
         message: "NotifyAllowedEnergyTransfer",
         capability: |c| c.der_control,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "CertificateSigned",
+        capability: |c| c.certificate_management,
         shape: RefusalShape::CallResultStatus,
     },
 ];

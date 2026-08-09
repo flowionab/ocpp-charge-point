@@ -1,4 +1,5 @@
-//! OCPP 2.0.1 wire adapter for certificate management (B4.2).
+//! OCPP 2.0.1 wire adapter for certificate management (B4.2) and the `SignCertificate`/
+//! `CertificateSigned` CSR round trip (B4.3).
 //!
 //! Not yet registered through `ChargePointBuilder` (nothing in this crate's public surface
 //! constructs [`Ocpp2_0_1CertificateHandler`] outside the `std`-convenience impl below and this
@@ -12,24 +13,30 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::wire::v201::common::{
-    CertificateHashData as WireHashData, CertificateHashDataChain, DeleteCertificateStatusEnum,
+    CertificateHashData as WireHashData, CertificateHashDataChain, CertificateSignedStatusEnum,
+    CertificateSigningUseEnum, DeleteCertificateStatusEnum, GenericStatusEnum,
     GetCertificateIdUseEnum, GetInstalledCertificateStatusEnum, HashAlgorithmEnum,
     InstallCertificateStatusEnum, InstallCertificateUseEnum,
 };
 use crate::wire::v201::{
-    DeleteCertificateRequest, DeleteCertificateResponse, GetInstalledCertificateIdsRequest,
+    CertificateSignedRequest, CertificateSignedResponse, DeleteCertificateRequest,
+    DeleteCertificateResponse, GetInstalledCertificateIdsRequest,
     GetInstalledCertificateIdsResponse, InstallCertificateRequest, InstallCertificateResponse,
+    SignCertificateRequest,
 };
-use ocpp_client::ocpp_2_0_1::OCPP2_0_1Client;
+use ocpp_client::ClientError;
+use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
 
 use crate::actor::ChargePointActor;
 use crate::certificates::{
-    CertificateHandler, handle_delete_certificate, handle_get_installed_certificate_ids,
-    handle_install_certificate,
+    CertificateHandler, CertificateSignedOutcome, CertificateSigningPurpose,
+    CertificateSigningRequester, CsrSubject, PendingSignRequests, SignCertificateError,
+    SignCertificateOutcome, build_signed_csr, handle_certificate_signed, handle_delete_certificate,
+    handle_get_installed_certificate_ids, handle_install_certificate, record_sign_certificate_sent,
 };
 use crate::hardware::{
     CertificateHashData, CertificateStore, CertificateUse, DeleteCertificateOutcome, HashAlgorithm,
-    InstallCertificateOutcome, InstalledCertificate,
+    InstallCertificateOutcome, InstalledCertificate, KeyStore,
 };
 
 /// 2.1's install-use enum onto this crate's. Every value has a counterpart.
@@ -155,6 +162,38 @@ fn delete_response(outcome: DeleteCertificateOutcome) -> DeleteCertificateRespon
     }
 }
 
+/// The wire `certificateType` onto this crate's purpose. Absent `certificateType` on
+/// `CertificateSigned` defaults to `ChargingStationCertificate`, per OCPP 2.0.1's spec text for
+/// that field.
+fn map_signing_purpose(use_for: Option<&CertificateSigningUseEnum>) -> CertificateSigningPurpose {
+    match use_for {
+        Some(CertificateSigningUseEnum::V2GCertificate) => {
+            CertificateSigningPurpose::V2GCertificate
+        }
+        _ => CertificateSigningPurpose::ChargingStationCertificate,
+    }
+}
+
+fn wire_signing_purpose(purpose: CertificateSigningPurpose) -> CertificateSigningUseEnum {
+    match purpose {
+        CertificateSigningPurpose::ChargingStationCertificate => {
+            CertificateSigningUseEnum::ChargingStationCertificate
+        }
+        CertificateSigningPurpose::V2GCertificate => CertificateSigningUseEnum::V2GCertificate,
+    }
+}
+
+fn certificate_signed_response(outcome: CertificateSignedOutcome) -> CertificateSignedResponse {
+    CertificateSignedResponse {
+        custom_data: None,
+        status: match outcome {
+            CertificateSignedOutcome::Accepted => CertificateSignedStatusEnum::Accepted,
+            CertificateSignedOutcome::Rejected => CertificateSignedStatusEnum::Rejected,
+        },
+        status_info: None,
+    }
+}
+
 fn ids_response(installed: &[InstalledCertificate]) -> GetInstalledCertificateIdsResponse {
     let chain: Vec<CertificateHashDataChain> = installed.iter().filter_map(wire_chain).collect();
     GetInstalledCertificateIdsResponse {
@@ -171,15 +210,55 @@ fn ids_response(installed: &[InstalledCertificate]) -> GetInstalledCertificateId
     }
 }
 
-/// Registers 2.1's three certificate messages.
+/// Registers 2.1's three certificate messages, plus the B4.3 `SignCertificate`/
+/// `CertificateSigned` round trip.
 pub struct Ocpp2_0_1CertificateHandler {
     client: OCPP2_0_1Client,
+    pending: alloc::sync::Arc<PendingSignRequests>,
 }
 
 impl Ocpp2_0_1CertificateHandler {
     /// Wraps `client`.
     pub fn new(client: OCPP2_0_1Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            pending: alloc::sync::Arc::new(PendingSignRequests::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CertificateSigningRequester<ClientError<OCPP2_0_1Error>> for Ocpp2_0_1CertificateHandler {
+    async fn sign_certificate<K>(
+        &self,
+        key_store: &K,
+        key: &crate::hardware::GeneratedKeyPair,
+        subject: &CsrSubject,
+        purpose: CertificateSigningPurpose,
+    ) -> Result<SignCertificateOutcome, SignCertificateError<K::Error, ClientError<OCPP2_0_1Error>>>
+    where
+        K: KeyStore + Send + Sync,
+    {
+        let csr = build_signed_csr(key_store, key, subject)
+            .await
+            .map_err(SignCertificateError::Csr)?;
+
+        let response = self
+            .client
+            .send_sign_certificate(SignCertificateRequest {
+                certificate_type: Some(wire_signing_purpose(purpose)),
+                csr,
+                custom_data: None,
+            })
+            .await
+            .map_err(SignCertificateError::Client)?;
+
+        let outcome = match response.status {
+            GenericStatusEnum::Accepted => SignCertificateOutcome::Accepted,
+            GenericStatusEnum::Rejected => SignCertificateOutcome::Rejected,
+        };
+        record_sign_certificate_sent(&self.pending, purpose, None, outcome);
+        Ok(outcome)
     }
 }
 
@@ -228,11 +307,13 @@ impl CertificateHandler for Ocpp2_0_1CertificateHandler {
             })
             .await;
 
+        let ids_actor = actor.clone();
+        let ids_store = store.clone();
         self.client
             .on_get_installed_certificate_ids(
                 move |request: GetInstalledCertificateIdsRequest, _client| {
-                    let actor = actor.clone();
-                    let store = store.clone();
+                    let actor = ids_actor.clone();
+                    let store = ids_store.clone();
                     async move {
                         let uses: Vec<CertificateUse> = request
                             .certificate_type
@@ -247,6 +328,28 @@ impl CertificateHandler for Ocpp2_0_1CertificateHandler {
                     }
                 },
             )
+            .await;
+
+        let signed_pending = self.pending.clone();
+        self.client
+            .on_certificate_signed(move |request: CertificateSignedRequest, _client| {
+                let actor = actor.clone();
+                let store = store.clone();
+                let pending = signed_pending.clone();
+                async move {
+                    let purpose = map_signing_purpose(request.certificate_type.as_ref());
+                    let outcome = handle_certificate_signed(
+                        &actor,
+                        &store,
+                        &pending,
+                        purpose,
+                        None,
+                        &request.certificate_chain,
+                    )
+                    .await;
+                    Ok(certificate_signed_response(outcome))
+                }
+            })
             .await;
     }
 }

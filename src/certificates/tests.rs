@@ -1,4 +1,4 @@
-//! Tests for the certificate-management block's protocol-agnostic handlers (B4.2).
+//! Tests for the certificate-management block's protocol-agnostic handlers (B4.2/B4.3).
 
 use super::*;
 use crate::executor::TokioExecutor;
@@ -6,7 +6,9 @@ use crate::hardware::{
     Capabilities, HashAlgorithm, InMemoryStorage, NoCertificateStore, StoredCertificates,
 };
 use crate::state::ChargePointEvent;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 fn hash(serial: &str) -> CertificateHashData {
     CertificateHashData {
@@ -171,5 +173,283 @@ async fn a_charge_point_with_no_store_at_all_still_answers_every_message() {
         handle_get_installed_certificate_ids(&actor, &store, &[])
             .await
             .is_empty()
+    );
+}
+
+// --- B4.3: SignCertificate / CertificateSigned -------------------------------------------------
+
+/// A [`CertificateStore`] that always accepts an install, so `handle_certificate_signed`'s
+/// success path can be tested without needing a store that can actually compute hashes.
+#[derive(Default)]
+struct AcceptingStore {
+    installed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl CertificateStore for AcceptingStore {
+    type Error = core::convert::Infallible;
+
+    async fn install(
+        &self,
+        _use_for: CertificateUse,
+        _certificate: &str,
+    ) -> Result<InstallCertificateOutcome, Self::Error> {
+        self.installed.store(true, Ordering::SeqCst);
+        Ok(InstallCertificateOutcome::Accepted)
+    }
+
+    async fn delete(
+        &self,
+        _hash_data: &CertificateHashData,
+    ) -> Result<DeleteCertificateOutcome, Self::Error> {
+        Ok(DeleteCertificateOutcome::NotFound)
+    }
+
+    async fn installed(
+        &self,
+        _uses: &[CertificateUse],
+    ) -> Result<Vec<InstalledCertificate>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn has_private_key(&self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+async fn an_unsolicited_certificate_signed_is_rejected_and_flagged() {
+    let actor = actor_with_certificates().await;
+    let store = AcceptingStore::default();
+    let pending = PendingSignRequests::new();
+
+    // Nothing was ever recorded as sent, so this is unsolicited.
+    let outcome = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        "-----BEGIN CERTIFICATE-----",
+    )
+    .await;
+
+    assert_eq!(outcome, CertificateSignedOutcome::Rejected);
+    assert!(
+        !store.installed.load(Ordering::SeqCst),
+        "must not touch the store"
+    );
+}
+
+#[tokio::test]
+async fn a_solicited_certificate_signed_is_installed_in_the_right_slot() {
+    let actor = actor_with_certificates().await;
+    let store = AcceptingStore::default();
+    let pending = PendingSignRequests::new();
+    pending.record_sent(CertificateSigningPurpose::ChargingStationCertificate, None);
+
+    let outcome = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        "-----BEGIN CERTIFICATE-----",
+    )
+    .await;
+
+    assert_eq!(outcome, CertificateSignedOutcome::Accepted);
+    assert!(store.installed.load(Ordering::SeqCst));
+    // Consumed: a second, identical `CertificateSigned` is no longer solicited.
+    let second = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        "-----BEGIN CERTIFICATE-----",
+    )
+    .await;
+    assert_eq!(second, CertificateSignedOutcome::Rejected);
+}
+
+#[tokio::test]
+async fn pending_for_one_purpose_does_not_authorize_the_other() {
+    let actor = actor_with_certificates().await;
+    let store = AcceptingStore::default();
+    let pending = PendingSignRequests::new();
+    pending.record_sent(CertificateSigningPurpose::ChargingStationCertificate, None);
+
+    let outcome = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::V2GCertificate,
+        None,
+        "-----BEGIN CERTIFICATE-----",
+    )
+    .await;
+
+    assert_eq!(outcome, CertificateSignedOutcome::Rejected);
+}
+
+#[tokio::test]
+async fn a_2_1_request_id_that_does_not_match_the_pending_one_is_rejected() {
+    let actor = actor_with_certificates().await;
+    let store = AcceptingStore::default();
+    let pending = PendingSignRequests::new();
+    pending.record_sent(
+        CertificateSigningPurpose::ChargingStationCertificate,
+        Some(1),
+    );
+
+    let outcome = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        Some(2),
+        "-----BEGIN CERTIFICATE-----",
+    )
+    .await;
+
+    assert_eq!(outcome, CertificateSignedOutcome::Rejected);
+}
+
+#[tokio::test]
+async fn a_missing_request_id_still_matches_a_pending_one_since_2_0_1_has_none() {
+    let actor = actor_with_certificates().await;
+    let store = AcceptingStore::default();
+    let pending = PendingSignRequests::new();
+    pending.record_sent(
+        CertificateSigningPurpose::ChargingStationCertificate,
+        Some(1),
+    );
+
+    // A 2.1 CSMS that omits `requestId` on `CertificateSigned` - or a 2.0.1 connection, which has
+    // no such field at all - should not be refused purely for that.
+    let outcome = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        "-----BEGIN CERTIFICATE-----",
+    )
+    .await;
+
+    assert_eq!(outcome, CertificateSignedOutcome::Accepted);
+}
+
+#[tokio::test]
+async fn a_chain_the_store_refuses_is_reported_as_rejected() {
+    let actor = actor_with_certificates().await;
+    let store = store(); // `StoredCertificates` refuses every bare `install`.
+    let pending = PendingSignRequests::new();
+    pending.record_sent(CertificateSigningPurpose::ChargingStationCertificate, None);
+
+    let outcome = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        "-----BEGIN CERTIFICATE-----",
+    )
+    .await;
+
+    assert_eq!(outcome, CertificateSignedOutcome::Rejected);
+}
+
+#[tokio::test]
+async fn without_the_capability_certificate_signed_is_rejected_without_touching_pending() {
+    let actor = ChargePointActor::spawn([1], &TokioExecutor);
+    let _ = actor
+        .send(ChargePointEvent::CapabilitiesDeclared(
+            Capabilities::default(),
+        ))
+        .await;
+    let store = AcceptingStore::default();
+    let pending = PendingSignRequests::new();
+    pending.record_sent(CertificateSigningPurpose::ChargingStationCertificate, None);
+
+    let outcome = handle_certificate_signed(
+        &actor,
+        &store,
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        "-----BEGIN CERTIFICATE-----",
+    )
+    .await;
+
+    assert_eq!(outcome, CertificateSignedOutcome::Rejected);
+    assert!(!store.installed.load(Ordering::SeqCst));
+    // The pending entry survives - an absent capability should not silently discard the
+    // charge point's own record of what it asked for.
+    assert!(pending.matches(CertificateSigningPurpose::ChargingStationCertificate, None));
+}
+
+#[test]
+fn record_sign_certificate_sent_only_arms_pending_on_acceptance() {
+    let pending = PendingSignRequests::new();
+
+    record_sign_certificate_sent(
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        SignCertificateOutcome::Rejected,
+    );
+    assert!(!pending.matches(CertificateSigningPurpose::ChargingStationCertificate, None));
+
+    record_sign_certificate_sent(
+        &pending,
+        CertificateSigningPurpose::ChargingStationCertificate,
+        None,
+        SignCertificateOutcome::Accepted,
+    );
+    assert!(pending.matches(CertificateSigningPurpose::ChargingStationCertificate, None));
+}
+
+#[test]
+fn a_second_sign_certificate_for_the_same_purpose_supersedes_the_first() {
+    let pending = PendingSignRequests::new();
+    pending.record_sent(
+        CertificateSigningPurpose::ChargingStationCertificate,
+        Some(1),
+    );
+    pending.record_sent(
+        CertificateSigningPurpose::ChargingStationCertificate,
+        Some(2),
+    );
+
+    // The stale id no longer matches; only the most recent one does.
+    assert!(!pending.matches(
+        CertificateSigningPurpose::ChargingStationCertificate,
+        Some(1)
+    ));
+    assert!(pending.matches(
+        CertificateSigningPurpose::ChargingStationCertificate,
+        Some(2)
+    ));
+}
+
+#[test]
+fn next_request_id_is_monotonically_increasing() {
+    let pending = PendingSignRequests::new();
+    let a = pending.next_request_id();
+    let b = pending.next_request_id();
+    assert!(b > a);
+}
+
+#[test]
+fn certificate_signing_purpose_maps_to_the_right_certificate_use() {
+    assert_eq!(
+        CertificateSigningPurpose::ChargingStationCertificate.certificate_use(),
+        CertificateUse::ChargingStation
+    );
+    assert_eq!(
+        CertificateSigningPurpose::V2GCertificate.certificate_use(),
+        CertificateUse::V2gCertificateChain
     );
 }
