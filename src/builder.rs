@@ -1572,6 +1572,36 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers outbound smart-charging notifications - `NotifyChargingLimit`/
+    /// `ClearedChargingLimit`/`NotifyEVChargingNeeds`/`NotifyEVChargingSchedule`
+    /// (`docs/PRODUCTION-ROADMAP.md` B2.8). **2.0.1/2.1 only** - 1.6J has none of these messages,
+    /// so `csms` must implement [`crate::smart_charging::ChargingLimitNotifier`] and
+    /// [`crate::smart_charging::EVChargingNotifier`], which no 1.6J client type does.
+    ///
+    /// Nothing here decides *when* to notify - see
+    /// [`crate::state::ChargePointEvent::ExternalChargingLimitSet`]/
+    /// [`crate::state::EvseEvent::EVChargingNeedsReported`] and friends for how an integrator (a
+    /// local energy-management binding, or an ISO 15118 stack) feeds this.
+    pub fn smart_charging_notifications<N>(self, csms: &N) -> Self
+    where
+        N: crate::smart_charging::ChargingLimitNotifier
+            + crate::smart_charging::EVChargingNotifier
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let notifications = self
+            .runtime
+            .actor()
+            .subscribe_smart_charging_notifications();
+        let notifier = csms.clone();
+        self.executor.spawn(Box::pin(async move {
+            crate::smart_charging::run_smart_charging_notifications(notifications, &notifier).await;
+        }));
+        self
+    }
+
     /// Registers the Reset functional block: the Reset handler feeds into the runtime's actor.
     pub async fn reset<N>(self, csms: &N) -> Self
     where

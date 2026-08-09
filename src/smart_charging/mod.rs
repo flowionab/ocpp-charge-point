@@ -32,6 +32,7 @@ use crate::state::{
 };
 
 mod handlers;
+pub mod notifications;
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6;
 #[cfg(feature = "ocpp_2_0_1")]
@@ -60,6 +61,10 @@ pub use self::handlers::{
     handle_clear_charging_profile, handle_get_charging_profiles, handle_get_composite_schedule,
     handle_set_charging_profile, handle_update_dynamic_schedule, handle_use_priority_charging,
     run_dynamic_schedule_pulls, run_priority_charging_notifications,
+};
+pub use self::notifications::{
+    ChargingLimitNotifier, EVChargingNeedsOutcome, EVChargingNotifier, GenericNotifyOutcome,
+    run_smart_charging_notifications,
 };
 pub use self::projection::{
     ChargingLimitProjection, connector_composition_context, run_charging_limit_projection,

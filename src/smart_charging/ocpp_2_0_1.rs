@@ -272,7 +272,7 @@ fn wire_recurrency(kind: RecurrencyKind) -> RecurrencyKindEnum {
 ///
 /// 2.0.1's period `limit` is mandatory, so every stored period reports - the mirror of this
 /// version having nothing to drop on the way in.
-fn wire_schedule(schedule: &ChargingSchedule) -> WireChargingSchedule {
+pub(super) fn wire_schedule(schedule: &ChargingSchedule) -> WireChargingSchedule {
     WireChargingSchedule {
         charging_rate_unit: wire_rate_unit(schedule.rate_unit),
         charging_schedule_period: schedule

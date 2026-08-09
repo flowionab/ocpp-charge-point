@@ -18,6 +18,7 @@ mod registration_status;
 mod reservation;
 mod reset;
 mod security_event;
+mod smart_charging_notification;
 mod tariff;
 mod transaction;
 mod variable_monitoring;
@@ -68,6 +69,10 @@ pub use self::registration_status::RegistrationStatus;
 pub use self::reservation::{Reservation, ReservationId};
 pub use self::reset::{PendingReset, ResetKind, ResetTarget};
 pub use self::security_event::{SecurityEvent, SecurityEventType};
+pub use self::smart_charging_notification::{
+    AcChargingNeeds, DcChargingNeeds, EVChargingNeeds, EVChargingScheduleReport,
+    EnergyTransferMode, ExternalChargingLimit, SmartChargingNotification,
+};
 pub use self::tariff::{
     InstalledTariff, Tariff, TariffClearCriteria, TariffId, TariffScope, TariffSetRejection,
     TariffStore,

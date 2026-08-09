@@ -281,7 +281,7 @@ fn wire_recurrency(kind: RecurrencyKind) -> RecurrencyKindEnum {
 /// Every 2.1 field this crate's model has no concept of goes out as `None` rather than a guess -
 /// the same fields [`map_schedule`] reads past on the way in, so a profile that arrived here and
 /// is reported back describes exactly what this charge point is acting on.
-fn wire_schedule(schedule: &ChargingSchedule) -> WireChargingSchedule {
+pub(super) fn wire_schedule(schedule: &ChargingSchedule) -> WireChargingSchedule {
     WireChargingSchedule {
         absolute_price_schedule: None,
         charging_rate_unit: wire_rate_unit(schedule.rate_unit),

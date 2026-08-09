@@ -2,7 +2,7 @@ use crate::executor::Executor;
 use crate::state::{
     AuthorizationRequested, ChargePointEffect, ChargePointEvent, ChargePointState,
     ConnectorStatusChanged, HardwareCommand, PriorityChargingChange, ReservationUpdate, ResetKind,
-    SecurityEvent, TransactionEventOccurred, TriggeredMonitor,
+    SecurityEvent, SmartChargingNotification, TransactionEventOccurred, TriggeredMonitor,
 };
 use crate::sync::{
     BroadcastReceiver, BroadcastSender, Chan, OneShot, WatchReceiver, broadcast_channel,
@@ -40,6 +40,7 @@ struct EffectSenders {
     reservation_updates: BroadcastSender<ReservationUpdate>,
     priority_charging_changes: BroadcastSender<PriorityChargingChange>,
     variable_monitor_events: BroadcastSender<TriggeredMonitor>,
+    smart_charging_notifications: BroadcastSender<SmartChargingNotification>,
 }
 
 /// An error sending an event to a [`ChargePointActor`].
@@ -77,6 +78,7 @@ pub struct ChargePointActor {
     reservation_updates: BroadcastSender<ReservationUpdate>,
     priority_charging_changes: BroadcastSender<PriorityChargingChange>,
     variable_monitor_events: BroadcastSender<TriggeredMonitor>,
+    smart_charging_notifications: BroadcastSender<SmartChargingNotification>,
     // A plain shared cell rather than a `Watch` - this is a settable-once, read-many hook, not a
     // stream of values anything needs to await a *change* in. See `set_boot_reason_recorder`'s
     // docs for what it's for and why `crate::reset::handle_reset` needs a synchronous way to
@@ -142,6 +144,7 @@ impl ChargePointActor {
         let reservation_updates = broadcast_channel();
         let priority_charging_changes = broadcast_channel();
         let variable_monitor_events = broadcast_channel();
+        let smart_charging_notifications = broadcast_channel();
         let effects = EffectSenders {
             commands: commands.clone(),
             status_notifications: status_notifications.clone(),
@@ -151,6 +154,7 @@ impl ChargePointActor {
             reservation_updates: reservation_updates.clone(),
             priority_charging_changes: priority_charging_changes.clone(),
             variable_monitor_events: variable_monitor_events.clone(),
+            smart_charging_notifications: smart_charging_notifications.clone(),
         };
         executor.spawn(Box::pin(run(
             state,
@@ -171,6 +175,7 @@ impl ChargePointActor {
             reservation_updates,
             priority_charging_changes,
             variable_monitor_events,
+            smart_charging_notifications,
             boot_reason_recorder: Arc::new(BlockingMutex::new(RefCell::new(None))),
         }
     }
@@ -280,6 +285,18 @@ impl ChargePointActor {
         self.variable_monitor_events.subscribe()
     }
 
+    /// Subscribes to every smart-charging notification this charge point has to forward to the
+    /// CSMS but did not decide to send on its own initiative - an external charging limit
+    /// changing, or something an EV reported via ISO 15118 - reported via
+    /// `NotifyChargingLimit`/`ClearedChargingLimit`/`NotifyEVChargingNeeds`/
+    /// `NotifyEVChargingSchedule` by [`crate::smart_charging::notifications::run_smart_charging_notifications`].
+    /// See `docs/PRODUCTION-ROADMAP.md` B2.8.
+    pub fn subscribe_smart_charging_notifications(
+        &self,
+    ) -> BroadcastReceiver<SmartChargingNotification> {
+        self.smart_charging_notifications.subscribe()
+    }
+
     /// Installs `recorder`, called by [`crate::reset::handle_reset`] with the accepted `Reset`'s
     /// `ResetKind` synchronously *before* the `ResetRequested` event that may immediately produce
     /// a `HardwareCommand::Reboot` is sent to this actor - so a durable-storage-backed `recorder`
@@ -354,6 +371,9 @@ async fn run(
                 }
                 ChargePointEffect::VariableMonitorTriggered(triggered) => {
                     effects.variable_monitor_events.send(triggered);
+                }
+                ChargePointEffect::SmartChargingNotification(notification) => {
+                    effects.smart_charging_notifications.send(notification);
                 }
             }
         }
