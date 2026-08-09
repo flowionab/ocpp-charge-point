@@ -269,6 +269,80 @@ LTO, or `panic = "unwind"` is a different and much larger number.
 
 ---
 
+## Reconnect-churn growth (H4.3, root-causing H4.1's open finding)
+
+[H4.1](PRODUCTION-ROADMAP.md#104-h4--longevity)'s long soak
+(`tests/network_flapping_soak.rs`) recorded a small, consistent memory-growth
+trend at 400+ reconnect rounds — a few hundred bytes per reconnect, well inside
+its 4 MB tolerance but not root-caused, with three named candidates: this
+crate's `ConnectionTarget`, `ocpp-client`'s reconnect path, or benign allocator
+fragmentation from thousands of short-lived TCP connections.
+
+**Reproduced at larger scale.** A 500-round run of the same soak (release
+profile) produced 9,611 reconnects and 2,500 transactions: retained memory read
+2,660,711 B after 250 rounds and 4,701,966 B after 500 — roughly 425 B per
+reconnect over the second half, still comfortably inside the 4 MB tolerance.
+
+**Isolated to reconnects, not transaction volume.** `tests/memory_growth.rs`
+(H4.2) already drives 3,000 transactions with zero reconnects and finds ~0 net
+growth (97 B of noise). `tests/reconnect_leak_bisect.rs` adds the missing data
+point directly: `bare_reconnect_churn_grows_without_any_transaction_traffic`
+runs this crate's full `connect_and_setup`/`ConnectionTarget` stack against a
+mock CSMS that answers exactly one `BootNotification` per connection and then
+closes the socket — no `StatusNotification`, no `TransactionEvent`, nothing for
+any offline queue or the security log to touch. Result: 600 → 1,201 reconnects
+grew retained memory by 60,931 B, ~101 B/reconnect, with literally zero
+transaction traffic. Transaction/offline-queue volume is therefore not a
+contributing factor — the growth axis is reconnect count.
+
+**Ruled out analytically: benign allocator fragmentation.** Both this file's
+counting `GlobalAlloc` and H4.1's own measure *live requested-minus-freed
+bytes* — bytes whose `alloc` has been observed but whose matching `dealloc`
+has not. Fragmentation (unusable gaps between still-allocated blocks) does not
+change this number: a fragmented allocator can waste address space without a
+single byte counted here failing to be freed. A monotonic climb in this
+specific metric can only mean a genuine allocation that is never freed, so
+"benign fragmentation" is not an available explanation for what was actually
+observed, independent of its magnitude.
+
+**Isolated to `ocpp-client`, not this crate's `ConnectionTarget`.**
+`tests/reconnect_leak_bisect.rs`'s second test,
+`bare_ocpp_client_reconnect_churn_with_no_charge_point_crate_involved`, removes
+this crate entirely: it drives `ocpp_client::connect_2_1` directly with a
+`Reconnector` that calls `ocpp_client::websocket_transport` straight (no
+`ConnectionTarget`, no `SizeLimitedStream`), and sends `BootNotification` by
+hand after each reconnect signal — no `ocpp_charge_point` code runs at all
+beyond that one call. Result: 600 → 1,200 reconnects grew retained memory by
+105,612 B, ~176 B/reconnect — the same phenomenon, at least as large, with
+none of this crate's reconnect-adjacent code in the loop. Reading
+`ConnectionTarget`'s own state (`src/network_switch.rs`) confirms why: it is a
+handful of fixed-size fields (`String`s replaced in place, a `u64` counter, an
+`Option<ChargePointActor>`) with no collection that grows with dial count.
+
+**Conclusion.** The leak is real (not fragmentation), scales with reconnect
+count (not transaction or message volume), and lives in `ocpp-client` 0.5.0
+itself — either its `Client`'s reconnect loop (`src/client.rs`) or the
+per-connection transport/handshake plumbing `websocket_transport` shares with
+it (`tokio-tungstenite`'s WebSocket handshake, most likely, since plain `ws://`
+with keepalive disabled and a client with no handlers beyond one `on_reconnect`
+callback still reproduces it — ruling out TLS setup, keepalive bookkeeping, and
+this crate's own handler registration as contributors). Tracing through
+`ocpp-client`'s own state (`pending_responses`, `pong_waiters`,
+`BroadcastRegistry`) by inspection did not turn up an unbounded per-reconnect
+collection: `pending_responses` entries are removed on both the success and
+timeout paths (confirmed in `src/client.rs`, and every `BootNotification` in
+this reproduction succeeds, so that path isn't even exercised here),
+`pong_waiters` is cleared on every reconnect, and both broadcast registries are
+subscribed to exactly once per client lifetime. The remaining, uninstrumented
+candidate is `tokio-tungstenite`'s own per-handshake allocation (HTTP upgrade
+parsing, frame buffers) — line-level confirmation there was outside this
+investigation's budget. At 100–400 B/reconnect this stays well under any
+tolerance a soak test would fail on for thousands of reconnects, but it is
+linear and genuine, so a station reconnecting on a very flaky link for months
+would eventually notice it. **Recommended next step:** file this against
+`ocpp-client` 0.5.0 with `tests/reconnect_leak_bisect.rs`'s second test as the
+minimal reproduction — it needs nothing from this crate to show the growth.
+
 ## What is not measured or bounded yet
 
 - **Transient allocation during deserialization.** An over-long CSMS payload or
