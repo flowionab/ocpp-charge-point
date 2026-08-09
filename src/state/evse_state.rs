@@ -1,7 +1,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::state::{ConnectorState, EvseEvent, MeterSample, Reservation, Tariff, Transaction};
+use crate::state::{
+    ConnectorState, EvseEvent, ExternalChargingLimit, MeterSample, Reservation, Tariff, Transaction,
+};
 
 /// The internal state of one EVSE (Electric Vehicle Supply Equipment): its own availability/
 /// fault status, plus one entry per connector it owns in each of the parallel `Vec`s below.
@@ -9,6 +11,12 @@ use crate::state::{ConnectorState, EvseEvent, MeterSample, Reservation, Tariff, 
 pub struct EvseState {
     /// This EVSE's own availability/fault status, independent of any individual connector.
     pub status: EvseStatus,
+    /// An external charging limit currently in force on this EVSE (from something other than a
+    /// CSMS charging profile - typically a local energy-management system), reported via
+    /// `NotifyChargingLimit`/`ClearedChargingLimit`. `None` when nothing external is currently
+    /// limiting this EVSE. See [`ExternalChargingLimit`]'s docs for why this is not a
+    /// [`crate::state::ChargingProfile`] and does not feed the composite-schedule projection.
+    pub external_charging_limit: Option<ExternalChargingLimit>,
     /// This EVSE's connectors, indexed by `connector_id` as used throughout this crate and OCPP.
     pub connectors: Vec<ConnectorState>,
     /// The active transaction for each connector, indexed the same as `connectors`. `None`
@@ -79,6 +87,7 @@ impl EvseState {
     pub fn new(connector_count: usize) -> Self {
         Self {
             status: EvseStatus::Available,
+            external_charging_limit: None,
             connectors: vec![ConnectorState::Available; connector_count],
             transactions: vec![None; connector_count],
             reservations: vec![None; connector_count],
@@ -99,7 +108,14 @@ impl EvseState {
             EvseEvent::SetUnavailable => set_if_changed(&mut self.status, EvseStatus::Unavailable),
             EvseEvent::FaultDetected => set_if_changed(&mut self.status, EvseStatus::Faulted),
             EvseEvent::FaultCleared => set_if_changed(&mut self.status, EvseStatus::Unavailable),
-            EvseEvent::Connector { .. } => false,
+            // `Connector { .. }` is dispatched by `ChargePointState::apply_connector_event`, and
+            // `EVChargingNeedsReported`/`EVChargingScheduleReported` are handled directly by
+            // `ChargePointState::apply` (they need to push a
+            // `ChargePointEffect::SmartChargingNotification`, which this method, returning only a
+            // `bool`, has no way to do) - neither reaches here.
+            EvseEvent::Connector { .. }
+            | EvseEvent::EVChargingNeedsReported(_)
+            | EvseEvent::EVChargingScheduleReported(_) => false,
         }
     }
 }

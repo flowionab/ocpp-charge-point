@@ -8,10 +8,11 @@ use crate::state::{
     AfrrSignal, AuthorizationCache, AuthorizationRequested, BatterySwapStore, ChargePointEffect,
     ChargePointEvent, ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent,
     ConnectorState, ConnectorStatusChanged, DERControlStore, DeviceModel, DeviceModelEvent,
-    DisplayMessageStore, EventTrigger, EvseEvent, EvseState, HardwareCommand, IdToken,
-    LocalAuthorizationList, LocalListEntry, MeterSample, NetworkProfileStore, PendingReset,
-    PeriodicEventStreamStore, RegistrationStatus, ReservationEndReason, ReservationUpdate,
-    ResetKind, ResetTarget, SecurityEvent, SecurityEventType, StateLimits, StopReason, TariffStore,
+    DisplayMessageStore, EventTrigger, EvseEvent, EvseState, ExternalChargingLimit,
+    HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry, MeterSample,
+    NetworkProfileStore, PendingReset, PeriodicEventStreamStore, RegistrationStatus,
+    ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget, SecurityEvent,
+    SecurityEventType, SmartChargingNotification, StateLimits, StopReason, TariffStore,
     Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
     TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable, VariableAttributeType,
     VariableMonitorStore, VariableMonitoringEvent,
@@ -110,6 +111,10 @@ pub struct ChargePointState {
     /// The most recent automatic frequency restoration reserve signal the CSMS pushed (OCPP 2.1
     /// `AFRRSignal`). `None` until the first one arrives. See [`AfrrSignal`].
     pub afrr_signal: Option<AfrrSignal>,
+    /// An external charging limit currently in force on the whole charging station (OCPP's own
+    /// `evseId` absent/zero case) - mirrors [`EvseState::external_charging_limit`] at
+    /// station scope. See `docs/PRODUCTION-ROADMAP.md` B2.8.
+    pub station_external_charging_limit: Option<ExternalChargingLimit>,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -171,6 +176,7 @@ impl ChargePointState {
             battery_swaps: BatterySwapStore::with_max_pending(limits.max_pending_battery_swaps),
             der_controls: DERControlStore::with_limit(limits.max_der_controls),
             afrr_signal: None,
+            station_external_charging_limit: None,
         }
     }
 
@@ -677,11 +683,47 @@ impl ChargePointState {
                 } => self.apply_connector_event(evse_id, connector_id, event, &mut effects),
                 EvseEvent::FaultDetected => self.cascade_evse_fault(evse_id, true, &mut effects),
                 EvseEvent::FaultCleared => self.cascade_evse_fault(evse_id, false, &mut effects),
+                EvseEvent::EVChargingNeedsReported(needs) => {
+                    if self.evses.get(evse_id).is_some() {
+                        effects.push(ChargePointEffect::SmartChargingNotification(
+                            SmartChargingNotification::EVChargingNeedsReported { evse_id, needs },
+                        ));
+                    } else {
+                        tracing::warn!(
+                            evse_id,
+                            "ignoring EV charging needs reported for an EVSE that doesn't exist"
+                        );
+                    }
+                    false
+                }
+                EvseEvent::EVChargingScheduleReported(report) => {
+                    if self.evses.get(evse_id).is_some() {
+                        effects.push(ChargePointEffect::SmartChargingNotification(
+                            SmartChargingNotification::EVChargingScheduleReported {
+                                evse_id,
+                                report,
+                            },
+                        ));
+                    } else {
+                        tracing::warn!(
+                            evse_id,
+                            "ignoring an EV charging schedule reported for an EVSE that doesn't \
+                             exist"
+                        );
+                    }
+                    false
+                }
                 _ => self
                     .evses
                     .get_mut(evse_id)
                     .is_some_and(|evse| evse.apply(event)),
             },
+            ChargePointEvent::ExternalChargingLimitSet { evse_id, limit } => {
+                self.set_external_charging_limit(evse_id, limit, &mut effects)
+            }
+            ChargePointEvent::ExternalChargingLimitCleared { evse_id, source } => {
+                self.clear_external_charging_limit(evse_id, source, &mut effects)
+            }
             ChargePointEvent::VariableMonitoring(event) => match event {
                 VariableMonitoringEvent::MonitorSet {
                     id,
@@ -1186,6 +1228,66 @@ impl ChargePointState {
             changed |= self.cascade_evse_fault(evse_id, detected, effects);
         }
         changed
+    }
+
+    /// Records an external charging limit - on one EVSE, or (`evse_id: None`) the whole charging
+    /// station - and pushes the [`ChargePointEffect::SmartChargingNotification`] that reports it.
+    /// A limit addressing an EVSE that doesn't exist is dropped and logged rather than recorded
+    /// anywhere, mirroring how an out-of-range address is handled throughout this crate.
+    fn set_external_charging_limit(
+        &mut self,
+        evse_id: Option<usize>,
+        limit: ExternalChargingLimit,
+        effects: &mut Vec<ChargePointEffect>,
+    ) -> bool {
+        match evse_id {
+            None => self.station_external_charging_limit = Some(limit.clone()),
+            Some(id) => {
+                let Some(evse) = self.evses.get_mut(id) else {
+                    tracing::warn!(
+                        evse_id = id,
+                        "ignoring an external charging limit set for an EVSE that doesn't exist"
+                    );
+                    return false;
+                };
+                evse.external_charging_limit = Some(limit.clone());
+            }
+        }
+        effects.push(ChargePointEffect::SmartChargingNotification(
+            SmartChargingNotification::ExternalChargingLimitSet { evse_id, limit },
+        ));
+        true
+    }
+
+    /// Clears an external charging limit previously recorded by [`Self::set_external_charging_limit`]
+    /// and pushes the [`ChargePointEffect::SmartChargingNotification`] that reports it - but only
+    /// if `evse_id`/`source` actually match a limit currently recorded there. Reporting a
+    /// clearance for a limit the CSMS was never told about would be worse than silence, so a
+    /// mismatch (or an already-clear slot) is a no-op.
+    fn clear_external_charging_limit(
+        &mut self,
+        evse_id: Option<usize>,
+        source: crate::state::ChargingLimitSource,
+        effects: &mut Vec<ChargePointEffect>,
+    ) -> bool {
+        let slot = match evse_id {
+            None => &mut self.station_external_charging_limit,
+            Some(id) => {
+                let Some(evse) = self.evses.get_mut(id) else {
+                    return false;
+                };
+                &mut evse.external_charging_limit
+            }
+        };
+        if slot.as_ref().is_some_and(|limit| limit.source == source) {
+            *slot = None;
+            effects.push(ChargePointEffect::SmartChargingNotification(
+                SmartChargingNotification::ExternalChargingLimitCleared { evse_id, source },
+            ));
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -3090,5 +3192,201 @@ mod tests {
         });
 
         assert!(effects.is_empty());
+    }
+
+    fn ems_limit() -> crate::state::ExternalChargingLimit {
+        crate::state::ExternalChargingLimit {
+            source: crate::state::ChargingLimitSource::Ems,
+            is_grid_critical: Some(true),
+            schedule: None,
+        }
+    }
+
+    #[test]
+    fn an_external_charging_limit_on_a_real_evse_is_recorded_and_reported() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(),
+        });
+
+        assert_eq!(state.evses[0].external_charging_limit, Some(ems_limit()));
+        assert!(
+            effects.contains(&ChargePointEffect::SmartChargingNotification(
+                crate::state::SmartChargingNotification::ExternalChargingLimitSet {
+                    evse_id: Some(0),
+                    limit: ems_limit(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn an_external_charging_limit_with_no_evse_id_applies_station_wide() {
+        let mut state = ChargePointState::new([1]);
+
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: None,
+            limit: ems_limit(),
+        });
+
+        assert_eq!(state.station_external_charging_limit, Some(ems_limit()));
+        // A station-wide limit must not be misattributed to the one EVSE that happens to exist.
+        assert_eq!(state.evses[0].external_charging_limit, None);
+    }
+
+    #[test]
+    fn an_external_charging_limit_for_an_unknown_evse_is_dropped() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(5),
+            limit: ems_limit(),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(state.evses[0].external_charging_limit, None);
+    }
+
+    #[test]
+    fn clearing_a_matching_external_charging_limit_removes_it_and_reports_it() {
+        let mut state = ChargePointState::new([1]);
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(),
+        });
+
+        let effects = state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            evse_id: Some(0),
+            source: crate::state::ChargingLimitSource::Ems,
+        });
+
+        assert_eq!(state.evses[0].external_charging_limit, None);
+        assert!(
+            effects.contains(&ChargePointEffect::SmartChargingNotification(
+                crate::state::SmartChargingNotification::ExternalChargingLimitCleared {
+                    evse_id: Some(0),
+                    source: crate::state::ChargingLimitSource::Ems,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn clearing_an_external_charging_limit_with_the_wrong_source_is_a_no_op() {
+        let mut state = ChargePointState::new([1]);
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(),
+        });
+
+        let effects = state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            evse_id: Some(0),
+            source: crate::state::ChargingLimitSource::Other,
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(state.evses[0].external_charging_limit, Some(ems_limit()));
+    }
+
+    #[test]
+    fn clearing_a_limit_that_was_never_set_is_a_no_op() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            evse_id: Some(0),
+            source: crate::state::ChargingLimitSource::Ems,
+        });
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn ev_charging_needs_reported_on_a_real_evse_is_forwarded() {
+        let mut state = ChargePointState::new([1]);
+        let needs = crate::state::EVChargingNeeds {
+            requested_energy_transfer: crate::state::EnergyTransferMode::AcThreePhase,
+            departure_time: None,
+            ac: Some(crate::state::AcChargingNeeds {
+                energy_amount_wh: 40_000,
+                ev_max_current_a: 32,
+                ev_max_voltage_v: 230,
+                ev_min_current_a: 6,
+            }),
+            dc: None,
+            max_schedule_tuples: None,
+        };
+
+        let effects = state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::EVChargingNeedsReported(needs.clone()),
+        });
+
+        assert!(
+            effects.contains(&ChargePointEffect::SmartChargingNotification(
+                crate::state::SmartChargingNotification::EVChargingNeedsReported {
+                    evse_id: 0,
+                    needs,
+                }
+            ))
+        );
+        // Purely a pass-through notification - nothing persists on the state itself.
+        assert!(!effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    #[test]
+    fn ev_charging_needs_reported_for_an_unknown_evse_is_dropped() {
+        let mut state = ChargePointState::new([1]);
+        let needs = crate::state::EVChargingNeeds {
+            requested_energy_transfer: crate::state::EnergyTransferMode::Dc,
+            departure_time: None,
+            ac: None,
+            dc: None,
+            max_schedule_tuples: None,
+        };
+
+        let effects = state.apply(ChargePointEvent::Evse {
+            evse_id: 9,
+            event: EvseEvent::EVChargingNeedsReported(needs),
+        });
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn ev_charging_schedule_reported_on_a_real_evse_is_forwarded() {
+        let mut state = ChargePointState::new([1]);
+        let report = crate::state::EVChargingScheduleReport {
+            schedule: crate::state::ChargingSchedule {
+                id: 1,
+                start_schedule: None,
+                duration_secs: None,
+                rate_unit: crate::state::ChargingRateUnit::Amps,
+                min_charging_rate: None,
+                periods: alloc::vec![crate::state::ChargingSchedulePeriod {
+                    start_period_secs: 0,
+                    limit: 16.0,
+                    number_phases: None,
+                }],
+            },
+            time_base: "2026-01-01T00:00:00Z".parse().unwrap(),
+            power_tolerance_accepted: Some(true),
+            selected_charging_schedule_id: Some(1),
+        };
+
+        let effects = state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::EVChargingScheduleReported(report.clone()),
+        });
+
+        assert!(
+            effects.contains(&ChargePointEffect::SmartChargingNotification(
+                crate::state::SmartChargingNotification::EVChargingScheduleReported {
+                    evse_id: 0,
+                    report,
+                }
+            ))
+        );
     }
 }

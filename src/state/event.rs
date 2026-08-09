@@ -5,15 +5,16 @@ use chrono::{DateTime, Utc};
 use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
 use crate::state::{
-    AuthorizationCacheEntry, AuthorizationStatus, BatterySwapEvent, ChargingProfile,
-    ChargingProfileCriteria, ChargingProfileId, ChargingProfileScope, Component, ConnectorState,
-    ConnectorStatus, DERControlQuery, DeviceModelEvent, DisplayMessageId, DisplayedMessage,
-    IdToken, InstalledChargingProfile, InstalledDERControl, LocalListEntry, MeterSample,
+    AuthorizationCacheEntry, AuthorizationStatus, BatterySwapEvent, ChargingLimitSource,
+    ChargingProfile, ChargingProfileCriteria, ChargingProfileId, ChargingProfileScope, Component,
+    ConnectorState, ConnectorStatus, DERControlQuery, DeviceModelEvent, DisplayMessageId,
+    DisplayedMessage, EVChargingNeeds, EVChargingScheduleReport, ExternalChargingLimit, IdToken,
+    InstalledChargingProfile, InstalledDERControl, LocalListEntry, MeterSample,
     NetworkConnectionProfile, NetworkProfileSlot, PendingBatterySwap, PeriodicEventStreamId,
     PeriodicEventStreamParams, RegistrationStatus, Reservation, ReservationId, ResetKind,
-    ResetTarget, SecurityEvent, StopReason, Tariff, TariffClearCriteria, TariffScope, Transaction,
-    TransactionId, TriggeredMonitor, Variable, VariableAttributeType, VariableMonitorId,
-    VariableMonitoringEvent,
+    ResetTarget, SecurityEvent, SmartChargingNotification, StopReason, Tariff, TariffClearCriteria,
+    TariffScope, Transaction, TransactionId, TriggeredMonitor, Variable, VariableAttributeType,
+    VariableMonitorId, VariableMonitoringEvent,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -368,6 +369,27 @@ pub enum ChargePointEvent {
     /// The CSMS removed a display message (OCPP `ClearDisplayMessage`), accepted by
     /// [`crate::display_message::handle_clear_display_message`].
     DisplayMessageCleared(DisplayMessageId),
+    /// An external charging limit (from something other than a CSMS charging profile - typically
+    /// a local energy-management system) came into force, to be reported via `NotifyChargingLimit`
+    /// (2.0.1/2.1 only, `docs/PRODUCTION-ROADMAP.md` B2.8). Pushed in by an integrator the same
+    /// way [`ConnectorEvent::MeterValueSampled`] is - this crate has no local energy-management
+    /// stack of its own.
+    ExternalChargingLimitSet {
+        /// The EVSE the limit applies to, or `None` for the whole charging station.
+        evse_id: Option<usize>,
+        /// The limit itself.
+        limit: ExternalChargingLimit,
+    },
+    /// A previously reported external charging limit has gone away, to be reported via
+    /// `ClearedChargingLimit` (2.0.1/2.1 only, `docs/PRODUCTION-ROADMAP.md` B2.8). A no-op if
+    /// `evse_id`/`source` do not match a limit this crate currently has recorded - reporting a
+    /// clearance for a limit the CSMS was never told about would be worse than silence.
+    ExternalChargingLimitCleared {
+        /// The EVSE the limit applied to, or `None` for the whole charging station.
+        evse_id: Option<usize>,
+        /// The source of the limit that ended.
+        source: ChargingLimitSource,
+    },
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {
         /// The addressed EVSE's index.
@@ -419,6 +441,16 @@ pub enum EvseEvent {
         /// The event to apply to that connector.
         event: ConnectorEvent,
     },
+    /// The EV connected to this EVSE reported its charging needs via ISO 15118, to be forwarded
+    /// as `NotifyEVChargingNeeds` (2.0.1/2.1 only, `docs/PRODUCTION-ROADMAP.md` B2.8). This crate
+    /// does not implement ISO 15118 itself (B4.5) - an integrator with a 15118 stack pushes this
+    /// in, the same way [`ConnectorEvent::MeterValueSampled`] lets hardware push in a reading.
+    EVChargingNeedsReported(EVChargingNeeds),
+    /// The EV connected to this EVSE reported (or accepted) a charging schedule via ISO 15118, to
+    /// be forwarded as `NotifyEVChargingSchedule` (2.0.1/2.1 only,
+    /// `docs/PRODUCTION-ROADMAP.md` B2.8). See [`Self::EVChargingNeedsReported`] for why this is
+    /// pushed in rather than derived.
+    EVChargingScheduleReported(EVChargingScheduleReport),
 }
 
 /// An event addressed to one connector, driving its [`crate::state::ConnectorState`] machine.
@@ -539,7 +571,10 @@ pub enum ConnectorEvent {
 
 /// A side effect of applying a [`ChargePointEvent`], to be carried out by the actor's caller
 /// (a hardware command dispatched, a report sent to the CSMS, or simply that state changed).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` only, not `Eq`: [`Self::SmartChargingNotification`] can carry a
+/// [`crate::state::ChargingSchedule`], whose periods carry `f64` limits.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChargePointEffect {
     /// [`crate::state::ChargePointState`] itself changed; the actor publishes the new state to
     /// [`crate::actor::ChargePointActor::subscribe`]/`state`.
@@ -574,6 +609,11 @@ pub enum ChargePointEffect {
     /// A battery-swap event occurred; the Battery Swap functional block reports this to the CSMS
     /// via `BatterySwap` (2.1 only). See [`crate::battery_swap::report_battery_swap_event`].
     BatterySwapEventOccurred(BatterySwapEvent),
+    /// An external charging limit changed, or an EV reported something via ISO 15118; the Smart
+    /// Charging block's `crate::smart_charging::notifications` forwards this to the CSMS as
+    /// `NotifyChargingLimit`/`ClearedChargingLimit`/`NotifyEVChargingNeeds`/
+    /// `NotifyEVChargingSchedule` (2.0.1/2.1 only). See `docs/PRODUCTION-ROADMAP.md` B2.8.
+    SmartChargingNotification(SmartChargingNotification),
 }
 
 /// A priority-charging grant the charge point made on its own, reported to the CSMS as
