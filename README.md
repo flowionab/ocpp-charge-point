@@ -488,7 +488,9 @@ You can help by:
 This crate is pre-1.0 and has been making breaking changes regularly. See
 [`docs/SEMVER.md`](docs/SEMVER.md) for what that means for code implementing `crate::hardware`
 traits specifically, the MSRV commitment, and what changes before the hardware trait surface
-freezes at 1.0. See [`CHANGELOG.md`](CHANGELOG.md) for what has actually broken so far.
+freezes at 1.0. See [`CHANGELOG.md`](CHANGELOG.md) for what has actually broken so far, and
+[`docs/RELEASE-1.0.md`](docs/RELEASE-1.0.md) for the per-trait stability assessment behind the
+1.0 freeze decision (current recommendation: not yet — three named gaps first).
 
 ---
 
