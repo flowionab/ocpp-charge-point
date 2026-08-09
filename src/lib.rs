@@ -152,6 +152,13 @@ pub mod tariff;
 mod topology;
 pub mod transaction_status;
 pub mod transactions;
+/// Trust store management (F2.2): builds a `rustls::RootCertStore` from the CSMS roots this
+/// charge point has installed (B4's `InstallCertificate`), so a TLS connection verifies the CSMS
+/// against those rather than whatever `rustls` would trust by default. `std`/`websocket`-only,
+/// like [`mutual_tls`] - see [`trust_store`]'s own docs, including how it handles a CSMS deleting
+/// or replacing the root the station is currently connected through.
+#[cfg(all(feature = "websocket", feature = "certificates"))]
+pub mod trust_store;
 pub mod variable_monitoring;
 mod wire;
 
