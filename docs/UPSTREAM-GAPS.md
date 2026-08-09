@@ -32,6 +32,12 @@
 >
 > Re-run the audit against 0.3.0/0.5.0 before planning D2.2; the method below still applies.
 
+See also [`UPSTREAM-POLICY.md`](./UPSTREAM-POLICY.md) (D3.2) for what to do
+once a finding here is confirmed: when to upstream a fix versus work around
+it locally, and — the failure this document's own header warns about — a
+cheap mechanism for re-checking a "blocked" finding before repeating it as
+still current.
+
 This document answers [D2 in `PRODUCTION-ROADMAP.md` §6.2](./PRODUCTION-ROADMAP.md#62-d2--type-completeness-audit):
 does `ocpp-types` actually contain every message OCPP 1.6J / 2.0.1 / 2.1
 define, does `ocpp-client` wrap all of them as callable actions, and does
