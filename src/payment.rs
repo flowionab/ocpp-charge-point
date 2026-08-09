@@ -15,15 +15,16 @@
 //! `NotifyWebPaymentStarted` when a driver begins a web/QR payment flow at a connector, and
 //! `VatNumberValidation` to ask the CSMS to check a VAT number for invoicing. All three still get
 //! a real CALLRESULT back (`NotifySettlement`/`VatNumberValidation` carry receipt/validation data
-//! the caller may need), so [`PaymentNotifier`]'s methods are request/response, not fire-and-
-//! forget.
+//! the caller may need), so [`crate::payment::PaymentNotifier`]'s methods are request/response,
+//! not fire-and-forget.
 //!
 //! Because there is no inbound handler, this block has no [`crate::refusal`] row: that module
 //! covers a handler that is *registered* but must refuse in the wire-correct shape when its
 //! capability is runtime-absent, which does not apply to a message this crate itself chooses
 //! whether to originate. The gate here is simpler and applied directly, in
-//! [`report_settlement`]/[`report_web_payment_started`]/[`validate_vat_number`]: a runtime-absent
-//! `payment` capability fails the call before it reaches a [`PaymentNotifier`] at all.
+//! [`crate::payment::report_settlement`]/[`crate::payment::report_web_payment_started`]/
+//! [`crate::payment::validate_vat_number`]: a runtime-absent `payment` capability fails the call
+//! before it reaches a [`crate::payment::PaymentNotifier`] at all.
 //!
 //! # Money, and what does *not* get logged
 //!

@@ -1,7 +1,7 @@
 //! Runtime refusal discipline for capability-gated handlers - see
 //! `docs/PRODUCTION-ROADMAP.md` §5.5 (C5).
 //!
-//! [`crate::hardware::capabilities::CAPABILITY_GATES`] (C3) already makes *advertisement*
+//! [`crate::hardware::CAPABILITY_GATES`] (C3) already makes *advertisement*
 //! consistent: when a capability's Cargo feature is compiled out, `setup()`/
 //! [`crate::builder::ChargePointBuilder`] skip registering that block's handler entirely, so
 //! `ocpp-client` answers a generic `NotImplemented` CALLERROR for the whole message. This module
@@ -14,10 +14,10 @@
 //! # Decision table
 //!
 //! Only capabilities with a real registered handler today
-//! ([`crate::hardware::capabilities::CapabilityGate::has_handler`] - `reservation`,
+//! ([`crate::hardware::CapabilityGate::has_handler`] - `reservation`,
 //! `local_auth_list`, `tariff_and_cost`) can actually be runtime-absent while still being
 //! registered, so those are the only rows with a real capability check wired up
-//! ([`REFUSAL_GATES`]). The other messages [`docs/PRODUCTION-ROADMAP.md`] §5.5 asks this table to
+//! ([`REFUSAL_GATES`]). The other messages `docs/PRODUCTION-ROADMAP.md` §5.5 asks this table to
 //! cover aren't gated by any [`Capabilities`] field in this crate today (`UnlockConnector`,
 //! `RequestStartTransaction`, `RequestStopTransaction`, `ChangeAvailability`, `GetVariables`,
 //! `SetVariables`, `GetBaseReport`, `GetReport`, `Reset`, `DataTransfer`, `Authorize`) - they're
@@ -117,7 +117,7 @@ pub struct RefusalGate {
 
 /// The messages this crate registers a handler for today whose underlying functional block can
 /// genuinely be runtime-absent while still compiled in - see [`RefusalGate`] and the module docs'
-/// decision table. Mirrors [`crate::hardware::capabilities::CAPABILITY_GATES`]' `has_handler:
+/// decision table. Mirrors [`crate::hardware::CAPABILITY_GATES`]' `has_handler:
 /// true` rows (`reservation`, `local_auth_list`, `tariff_and_cost`, `smart_charging`).
 pub const REFUSAL_GATES: &[RefusalGate] = &[
     RefusalGate {

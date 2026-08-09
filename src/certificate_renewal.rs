@@ -7,15 +7,15 @@
 //! [`crate::hardware::GeneratedKeyPair`] per call and remembers nothing about it once the CSR is
 //! sent - fine for an initial certificate, wrong for a renewal, which must ask the CSMS to sign a
 //! *replacement* certificate for the **same key** as the one it replaces (or deliberately rotate
-//! to a new one - this module always reuses, see [`RenewalStore::key_pair_for`]'s docs for why
-//! that is the safer default). [`RenewalStore`] is the piece that remembers: it persists, per
-//! [`CertificateSigningPurpose`], the [`GeneratedKeyPair`] this charge point last used to request
-//! a certificate for that purpose, so [`renew_certificate`] can hand the *same* key back to
-//! [`build_signed_csr`] instead of generating a new one.
+//! to a new one - this module always reuses, see [`crate::certificate_renewal::RenewalStore::key_pair_for`]'s docs for why
+//! that is the safer default). [`crate::certificate_renewal::RenewalStore`] is the piece that remembers: it persists, per
+//! [`crate::certificates::CertificateSigningPurpose`], the [`crate::hardware::GeneratedKeyPair`] this charge point last used to request
+//! a certificate for that purpose, so [`crate::certificate_renewal::renew_certificate`] can hand the *same* key back to
+//! [`crate::certificates::build_signed_csr`] instead of generating a new one.
 //!
 //! **Keyed by purpose, not by [`crate::hardware::CertificateHashData`].** The obvious design
 //! keys the association off the certificate's own hash, but this crate's certificate slots
-//! ([`CertificateUse::ChargingStation`]/[`CertificateUse::V2gCertificateChain`]) are
+//! ([`crate::hardware::CertificateUse::ChargingStation`]/[`crate::hardware::CertificateUse::V2gCertificateChain`]) are
 //! single-slotted by construction - see [`crate::hardware::CertificateStore::certificate_chain_pem`]'s
 //! docs - so "the key behind the certificate currently installed for this purpose" and "the key
 //! behind the certificate this purpose's hash names" are the same fact. Keying by purpose avoids
@@ -24,23 +24,23 @@
 //!
 //! # When to renew
 //!
-//! OCPP mandates no threshold, so [`RenewalPolicy`] makes it a configurable duration
-//! ([`RenewalPolicy::new`]), defaulting to [`DEFAULT_RENEW_BEFORE_DAYS`] days
-//! ([`RenewalPolicy::default`]).
+//! OCPP mandates no threshold, so [`crate::certificate_renewal::RenewalPolicy`] makes it a configurable duration
+//! ([`crate::certificate_renewal::RenewalPolicy::new`]), defaulting to [`crate::certificate_renewal::DEFAULT_RENEW_BEFORE_DAYS`] days
+//! ([`crate::certificate_renewal::RenewalPolicy`]'s `Default` impl).
 //!
 //! # Where the expiry comes from
 //!
 //! This crate does no X.509 parsing (`CLAUDE.md`'s "no crypto dependency"), so it cannot compute
 //! a certificate's expiry from its PEM bytes. [`crate::hardware::CertificateStore::expires_at`]
 //! is the honest hook for it: `None` is not "never expires" or "far away", it is "this store
-//! cannot say", and [`run_certificate_renewal`] skips a slot it gets `None` for rather than
+//! cannot say", and [`crate::certificate_renewal::run_certificate_renewal`] skips a slot it gets `None` for rather than
 //! guessing - the same stance [`crate::clock::is_synchronized`]'s callers take for an unset RTC.
 //! An integrator who wants ahead-of-expiry renewal must override that method (directly, or by
 //! feeding a value learned some other way, e.g. out of band alongside a `CertificateSigned`).
 //!
 //! # The clock
 //!
-//! [`run_certificate_renewal`] skips its sweep entirely while
+//! [`crate::certificate_renewal::run_certificate_renewal`] skips its sweep entirely while
 //! [`crate::clock::is_synchronized`] says the clock is not - mirroring
 //! [`crate::reservation::run_reservation_expiry`]'s precedent exactly. A station that does not
 //! know the date must not conclude a certificate has expired: an unsynchronized reading is
@@ -53,10 +53,10 @@
 //! [`crate::certificates::handle_certificate_signed`]), and only by *replacing* the same
 //! single slot. A CSMS that rejects the request, or that never answers at all, therefore leaves
 //! the existing, still-valid certificate exactly where it was: there is no window where this
-//! charge point holds neither. [`discard_certificate_renewal`] closes the one remaining gap - a
+//! charge point holds neither. [`crate::certificate_renewal::discard_certificate_renewal`] closes the one remaining gap - a
 //! `CertificateSigned` that *did* install a new certificate, but that certificate then fails to
 //! establish a connection (a mismatched CA, a CSMS that never actually trusted it) - by restoring
-//! the [`RenewalStore`]'s stashed backup and reporting
+//! the [`crate::certificate_renewal::RenewalStore`]'s stashed backup and reporting
 //! [`crate::state::SecurityEventType::DiscardedRenewedClientCertificate`], the security event
 //! OCPP models for exactly this.
 

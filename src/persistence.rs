@@ -94,7 +94,7 @@ pub struct PersistedTransaction {
     pub transaction: Transaction,
     /// When the transaction started, per the [`Clock`] supplied to
     /// [`run_transaction_persistence`]. `None` if the charge point has no usable time source -
-    /// either because no record reached storage before this one (see [`next_record`]'s docs), or
+    /// either because no record reached storage before this one (see `next_record`'s docs, private to this module), or
     /// because `clock.now()` itself didn't look synchronized (see
     /// [`crate::clock::is_synchronized`]) at the moment the transaction started - e.g. hardware
     /// with no RTC that hasn't yet received a CSMS `currentTime` (see `crate::provisioning`'s
@@ -2916,7 +2916,7 @@ impl<S: Storage + Send + Sync> ReservationStore<AtomicStorage<S>> {
 /// The expiry check itself only fires when `clock` looks synchronized (see
 /// [`crate::clock::is_synchronized`]): hardware with no RTC yet must not have every restored
 /// reservation dropped as "expired" just because its unset clock reads before any real
-/// `expires_at` - the same G3.1 stance [`next_record`] already takes for `started_at`, applied
+/// `expires_at` - the same G3.1 stance `next_record` already takes for `started_at`, applied
 /// here as "don't discard based on a clock reading we don't trust" rather than "don't record a
 /// timestamp we don't trust". A reservation with `expires_at: None` (see that field's docs on the
 /// wire value not being wired through yet) is likewise never treated as expired.
@@ -3365,7 +3365,7 @@ impl<S: Storage> BootReasonStore<S> {
 
     /// Removes the stored cause, if any. A missing record is not an error. Call this once the
     /// `BootNotification` carrying the recorded cause has been *accepted* by the CSMS, not
-    /// before - see the module docs and [`restore_boot_reason`] for why clearing early would lose
+    /// before - see the module docs and [`Self::load`] for why clearing early would lose
     /// the reason across a crash that happens between the reboot and a successful registration.
     pub async fn clear(&self) {
         if let Err(err) = self.storage.remove(BOOT_REASON_KEY).await {

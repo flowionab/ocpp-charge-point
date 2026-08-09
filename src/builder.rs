@@ -1898,7 +1898,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// [`crate::setup::setup`] today - `setup()` bounds its CSMS type by every block it wires at
     /// once, and extending that bound for a block this new is a larger, riskier change than this
     /// task's scope; call this explicitly alongside `setup()`/the rest of this builder until a
-    /// future change folds it in. [`crate::hardware::capabilities::CAPABILITY_GATES`]'s
+    /// future change folds it in. [`crate::hardware::CAPABILITY_GATES`]'s
     /// `der_control` row therefore records `has_handler: false` even though this method's
     /// handlers are real - see that row's docs.
     ///
@@ -2301,9 +2301,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// Registers `GetCertificateStatus` (`docs/PRODUCTION-ROADMAP.md` B4.4): the CSMS asks this
     /// charge point to check a certificate's OCSP status via `checker`.
     ///
-    /// **2.x only.** Builder-only for the same reason [`Self::certificates`] is: it needs a
+    /// **2.x only.** Builder-only for the same reason `Self::certificates` (only present with the certificate-management feature) is: it needs a
     /// [`crate::hardware::OcspChecker`], which `setup()`'s signature cannot receive. Separate
-    /// from [`Self::certificates`] because the two need genuinely different hardware capabilities
+    /// from `Self::certificates` (only present with the certificate-management feature) because the two need genuinely different hardware capabilities
     /// - see [`crate::certificate_status`]'s module docs.
     ///
     /// Only present when the `ocsp-checking` Cargo feature is enabled (C4.2).
@@ -2344,7 +2344,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// **2.1 only** - battery swap does not exist before 2.1. Niche and feature-gated: only
     /// present when the `battery-swap` Cargo feature is compiled in, and refuses at runtime (C5)
     /// unless [`Capabilities::battery_swap`] is also declared - see [`crate::battery_swap`]'s
-    /// docs. Builder-only for the same reason [`Self::certificates`]/[`Self::log_uploads`] are:
+    /// docs. Builder-only for the same reason `Self::certificates` (only present with the certificate-management feature)/[`Self::log_uploads`] are:
     /// it needs a [`crate::hardware::BatterySwapStation`], which `setup()`'s signature cannot
     /// receive.
     ///
@@ -2371,7 +2371,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// **2.1 only** - `PaymentCtrlr` and the messages built on it
     /// (`NotifySettlement`/`NotifyWebPaymentStarted`/`VatNumberValidation`, see
     /// [`crate::payment`]) do not exist before 2.1. Unlike [`Self::battery_swap`]/
-    /// [`Self::certificates`], this registers no CSMS handler at all - the Payment block has none
+    /// `Self::certificates` (only present with the certificate-management feature), this registers no CSMS handler at all - the Payment block has none
     /// (see [`crate::payment`]'s module docs) - only `terminal`'s identity, overwriting the empty
     /// placeholder [`crate::device_model::capability_gate_events`] already registered for
     /// `VendorName`/`Model`/`SerialNumber`/`FirmwareVersion`/`TerminalID`/
@@ -2442,7 +2442,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// charge point state changes - with no CSMS involvement needed for that second part.
     ///
     /// **2.x only** - 1.6J has no display-message concept at all. Builder-only for the same reason
-    /// [`Self::log_uploads`]/[`Self::certificates`] are: it needs a
+    /// [`Self::log_uploads`]/`Self::certificates` (only present with the certificate-management feature) are: it needs a
     /// [`crate::hardware::Display`], which `setup()`'s signature cannot receive.
     #[cfg(feature = "display-message")]
     pub async fn display_messages<N, D>(self, csms: &N, display: D) -> Self

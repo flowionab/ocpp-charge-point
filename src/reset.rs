@@ -39,7 +39,8 @@ pub enum ResetOutcome {
 /// *awaits it to completion* before sending `ResetRequested` - the only way to guarantee a
 /// durable-storage-backed recorder (see [`crate::persistence::BootReasonStore`], wired up by
 /// [`crate::builder::ChargePointBuilder::boot_reason_persistence`]) has finished writing before
-/// `ResetRequested`'s processing can produce an immediate [`HardwareCommand::Reboot`] - see
+/// `ResetRequested`'s processing can produce an immediate
+/// [`crate::state::HardwareCommand::Reboot`] - see
 /// `docs/PRODUCTION-ROADMAP.md` §7.2/§7.4 (the boot-reason row of E2, and E4.2). No recorder
 /// installed (the default) makes this a no-op, exactly as if this hook didn't exist.
 pub async fn handle_reset(

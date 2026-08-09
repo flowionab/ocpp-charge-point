@@ -12,7 +12,7 @@
 //! where its integrator connected it; only [`crate::connect::connect_and_setup`] installs the
 //! redial target a switch needs.
 //!
-//! 2.x only - 1.6J has no `SetNetworkProfile` (see [`crate::state::network_profile`]).
+//! 2.x only - 1.6J has no `SetNetworkProfile` (see [`crate::state::NetworkProfileStore`]).
 
 use alloc::boxed::Box;
 

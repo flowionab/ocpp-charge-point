@@ -20,7 +20,8 @@
 //! a transaction, relevant to an ISO 15118-20 negotiation this crate does not otherwise model).
 //! `ReportDERControl` is this charge point's response to `GetDERControl`, sent inline by the same
 //! handler. `NotifyDERAlarm` and `NotifyDERStartStop` are charge-point-initiated: this crate
-//! exposes [`DERAlarmNotifier`]/[`DERStartStopNotifier`] for a caller to send one when it has
+//! exposes [`crate::der_control::DERAlarmNotifier`]/[`crate::der_control::DERStartStopNotifier`]
+//! for a caller to send one when it has
 //! something to report, but - per the store-and-report scope above - nothing in this crate
 //! spontaneously raises one yet, since nothing here actuates a control in the first place to
 //! notice it starting, stopping, or alarming.

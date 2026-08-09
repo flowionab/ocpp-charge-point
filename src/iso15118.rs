@@ -5,7 +5,7 @@
 //! like `SignCertificate` (B4.3, see [`crate::certificates`]): the vehicle presents a
 //! `CertificateInstallationReq` over its ISO 15118 high-level communication (HLC) link, this
 //! crate's integrator-supplied HLC stack hands the raw request to
-//! [`Iso15118CertificateRequester`]'s `request_ev_certificate`, and this crate forwards it to the
+//! [`crate::iso15118::Iso15118CertificateRequester`]'s `request_ev_certificate`, and this crate forwards it to the
 //! CSMS and returns what came back so it can be relayed to the vehicle. There is no inbound
 //! `Get15118EVCertificate` handler to register - the CSMS never sends this message to a charge
 //! point - so, like `SignCertificate`, this block has no row in `crate::refusal`'s decision table
@@ -53,7 +53,7 @@
 //! The specific level (`Iso15118_2` vs `Iso15118_20`) does not change whether this crate sends the
 //! message - both support levels use `Get15118EVCertificate`, 2.1 having extended the same action
 //! to also cover ISO 15118-20's contract-chain fields. It does change what the *caller* should
-//! populate in [`Iso15118CertificateRequest`]: `maximum_contract_certificate_chains` and
+//! populate in [`crate::hardware::Iso15118CertificateRequest`]: `maximum_contract_certificate_chains` and
 //! `prioritized_emaids` are meaningful only for an `Iso15118_20` session (OCPP 2.1's field
 //! description: "Absent during ISO 15118-2 session"), so a caller on an `Iso15118_2` session
 //! should leave them `None` - this crate does not second-guess that choice, it only has no 2.0.1

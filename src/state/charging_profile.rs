@@ -145,7 +145,10 @@ pub struct ChargingSchedule {
     /// reported back in a composite schedule, but never used to *raise* a computed limit: a
     /// minimum that overrode a lower installation limit would be a safety problem, not a feature.
     pub min_charging_rate: Option<f64>,
-    /// The periods, which [`ChargingProfile::new`] keeps sorted by `start_period_secs`.
+    /// The periods. Each version adapter (`ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1`) sorts these by
+    /// `start_period_secs` before they reach this type - this type itself does not enforce the
+    /// order, so a caller constructing one outside those adapters is responsible for the same
+    /// invariant if it wants [`ChargingSchedule::limit_at`] to behave sensibly.
     pub periods: Vec<ChargingSchedulePeriod>,
 }
 

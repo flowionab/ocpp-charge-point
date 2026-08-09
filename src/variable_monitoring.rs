@@ -237,7 +237,7 @@ pub enum SetMonitoringLevelOutcome {
 }
 
 /// Handles a CSMS-initiated `SetMonitoringLevel` request against `actor`: `severity` must be in
-/// OCPP's `0..=9` range (mirroring [`resolve_and_apply_set`]'s own severity validation for
+/// OCPP's `0..=9` range (mirroring `resolve_and_apply_set` (private)'s own severity validation for
 /// `SetVariableMonitoring`) or the request is `Rejected` without touching the store at all. An
 /// accepted level is not just remembered - see [`crate::state::VariableMonitorStore::is_reportable`],
 /// consulted by [`run_variable_monitor_events`]/[`run_periodic_variable_monitors`] before every
@@ -262,7 +262,7 @@ pub async fn handle_set_monitoring_level(
 }
 
 /// Which of OCPP's three `MonitoringCriterionEnum` values a `GetMonitoringReport` filter names.
-/// See [`Self::matches`] for how each maps onto this crate's [`MonitorType`].
+/// See `Self::matches` (private) for how each maps onto this crate's [`MonitorType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitoringCriterion {
     /// Matches [`MonitorType::UpperThreshold`]/[`MonitorType::LowerThreshold`] monitors - OCPP
@@ -313,7 +313,7 @@ pub struct MonitoringReportEntry {
     /// The monitored variable.
     pub variable: Variable,
     /// Every monitor installed on this `(component, variable)` pair that matched the request's
-    /// filter - never empty (see [`filter_monitoring_entries`]).
+    /// filter - never empty (see `filter_monitoring_entries`, private to this module).
     pub monitors: Vec<MonitoringReportMonitor>,
 }
 

@@ -3,9 +3,9 @@
 //!
 //! # What this module builds, and what it deliberately does not
 //!
-//! [`client_config`] builds an `ocpp_client::rustls::ClientConfig` that offers the certificate
-//! chain installed in [`crate::hardware::CertificateStore`]'s
-//! [`CertificateUse::ChargingStation`] slot, signing the TLS handshake through
+//! [`crate::mutual_tls::client_config`] builds an `ocpp_client::rustls::ClientConfig` that offers
+//! the certificate chain installed in [`crate::hardware::CertificateStore`]'s
+//! [`crate::hardware::CertificateUse::ChargingStation`] slot, signing the TLS handshake through
 //! [`crate::hardware::KeyStore::sign`] - the private key never appears here, matching that
 //! trait's whole reason for existing (see its module docs). The resulting `Arc<ClientConfig>` is
 //! meant to be handed straight to `ocpp_client::ConnectOptions::tls_config`; this crate does not
@@ -18,30 +18,31 @@
 //! # The hard part: rustls signs synchronously, `KeyStore` signs asynchronously
 //!
 //! rustls 0.23 (the version pinned through `ocpp-client` 0.5.0) has exactly the extension point
-//! this needs: [`rustls::sign::SigningKey`]/[`rustls::sign::Signer`], the trait pair it already
+//! this needs: `rustls::sign::SigningKey`/`rustls::sign::Signer`, the trait pair it already
 //! uses internally to delegate signing to a `CryptoProvider`, plus
 //! `ConfigBuilder::with_client_cert_resolver` to install a custom
-//! [`rustls::client::ResolvesClientCert`] instead of a raw private key
-//! (`with_client_auth_cert` takes DER key bytes, which is exactly what [`KeyStore`] must never
-//! give up - see its module docs - so this module does not use it). [`KeyStoreSigningKey`] and
-//! [`KeyStoreSigner`] are that pair, implemented over a [`KeyStore`] handle instead of key bytes.
+//! `rustls::client::ResolvesClientCert` instead of a raw private key
+//! (`with_client_auth_cert` takes DER key bytes, which is exactly what [`crate::hardware::KeyStore`]
+//! must never give up - see its module docs - so this module does not use it).
+//! `KeyStoreSigningKey` and `KeyStoreSigner` (private to this module) are that pair, implemented
+//! over a [`crate::hardware::KeyStore`] handle instead of key bytes.
 //! This is the established pattern for delegating TLS client-cert signing to external hardware,
 //! and it is fully sufficient for the certificate-chain and public-key parts.
 //!
-//! Where it stops being clean: [`rustls::sign::Signer::sign`] is **synchronous** -
+//! Where it stops being clean: `rustls::sign::Signer::sign` is **synchronous** -
 //! `fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error>` - because rustls itself has
 //! no async story; it is driven by whatever I/O loop the caller built (here,
-//! `tokio-tungstenite`'s). [`KeyStore::sign`] is `async fn` on purpose, because a real secure
-//! element's signing operation is a round trip (SPI, I2C, a hardware queue) that must be able to
-//! yield. There is no version of rustls 0.23's `Signer` that is async, and `KeyStore::sign`
-//! cannot become sync without breaking every hardware-backed implementation this crate exists to
-//! support - CLAUDE.md's whole reason for the trait. So this module bridges the two with
-//! [`tokio::task::block_in_place`] plus `Handle::block_on`: the calling worker thread hands
-//! itself back to the runtime's scheduler for the duration of the `await`, then blocks on the
-//! result. That has exactly one hard requirement, and it is a real limitation rather than a
+//! `tokio-tungstenite`'s). [`crate::hardware::KeyStore::sign`] is `async fn` on purpose, because a
+//! real secure element's signing operation is a round trip (SPI, I2C, a hardware queue) that must
+//! be able to yield. There is no version of rustls 0.23's `Signer` that is async, and
+//! `KeyStore::sign` cannot become sync without breaking every hardware-backed implementation this
+//! crate exists to support - CLAUDE.md's whole reason for the trait. So this module bridges the
+//! two with `tokio::task::block_in_place` plus `Handle::block_on`: the calling worker thread
+//! hands itself back to the runtime's scheduler for the duration of the `await`, then blocks on
+//! the result. That has exactly one hard requirement, and it is a real limitation rather than a
 //! rough edge:
 //!
-//! **[`KeyStoreSigner::sign`] requires a multi-thread Tokio runtime.** `block_in_place` panics
+//! **`KeyStoreSigner::sign` requires a multi-thread Tokio runtime.** `block_in_place` panics
 //! outright on a `current_thread` runtime (Tokio's own documented behaviour, not something this
 //! crate can change) - there is no second thread to keep the runtime alive while this one blocks.
 //! A charge point built with a `current_thread` runtime cannot use security profile 3 through
@@ -56,29 +57,33 @@
 //!
 //! # No fallback, and no silent weakening
 //!
-//! [`client_config`] returns [`MutualTlsError::NoChargingStationCertificate`] when
-//! [`CertificateStore::certificate_chain_pem`] reports nothing installed for
-//! [`CertificateUse::ChargingStation`] - it does **not** build a profile-2-shaped config with no
-//! client certificate, and it does not retry or wait. A station that silently connected without
-//! presenting a certificate it was configured to present would be indistinguishable, from the
-//! CSMS's side, from one that had been quietly downgraded - exactly the fleet-wide weakening
-//! [`crate::security_profile`]'s module docs describe for the OCPP-level downgrade rule, just
-//! reached through a different door. Equally, this module does not brick the charge point's
-//! connectivity on its behalf: it simply declines to build *this* config and returns an error,
-//! leaving the decision - refuse to dial, fall back to a *different, still-profile-3* address,
-//! wait for [`crate::certificates::build_signed_csr`]/`SignCertificate` to obtain a certificate
-//! and retry, or alert an operator - to the integrator's connection logic, which already owns
-//! that decision for every other dial failure. [`crate::security_profile::SecurityProfile::is_usable`]
-//! is the check a caller should make before ever reaching for this module, so the "no
-//! certificate" case is something a well-behaved caller expects rather than discovers here.
+//! [`crate::mutual_tls::client_config`] returns
+//! [`crate::mutual_tls::MutualTlsError::NoChargingStationCertificate`] when
+//! [`crate::hardware::CertificateStore::certificate_chain_pem`] reports nothing installed for
+//! [`crate::hardware::CertificateUse::ChargingStation`] - it does **not** build a profile-2-shaped
+//! config with no client certificate, and it does not retry or wait. A station that silently
+//! connected without presenting a certificate it was configured to present would be
+//! indistinguishable, from the CSMS's side, from one that had been quietly downgraded - exactly
+//! the fleet-wide weakening `crate::security_profile`'s module docs describe for the OCPP-level
+//! downgrade rule, just reached through a different door. Equally, this module does not brick the
+//! charge point's connectivity on its behalf: it simply declines to build *this* config and
+//! returns an error, leaving the decision - refuse to dial, fall back to a *different,
+//! still-profile-3* address, wait for [`crate::certificates::build_signed_csr`]/`SignCertificate`
+//! to obtain a certificate and retry, or alert an operator - to the integrator's connection
+//! logic, which already owns that decision for every other dial failure.
+//! [`crate::security_profile::SecurityProfile::is_usable`] is the check a caller should make
+//! before ever reaching for this module, so the "no certificate" case is something a
+//! well-behaved caller expects rather than discovers here.
 //!
 //! # Credentials: profile 3 sends none
 //!
 //! Nothing in this crate ever populates `ConnectOptions::username`/`password` on its own (see
 //! `crate::connect::connection_options_from_device_model`, which never touches either field) -
-//! only a caller who explicitly sets them does, and [`SecurityProfile::needs_basic_auth`] already
-//! answers `false` for [`SecurityProfile::TlsMutualAuth`]. A caller building `ConnectOptions` from
-//! the selected [`SecurityProfile`] and consulting `needs_basic_auth` before setting credentials
+//! only a caller who explicitly sets them does, and
+//! [`crate::security_profile::SecurityProfile::needs_basic_auth`] already answers `false` for
+//! [`crate::security_profile::SecurityProfile::TlsMutualAuth`]. A caller building
+//! `ConnectOptions` from the selected [`crate::security_profile::SecurityProfile`] and consulting
+//! `needs_basic_auth` before setting credentials
 //! - the natural way to wire this up - therefore never sends a password on a profile-3 connection
 //! by construction; this module adds nothing that could send one either, since it only ever
 //! touches `tls_config`.
@@ -151,7 +156,7 @@ impl<E: fmt::Debug + fmt::Display> core::error::Error for MutualTlsError<E> {}
 /// job, not this one's.
 ///
 /// See the module docs for exactly when this errors rather than falling back, and for
-/// [`KeyStoreSigner`]'s one hard runtime requirement (a multi-thread Tokio runtime).
+/// `KeyStoreSigner`'s one hard runtime requirement (a multi-thread Tokio runtime).
 pub async fn client_config<C, K>(
     certificate_store: &C,
     key_store: Arc<K>,

@@ -180,10 +180,10 @@ impl ConnectionTarget {
             .max_inbound_frame_bytes = bytes;
     }
 
-    /// Attaches the charge-point actor a redial's [`SizeLimitedStream`] reports a
-    /// `MemoryExhaustion` security event to when it refuses an oversized inbound frame (F5.2).
-    /// Set once the actor exists - see [`Inner::security_actor`] for why every reachable redial
-    /// already has one by the time it dials.
+    /// Attaches the charge-point actor a redial's [`crate::payload_limit::SizeLimitedStream`]
+    /// reports a `MemoryExhaustion` security event to when it refuses an oversized inbound frame
+    /// (F5.2). Set once the actor exists - see `Inner::security_actor` (private) for why every
+    /// reachable redial already has one by the time it dials.
     pub fn attach_security_reporting(&self, actor: ChargePointActor) {
         self.inner.lock().expect("target lock").security_actor = Some(actor);
     }
@@ -372,10 +372,11 @@ impl ConnectionTarget {
     /// connection to go test it, unlike [`run_network_profile_switching`]'s deliberate address
     /// move, because there is no address to "arrive at"; the existing connection keeps working
     /// under its confirmed configuration until it would have redialled anyway (a keepalive
-    /// timeout, a network blip, an address switch). Only then does [`Self::dial`] try the staged
-    /// configuration, [`Self::record_success`] commits it once a redial actually succeeds under
-    /// it, and [`Self::record_failure`] discards it - reverting to the configuration proven
-    /// before it - after `attempts_before_rollback` consecutive failures while it is staged, the
+    /// timeout, a network blip, an address switch). Only then does `Self::dial` (private) try the
+    /// staged configuration, `Self::record_success` (private) commits it once a redial actually
+    /// succeeds under it, and `Self::record_failure` (private) discards it - reverting to the
+    /// configuration proven before it - after `attempts_before_rollback` consecutive failures
+    /// while it is staged, the
     /// same threshold [`Self::switch_to`]'s address rollback uses
     /// (`OCPPCommCtrlr`/`NetworkProfileConnectionAttempts`).
     ///

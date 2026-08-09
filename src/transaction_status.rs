@@ -38,7 +38,7 @@
 //! transaction (anymore)."
 //!
 //! That is exactly how this crate's state already behaves, with no extra bookkeeping needed to
-//! match it: [`crate::state::charge_point_state`]'s `advance_transaction` clears a connector's
+//! match it: [`crate::state::ChargePointState`]'s private `advance_transaction` helper clears a connector's
 //! transaction slot (`Option<Transaction>::take()`) the moment its `Ended` TransactionEvent is
 //! raised. A transaction id this charge point finished five minutes ago and one it never had at
 //! all are therefore genuinely indistinguishable from here - both look like "not present in any

@@ -8,7 +8,7 @@
 //! this crate's own responsibility. See the repository's `CLAUDE.md` for the full architectural
 //! guidance this crate follows.
 #![cfg_attr(not(feature = "std"), no_std)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 // G4.2: `CLAUDE.md` requires that a hardware fault never take down the charge point, and that
 // every hardware binding call be treated as fallible. These two lints turn that from a stance into
 // a compiler error - a panic on a path a glitching sensor or a hostile CSMS can reach is a charge

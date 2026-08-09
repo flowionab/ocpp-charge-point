@@ -26,7 +26,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 /// rather than relying on this default.
 pub const DEFAULT_CAPACITY: usize = 100;
 
-/// What [`OfflineQueue::push`] does when the queue is already at capacity.
+/// What `OfflineQueue::push` (crate-private) does when the queue is already at capacity.
 ///
 /// There is no policy that is safe for every message kind: OCPP's `TransactionEvent`s carry
 /// billable energy readings and must arrive in order, so losing one is a billing-data loss,
@@ -62,12 +62,12 @@ pub enum OverflowPolicy {
 /// CSMS outage grows the queue only up to that bound rather than until allocation fails - see
 /// `docs/PRODUCTION-ROADMAP.md` §9.2 (G2.1). What happens once the bound is hit is controlled by
 /// [`OverflowPolicy`] (see [`Self::with_overflow_policy`]); either way, the message that overflow
-/// removes (the incoming one, or the evicted oldest one) is handed back from [`Self::push`] so a
-/// caller such as [`run_with_offline_queue`] can react - typically by raising a `MemoryExhaustion`
-/// security event, since a saturated offline queue signals the same operational condition as
-/// approaching the wider firmware's memory limits, without needing this crate's own module to
-/// depend on `crate::security` (embedded/no_std callers that don't need that reporting can just
-/// ignore it).
+/// removes (the incoming one, or the evicted oldest one) is handed back from `Self::push`
+/// (crate-private) so a caller such as [`crate::offline_queue::run_with_offline_queue`] can
+/// react, typically by raising a `MemoryExhaustion` security event, since a saturated offline
+/// queue signals the same operational condition as approaching the wider firmware's memory
+/// limits, without needing this crate's own module to depend on `crate::security`
+/// (embedded/no_std callers that don't need that reporting can just ignore it).
 pub struct OfflineQueue<M> {
     pending: BlockingMutex<CriticalSectionRawMutex, RefCell<VecDeque<M>>>,
     capacity: usize,
@@ -201,14 +201,14 @@ impl<M: Clone> OfflineQueue<M> {
     /// Every currently queued message, oldest first - the exact order [`flush_offline_queue`]
     /// would deliver them in. Used to snapshot the backlog for durable storage
     /// (`docs/PRODUCTION-ROADMAP.md` §7.4, E4.3); not used on the hot delivery path, which uses
-    /// [`Self::peek_front`]/[`Self::pop_front`] instead to avoid cloning the whole queue on every
-    /// message.
+    /// `Self::peek_front`/`Self::pop_front` (both private) instead to avoid cloning the whole
+    /// queue on every message.
     pub fn snapshot(&self) -> alloc::vec::Vec<M> {
         self.pending
             .lock(|queue| queue.borrow().iter().cloned().collect())
     }
 
-    /// Pushes every message from `messages`, in order, through [`Self::push`] - so a backlog
+    /// Pushes every message from `messages`, in order, through `Self::push` (crate-private) - so a backlog
     /// restored from durable storage after a reboot still respects this queue's capacity and
     /// [`OverflowPolicy`] exactly as if the messages had arrived one at a time while running.
     /// Returns every message the overflow policy dropped while restoring (in the order they were
@@ -409,7 +409,7 @@ pub async fn run_offline_queue_retries<M, B, F, Fut, E>(
 /// `events` closes.
 ///
 /// `on_overflow` is called with whatever message the queue's [`OverflowPolicy`] dropped, whenever
-/// pushing a newly-arrived message causes an overflow (see [`OfflineQueue::push`]) - typically
+/// pushing a newly-arrived message causes an overflow (see `OfflineQueue::push`, crate-private) - typically
 /// wired to raise a `MemoryExhaustion` security event. Pass `|_dropped| async {}` to ignore
 /// overflow entirely.
 pub async fn run_with_offline_queue<M, F, Fut, E, H, HFut>(

@@ -31,16 +31,16 @@
 //! pretending otherwise. Building one would mean re-implementing the WebSocket handshake and
 //! subprotocol negotiation this crate deliberately does not duplicate.
 //!
-//! What this crate *does* control is [`crate::network_switch::ConnectionTarget::dial`]: every
+//! What this crate *does* control is `crate::network_switch::ConnectionTarget::dial` (private): every
 //! redial (after the very first connection - unavoidably dialled through `ocpp_client::connect`)
 //! goes through the public `ocpp_client::websocket_transport`, which hands back the raw
 //! [`ocpp_client::TransportSink`]/[`ocpp_client::TransportStream`] halves before they are wired
-//! into a `Client`. [`SizeLimitedStream`] wraps that stream: a text frame over the configured
+//! into a `Client`. [`crate::payload_limit::SizeLimitedStream`] wraps that stream: a text frame over the configured
 //! ceiling is refused and **never handed to `Client`**, so neither of `ocpp-client`'s
 //! deserialization allocations happens for it. That is a real, if partial, improvement over doing
 //! nothing - and it is honestly short of "before allocation" in the strictest sense, since
 //! `tokio-tungstenite` has already assembled the frame into one `String` by the time
-//! [`TransportStream::recv`] returns it (bounded only by its own 64 MiB default, which this crate
+//! [`ocpp_client::TransportStream::recv`] returns it (bounded only by its own 64 MiB default, which this crate
 //! cannot lower - point 1 above). What this guard prevents is the *second*, much more expensive
 //! allocation: the sized Rust structures `ocpp-client` builds from the frame, which is where
 //! D2.3's cost actually lives.

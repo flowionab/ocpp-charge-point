@@ -245,7 +245,7 @@ pub fn handle_get_charging_profiles(
 pub enum UsePriorityChargingOutcome {
     /// Priority charging was granted (or withdrawn) for the named transaction.
     Accepted,
-    /// The transaction exists, but no [`ChargingProfilePurpose::PriorityCharging`] profile is
+    /// The transaction exists, but no [`crate::state::ChargingProfilePurpose::PriorityCharging`] profile is
     /// installed for the EVSE running it, so granting priority would change nothing.
     ///
     /// OCPP gives this its own status rather than folding it into `Rejected` because it is the one

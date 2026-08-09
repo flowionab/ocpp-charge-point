@@ -248,7 +248,7 @@ fn due_periodic_stream_samples(
     due
 }
 
-/// Runs the sweep [`due_periodic_stream_samples`] describes, forever, every `sweep_interval_secs`.
+/// Runs the sweep `due_periodic_stream_samples` (private) describes, forever, every `sweep_interval_secs`.
 ///
 /// **Skipped entirely while the clock is unsynchronized** (see [`crate::clock::is_synchronized`]),
 /// exactly like `run_reservation_expiry`/`run_periodic_variable_monitors`: a charge point that

@@ -74,7 +74,7 @@ pub enum ReserveNowOutcome {
 ///
 /// `expires_at` becomes [`Reservation::expires_at`] directly - callers (the `ocpp_1_6`/
 /// `ocpp_2_0_1`/`ocpp_2_1` adapters below) convert it from the wire request via
-/// [`parse_expiry_date_time`]. `None` means a reservation that never expires, per
+/// `parse_expiry_date_time` (private to this module). `None` means a reservation that never expires, per
 /// [`Reservation`]'s docs; it no longer doubles as "the CSMS sent something unparseable", which
 /// the wire types now rule out.
 pub async fn handle_reserve_now(

@@ -108,7 +108,7 @@ pub trait HeartbeatSender {
 /// (see `ChargePointEvent::RegistrationStatusReceived`). If the response carried a parseable
 /// `currentTime`, also evaluates it via [`evaluate_time_sync`] against `actor`'s stored
 /// [`crate::state::TimeSyncAnchor`] (advanced by `monotonic` since it was recorded - see
-/// [`local_time_estimate`]), reports a `SettingSystemTime` security event when warranted, and
+/// `local_time_estimate`, private to this module), reports a `SettingSystemTime` security event when warranted, and
 /// advances the stored anchor either way. This crate only *detects and reports* a clock step this
 /// way - actually correcting the system/RTC clock is the integrator's job (typically in response
 /// to observing the `SettingSystemTime` `SecurityEventNotification`, or by reading
@@ -299,7 +299,8 @@ pub struct TimeSyncStep {
 /// Deliberately a pure decision function (no `actor`, no I/O) so the threshold/first-sync/
 /// recovery logic above is unit-testable without a live `ChargePointActor` - see [`register`],
 /// [`register_until_accepted`], and [`run_heartbeat`] for where it's actually wired in, via
-/// [`local_time_estimate`] and [`sync_time`]. See `docs/PRODUCTION-ROADMAP.md` §9.3 (G3.2).
+/// `local_time_estimate` and `sync_time` (both private to this module). See
+/// `docs/PRODUCTION-ROADMAP.md` §9.3 (G3.2).
 pub fn evaluate_time_sync(
     local_estimate: Option<DateTime<Utc>>,
     csms_time: DateTime<Utc>,

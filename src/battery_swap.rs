@@ -4,7 +4,7 @@
 //! **2.1 only** - battery swap does not exist before 2.1, so there is no 1.6J/2.0.1 projection to
 //! write.
 //!
-//! See [`crate::state::battery_swap`] for what state this crate keeps between the two messages
+//! See [`crate::state::BatterySwapStore`] for what state this crate keeps between the two messages
 //! and why, and [`crate::hardware::BatterySwapStation`] for the one hardware hook this block
 //! needs.
 //!
@@ -42,7 +42,7 @@ pub enum RequestBatterySwapOutcome {
 
 /// Handles a CSMS-initiated `RequestBatterySwap` against `actor`: records it as a
 /// [`PendingBatterySwap`] (so a later correlated `BatterySwap` event can resolve it - see
-/// [`crate::state::battery_swap`]'s module docs) and asks `station` to physically prepare for it.
+/// [`crate::state::BatterySwapStore`]'s docs) and asks `station` to physically prepare for it.
 ///
 /// Refuses (C5, [`crate::refusal`]) before touching the store or the hardware when the
 /// `battery_swap` capability is runtime-absent. A station preparation failure also refuses and

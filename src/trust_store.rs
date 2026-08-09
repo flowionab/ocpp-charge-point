@@ -6,13 +6,13 @@
 //!
 //! # Building the store
 //!
-//! [`build_root_cert_store`] turns every installed `CsmsRoot` chain into rustls trust anchors. It
-//! needs *every* PEM the store holds for that use, not just one - unlike
-//! [`CertificateStore::certificate_chain_pem`] (right for the charge point's own single-slotted
-//! certificate, wrong for a trust store, which typically holds several roots side by side), so it
-//! goes through [`CertificateStore::all_certificate_chain_pems`], the multi-valued counterpart
-//! this task adds to that trait. PEM framing is decoded with
-//! [`crate::mutual_tls::decode_pem_certificates`] - the same routine [`crate::mutual_tls`]
+//! [`crate::trust_store::build_root_cert_store`] turns every installed `CsmsRoot` chain into
+//! rustls trust anchors. It needs *every* PEM the store holds for that use, not just one - unlike
+//! [`crate::hardware::CertificateStore::certificate_chain_pem`] (right for the charge point's own
+//! single-slotted certificate, wrong for a trust store, which typically holds several roots side
+//! by side), so it goes through [`crate::hardware::CertificateStore::all_certificate_chain_pems`],
+//! the multi-valued counterpart this task adds to that trait. PEM framing is decoded with
+//! `crate::mutual_tls::decode_pem_certificates` (private) - the same routine [`crate::mutual_tls`]
 //! already uses for the charge point's own chain - rather than a second copy of it.
 //!
 //! # Never "empty means trust everything"
@@ -22,7 +22,7 @@
 //! whatever TLS trust configuration it already had alone (public CAs, or a config it built some
 //! other way) rather than treat the absence of a root as "trust nothing" or, worse, feel invited
 //! to build a verifier that skips validation. When at least one `CsmsRoot` PEM is installed but
-//! none of it decodes into a usable certificate, [`build_root_cert_store`] returns
+//! none of it decodes into a usable certificate, [`crate::trust_store::build_root_cert_store`] returns
 //! `Some(RootCertStore::empty())` rather than `None` - that *is* the fail-safe rustls already
 //! gives an empty root store (a `ServerCertVerifier` that accepts nothing), and it is the honest
 //! answer to "the charge point was told to trust some roots and none of them were usable", not a

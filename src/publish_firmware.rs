@@ -15,8 +15,9 @@
 //! # Relationship to `crate::firmware`
 //!
 //! The download half is identical in spirit to [`crate::firmware`]'s: the same
-//! [`FileTransfer::download`](crate::hardware::FileTransfer::download) path, honouring the same
-//! `retries`/`retryInterval` the CSMS asks for (see [`download_with_retries`]). It is not the same
+//! [`crate::hardware::FileTransfer::download`] path, honouring the same
+//! `retries`/`retryInterval` the CSMS asks for (see `download_with_retries`, private to this
+//! module). It is not the same
 //! *code path*, because `PublishFirmwareRequest` is a materially smaller message than
 //! `UpdateFirmwareRequest` - it has no `retrieveDateTime`/`installDateTime` to schedule around, so
 //! there is no `DownloadScheduled` wait and no availability-holding dance. What is new here is the
