@@ -907,6 +907,8 @@ mod ocpp_2_1 {
     ///
     /// `Err(())` is an address that cannot exist - a non-positive id - which the caller answers
     /// with `Rejected` rather than silently widening it to "the whole charge point".
+    // Only called from the `std`-gated `TriggerMessageHandler` impl below (see its cfg for why).
+    #[cfg(feature = "std")]
     fn trigger_target(evse: Option<&EVSE>) -> Result<AvailabilityTarget, ()> {
         let Some(evse) = evse else {
             return Ok(AvailabilityTarget::ChargePoint);
@@ -934,6 +936,7 @@ mod ocpp_2_1 {
     /// value no functional block here can fulfil - which is exactly OCPP's `NotImplemented`, and
     /// why [`TriggerMessageOutcome`] has no variant for it (see that type's docs): the
     /// distinction only exists at the wire, where the unsupported values live.
+    #[cfg(feature = "std")]
     fn triggerable_message(
         requested: &MessageTriggerEnum,
         target: AvailabilityTarget,
@@ -947,6 +950,7 @@ mod ocpp_2_1 {
         }
     }
 
+    #[cfg(feature = "std")]
     fn trigger_response(status: TriggerMessageStatusEnum) -> TriggerMessageResponse {
         TriggerMessageResponse {
             custom_data: None,
@@ -955,6 +959,12 @@ mod ocpp_2_1 {
         }
     }
 
+    // `std`-gated: the notifier is `self` (the bare client), and `OCPP2_1Client` only implements
+    // `StatusNotifier` under `std` (it sources the StatusNotification timestamp from
+    // `crate::clock::SystemClock` - see `crate::availability`'s "std convenience" impl). Without
+    // `std`, wrap the client in `Ocpp2_1StatusNotifier::with_clock` and implement
+    // `TriggerMessageHandler` against that instead.
+    #[cfg(feature = "std")]
     #[async_trait::async_trait]
     impl TriggerMessageHandler for OCPP2_1Client {
         async fn register_trigger_message_handler(&self, actor: ChargePointActor) {
@@ -1063,24 +1073,31 @@ mod ocpp_2_1 {
 
     use super::{
         RequestStartTransactionHandler, RequestStartTransactionOutcome,
-        RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
-        TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
-        handle_request_start_transaction, handle_request_stop_transaction_with_replay_guard,
-        handle_trigger_message, handle_unlock_request,
+        RequestStopTransactionHandler, RequestStopTransactionOutcome, UnlockConnectorHandler,
+        UnlockOutcome, handle_request_start_transaction,
+        handle_request_stop_transaction_with_replay_guard, handle_unlock_request,
+    };
+    // Only used by the `std`-gated `impl TriggerMessageHandler for OCPP2_1Client` above (see its
+    // cfg for why) and by `trigger_message_tests`.
+    #[cfg(feature = "std")]
+    use super::{
+        TriggerMessageHandler, TriggerMessageOutcome, TriggerableMessage, handle_trigger_message,
     };
     use crate::actor::ChargePointActor;
+    #[cfg(feature = "std")]
     use crate::availability::AvailabilityTarget;
     use crate::replay_protection::ReplayGuard;
     use crate::state::{IdToken, IdTokenKind, TransactionId};
-    use crate::wire::v21::common::{
-        EVSE, MessageTriggerEnum, RequestStartStopStatusEnum, TriggerMessageStatusEnum,
-        UnlockStatusEnum,
-    };
+    #[cfg(feature = "std")]
+    use crate::wire::v21::common::{EVSE, MessageTriggerEnum, TriggerMessageStatusEnum};
+    use crate::wire::v21::common::{RequestStartStopStatusEnum, UnlockStatusEnum};
     use crate::wire::v21::{
         RequestStartTransactionRequest, RequestStartTransactionResponse,
-        RequestStopTransactionRequest, RequestStopTransactionResponse, TriggerMessageRequest,
-        TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
+        RequestStopTransactionRequest, RequestStopTransactionResponse, UnlockConnectorRequest,
+        UnlockConnectorResponse,
     };
+    #[cfg(feature = "std")]
+    use crate::wire::v21::{TriggerMessageRequest, TriggerMessageResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use alloc::sync::Arc;
@@ -1409,6 +1426,8 @@ pub(crate) mod ocpp_2_0_1 {
     ///
     /// `Err(())` is an address that cannot exist - a non-positive id - which the caller answers
     /// with `Rejected` rather than silently widening it to "the whole charge point".
+    // Only called from the `std`-gated `TriggerMessageHandler` impl below (see its cfg for why).
+    #[cfg(feature = "std")]
     fn trigger_target(evse: Option<&EVSE>) -> Result<AvailabilityTarget, ()> {
         let Some(evse) = evse else {
             return Ok(AvailabilityTarget::ChargePoint);
@@ -1436,6 +1455,7 @@ pub(crate) mod ocpp_2_0_1 {
     /// value no functional block here can fulfil - which is exactly OCPP's `NotImplemented`, and
     /// why [`TriggerMessageOutcome`] has no variant for it (see that type's docs): the
     /// distinction only exists at the wire, where the unsupported values live.
+    #[cfg(feature = "std")]
     fn triggerable_message(
         requested: &MessageTriggerEnum,
         target: AvailabilityTarget,
@@ -1449,6 +1469,7 @@ pub(crate) mod ocpp_2_0_1 {
         }
     }
 
+    #[cfg(feature = "std")]
     fn trigger_response(status: TriggerMessageStatusEnum) -> TriggerMessageResponse {
         TriggerMessageResponse {
             custom_data: None,
@@ -1457,6 +1478,9 @@ pub(crate) mod ocpp_2_0_1 {
         }
     }
 
+    // `std`-gated: see the matching note on the `OCPP2_1Client` impl above - `OCPP2_0_1Client`
+    // only implements `StatusNotifier` under `std`.
+    #[cfg(feature = "std")]
     #[async_trait::async_trait]
     impl TriggerMessageHandler for OCPP2_0_1Client {
         async fn register_trigger_message_handler(&self, actor: ChargePointActor) {
@@ -1565,24 +1589,31 @@ pub(crate) mod ocpp_2_0_1 {
 
     use super::{
         RequestStartTransactionHandler, RequestStartTransactionOutcome,
-        RequestStopTransactionHandler, RequestStopTransactionOutcome, TriggerMessageHandler,
-        TriggerMessageOutcome, TriggerableMessage, UnlockConnectorHandler, UnlockOutcome,
-        handle_request_start_transaction, handle_request_stop_transaction_with_replay_guard,
-        handle_trigger_message, handle_unlock_request,
+        RequestStopTransactionHandler, RequestStopTransactionOutcome, UnlockConnectorHandler,
+        UnlockOutcome, handle_request_start_transaction,
+        handle_request_stop_transaction_with_replay_guard, handle_unlock_request,
+    };
+    // Only used by the `std`-gated `impl TriggerMessageHandler for OCPP2_0_1Client` above (see
+    // its cfg for why) and by `trigger_message_tests`.
+    #[cfg(feature = "std")]
+    use super::{
+        TriggerMessageHandler, TriggerMessageOutcome, TriggerableMessage, handle_trigger_message,
     };
     use crate::actor::ChargePointActor;
+    #[cfg(feature = "std")]
     use crate::availability::AvailabilityTarget;
     use crate::replay_protection::ReplayGuard;
     use crate::state::{IdToken, IdTokenKind, TransactionId};
-    use crate::wire::v201::common::{
-        EVSE, IdTokenEnum, MessageTriggerEnum, RequestStartStopStatusEnum,
-        TriggerMessageStatusEnum, UnlockStatusEnum,
-    };
+    #[cfg(feature = "std")]
+    use crate::wire::v201::common::{EVSE, MessageTriggerEnum, TriggerMessageStatusEnum};
+    use crate::wire::v201::common::{IdTokenEnum, RequestStartStopStatusEnum, UnlockStatusEnum};
     use crate::wire::v201::{
         RequestStartTransactionRequest, RequestStartTransactionResponse,
-        RequestStopTransactionRequest, RequestStopTransactionResponse, TriggerMessageRequest,
-        TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
+        RequestStopTransactionRequest, RequestStopTransactionResponse, UnlockConnectorRequest,
+        UnlockConnectorResponse,
     };
+    #[cfg(feature = "std")]
+    use crate::wire::v201::{TriggerMessageRequest, TriggerMessageResponse};
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use alloc::sync::Arc;

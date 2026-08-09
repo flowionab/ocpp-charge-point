@@ -1,5 +1,6 @@
 //! OCPP 2.1 wire adapter for `CustomerInformation`/`NotifyCustomerInformation` (B5.5).
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 
 use crate::wire::v21::common::CustomerInformationStatusEnum;

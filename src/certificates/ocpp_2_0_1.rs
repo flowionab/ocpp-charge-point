@@ -1,4 +1,11 @@
 //! OCPP 2.0.1 wire adapter for certificate management (B4.2).
+//!
+//! Not yet registered through `ChargePointBuilder` (nothing in this crate's public surface
+//! constructs [`Ocpp2_0_1CertificateHandler`] outside the `std`-convenience impl below and this
+//! module's own tests) - see `certificates` capability feature's Cargo.toml comment. Until it is,
+//! every item here is unreachable in a `--no-default-features` (no `std`, no `test`) build, which
+//! `deny(warnings)` would otherwise flag as dead code.
+#![cfg_attr(not(any(feature = "std", test)), allow(dead_code))]
 
 use alloc::boxed::Box;
 use alloc::string::ToString;
