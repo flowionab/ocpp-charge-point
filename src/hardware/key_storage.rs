@@ -30,6 +30,45 @@
 //! crate::hardware::CertificateHashData), and hands the handle back to [`KeyStore::sign`] when it
 //! needs a new CSR signed with the same key.
 //!
+//! # Reboot durability, and what happens when the handle outlives the key (E2.9)
+//!
+//! A [`KeyHandle`] is only useful if it keeps resolving to the same key after the charge point
+//! restarts - a handle that only works until the next power cycle would force a fresh CSR (B4.3)
+//! on every boot, defeating the point of persisting one next to a certificate at all (see the
+//! section above). [`SoftKeyStore`] earns this the straightforward way: the handle and the key
+//! material it names are written to [`Storage`](crate::hardware::Storage) together, so both
+//! survive a restart or they both don't - see `keys_survive_a_reboot` in this module's tests. A
+//! real secure element earns the same property in hardware: the handle is typically a slot index
+//! or label the element itself keeps populated across power cycles, so nothing in this crate needs
+//! to do anything extra for the *durable* case - it falls out of the handle being "whatever the
+//! implementor uses to locate the key again" plus that locator being persisted (in `Storage`, next
+//! to the certificate) rather than held only in memory.
+//!
+//! The case that needs an explicit answer is the other one: **a handle that still resolves to
+//! *something*, but not to the key it used to** - a secure element physically replaced during
+//! service, a slot index reused after the element was reset, or a `Storage` backup restored onto
+//! different hardware than it was taken from. Silently succeeding here - signing with whatever key
+//! now occupies that slot - would be a security defect: the resulting signature would be valid,
+//! attributable to a certificate the *old* key earned, and produced by a key the certificate's
+//! issuer never saw. **Every [`KeyStore`] implementation, present and future, must fail closed in
+//! this situation**: [`KeyStore::sign`] returns `Err` rather than a signature it cannot vouch for.
+//! [`SoftKeyStore`] already does this - `KeyNotFound` is returned whenever the handle it is asked
+//! to sign with does not resolve inside its own `Storage`, whether that handle was never valid or
+//! is stale after the key store's backing `Storage` was reset or replaced (see
+//! `a_handle_from_a_replaced_key_store_fails_closed_rather_than_signing_with_a_different_key`
+//! below). This crate cannot check this for a hardware implementor - verifying that a returned
+//! signature actually came from the expected key would need the asymmetric verification math this
+//! crate deliberately does not carry (see the "no crypto dependency" stance throughout
+//! `crate::hardware`) - so upholding it is squarely the implementor's responsibility, the same way
+//! the no-export invariant above is.
+//!
+//! The recovery from a failed-closed `sign` is not this trait's to prescribe (it is a protocol
+//! decision, not a storage one), but it is the one that keeps the "fail-safe over fail-open" rule
+//! in `CLAUDE.md`: treat the handle as dead, generate a fresh keypair with
+//! [`KeyStore::generate_key_pair`], and drive a new `SignCertificate` round trip (B4.3) for a
+//! replacement certificate over the new key, rather than continuing to address the old
+//! certificate's handle and hoping it comes back.
+//!
 //! # Hardware-backed vs. software fallback - and never confusing the two
 //!
 //! Most charge points have no secure element. [`SoftKeyStore`] is the software fallback: it keeps
@@ -42,7 +81,6 @@
 //! element that happens to be implemented over `Storage`.
 
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::vec::Vec;
 
 /// An asymmetric key algorithm a [`KeyStore`] can be asked to generate a keypair for, or that a
@@ -304,8 +342,29 @@ const KEYS_KEY: &str = "keys";
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct PersistedKeys {
-    next_id: u64,
     entries: Vec<PersistedKey>,
+}
+
+/// Derives a [`SoftKeyStore`] handle from the key it names, rather than from a per-store counter.
+///
+/// A counter (`"key-0"`, `"key-1"`, ...) would hand out the same handle bytes from any two
+/// [`SoftKeyStore`]s that generated their first key independently - exactly the E2.9 "element
+/// replaced" scenario (see the module docs): a stale handle from a wiped-and-regenerated store
+/// would then collide with, and silently resolve to, whatever unrelated key now occupies that same
+/// sequence position. Hashing the algorithm and the public key instead ties the handle to the
+/// specific key it was generated for, so a handle from a different key-generation event practically
+/// never matches - collision would require finding two distinct keys with the same SHA-256 digest.
+/// Reuses [`crate::certificates::csr::sha256`], the one keyless, dependency-free hash this crate
+/// already carries and pins against test vectors, rather than adding a second implementation.
+fn derive_handle(algorithm: SignatureAlgorithm, public_key: &[u8]) -> Vec<u8> {
+    let mut preimage = alloc::vec![match algorithm {
+        SignatureAlgorithm::EcdsaP256Sha256 => 0u8,
+        SignatureAlgorithm::EcdsaP384Sha384 => 1u8,
+        SignatureAlgorithm::Rsa2048Sha256 => 2u8,
+        SignatureAlgorithm::Rsa3072Sha256 => 3u8,
+    }];
+    preimage.extend_from_slice(public_key);
+    crate::certificates::csr::sha256(&preimage)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -467,9 +526,7 @@ where
             return Err(SoftKeyStoreError::StoreFull);
         }
 
-        let id = keys.next_id;
-        keys.next_id = keys.next_id.wrapping_add(1);
-        let handle = KeyHandle::new(format!("key-{id}").into_bytes());
+        let handle = KeyHandle::new(derive_handle(algorithm, &public_key.bytes));
         keys.entries.push(PersistedKey {
             handle: handle.as_bytes().to_vec(),
             algorithm: algorithm.into(),
@@ -711,6 +768,42 @@ mod tests {
 
         let signature = after.sign(&generated.handle, b"digest").await.unwrap();
         assert!(signature.ends_with(b"digest"));
+    }
+
+    #[tokio::test]
+    async fn a_handle_from_a_replaced_key_store_fails_closed_rather_than_signing_with_a_different_key()
+     {
+        // Models E2.9's "the handle persists but the key is gone" case: a secure element physically
+        // replaced, or a `Storage` backup restored onto different hardware than it was taken from.
+        let original_storage = Arc::new(InMemoryStorage::new());
+        let original = SoftKeyStore::new(original_storage, FakeCrypto::default());
+        let stale_handle = original
+            .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
+            .await
+            .unwrap()
+            .handle;
+
+        // --- the cut: a fresh `Storage` (a replaced element / restored-elsewhere backup) that
+        // happens to hold a *different* key, generated independently. A distinct starting byte
+        // (rather than another `FakeCrypto::default()`) stands in for two independent key
+        // generations actually producing different key material, the way any two real keypairs
+        // would.
+        let replacement_storage = Arc::new(InMemoryStorage::new());
+        let replacement = SoftKeyStore::new(
+            replacement_storage,
+            FakeCrypto {
+                next_key_byte: core::sync::atomic::AtomicU8::new(200),
+            },
+        );
+        replacement
+            .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
+            .await
+            .unwrap();
+
+        // The old handle must not resolve to whatever key now lives in the replacement store - it
+        // must fail closed, never silently sign with the wrong key.
+        let result = replacement.sign(&stale_handle, b"digest").await;
+        assert!(matches!(result, Err(SoftKeyStoreError::KeyNotFound)));
     }
 
     #[tokio::test]
