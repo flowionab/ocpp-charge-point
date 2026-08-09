@@ -89,6 +89,7 @@ pub mod provisioning;
 pub mod publish_firmware;
 pub mod refusal;
 pub mod remote_control;
+pub mod replay_protection;
 pub mod reporting;
 #[cfg(feature = "reservation")]
 pub mod reservation;
