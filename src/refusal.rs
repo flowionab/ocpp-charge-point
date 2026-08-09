@@ -69,6 +69,8 @@
 //! | `AFRRSignal`                 | n/a (2.1-only) | n/a | CALLRESULT `GenericStatusEnum::Rejected` (no `NotSupported` in this enum) |
 //! | `NotifyAllowedEnergyTransfer`| n/a (2.1-only) | n/a | CALLRESULT `NotifyAllowedEnergyTransferStatusEnum::Rejected` (no `NotSupported` in this enum) |
 //! | `CertificateSigned`          | n/a (2.x-only) | CALLRESULT `CertificateSignedStatusEnum::Rejected` | same as 2.0.1 |
+//! | `GetCertificateStatus`        | n/a (2.x-only) | CALLRESULT `GetCertificateStatusEnum::Failed` (no dedicated "unsupported" value - see `crate::certificate_status`'s module docs) | same as 2.0.1 |
+//! | `GetCertificateChainStatus`   | n/a (2.1-only) | n/a | CALLRESULT `CertificateStatusEnum::Failed` per requested entry (no top-level status - see `crate::certificate_status`) |
 //!
 //! `SignCertificate` (B4.3) has no row here: it is charge-point-initiated (this crate sends it,
 //! rather than answering a CSMS call), so there is no inbound message for a runtime-absent
@@ -289,6 +291,16 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         capability: |c| c.certificate_management,
         shape: RefusalShape::CallResultStatus,
     },
+    RefusalGate {
+        message: "GetCertificateStatus",
+        capability: |c| c.ocsp_checking,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "GetCertificateChainStatus",
+        capability: |c| c.ocsp_checking,
+        shape: RefusalShape::CallResultStatus,
+    },
 ];
 
 /// Looks up the [`RefusalGate`] for `message` (by `Action::NAME`), if this crate has one.
@@ -446,6 +458,28 @@ mod tests {
         assert!(capability_present(&present, "AdjustPeriodicEventStream"));
         assert!(capability_present(&present, "ClosePeriodicEventStream"));
         assert!(capability_present(&present, "GetPeriodicEventStream"));
+    }
+
+    #[test]
+    fn capability_present_reflects_ocsp_checking_independently_of_certificate_management() {
+        let absent = Capabilities::default();
+        let cert_store_only = capabilities_with(|c| c.certificate_management = true);
+        let present = capabilities_with(|c| c.ocsp_checking = true);
+
+        assert!(!capability_present(&absent, "GetCertificateStatus"));
+        assert!(!capability_present(&absent, "GetCertificateChainStatus"));
+        // Holding a certificate store is not the same fact as being able to check OCSP - see
+        // `Capabilities::ocsp_checking`'s docs.
+        assert!(!capability_present(
+            &cert_store_only,
+            "GetCertificateStatus"
+        ));
+        assert!(!capability_present(
+            &cert_store_only,
+            "GetCertificateChainStatus"
+        ));
+        assert!(capability_present(&present, "GetCertificateStatus"));
+        assert!(capability_present(&present, "GetCertificateChainStatus"));
     }
 
     #[cfg(feature = "ocpp_2_1")]

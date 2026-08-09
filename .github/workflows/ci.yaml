@@ -124,7 +124,7 @@ jobs:
       # 2.1-only capabilities (der-control, battery-swap,
       # periodic-event-stream) need one to gate any code in.
       - name: 'Capability set: no_std, every capability, every version'
-        run: cargo check --no-default-features --features ocpp_1_6,ocpp_2_0_1,ocpp_2_1,battery-swap,certificate-management,certificates,der-control,diagnostics,display-message,firmware-management,firmware-publishing,iso15118,key-storage,local-auth-list,payment,periodic-event-stream,reservation,smart-charging,tariff-cost,variable-monitoring --lib
+        run: cargo check --no-default-features --features ocpp_1_6,ocpp_2_0_1,ocpp_2_1,battery-swap,certificate-management,certificates,der-control,diagnostics,display-message,firmware-management,firmware-publishing,iso15118,key-storage,local-auth-list,ocsp-checking,payment,periodic-event-stream,reservation,smart-charging,tariff-cost,variable-monitoring --lib
 
   # H1.3: the target this crate exists for. `cargo check` (not build) because
   # linking a bare-metal binary additionally needs a `critical-section` backend

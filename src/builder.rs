@@ -2221,6 +2221,40 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Registers `GetCertificateStatus` (`docs/PRODUCTION-ROADMAP.md` B4.4): the CSMS asks this
+    /// charge point to check a certificate's OCSP status via `checker`.
+    ///
+    /// **2.x only.** Builder-only for the same reason [`Self::certificates`] is: it needs a
+    /// [`crate::hardware::OcspChecker`], which `setup()`'s signature cannot receive. Separate
+    /// from [`Self::certificates`] because the two need genuinely different hardware capabilities
+    /// - see [`crate::certificate_status`]'s module docs.
+    pub async fn ocsp_status<N, O>(self, csms: &N, checker: O) -> Self
+    where
+        N: crate::certificate_status::GetCertificateStatusHandler + Send + Sync + 'static,
+        O: crate::hardware::OcspChecker + Send + Sync + 'static,
+    {
+        csms.register_get_certificate_status_handler(self.runtime.actor(), checker)
+            .await;
+        self
+    }
+
+    /// Registers `GetCertificateChainStatus` (`docs/PRODUCTION-ROADMAP.md` B4.4): the chain-wide
+    /// equivalent of [`Self::ocsp_status`].
+    ///
+    /// **2.1 only** - 2.0.1 has no `GetCertificateChainStatus`. `clock` supplies the fallback
+    /// `nextUpdate` timestamp when `checker` does not provide one - see
+    /// [`crate::certificate_status::handle_get_certificate_chain_status`].
+    pub async fn ocsp_chain_status<N, O, C>(self, csms: &N, checker: O, clock: C) -> Self
+    where
+        N: crate::certificate_status::GetCertificateChainStatusHandler + Send + Sync + 'static,
+        O: crate::hardware::OcspChecker + Send + Sync + 'static,
+        C: crate::clock::Clock + Send + Sync + 'static,
+    {
+        csms.register_get_certificate_chain_status_handler(self.runtime.actor(), checker, clock)
+            .await;
+        self
+    }
+
     /// Registers the Battery Swap functional block (`docs/PRODUCTION-ROADMAP.md` B8.3):
     /// `RequestBatterySwap` inbound handling, dispatching hardware preparation to `station`.
     ///
