@@ -6,6 +6,7 @@ mod charge_point_state;
 mod charging_profile;
 mod connector_state;
 mod connector_status;
+mod der_control;
 mod device_model;
 mod display_message;
 mod event;
@@ -42,6 +43,12 @@ pub use self::charging_profile::{
 };
 pub use self::connector_state::ConnectorState;
 pub use self::connector_status::ConnectorStatus;
+pub use self::der_control::{
+    AfrrSignal, DERControlId, DERControlKind, DERControlQuery, DERControlRejection,
+    DERControlSettings, DERControlStore, DERCurvePoint, DERCurveSettings, DERUnit,
+    EnterServiceSettings, FixedPfSettings, FixedVarSettings, FreqDroopSettings, GradientSettings,
+    InstalledDERControl, LimitMaxDischargeSettings,
+};
 pub use self::device_model::{
     Component, DeviceModel, DeviceModelEvent, Variable, VariableAttribute, VariableAttributeType,
     VariableCharacteristics, VariableDataType, VariableDefinition, VariableMutability,
@@ -60,7 +67,7 @@ pub use self::event::{
 pub use self::evse_state::{EvseState, EvseStatus};
 pub use self::id_token::{IdToken, IdTokenKind};
 pub use self::limits::{
-    DEFAULT_MAX_CHARGING_PROFILES, DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
+    DEFAULT_MAX_CHARGING_PROFILES, DEFAULT_MAX_DER_CONTROLS, DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
     DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, DEFAULT_MAX_PERIODIC_EVENT_STREAMS,
     DEFAULT_MAX_TARIFFS, DEFAULT_MAX_VARIABLE_MONITORS, StateLimits,
 };

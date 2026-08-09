@@ -71,6 +71,16 @@ pub const DEFAULT_MAX_TARIFFS: usize = 8;
 /// [`StateLimits::with_max_periodic_event_streams`] rather than have `OpenPeriodicEventStream`
 /// refused.
 pub const DEFAULT_MAX_PERIODIC_EVENT_STREAMS: usize = 4;
+/// Default maximum number of DER control settings the store holds (see
+/// [`StateLimits::max_der_controls`]).
+///
+/// 16 mirrors [`DEFAULT_MAX_CHARGING_PROFILES`]'s reasoning: enough for a handful of default
+/// grid-code curves (enter-service, frequency-droop, one or two Volt-Var/Volt-Watt curves) plus a
+/// few scheduled overrides, while bounding the store to a few KB - a control is a handful of
+/// scalars plus, for curve-shaped kinds, up to ten `(x, y)` points. A CSMS installing more than
+/// that should raise it via [`StateLimits::with_max_der_controls`] rather than have
+/// `SetDERControl` refused.
+pub const DEFAULT_MAX_DER_CONTROLS: usize = 16;
 
 /// Default maximum number of display messages the store holds - see
 /// [`crate::state::DEFAULT_MAX_DISPLAY_MESSAGES`], which documents the reasoning; this re-export
@@ -171,6 +181,10 @@ pub struct StateLimits {
     /// (see [`crate::state::BatterySwapStore::insert`]); replacing an already-pending request's
     /// id always succeeds. Clamped to at least 1.
     pub max_pending_battery_swaps: usize,
+    /// The most DER control settings the store may hold. A `SetDERControl` for a *new* id beyond
+    /// it is refused with [`DERControlRejection::TooManyControls`](crate::state::DERControlRejection::TooManyControls);
+    /// replacing an already-installed control's id always succeeds. Clamped to at least 1.
+    pub max_der_controls: usize,
 }
 
 impl StateLimits {
@@ -188,12 +202,19 @@ impl StateLimits {
             max_display_messages: DEFAULT_MAX_DISPLAY_MESSAGES,
             max_periodic_event_streams: DEFAULT_MAX_PERIODIC_EVENT_STREAMS,
             max_pending_battery_swaps: DEFAULT_MAX_PENDING_BATTERY_SWAPS,
+            max_der_controls: DEFAULT_MAX_DER_CONTROLS,
         }
     }
 
     /// Overrides [`Self::max_periodic_event_streams`].
     pub const fn with_max_periodic_event_streams(mut self, max: usize) -> Self {
         self.max_periodic_event_streams = max;
+        self
+    }
+
+    /// Overrides [`Self::max_der_controls`].
+    pub const fn with_max_der_controls(mut self, max: usize) -> Self {
+        self.max_der_controls = max;
         self
     }
 

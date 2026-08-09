@@ -52,6 +52,12 @@ pub mod connection;
 pub mod cost;
 pub mod customer_information;
 pub mod data_transfer;
+/// DER (Distributed Energy Resource) control functional block: `GetDERControl`/`SetDERControl`/
+/// `ClearDERControl`/`ReportDERControl`, `NotifyDERAlarm`/`NotifyDERStartStop`, `AFRRSignal`, and
+/// `NotifyAllowedEnergyTransfer` (OCPP 2.1 only). See [`der_control`]'s own docs for why this
+/// block stores and reports DER controls rather than actuating them.
+#[cfg(feature = "der-control")]
+pub mod der_control;
 pub mod device_model;
 pub mod diagnostics;
 #[cfg(feature = "display-message")]

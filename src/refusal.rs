@@ -63,6 +63,11 @@
 //! | `ClosePeriodicEventStream`   | n/a | n/a | CALLERROR (`ClosePeriodicEventStreamResponse` is `{}`, no status field) |
 //! | `GetPeriodicEventStream`     | n/a | n/a | CALLERROR (`GetPeriodicEventStreamResponse` is `{ constantStreamData? }`, no status field) |
 //! | `RequestBatterySwap`         | n/a (2.1-only) | n/a | CALLRESULT `GenericStatusEnum::Rejected` |
+//! | `GetDERControl`              | n/a (2.1-only) | n/a | CALLRESULT `DERControlStatusEnum::NotSupported` |
+//! | `SetDERControl`              | n/a (2.1-only) | n/a | CALLRESULT `DERControlStatusEnum::NotSupported` |
+//! | `ClearDERControl`            | n/a (2.1-only) | n/a | CALLRESULT `DERControlStatusEnum::NotSupported` |
+//! | `AFRRSignal`                 | n/a (2.1-only) | n/a | CALLRESULT `GenericStatusEnum::Rejected` (no `NotSupported` in this enum) |
+//! | `NotifyAllowedEnergyTransfer`| n/a (2.1-only) | n/a | CALLRESULT `NotifyAllowedEnergyTransferStatusEnum::Rejected` (no `NotSupported` in this enum) |
 //!
 //! Nothing here needed to fall back on assumption where the vendored spec/generated types didn't
 //! settle it - every response type above either has a documented status enum or documented-empty
@@ -248,6 +253,31 @@ pub const REFUSAL_GATES: &[RefusalGate] = &[
         capability: |c| c.battery_swap,
         shape: RefusalShape::CallResultStatus,
     },
+    RefusalGate {
+        message: "GetDERControl",
+        capability: |c| c.der_control,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "SetDERControl",
+        capability: |c| c.der_control,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "ClearDERControl",
+        capability: |c| c.der_control,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "AFRRSignal",
+        capability: |c| c.der_control,
+        shape: RefusalShape::CallResultStatus,
+    },
+    RefusalGate {
+        message: "NotifyAllowedEnergyTransfer",
+        capability: |c| c.der_control,
+        shape: RefusalShape::CallResultStatus,
+    },
 ];
 
 /// Looks up the [`RefusalGate`] for `message` (by `Action::NAME`), if this crate has one.
@@ -364,6 +394,23 @@ mod tests {
         assert!(!capability_present(&absent, "UnpublishFirmware"));
         assert!(capability_present(&present, "PublishFirmware"));
         assert!(capability_present(&present, "UnpublishFirmware"));
+    }
+
+    #[test]
+    fn capability_present_reflects_der_control() {
+        let absent = Capabilities::default();
+        let present = capabilities_with(|c| c.der_control = true);
+
+        assert!(!capability_present(&absent, "GetDERControl"));
+        assert!(!capability_present(&absent, "SetDERControl"));
+        assert!(!capability_present(&absent, "ClearDERControl"));
+        assert!(!capability_present(&absent, "AFRRSignal"));
+        assert!(!capability_present(&absent, "NotifyAllowedEnergyTransfer"));
+        assert!(capability_present(&present, "GetDERControl"));
+        assert!(capability_present(&present, "SetDERControl"));
+        assert!(capability_present(&present, "ClearDERControl"));
+        assert!(capability_present(&present, "AFRRSignal"));
+        assert!(capability_present(&present, "NotifyAllowedEnergyTransfer"));
     }
 
     #[test]
