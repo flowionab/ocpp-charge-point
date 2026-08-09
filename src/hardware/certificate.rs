@@ -175,6 +175,23 @@ pub trait CertificateStore {
     /// nothing above needs the key itself. An implementation backed by a secure element answers
     /// this without the key ever leaving the chip.
     async fn has_private_key(&self) -> Result<bool, Self::Error>;
+
+    /// The PEM-encoded certificate chain currently installed for `use_for`, or `None` if this
+    /// store holds none.
+    ///
+    /// Additive (default `Ok(None)`) so existing implementors keep compiling without adopting
+    /// it. It exists for security profile 3 mutual TLS ([F1.3](crate)):
+    /// [`crate::mutual_tls`] needs the actual certificate bytes to offer on a TLS connection,
+    /// not merely [`Self::has_private_key`]'s yes/no or [`Self::installed`]'s hash-only summary.
+    /// [`StoredCertificates`] overrides this; a secure-element-backed store that keeps
+    /// certificates elsewhere should too.
+    async fn certificate_chain_pem(
+        &self,
+        use_for: CertificateUse,
+    ) -> Result<Option<String>, Self::Error> {
+        let _ = use_for;
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]
@@ -205,6 +222,13 @@ impl<T: CertificateStore + Send + Sync + ?Sized> CertificateStore for alloc::syn
 
     async fn has_private_key(&self) -> Result<bool, Self::Error> {
         (**self).has_private_key().await
+    }
+
+    async fn certificate_chain_pem(
+        &self,
+        use_for: CertificateUse,
+    ) -> Result<Option<String>, Self::Error> {
+        (**self).certificate_chain_pem(use_for).await
     }
 }
 
@@ -498,6 +522,33 @@ impl<S: crate::hardware::Storage + Send + Sync> CertificateStore for StoredCerti
         // implementation of this trait, which is why the trait exists.
         Ok(false)
     }
+
+    async fn certificate_chain_pem(
+        &self,
+        use_for: CertificateUse,
+    ) -> Result<Option<String>, Self::Error> {
+        // Correct but, today, empty for `CertificateUse::ChargingStation`/`V2gCertificateChain`:
+        // neither `install` (always `Rejected` - no hashes to compute) nor `install_with_hash`
+        // (refuses a non-installable use, by the same `is_installable` gate `InstallCertificate`
+        // itself uses) can ever put an entry in either slot. That is a pre-existing B4.3
+        // limitation of *this* store, not something F1.3 changes - a charge point wanting
+        // security profile 3's `crate::mutual_tls` with `StoredCertificates` needs either that
+        // gap closed or its own `CertificateStore` implementation that can hold its own signed
+        // certificate (the same "an integrator who can parse X.509 implements the trait" escape
+        // hatch this module's own docs describe for roots).
+        //
+        // Each use holds exactly one entry (`install_with_hash` replaces rather than
+        // duplicates), and `install`/`install_with_hash` both take the caller's certificate
+        // string whole - a chain rather than a single leaf is expected to already be
+        // concatenated PEM blocks, so returning this entry's `pem` verbatim is the whole chain.
+        Ok(self
+            .load()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| CertificateUse::from(entry.use_for) == use_for)
+            .map(|entry| entry.pem))
+    }
 }
 
 impl<S: crate::hardware::Storage + Send + Sync> StoredCertificates<S> {
@@ -747,6 +798,51 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn certificate_chain_pem_returns_the_installed_pem_for_the_matching_use() {
+        // `CertificateUse::ChargingStation` cannot be exercised through `StoredCertificates`
+        // here: `install_with_hash` refuses it too (see
+        // `the_charge_points_own_certificate_cannot_be_installed_into_the_store_either`), a
+        // pre-existing B4.3 limitation this method does not change - see
+        // `certificate_chain_pem`'s own docs. `CsmsRoot` proves the same lookup plumbing.
+        let store = store();
+        store
+            .install_with_hash(
+                CertificateUse::CsmsRoot,
+                "-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----",
+                hash("01"),
+            )
+            .await;
+
+        assert_eq!(
+            store
+                .certificate_chain_pem(CertificateUse::CsmsRoot)
+                .await
+                .unwrap(),
+            Some("-----BEGIN CERTIFICATE-----\nchain\n-----END CERTIFICATE-----".to_string())
+        );
+        // A use with nothing installed reports `None` rather than an empty string - "no
+        // certificate" and "an empty certificate" must not be conflated.
+        assert_eq!(
+            store
+                .certificate_chain_pem(CertificateUse::V2gRoot)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_with_nothing_installed_never_claims_a_chain_exists() {
+        assert_eq!(
+            NoCertificateStore
+                .certificate_chain_pem(CertificateUse::ChargingStation)
+                .await
+                .unwrap(),
+            None
         );
     }
 }

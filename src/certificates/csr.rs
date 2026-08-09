@@ -377,7 +377,11 @@ const SHA256_H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
-fn sha256(data: &[u8]) -> Vec<u8> {
+/// FIPS 180-4 SHA-256, `pub(crate)` so [`crate::mutual_tls`] can hash a TLS handshake message
+/// into the digest [`KeyStore::sign`] expects, the same way this module hashes a CSR's
+/// `CertificationRequestInfo` - see the module docs for why this one hash lives here rather than
+/// behind a trait or a dependency.
+pub(crate) fn sha256(data: &[u8]) -> Vec<u8> {
     let mut h = SHA256_H0;
 
     let bit_len = (data.len() as u64).wrapping_mul(8);

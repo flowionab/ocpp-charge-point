@@ -19,10 +19,11 @@
 //! [`BasicAuthPassword`] validates and holds the profile 1/2 password to OCPP's own rules, and
 //! [`ChargePointIdentity`] the username those profiles pair it with. What is deliberately *not*
 //! here is anything needing a certificate - profile 3's client certificate, the CSMS trust store,
-//! and renewal all wait on the certificate store (B4.1). A charge point configured for profile 3
-//! today is recorded as such and cannot present a client certificate, which is why
-//! [`SecurityProfile::is_implemented`] exists and says so rather than letting a station believe it
-//! is running mutual TLS.
+//! and the TLS wiring itself live in [`crate::certificates`] and [`crate::mutual_tls`] (F1.3),
+//! which this crate can now run end to end. What [`SecurityProfile::is_implemented`] says is
+//! narrower than "this station is currently running mutual TLS" - see its own docs and
+//! [`SecurityProfile::is_usable`] for the distinction between "this crate can wire profile 3 at
+//! all" and "this particular station has a certificate installed to present".
 
 use alloc::string::String;
 
@@ -39,9 +40,11 @@ pub enum SecurityProfile {
     /// **2 - TLS with Basic Authentication.** The CSMS authenticates with a TLS server
     /// certificate; the charge point still authenticates with HTTP Basic, now sent encrypted.
     TlsBasicAuth,
-    /// **3 - TLS with client-side certificates.** Both ends authenticate with certificates. Needs
-    /// a client certificate and a private key, which is why it is not implemented yet - see
-    /// [`Self::is_implemented`].
+    /// **3 - TLS with client-side certificates.** Both ends authenticate with certificates. This
+    /// crate can wire it end to end ([F1.3](crate), [`crate::mutual_tls`]) - but a *particular*
+    /// station still needs a client certificate installed and a key to sign with before it can
+    /// actually run it. See [`Self::is_implemented`] and [`Self::is_usable`] for that
+    /// distinction.
     TlsMutualAuth,
 }
 
@@ -75,15 +78,37 @@ impl SecurityProfile {
         matches!(self, Self::TlsBasicAuth | Self::TlsMutualAuth)
     }
 
-    /// Whether *this crate* can actually run this profile end to end today.
+    /// Whether *this crate build* has the machinery to run this profile end to end at all.
     ///
-    /// Profiles 1 and 2 it can: Basic credentials and a TLS trust configuration both reach the
-    /// transport. Profile 3 it cannot - a client certificate and private key need the certificate
-    /// store (B4.1) and a key-storage abstraction (F2.4), neither of which exists. This is
-    /// reported rather than hidden so a charge point never behaves as though it is presenting a
-    /// certificate it does not have.
+    /// This is a statement about the *code*, not about any particular station: it answers "does
+    /// this crate know how to speak this profile" rather than "can this station present a
+    /// certificate right now" - see [`Self::is_usable`] for the latter, which is almost always
+    /// the question that actually matters before dialing. All three profiles are implemented as
+    /// of [F1.3](crate): 1 and 2 through Basic credentials and a TLS trust configuration reaching
+    /// the transport, and 3 through the certificate store (B4.1), key storage (F2.4) and
+    /// [`crate::mutual_tls`]'s rustls wiring (F1.3) together.
     pub fn is_implemented(&self) -> bool {
-        !matches!(self, Self::TlsMutualAuth)
+        true
+    }
+
+    /// Whether *this station* can actually run this profile right now.
+    ///
+    /// For profiles 1 and 2 this is always `true` - [`Self::is_implemented`] already covers
+    /// everything they need. For profile 3, it is exactly `has_charging_station_certificate`:
+    /// mutual TLS needs an installed [`CertificateUse::ChargingStation`](
+    /// crate::hardware::CertificateUse) chain and a key to sign with
+    /// ([`crate::hardware::CertificateStore::has_private_key`]), and code existing to wire one up
+    /// (`is_implemented`) says nothing about whether *this* station has actually obtained one -
+    /// see [`crate::mutual_tls`]'s module docs for why a station with neither is refused a
+    /// profile-3 connection rather than silently handed a weaker one. Callers are expected to
+    /// check this (with `has_charging_station_certificate` from
+    /// `CertificateStore::has_private_key`/[`crate::mutual_tls::client_config`]'s success) before
+    /// choosing to dial with this profile at all.
+    pub fn is_usable(&self, has_charging_station_certificate: bool) -> bool {
+        match self {
+            Self::UnsecuredBasicAuth | Self::TlsBasicAuth => true,
+            Self::TlsMutualAuth => has_charging_station_certificate,
+        }
     }
 }
 
@@ -359,12 +384,35 @@ mod tests {
     }
 
     #[test]
-    fn only_the_profiles_this_crate_can_actually_run_say_so() {
+    fn every_profile_is_implemented_now_that_f1_3_has_landed() {
+        // "Implemented" is about the crate, not any one station - see `is_usable` for the
+        // station-specific question.
         assert!(SecurityProfile::UnsecuredBasicAuth.is_implemented());
         assert!(SecurityProfile::TlsBasicAuth.is_implemented());
-        // Profile 3 needs a client certificate and private key: B4.1 and F2.4. Saying otherwise
-        // would have a station behave as though it presents a certificate it does not have.
-        assert!(!SecurityProfile::TlsMutualAuth.is_implemented());
+        assert!(SecurityProfile::TlsMutualAuth.is_implemented());
+    }
+
+    #[test]
+    fn profile_3_is_only_usable_with_a_charging_station_certificate() {
+        // Profiles 1/2 need nothing beyond what `is_implemented` already covers.
+        assert!(SecurityProfile::UnsecuredBasicAuth.is_usable(false));
+        assert!(SecurityProfile::TlsBasicAuth.is_usable(false));
+
+        // Profile 3 needs a certificate a *station* actually holds - code existing to wire one up
+        // is not the same as this station having done so. Saying otherwise would have a station
+        // behave as though it presents a certificate it does not have.
+        assert!(!SecurityProfile::TlsMutualAuth.is_usable(false));
+        assert!(SecurityProfile::TlsMutualAuth.is_usable(true));
+    }
+
+    #[test]
+    fn profile_3_needs_no_basic_auth_credentials() {
+        // Mutual TLS authenticates both ends with certificates; a caller building
+        // `ConnectOptions` from the selected profile and consulting this before setting
+        // `username`/`password` never sends a password on a profile-3 connection.
+        assert!(!SecurityProfile::TlsMutualAuth.needs_basic_auth());
+        assert!(SecurityProfile::UnsecuredBasicAuth.needs_basic_auth());
+        assert!(SecurityProfile::TlsBasicAuth.needs_basic_auth());
     }
 
     #[test]

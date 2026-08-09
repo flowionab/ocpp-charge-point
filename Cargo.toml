@@ -156,7 +156,12 @@ certificates = []
 key-storage = []
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
+# `rt-multi-thread` is here for `crate::mutual_tls`'s `KeyStoreSigner` (F1.3): rustls's `Signer`
+# trait is synchronous, but `hardware::KeyStore::sign` is async, so bridging the two needs
+# `tokio::task::block_in_place` - which is only compiled in under this feature, and only actually
+# works (rather than panicking) on a multi-thread runtime. See `crate::mutual_tls`'s module docs
+# for the full explanation of why this bridge exists and its one hard requirement.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"], optional = true }
 # The `chrono` feature forwards to `ocpp-types`' own: `From` between `OcppTimestamp` and
 # `chrono::DateTime<Utc>` and back. `ocpp-types` 0.2.0 made every wire `dateTime` an
 # `OcppTimestamp` rather than a

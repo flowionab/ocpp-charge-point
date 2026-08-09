@@ -71,6 +71,17 @@ pub mod keepalive;
 #[cfg(feature = "local-auth-list")]
 pub mod local_authorization_list;
 pub mod meter_values;
+/// Security profile 3 (mutual TLS): builds a `rustls::ClientConfig` presenting this charge
+/// point's installed client certificate, signed through `hardware::KeyStore` without ever
+/// exporting the private key (`docs/PRODUCTION-ROADMAP.md` F1.3). `std`/`websocket`-only - see
+/// [`mutual_tls`]'s own docs for why (rustls) and for the Tokio multi-thread runtime requirement
+/// its signing bridge carries.
+#[cfg(all(
+    feature = "websocket",
+    feature = "certificates",
+    feature = "key-storage"
+))]
+pub mod mutual_tls;
 pub mod network_profile;
 #[cfg(feature = "websocket")]
 pub mod network_switch;
