@@ -231,6 +231,26 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         has_handler: true,
     },
     CapabilityGate {
+        name: "variable_monitoring",
+        cargo_feature: "variable-monitoring",
+        enabled: |c| c.variable_monitoring,
+        // `MonitoringCtrlr` is the real, spec-named 2.1 component governing
+        // `SetVariableMonitoring`/`SetMonitoringBase`/`SetMonitoringLevel` (see
+        // `docs/OCPP-2.1/Appendices_CSV_v2.1/dm_components_vars.csv`) - the same component
+        // `periodic_event_stream`'s row above already names as "the closest thing" for its own
+        // (component-less) entry.
+        ctrlr_component: Some("MonitoringCtrlr"),
+        // Not part of any 1.6J `SupportedFeatureProfiles` value - 1.6J has no variable
+        // monitoring concept.
+        feature_profile_1_6: None,
+        // C4.3: until this round, `setup()` registered `variable_monitoring`/
+        // `monitoring_reports`/`variable_monitor_events` unconditionally, regardless of
+        // `Capabilities::variable_monitoring` - the one block in `setup()`'s chain that wasn't
+        // runtime-gated to match its Cargo feature gate. Now behind the same
+        // `if capabilities.variable_monitoring` pattern as every other `true` row below.
+        has_handler: true,
+    },
+    CapabilityGate {
         name: "has_display",
         cargo_feature: "display-message",
         enabled: |c| c.has_display,
@@ -350,9 +370,10 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         feature_profile_1_6: None,
         // `false` even though this module's handlers are real (unlike `has_display`/
         // `diagnostics`/`firmware_management`, whose docs this mirrors): registration goes
-        // through `ChargePointBuilder::der_control` rather than `setup()`, which only bounds
-        // itself by `reservation`/`local-auth-list`/`tariff-cost` today - see that method's docs
-        // for the scope decision.
+        // through `ChargePointBuilder::der_control` rather than `setup()`, which (as of C4.2/C4.3)
+        // bounds itself by `reservation`/`local-auth-list`/`tariff-cost`/`periodic-event-stream`/
+        // `smart-charging`/`variable-monitoring` - der-control was deliberately not added to that
+        // list, for the reason `ChargePointBuilder::der_control`'s own docs give.
         has_handler: false,
     },
     CapabilityGate {

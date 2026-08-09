@@ -46,20 +46,31 @@ use crate::periodic_event_stream::{
     run_periodic_event_streams,
 };
 use crate::persistence::{
-    AuthorizationCacheStore, BootReasonStore, ChargingProfileSnapshotStore, DeviceModelStore,
-    LocalAuthorizationListStore, NetworkProfileSnapshotStore, QueueStore, ReservationStore,
-    TransactionStore, flush_and_persist_security_event_queue,
+    AuthorizationCacheStore, BootReasonStore, DeviceModelStore, NetworkProfileSnapshotStore,
+    QueueStore, TransactionStore, flush_and_persist_security_event_queue,
     flush_and_persist_status_notification_queue, flush_and_persist_transaction_event_queue,
-    restore_authorization_cache, restore_charging_profiles, restore_device_model,
-    restore_local_authorization_list, restore_network_profiles, restore_reservations,
+    restore_authorization_cache, restore_device_model, restore_network_profiles,
     restore_security_event_queue, restore_security_log, restore_status_notification_queue,
     restore_transaction_event_queue, restore_transactions, run_authorization_cache_persistence,
-    run_charging_profile_persistence, run_device_model_persistence,
-    run_local_authorization_list_persistence, run_network_profile_persistence,
+    run_device_model_persistence, run_network_profile_persistence,
     run_persisted_security_event_queue, run_persisted_status_notification_queue,
-    run_persisted_transaction_event_queue, run_reservation_persistence,
-    run_security_log_persistence, run_transaction_persistence,
+    run_persisted_transaction_event_queue, run_security_log_persistence,
+    run_transaction_persistence,
 };
+// Split out from the `crate::persistence` import above (C4.2): each of these backs exactly one
+// feature-gated registration method below, so importing it unconditionally would leave an unused
+// import (denied by `-D warnings`) whenever that block's Cargo feature is off.
+#[cfg(feature = "smart-charging")]
+use crate::persistence::run_charging_profile_persistence;
+#[cfg(feature = "smart-charging")]
+use crate::persistence::{ChargingProfileSnapshotStore, restore_charging_profiles};
+#[cfg(feature = "local-auth-list")]
+use crate::persistence::{
+    LocalAuthorizationListStore, restore_local_authorization_list,
+    run_local_authorization_list_persistence,
+};
+#[cfg(feature = "reservation")]
+use crate::persistence::{ReservationStore, restore_reservations, run_reservation_persistence};
 use crate::provisioning::{Backoff, BootNotifier, HeartbeatSender, run_heartbeat};
 use crate::remote_control::{
     RequestStartTransactionHandler, RequestStopTransactionHandler, UnlockConnectorHandler,
@@ -80,6 +91,7 @@ use crate::tariff::{
     ChangeTransactionTariffHandler, ClearTariffsHandler, GetTariffsHandler, SetDefaultTariffHandler,
 };
 use crate::transactions::TransactionNotifier;
+#[cfg(feature = "variable-monitoring")]
 use crate::variable_monitoring::{
     ClearVariableMonitoringHandler, GetMonitoringReportHandler, SetMonitoringBaseHandler,
     SetMonitoringLevelHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
@@ -462,6 +474,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     ///
     /// **2.x only** - see [`Self::variable_monitoring`]'s docs. `backoff`/`clock` are
     /// caller-supplied for the same no_std reason [`Self::provisioning`]'s are.
+    ///
+    /// Only present when the `variable-monitoring` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "variable-monitoring")]
     pub fn variable_monitor_events<N, B, K>(
         self,
         csms: &N,
@@ -547,6 +562,13 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// `clock` decides whether a persisted profile's `valid_to` is trustworthy to compare
     /// against; see [`crate::persistence::restore_charging_profiles`] for what an unsynchronized
     /// clock does (nothing, deliberately).
+    ///
+    /// Only present when the `smart-charging` Cargo feature is enabled (C4.2). Unlike
+    /// [`Self::reservation`]'s `crate::reservation`, `crate::smart_charging`'s types stay
+    /// compiled regardless of this feature - `crate::tariff`/`crate::device_model`/
+    /// `crate::provisioning` depend on them unconditionally - so this gates only the
+    /// registration entry point, not the module.
+    #[cfg(feature = "smart-charging")]
     pub async fn charging_profile_persistence<S, K>(self, storage: S, clock: K) -> Self
     where
         S: crate::hardware::Storage + Send + Sync + 'static,
@@ -583,6 +605,11 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// Registered by [`crate::setup::setup`] only when the hardware declares
     /// [`Capabilities::smart_charging`](crate::hardware::Capabilities::smart_charging) - a charge
     /// point that cannot limit its current has nothing to project a schedule onto (C3.1).
+    ///
+    /// Only present when the `smart-charging` Cargo feature is enabled - see
+    /// [`Self::charging_profile_persistence`]'s doc comment for why the module itself does not
+    /// disappear alongside this method (C4.2).
+    #[cfg(feature = "smart-charging")]
     pub async fn smart_charging<N, K, B>(
         self,
         csms: &N,
@@ -1257,6 +1284,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// Separate from [`Self::smart_charging`] because it is **2.x only** - 1.6J has no way to ask
     /// what is installed at all - and folding it into that method's bounds would make the block
     /// unregisterable on a 1.6J connection.
+    ///
+    /// Only present when the `smart-charging` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "smart-charging")]
     pub async fn charging_profile_reports<N>(self, csms: &N) -> Self
     where
         N: crate::smart_charging::GetChargingProfilesHandler + Send + Sync + 'static,
@@ -1277,6 +1307,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     ///
     /// **2.1 only.** Dynamic charging profiles do not exist in 1.6J or 2.0.1, so this is separate
     /// from [`Self::smart_charging`] for the same reason [`Self::priority_charging`] is.
+    ///
+    /// Only present when the `smart-charging` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "smart-charging")]
     pub async fn dynamic_charging_profiles<N, K, B>(
         self,
         csms: &N,
@@ -1320,6 +1353,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// Separate from [`Self::smart_charging`] because it is **2.1 only** - neither 1.6J nor 2.0.1
     /// has the messages or the profile purpose behind them - and folding it into that method's
     /// bounds would make the whole block unregisterable on the older versions.
+    ///
+    /// Only present when the `smart-charging` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "smart-charging")]
     pub async fn priority_charging<N>(self, csms: &N) -> Self
     where
         N: crate::smart_charging::UsePriorityChargingHandler
@@ -1603,6 +1639,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// [`crate::state::ChargePointEvent::ExternalChargingLimitSet`]/
     /// [`crate::state::EvseEvent::EVChargingNeedsReported`] and friends for how an integrator (a
     /// local energy-management binding, or an ISO 15118 stack) feeds this.
+    ///
+    /// Only present when the `smart-charging` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "smart-charging")]
     pub fn smart_charging_notifications<N>(self, csms: &N) -> Self
     where
         N: crate::smart_charging::ChargingLimitNotifier
@@ -1699,6 +1738,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// simply never invokes a handler a 1.6J CSMS has no message to trigger. Pair with
     /// [`Self::variable_monitor_events`] to also report triggered monitors outbound - registering
     /// only this half lets a CSMS install/clear monitors that never fire anything back.
+    ///
+    /// Only present when the `variable-monitoring` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "variable-monitoring")]
     pub async fn variable_monitoring<N>(self, csms: &N) -> Self
     where
         N: SetVariableMonitoringHandler + ClearVariableMonitoringHandler + Send + Sync + 'static,
@@ -1720,6 +1762,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// [`Self::configuration`]'s same split).
     ///
     /// **2.x only** - see [`Self::variable_monitoring`]'s docs; 1.6J has no such messages.
+    ///
+    /// Only present when the `variable-monitoring` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "variable-monitoring")]
     pub async fn monitoring_reports<N>(self, csms: &N) -> Self
     where
         N: SetMonitoringBaseHandler
@@ -1942,6 +1987,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// before the connection that would deliver such a request is established - so a request
     /// can't race the restore. In practice this just means calling this method during the same
     /// build chain, before `.build()`.
+    ///
+    /// Only present when the `local-auth-list` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "local-auth-list")]
     pub async fn local_authorization_list_persistence<S>(self, storage: S) -> Self
     where
         S: crate::hardware::Storage + Send + Sync + 'static,
@@ -1973,6 +2021,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     ///
     /// Register this before [`Self::reservation`] is reachable by a CSMS request, for the same
     /// race-avoidance reason as [`Self::local_authorization_list_persistence`].
+    ///
+    /// Only present when the `reservation` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "reservation")]
     pub async fn reservation_persistence<S, K>(self, storage: S, clock: K) -> Self
     where
         S: crate::hardware::Storage + Send + Sync + 'static,
@@ -2080,6 +2131,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     ///
     /// The upload runs on its own task because OCPP's sequence requires the response to go out
     /// before the transfer starts - see [`crate::diagnostics`].
+    ///
+    /// Only present when the `diagnostics` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "diagnostics")]
     pub async fn log_uploads<N, F, B>(
         self,
         csms: &N,
@@ -2123,6 +2177,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// installed (B3.3; [`crate::hardware::NoFirmwareVerifier`] if this charge point never
     /// receives signed updates) - which is why, like [`Self::log_uploads`], this is builder-only:
     /// `setup()` has no way to receive any of them.
+    ///
+    /// Only present when the `firmware-management` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "firmware-management")]
     pub async fn firmware_updates<N, F, I, K, B, V>(
         self,
         csms: &N,
@@ -2179,6 +2236,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// like [`Self::firmware_updates`], this is builder-only: `setup()` has no way to receive
     /// either. Independent of [`Self::firmware_updates`] - a charge point can publish firmware for
     /// others without ever calling it on itself, and vice versa.
+    ///
+    /// Only present when the `firmware-publishing` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "firmware-publishing")]
     pub async fn publish_firmware<N, R, F, B>(
         self,
         csms: &N,
@@ -2225,6 +2285,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// `ocpp-types` does not generate. Builder-only for the same reason
     /// [`Self::log_uploads`] is: it needs a [`crate::hardware::CertificateStore`], which
     /// `setup()`'s signature cannot receive.
+    ///
+    /// Only present when the `certificate-management` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "certificate-management")]
     pub async fn certificates<N, S>(self, csms: &N, store: S) -> Self
     where
         N: crate::certificates::CertificateHandler + Send + Sync + 'static,
@@ -2242,6 +2305,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// [`crate::hardware::OcspChecker`], which `setup()`'s signature cannot receive. Separate
     /// from [`Self::certificates`] because the two need genuinely different hardware capabilities
     /// - see [`crate::certificate_status`]'s module docs.
+    ///
+    /// Only present when the `ocsp-checking` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "ocsp-checking")]
     pub async fn ocsp_status<N, O>(self, csms: &N, checker: O) -> Self
     where
         N: crate::certificate_status::GetCertificateStatusHandler + Send + Sync + 'static,
@@ -2258,6 +2324,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// **2.1 only** - 2.0.1 has no `GetCertificateChainStatus`. `clock` supplies the fallback
     /// `nextUpdate` timestamp when `checker` does not provide one - see
     /// [`crate::certificate_status::handle_get_certificate_chain_status`].
+    ///
+    /// Only present when the `ocsp-checking` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "ocsp-checking")]
     pub async fn ocsp_chain_status<N, O, C>(self, csms: &N, checker: O, clock: C) -> Self
     where
         N: crate::certificate_status::GetCertificateChainStatusHandler + Send + Sync + 'static,
@@ -2415,6 +2484,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// dependency. Calling this without either is still correct, just less informative: with no
     /// queue wired, nothing this crate produces is ever queued, so `false` is the honest answer,
     /// not a fallback standing in for one.
+    ///
+    /// Only present when the `diagnostics` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "diagnostics")]
     pub async fn get_transaction_status<N>(self, csms: &N) -> Self
     where
         N: crate::transaction_status::GetTransactionStatusHandler + Send + Sync + 'static,
@@ -2439,6 +2511,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// [`crate::setup::setup`]'s response-then-work worker, so that a future
     /// [`crate::hardware`]-backed customer store can slot in here without changing `setup()`'s
     /// signature.
+    ///
+    /// Only present when the `diagnostics` Cargo feature is enabled (C4.2).
+    #[cfg(feature = "diagnostics")]
     pub async fn customer_information<N, K>(self, csms: &N, clock: K) -> Self
     where
         N: crate::customer_information::CustomerInformationHandler
