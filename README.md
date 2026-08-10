@@ -185,14 +185,14 @@ By default, the crate builds with the `tokio-runtime` feature (which implies `st
 
 ```toml
 [dependencies]
-ocpp-charge-point = "0.x"
+ocpp-charge-point = "0.1"
 ```
 
 For a real `#![no_std]` + `alloc` build, disable default features:
 
 ```toml
 [dependencies]
-ocpp-charge-point = { version = "0.x", default-features = false, features = ["ocpp_2_1"] }
+ocpp-charge-point = { version = "0.1", default-features = false, features = ["ocpp_2_1"] }
 ```
 
 `cargo check --no-default-features --lib` compiles this crate under `#![no_std]` - internally it's backed by [`embassy-sync`](https://docs.rs/embassy-sync) (`CriticalSectionRawMutex`-based `Mutex`/`Signal`) instead of `tokio::sync`, so no async runtime is baked in.
@@ -276,7 +276,7 @@ version) rather than trusting a hardcoded list here.
 
 ## 🧱 Capability Cargo Features
 
-On top of the protocol-version features above (`ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1`), the crate has one Cargo feature per optional OCPP *functional block*. Both groups are orthogonal - any combination compiles (verified in CI's feature matrix, and via `cargo check --no-default-features --features ...` for representative combinations). All capability features are in `default`, so a plain `ocpp-charge-point = "0.x"` dependency behaves exactly as before this section existed; turning one off is an opt-in decision to shrink a firmware image that will never exercise that block, not a runtime behaviour change - see [`docs/PRODUCTION-ROADMAP.md`](docs/PRODUCTION-ROADMAP.md) §5 for the compile-time-vs-runtime split this is one half of.
+On top of the protocol-version features above (`ocpp_1_6`/`ocpp_2_0_1`/`ocpp_2_1`), the crate has one Cargo feature per optional OCPP *functional block*. Both groups are orthogonal - any combination compiles (verified in CI's feature matrix, and via `cargo check --no-default-features --features ...` for representative combinations). All capability features are in `default`, so a plain `ocpp-charge-point = "0.1"` dependency behaves exactly as before this section existed; turning one off is an opt-in decision to shrink a firmware image that will never exercise that block, not a runtime behaviour change - see [`docs/PRODUCTION-ROADMAP.md`](docs/PRODUCTION-ROADMAP.md) §5 for the compile-time-vs-runtime split this is one half of.
 
 Eight blocks gate real code today - the module, its re-exports, and (where one exists) the
 corresponding `ChargePointBuilder` registration method are all `#[cfg]`'d away when the feature is
@@ -314,7 +314,7 @@ feature's status changes.
 
 ### OCPP certification profile mapping
 
-The OCPP 2.1 and 2.0.1 "Part 5 - Certification Profiles" specifications (vendored under [`docs/OCPP-2.1/`](docs/OCPP-2.1/) and [`docs/OCPP-2.0.1/`](docs/OCPP-2.0.1/)) define independently-certifiable certification profiles on top of the mandatory "Core" profile. The table below maps each [`CAPABILITY_GATES`](src/hardware/capabilities.rs) entry to the profile(s)/component(s) it participates in, so a build can be described as, for example, "Core + Reservation + Smart Charging" - **describing** it that way is not the same as being able to **certify** it that way; see [H3](docs/PRODUCTION-ROADMAP.md#103-h3--compliance) for the gap.
+The OCPP 2.1 and 2.0.1 "Part 5 - Certification Profiles" specifications (available from the [Open Charge Alliance](https://openchargealliance.org/protocols/open-charge-point-protocol/); this project reads them from `docs/OCPP-2.1/` and `docs/OCPP-2.0.1/`, which are gitignored, so they are in neither this repository nor the published crate - obtain your own copies to check this table against) define independently-certifiable certification profiles on top of the mandatory "Core" profile. The table below maps each [`CAPABILITY_GATES`](src/hardware/capabilities.rs) entry to the profile(s)/component(s) it participates in, so a build can be described as, for example, "Core + Reservation + Smart Charging" - **describing** it that way is not the same as being able to **certify** it that way; see [H3](docs/PRODUCTION-ROADMAP.md#103-h3--compliance) for the gap.
 
 | Capability (`CAPABILITY_GATES` name) | Cargo feature | 2.x `*Ctrlr` component | 1.6J feature profile | OCPP 2.1 profile | OCPP 2.0.1 profile | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -398,7 +398,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-ocpp-charge-point = "0.x"
+ocpp-charge-point = "0.1"
 ```
 
 For a full walkthrough of what to implement, which Cargo features to pick, and how the

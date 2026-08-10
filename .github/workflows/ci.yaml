@@ -21,6 +21,11 @@ on:
   schedule:
     - cron: '17 6 * * 1-5'
   workflow_dispatch: {}
+  # Lets `release.yaml` run this exact file against the tagged commit rather
+  # than keeping a second, drifting copy of the gates in the release pipeline.
+  # A tag push does not match the `push` trigger above (it is branch-scoped),
+  # so this adds a call path rather than duplicating a run.
+  workflow_call: {}
 
 env:
   CARGO_TERM_COLOR: always

@@ -1,0 +1,227 @@
+name: Release
+
+# Publishing is triggered by a tag, never by a push to `main`. `cargo publish`
+# is irreversible - a version number on crates.io can be yanked but never
+# reused, and the tarball stays downloadable forever - so it has to be
+# something a maintainer does deliberately rather than a side effect of
+# merging. `v0.1.0` is the tag shape CHANGELOG.md's link anchors already
+# assume.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  # Rehearsal path: runs every guard, the full CI suite, and `cargo publish
+  # --dry-run` without spending the version number. Defaults to a dry run
+  # precisely because the destructive choice should be the one you have to
+  # make on purpose.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run all checks and a --dry-run publish, but do not publish'
+        type: boolean
+        default: true
+
+# Two releases in flight at once would race on the same version number, and
+# `cancel-in-progress` is deliberately false: cancelling a run that has already
+# reached `cargo publish` would leave a published version with no GitHub
+# release and no tag notes.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything that can be wrong about a release *before* any of it is
+  # irreversible. Each check here is one that has, somewhere, produced a
+  # published version nobody could take back: a tag that disagrees with
+  # Cargo.toml, a version with no changelog entry, a re-run that tried to
+  # republish an existing version, or a tag cut from a branch that never
+  # merged.
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      dry_run: ${{ steps.mode.outputs.dry_run }}
+    steps:
+      # `fetch-depth: 0` because the "is this commit actually on main" check
+      # below needs history, not just the tagged commit.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve mode
+        id: mode
+        # A tag push is always a real publish; only the manual trigger can ask
+        # for a dry run. `inputs.dry_run` is unset on a tag push, so it is
+        # compared as a string rather than trusted as a boolean.
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+            echo "Mode: DRY RUN - nothing will be published."
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+            echo "Mode: PUBLISH - this run will publish to crates.io."
+          fi
+
+      - name: Read version from Cargo.toml
+        id: version
+        # `cargo metadata` rather than grepping the file: it is the same
+        # resolution `cargo publish` itself will do, so the two cannot disagree
+        # about what is being released.
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+
+      - name: Tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        # The failure this catches is tagging v0.2.0 having forgotten to bump
+        # Cargo.toml, which would publish 0.1.0 again (or, worse, silently
+        # publish the wrong contents under a version number people then pin).
+        run: |
+          if [ "${{ github.ref_name }}" != "v$VERSION" ]; then
+            echo "::error::Tag '${{ github.ref_name }}' does not match Cargo.toml version 'v$VERSION'"
+            exit 1
+          fi
+          echo "Tag ${{ github.ref_name }} matches Cargo.toml."
+
+      - name: Tagged commit is on main
+        if: github.event_name == 'push'
+        # A tag can be cut from any commit, including one that was never
+        # reviewed or merged. CI passing on it proves it compiles, not that it
+        # is the code the project agreed to ship.
+        run: |
+          # Fetched explicitly rather than relying on `fetch-depth: 0` having
+          # populated `origin/main`: on a tag push the checkout's refspec is
+          # tag-centric, and this check silently passes nothing useful if the
+          # ref is missing.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
+            echo "::error::Tagged commit ${{ github.sha }} is not an ancestor of origin/main"
+            exit 1
+          fi
+          echo "Tagged commit is reachable from main."
+
+      - name: Changelog has an entry for this version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        # CLAUDE.md makes the changelog the integrator-facing record of what
+        # each release changes about the traits they implement. A release with
+        # no entry is one whose breaking changes an integrator finds out about
+        # from a compiler error.
+        run: |
+          if ! grep -qF "## [$VERSION]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section"
+            exit 1
+          fi
+          echo "CHANGELOG.md documents $VERSION."
+
+      - name: Version is not already on crates.io
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        # The sparse index rather than the crates.io API: the API rejects
+        # unrecognised user agents, while the index is built for exactly this
+        # kind of automated lookup. A 404 means the crate has never been
+        # published, which is the correct state for the very first release.
+        run: |
+          url="https://index.crates.io/oc/pp/ocpp-charge-point"
+          body=$(curl -sSf "$url" 2>/dev/null) || {
+            echo "Crate not yet on crates.io - this is a first publish."
+            exit 0
+          }
+          if echo "$body" | jq -r '.vers' | grep -qxF "$VERSION"; then
+            echo "::error::Version $VERSION is already published on crates.io and cannot be republished"
+            exit 1
+          fi
+          echo "Version $VERSION is not on crates.io yet."
+
+  # The full gate suite from ci.yaml, re-run against the tagged commit rather
+  # than trusted from whenever it last ran on `main`. Calling the file keeps
+  # one definition of "the checks": a gate added to CI is automatically a gate
+  # on releases, with no second list to keep in step.
+  ci:
+    needs: guard
+    uses: ./.github/workflows/ci.yaml
+
+  publish:
+    needs: [guard, ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` so the published crate is built against the exact
+      # dependency versions CI just tested, rather than whatever resolves at
+      # publish time.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ needs.guard.outputs.dry_run }}
+        # The token is a repository secret (Settings -> Secrets and variables
+        # -> Actions -> CARGO_REGISTRY_TOKEN), scoped to publish-update for
+        # this crate only. Once 0.1.0 exists, this can be replaced with
+        # crates.io Trusted Publishing (OIDC, no long-lived secret) - that is
+        # configured per-crate on crates.io and so cannot be set up until the
+        # crate has been published at least once, which is why the first
+        # release goes out on a token.
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run - packaging and verifying without publishing."
+            cargo publish --locked --dry-run
+          else
+            if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+              echo "::error::CARGO_REGISTRY_TOKEN secret is not set - cannot publish"
+              exit 1
+            fi
+            cargo publish --locked
+          fi
+
+  # Only after crates.io has accepted the version, so a failed publish does not
+  # leave a GitHub release announcing something nobody can depend on.
+  github-release:
+    needs: [guard, publish]
+    if: needs.guard.outputs.dry_run != 'true' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release notes are the changelog section for this version, not a
+      # separately written summary that can drift from it.
+      - name: Extract this version's changelog section
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          # Stops at the next version heading, or at the `---` rule that
+          # separates the entries from the link definitions at the foot of the
+          # file - without the second condition the last release in the file
+          # would carry those definitions into its notes.
+          awk -v ver="## [$VERSION]" '
+            index($0, ver) == 1 { found = 1; next }
+            found && (/^## / || /^---[[:space:]]*$/) { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::Extracted an empty changelog section for $VERSION"
+            exit 1
+          fi
+          wc -l < release-notes.md | xargs echo "Release notes lines:"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "v$VERSION" \
+            --notes-file release-notes.md \
+            --verify-tag

@@ -7,6 +7,12 @@ repository = "https://github.com/flowionab/ocpp-charge-point"
 license = "MIT OR Apache-2.0"
 authors = ["Joatin Granlund <joatin@granlund.io>"]
 keywords = ["OCPP", "CP", "ChargePoint", "ocpp16", "ocpp201"]
+# crates.io's own slugs, not free text - an unrecognised one is dropped silently on publish. Five
+# keywords and five categories is the per-crate ceiling for both, so both lists are full. `no-std`
+# and `embedded` are the load-bearing pair: this crate's differentiator against other OCPP crates
+# is that it builds for a microcontroller, and those are the two categories someone shopping for
+# firmware filters on.
+categories = ["embedded", "no-std", "network-programming", "asynchronous", "api-bindings"]
 # Verified, not guessed: 1.87 fails to compile this crate (`src/state/` uses
 # let-chains, stable only from 1.88), and several transitive dependencies
 # already require 1.86/1.87. CI enforces this on every push - see the `msrv`

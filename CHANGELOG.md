@@ -15,7 +15,7 @@ ones that would break or surprise an integrator, or that materially describe wha
 now do; purely internal refactors, test additions, and documentation-only commits are omitted
 unless they're the easiest way to explain a milestone's scope.
 
-## [0.1.0] — 2026-08-09
+## [0.1.0] — 2026-08-10
 
 First published release. The **Breaking** entries below are pre-release history — changes made
 while the crate was unpublished, listed because anyone who tracked `main` lived through them.
@@ -64,6 +64,28 @@ Nothing here breaks an earlier *release*, because there was none.
   bound on its existing CSMS type parameter — signed-firmware verification is now mandatory
   wiring for this registration method; pass `hardware::NoFirmwareVerifier` (fails closed) if the
   charge point never receives signed updates. (B3.3, signed firmware verification)
+- **`ChargePoint::start` takes `self: Arc<Self>`** rather than `&self`. The command loop it spawns
+  has to outlive the call, so with `&self` every implementation kept an `Arc` inside its own struct
+  purely to have something to move into that task — both bundled examples did it. The runtime
+  already holds an `Arc<T>` and now hands that same one to `start`, so bindings go back to plain
+  owned fields; `ChargePointRuntime` stores `Arc<T>` to match. (H5.6, hardware trait
+  implementability)
+- **Five hardware accessors are plain `fn`, not `async fn`**: `ChargePoint::vendor_name`,
+  `model_name`, `evses` and `capabilities`, plus `Evse::connectors`. None of them awaited or
+  failed. `connectors()` is the one that mattered — `execute_hardware_command` calls it per
+  command, so an `async fn` returning a fixed slice boxed a future per contactor operation. Impls
+  need the `async` keyword removed. (H5.6)
+- **`CertificateStore::has_private_key` is now `has_client_private_key`.** A real store holds
+  several keys and only the client certificate's answers the question this method is asked. Rename
+  the method in existing impls. (H5.6)
+- **`hardware::Watchdog` lost its `Send + Sync` supertrait** — the only trait in `crate::hardware`
+  to have had one. The bound now sits on the actor's `Arc<dyn Watchdog + Send + Sync>`, where the
+  sharing actually happens. (H5.6)
+- **`Authorizer` gained an `authorize_contract` method with a default implementation** — see
+  Plug & Charge below. The default refuses locally, so an existing impl keeps compiling but
+  declines every contract-certificate authorization until it implements the method.
+  `run_authorization_requests` also gained a `Sync` bound, which `ChargePointBuilder` already
+  required of every authorizer. (B4.6)
 
 ### Added — by milestone
 
@@ -105,6 +127,41 @@ Nothing here breaks an earlier *release*, because there was none.
   event streams, `PublishFirmware`/`UnpublishFirmware`/`PublishFirmwareStatusNotification`, a
   secure-element/key-storage abstraction (`hardware::KeyStore`), the tariff store and
   per-transaction tariff assignment, and the display-message block.
+- **Plug & Charge authorization (OCPP use case C07, 2.0.1 and 2.1)**: `Authorize` now carries the
+  ISO 15118 contract certificate (`certificate`/`iso15118CertificateHashData`) and reads the
+  response's `certificateStatus`, where both were previously hardcoded `None` and dropped
+  respectively. The presentation is a first-class connector event —
+  `ConnectorEvent::ContractCertificatePresented { id_token, certificate }` reaches `Authorizing`
+  by the same transition a card tap uses, sent on the `HardwareEventSender` an integrator's HLC
+  stack already has, so no new hardware trait and no change to `Iso15118Controller`. Acceptance
+  needs both of the CSMS's answers: `ContractAuthorization` keeps token status and certificate
+  status apart because C07.FR.13/FR.14 make them genuinely independent. Offline, C07.FR.07
+  overrides this crate's own offline fallback — a contract presentation with no CSMS is refused
+  and does not consult the authorization cache or local list.
+  `ISO15118Ctrlr.CentralContractValidationAllowed` is registered and read (C07.FR.06), `false` by
+  default like every other capability-gated value, with a withheld chain logged rather than
+  silently dropped. 1.6J downgrades instead of refusing: its `Authorize` has no certificate
+  fields, so the eMAID goes as a plain `idTag` with a warning saying plainly that nothing
+  validated the contract. (B4.6)
+- **Capability propagation for ISO 15118 and display messages**: `iso15118_support` gained its
+  `CAPABILITY_GATES` row (`ISO15118Ctrlr`, charge-point-initiated so `has_handler: false`, no 1.6J
+  profile, and the component's required `ContractValidationOffline` variable) — B4.5 had wired
+  `Get15118EVCertificate` but left the capability out of the table, so a station with a PLC modem
+  advertised nothing and one without it left the component unknown rather than honestly
+  unavailable. It is the only gate whose capability is an enum; both non-`None` levels count as
+  support. `DisplayMessageCtrlr` now registers all five of its required variables rather than only
+  `DisplayMessages`: `SupportedPriorities`/`SupportedStates` are held in step with
+  `MessagePriority::ALL`/`MessageState::ALL` by a test, and `SupportedFormats` is seeded empty and
+  overwritten by `ChargePointBuilder::display_messages` from `Display::supported_formats`, which
+  is what that trait's docs already claimed happened. A CSMS can read the format and state limits
+  instead of discovering them through a refusal. (C3)
+- **Logging and personal-data redaction**: `IdToken` has a hand-written `Debug` that redacts the
+  card number, so anything containing one is safe to log by construction rather than by each call
+  site remembering. The new off-by-default **`unredacted-logs`** Cargo feature restores full values
+  for local bring-up against a bench CSMS; never ship an image with it on. Handlers carry
+  `#[instrument(skip_all)]`, log levels follow the rules now written down in `CLAUDE.md` (an 8 KiB
+  `{:?}` of `ChargePointState` belongs at `trace!`, not `info!`), and `tracing_test_support` makes
+  log level and content testable rather than conventional.
 - **`no_std` + `alloc` support**: `cargo check --no-default-features --lib` compiles under
   `#![no_std]`, backed by `embassy-sync` primitives (`src/sync.rs`) instead of `tokio::sync`;
   `tokio` is a fully optional dependency behind the `tokio-runtime` feature (in `default` for

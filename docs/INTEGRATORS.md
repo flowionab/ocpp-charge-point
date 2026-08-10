@@ -132,7 +132,7 @@ one — read those comments; this section only summarizes them.
   you keep on (see §3 for the piece that *does* change behaviour).
 
 All of the above are in `default`, plus `tokio-runtime`, `websocket`, and `std` (pulled in
-transitively). A plain `ocpp-charge-point = "0.x"` dependency is therefore the maximal build.
+transitively). A plain `ocpp-charge-point = "0.1"` dependency is therefore the maximal build.
 
 Suggested starting points (see `README.md`'s "Recommended feature set per hardware class"
 table for the full rationale per block — it's kept current there so it isn't duplicated here):
