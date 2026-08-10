@@ -21,6 +21,15 @@
 
 set -euo pipefail
 
+# The probe's flags live in tools/flash-probe/.cargo/config.toml - the `getrandom_backend="custom"`
+# cfg it cannot link without, and the linker script that gives it a memory layout. Cargo does not
+# merge `RUSTFLAGS` with `target.<triple>.rustflags`: an inherited `RUSTFLAGS` *replaces* them
+# wholesale, so the probe then fails in `getrandom` before reaching any of this crate's code. CI
+# sets `RUSTFLAGS: -D warnings` workflow-wide, which is exactly how that happened. Clearing it here
+# rather than in the workflow keeps the script correct however it is invoked; the crate itself is
+# still built with `-D warnings` by the `embedded` job's own steps, and this script only measures.
+unset RUSTFLAGS
+
 TARGET=thumbv7em-none-eabihf
 PROBE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/flash-probe" && pwd)"
 HOST="$(rustc -vV | sed -n 's/^host: //p')"

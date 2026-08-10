@@ -39,6 +39,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::alloc::{GlobalAlloc, Layout};
 use core::future::Future;
 use core::pin::Pin;
@@ -208,24 +209,24 @@ struct ProbeConnector;
 impl ChargePoint<ProbeEvse, ProbeConnector> for ProbeChargePoint {
     type StartError = core::convert::Infallible;
 
-    async fn vendor_name(&self) -> &str {
+    fn vendor_name(&self) -> &str {
         "Flash"
     }
 
-    async fn model_name(&self) -> &str {
+    fn model_name(&self) -> &str {
         "Probe"
     }
 
-    async fn evses(&self) -> &[ProbeEvse] {
+    fn evses(&self) -> &[ProbeEvse] {
         &self.evses
     }
 
-    async fn capabilities(&self) -> Capabilities {
+    fn capabilities(&self) -> Capabilities {
         Capabilities::default()
     }
 
     async fn start(
-        &self,
+        self: Arc<Self>,
         events: HardwareEventSender,
         mut commands: HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
@@ -243,7 +244,7 @@ impl ChargePoint<ProbeEvse, ProbeConnector> for ProbeChargePoint {
 impl Evse<ProbeConnector> for ProbeEvse {
     type Error = core::convert::Infallible;
 
-    async fn connectors(&self) -> &[ProbeConnector] {
+    fn connectors(&self) -> &[ProbeConnector] {
         &self.connectors
     }
 
@@ -272,7 +273,7 @@ impl Connector for ProbeConnector {
         Ok(())
     }
 
-    async fn set_current_limit(&self, _limit_ma: u32) -> Result<(), Self::Error> {
+    async fn set_current_limit(&self, _limit_ma: Option<u32>) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -307,12 +308,14 @@ mod transport {
 
         fn ping<'a>(
             &'a mut self,
+            _payload: alloc::vec::Vec<u8>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
         }
 
         fn pong<'a>(
             &'a mut self,
+            _payload: alloc::vec::Vec<u8>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
         }
@@ -454,6 +457,7 @@ fn wire_ocpp_2_1(actor: &ChargePointActor) {
             authorization_requests,
             &authorizer,
             authorization_actor,
+            &Probe,
         )
         .await;
     }));
@@ -577,6 +581,7 @@ fn wire_ocpp_2_0_1(actor: &ChargePointActor) {
             authorization_requests,
             &authorizer,
             authorization_actor,
+            &Probe,
         )
         .await;
     }));
@@ -695,6 +700,7 @@ fn wire_ocpp_1_6(actor: &ChargePointActor) {
             authorization_requests,
             &authorizer,
             authorization_actor,
+            &Probe,
         )
         .await;
     }));

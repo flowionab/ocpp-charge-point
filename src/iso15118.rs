@@ -71,19 +71,28 @@
 
 use alloc::boxed::Box;
 
-use crate::hardware::{
-    Iso15118CertificateRequest, Iso15118CertificateResult, Iso15118CertificateStatus,
-    Iso15118Controller, Iso15118SupportLevel,
-};
+use crate::hardware::{Iso15118CertificateRequest, Iso15118CertificateResult, Iso15118Controller};
+// Used only by the version adapters below, so imported under the same gate they are - see
+// `iso15118_supported`'s note for why the three helpers are gated at all.
+#[cfg(any(feature = "ocpp_2_1", feature = "ocpp_2_0_1"))]
+use crate::hardware::{Iso15118CertificateStatus, Iso15118SupportLevel};
 
 /// Whether this charge point should attempt `Get15118EVCertificate` at all, per the module docs'
 /// capability gating.
+///
+/// This and the two helpers below are shared by the 2.1 and 2.0.1 adapters and used by nothing
+/// else, so they carry the same gate the adapter modules do (matching `crate::security`'s
+/// `wire_type`/`oversized_event_type`). Without it, `--features iso15118` with neither version
+/// feature on - a combination `cargo hack --each-feature` builds in CI - compiles this module with
+/// no consumer for them and fails on `dead_code` under the workspace's `-D warnings`.
+#[cfg(any(feature = "ocpp_2_1", feature = "ocpp_2_0_1"))]
 fn iso15118_supported(capabilities: &crate::hardware::Capabilities) -> bool {
     capabilities.iso15118_support != Iso15118SupportLevel::None
 }
 
 /// The result of refusing a `Get15118EVCertificate` locally: `Failed`, with no EXI payload and no
 /// contract count, because no CSMS was ever asked.
+#[cfg(any(feature = "ocpp_2_1", feature = "ocpp_2_0_1"))]
 fn refused_locally() -> Iso15118CertificateResult {
     Iso15118CertificateResult {
         status: Iso15118CertificateStatus::Failed,
@@ -95,6 +104,7 @@ fn refused_locally() -> Iso15118CertificateResult {
 /// Delivers `result` to `controller`, logging (rather than propagating) a failure: the CSMS
 /// round trip already completed by the time this runs, so a local delivery problem is reported
 /// but does not turn a successful OCPP exchange into an error.
+#[cfg(any(feature = "ocpp_2_1", feature = "ocpp_2_0_1"))]
 async fn deliver<C: Iso15118Controller>(controller: &C, result: &Iso15118CertificateResult) {
     if let Err(err) = controller.deliver_certificate_response(result).await {
         tracing::warn!(

@@ -169,6 +169,16 @@ Nothing here breaks an earlier *release*, because there was none.
 
 ### Fixed
 
+- **`--features iso15118` with neither `ocpp_2_0_1` nor `ocpp_2_1` failed to compile.** The
+  module's three shared helpers are used only by its version adapters, so with both adapters gated
+  out they tripped `dead_code` under `-D warnings`. They now carry the same `cfg` the adapters do.
+- **The flash figures in [`docs/MEMORY.md`](docs/MEMORY.md), the README and the roadmap were
+  measured against a stale `ocpp-client`.** `tools/flash-probe` — a separate workspace, so it
+  resolves its own direct dependency — still pinned 0.2.1 after the library moved to 0.5.0, which
+  put both majors in one graph and stopped the probe building at all. Bumped to 0.5.0, brought the
+  probe up to the current hardware traits, and re-measured every row: the version-independent core
+  is 92 KB (not 32 KB) and all three protocol versions together are 558 KB, which no longer fits a
+  512 KB part before a transport and TLS.
 - Migrated `ocpp-client` 0.2.2 → 0.5.0 (`ocpp-types` 0.1.3 → 0.3.0) in one change — see
   [`docs/MIGRATION-ocpp-client-0.4.md`](docs/MIGRATION-ocpp-client-0.4.md) for the measured diff.
   Closed **A4** (WebSocket keepalive, `crate::keepalive` driving `OCPPCommCtrlr.WebSocketPingInterval`

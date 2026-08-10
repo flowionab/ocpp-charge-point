@@ -206,42 +206,50 @@ scripts/flash-cost.sh          # the whole table
 scripts/flash-cost.sh --quick  # core + everything, what CI runs
 ```
 
+Measured 2026-08-10, against `ocpp-client` 0.5.0. The previous table on this page
+was measured while `tools/flash-probe` still pinned `ocpp-client` 0.2.1 — a skew
+that had gone unnoticed because it made the probe fail to build, and the build
+failure was masked by an earlier one in the same CI step. Every row below is
+larger than that table's, which is what re-measuring against the version the
+library actually depends on costs.
+
 | Feature set | Flash | vs core |
 | --- | --- | --- |
-| Core, no protocol version | 32 KB | — |
-| Core + OCPP 1.6J | 174 KB | +141 KB |
-| Core + OCPP 2.0.1 | 224 KB | +191 KB |
-| Core + OCPP 2.1 | 310 KB | +277 KB |
-| Core + all three versions | 474 KB | +441 KB |
-| Core + 2.1 + `reservation` | 320 KB | +10 KB over 2.1 |
-| Core + 2.1 + `local-auth-list` | 322 KB | +12 KB over 2.1 |
-| Core + 2.1 + `tariff-cost` | 315 KB | +5 KB over 2.1 |
-| Core + 2.1 + the 11 declared-capability features | 311 KB | +1 KB over 2.1 |
-| Everything | 523 KB | +490 KB |
+| Core, no protocol version | 92 KB | — |
+| Core + OCPP 1.6J | 247 KB | +154 KB |
+| Core + OCPP 2.0.1 | 297 KB | +204 KB |
+| Core + OCPP 2.1 | 384 KB | +292 KB |
+| Core + all three versions | 558 KB | +466 KB |
+| Core + 2.1 + `reservation` | 396 KB | +12 KB over 2.1 |
+| Core + 2.1 + `local-auth-list` | 398 KB | +14 KB over 2.1 |
+| Core + 2.1 + `tariff-cost` | 390 KB | +6 KB over 2.1 |
+| Core + 2.1 + the 11 declared-capability features | 385 KB | +1 KB over 2.1 |
+| Everything | 612 KB | +520 KB |
 
 "Core" is the version-independent charge point: the state machine, the actor, the
 hardware binding and dispatch, and every functional block that isn't
-feature-gated. **32 KB** — that part is small.
+feature-gated. **92 KB** — that part is small.
 
 ### What this tells you
 
 **The protocol version is the decision that matters.** A 2.1-only charge point is
-310 KB; supporting all three versions is 474 KB, so the second and third version
-cost **+164 KB** on top of 2.1 alone (less than the 609 KB the three would sum to,
+384 KB; supporting all three versions is 558 KB, so the second and third version
+cost **+174 KB** on top of 2.1 alone (less than the 650 KB the three would sum to,
 because they share this crate's internal model and much of `ocpp-types`). On a
-512 KB part, all-three-versions plus TLS plus your own application is a tight fit;
-a single negotiated version is the lever to pull first, and it's a one-line
-feature change.
+512 KB part, all three versions **do not fit at all** before you add TLS, a
+transport or your own application — 2.1 alone leaves ~128 KB of that part for
+everything else, and 1.6J-only leaves ~265 KB. A single negotiated version is the
+lever to pull first, and it's a one-line feature change.
 
 The per-version figure is the *whole* wire stack — this crate's adapters plus the
 `ocpp-client` code and `ocpp-types`/`serde` monomorphizations they pull in —
 because that is what a charge point must flash to speak the version at all. Don't
-read it as "this crate's adapter code is 277 KB"; the split isn't cleanly
+read it as "this crate's adapter code is 292 KB"; the split isn't cleanly
 attributable, since the codecs are only reachable *because* the adapters name
 those message types. `cargo bloat` on the probe is the tool if you want to see
 inside the number.
 
-**The functional-block features are cheap: 5–12 KB each.** Reservation, local
+**The functional-block features are cheap: 6–14 KB each.** Reservation, local
 authorization list and tariff/cost are genuinely feature-gated, so a charge point
 that doesn't need one doesn't flash it.
 

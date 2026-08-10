@@ -19,7 +19,11 @@ path = "src/main.rs"
 # `scripts/flash-cost.sh` turns individual features on from the outside, one feature set per
 # measurement.
 ocpp-charge-point = { path = "../..", default-features = false }
-ocpp-client = { version = "0.2.1", default-features = false }
+# Must track the version `ocpp-charge-point` itself depends on. This is a separate workspace, so
+# its direct `ocpp-client` resolves independently: left at 0.2.1 after the library moved to 0.5.0,
+# cargo pulled both majors into one graph and the probe passed a 0.2 `Client` to a library
+# expecting a 0.5 one - 74 errors that read as missing methods rather than as a version skew.
+ocpp-client = { version = "0.5.0", default-features = false }
 chrono = { version = "0.4", default-features = false }
 critical-section = { version = "1", features = ["restore-state-bool"] }
 async-trait = "0.1"

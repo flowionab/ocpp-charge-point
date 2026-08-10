@@ -3177,25 +3177,25 @@ All 21 event types in the vendored appendix are modelled, and OCPP's
 
       | Feature set | Flash | vs core |
       | --- | --- | --- |
-      | Core, no protocol version | 32 KB | - |
-      | Core + 1.6J | 174 KB | +141 KB |
-      | Core + 2.0.1 | 224 KB | +191 KB |
-      | Core + 2.1 | 310 KB | +277 KB |
-      | Core + all three versions | 474 KB | +441 KB |
-      | Core + 2.1 + `reservation` | 320 KB | +10 KB over 2.1 |
-      | Core + 2.1 + `local-auth-list` | 322 KB | +12 KB over 2.1 |
-      | Core + 2.1 + `tariff-cost` | 315 KB | +5 KB over 2.1 |
-      | Core + 2.1 + the 11 declared-capability features | 311 KB | +1 KB over 2.1 |
-      | Everything | 523 KB | +490 KB |
+      | Core, no protocol version | 92 KB | - |
+      | Core + 1.6J | 247 KB | +154 KB |
+      | Core + 2.0.1 | 297 KB | +204 KB |
+      | Core + 2.1 | 384 KB | +292 KB |
+      | Core + all three versions | 558 KB | +466 KB |
+      | Core + 2.1 + `reservation` | 396 KB | +12 KB over 2.1 |
+      | Core + 2.1 + `local-auth-list` | 398 KB | +14 KB over 2.1 |
+      | Core + 2.1 + `tariff-cost` | 390 KB | +6 KB over 2.1 |
+      | Core + 2.1 + the 11 declared-capability features | 385 KB | +1 KB over 2.1 |
+      | Everything | 612 KB | +520 KB |
 
       **What it says about [C1](#51-c1--cargo-feature-per-functional-block).**
-      The version-independent core is small (32 KB); the negotiated protocol
+      The version-independent core is small (92 KB); the negotiated protocol
       version dominates everything else, and the second and third version cost
-      +164 KB on top of 2.1 alone - so on a 512 KB part, "which versions do we
-      speak" is the flash decision, and a single-version build is the first
-      lever. The three functional blocks that are *genuinely* feature-gated
-      today are cheap and behave exactly as C1 intends: 5-12 KB each, absent if
-      unused. The other eleven capability features cost ~1 KB **in total**, and
+      +174 KB on top of 2.1 alone - so on a 512 KB part, "which versions do we
+      speak" is the flash decision (all three no longer fit one at all), and a
+      single-version build is the first lever. The three functional blocks that
+      are *genuinely* feature-gated today are cheap and behave exactly as C1
+      intends: 6-14 KB each, absent if unused. The other eleven capability features cost ~1 KB **in total**, and
       the honest reading is not "they're free" but "there is nothing behind them
       yet" - they are capability declarations whose functional blocks (workstream
       B) aren't implemented. Each should grow a real number as its block lands,
