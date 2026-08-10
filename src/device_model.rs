@@ -419,12 +419,12 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         value: "false",
         mutability: VariableMutability::ReadOnly,
     },
-    // `ISO15118Ctrlr`'s single required variable (B4.5), gated by
-    // `Capabilities::iso15118_support`. The appendix lists sixteen more for this component
-    // (`SeccId`, `PnCEnabled`, `ProtocolSupported`, ...) and every one of them is optional and
-    // describes the *HLC stack*, which lives behind `hardware::Iso15118Controller` rather than in
-    // this crate - registering guesses at them would advertise a session state machine this crate
-    // does not own (see `crate::iso15118`'s "what this crate does and does not do").
+    // `ISO15118Ctrlr`'s required variable (B4.5) and the one optional one this crate can act on
+    // (B4.6), both gated by `Capabilities::iso15118_support`. The appendix lists fifteen further
+    // optional variables (`SeccId`, `PnCEnabled`, `ProtocolSupported`, ...) which describe the
+    // *HLC stack*, living behind `hardware::Iso15118Controller` rather than in this crate -
+    // registering guesses at them would advertise a session state machine this crate does not own
+    // (see `crate::iso15118`'s "what this crate does and does not do").
     CapabilityGatedVariable {
         component: "ISO15118Ctrlr",
         variable: "ContractValidationOffline",
@@ -437,6 +437,24 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // why the spec's `ReadWrite` mutability is kept rather than narrowed to `ReadOnly`:
         // OCPP 2.1 Part 2 §2.15.3 defines it as a configuration variable, and a station that
         // refused the write would misreport a stack limitation as a spec deviation.
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "ISO15118Ctrlr",
+        variable: "CentralContractValidationAllowed",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        // Optional in the appendix, but registered because this crate *acts* on it: it is the
+        // C07.FR.06 switch deciding whether a contract certificate chain this charge point cannot
+        // validate may be forwarded to the CSMS to validate instead (see
+        // `crate::authorization`'s contract-authorization path).
+        //
+        // `false`, conservatively, like every other capability-gated default - but note what that
+        // costs here: this crate can *never* validate a contract certificate locally, so a
+        // station left at `false` asks the CSMS to decide from the OCSP data alone. Turning it on
+        // is how an operator enables full Plug & Charge; the withheld chain is logged each time
+        // so the misconfiguration is visible rather than silent.
         value: "false",
         mutability: VariableMutability::ReadWrite,
     },
@@ -905,12 +923,19 @@ mod tests {
             Iso15118SupportLevel::Iso15118_2,
             Iso15118SupportLevel::Iso15118_20,
         ] {
-            assert!(
-                registered(level)
-                    .iter()
-                    .any(|(_, name)| name == "ContractValidationOffline"),
-                "ISO15118Ctrlr.ContractValidationOffline should arrive with {level:?}"
-            );
+            for variable in [
+                // B4.5: the component's one *required* variable.
+                "ContractValidationOffline",
+                // B4.6: optional in the appendix, but the switch the contract-authorization path
+                // reads before forwarding a chain to the CSMS - a variable this crate acts on
+                // must be one a CSMS can see and set.
+                "CentralContractValidationAllowed",
+            ] {
+                assert!(
+                    registered(level).iter().any(|(_, name)| name == variable),
+                    "ISO15118Ctrlr.{variable} should arrive with {level:?}"
+                );
+            }
         }
 
         // No support declared: `Available: false` and nothing else - a charge point with no PLC

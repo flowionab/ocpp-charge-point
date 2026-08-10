@@ -6,6 +6,7 @@ mod charge_point_state;
 mod charging_profile;
 mod connector_state;
 mod connector_status;
+mod contract_certificate;
 mod der_control;
 mod device_model;
 mod display_message;
@@ -44,6 +45,7 @@ pub use self::charging_profile::{
 };
 pub use self::connector_state::ConnectorState;
 pub use self::connector_status::ConnectorStatus;
+pub use self::contract_certificate::{ContractCertificate, ContractCertificateStatus};
 pub use self::der_control::{
     AfrrSignal, DERControlId, DERControlKind, DERControlQuery, DERControlRejection,
     DERControlSettings, DERControlStore, DERCurvePoint, DERCurveSettings, DERUnit,

@@ -782,8 +782,14 @@ impl ChargePointState {
             ConnectorEvent::ResetRequested => Some(StopReason::Reset),
             _ => None,
         };
+        // Both presentations authorize an identifier; only the Plug & Charge one carries
+        // certificate material with it (see `ConnectorEvent::ContractCertificatePresented`).
         let presented_id_token = match &event {
-            ConnectorEvent::IdTokenPresented(id_token) => Some(id_token.clone()),
+            ConnectorEvent::IdTokenPresented(id_token) => Some((id_token.clone(), None)),
+            ConnectorEvent::ContractCertificatePresented {
+                id_token,
+                certificate,
+            } => Some((id_token.clone(), Some(certificate.clone()))),
             _ => None,
         };
         let authorized_id_token = match &event {
@@ -889,13 +895,14 @@ impl ChargePointState {
             ));
         }
         if new_state == ConnectorState::Authorizing
-            && let Some(id_token) = presented_id_token
+            && let Some((id_token, contract)) = presented_id_token
         {
             effects.push(ChargePointEffect::AuthorizationRequested(
                 AuthorizationRequested {
                     evse_id,
                     connector_id,
                     id_token,
+                    contract,
                 },
             ));
         }
@@ -1676,9 +1683,54 @@ mod tests {
                 evse_id: 0,
                 connector_id: 0,
                 id_token: test_id_token(),
+                contract: None,
             }
         )));
         assert_eq!(state.evses[0].transactions[0], None);
+    }
+
+    /// C07: a Plug & Charge presentation reaches `Authorizing` exactly like a card tap, and the
+    /// certificate material rides along to the Authorize rather than being kept somewhere the
+    /// authorization path would have to go looking for it.
+    #[test]
+    fn presenting_a_contract_certificate_requests_authorization_carrying_it() {
+        use crate::hardware::{CertificateHashData, HashAlgorithm, OcspCertificateId};
+        use crate::state::ContractCertificate;
+
+        let certificate = ContractCertificate {
+            chain_pem: Some("-----BEGIN CERTIFICATE-----".into()),
+            ocsp_data: alloc::vec![OcspCertificateId {
+                hash_data: CertificateHashData {
+                    hash_algorithm: HashAlgorithm::Sha256,
+                    issuer_name_hash: "a".into(),
+                    issuer_key_hash: "b".into(),
+                    serial_number: "01".into(),
+                },
+                responder_url: "http://ocsp.example.com".into(),
+            }],
+        };
+
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::ContractCertificatePresented {
+                id_token: test_id_token(),
+                certificate: certificate.clone(),
+            },
+        );
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Authorizing);
+        assert!(effects.contains(&ChargePointEffect::AuthorizationRequested(
+            AuthorizationRequested {
+                evse_id: 0,
+                connector_id: 0,
+                id_token: test_id_token(),
+                contract: Some(certificate),
+            }
+        )));
     }
 
     #[test]

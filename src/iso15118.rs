@@ -25,6 +25,16 @@
 //! [`crate::hardware::NoIso15118Controller`] in instead and never calls it at all - see that
 //! trait's module docs for the full boundary.
 //!
+//! # Relationship to Plug & Charge *authorization* (B4.6)
+//!
+//! This module gets a contract certificate *onto* the vehicle. Using one to authorize a charging
+//! session afterwards is OCPP use case C07 and lives in [`crate::authorization`]: the HLC stack
+//! presents the eMAID and the certificate material together via
+//! [`crate::state::ConnectorEvent::ContractCertificatePresented`],
+//! and the `Authorize` that follows carries them to the CSMS. The two halves are independent -
+//! a vehicle whose contract certificate was installed at some other charge point authorizes here
+//! without this module ever being called.
+//!
 //! # Relationship to `V2GCertificate` (B4.3)
 //!
 //! [`crate::certificates::CertificateSigningPurpose::V2GCertificate`] is a *different*

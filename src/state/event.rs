@@ -7,14 +7,14 @@ use crate::hardware::Capabilities;
 use crate::state::{
     AuthorizationCacheEntry, AuthorizationStatus, BatterySwapEvent, ChargingLimitSource,
     ChargingProfile, ChargingProfileCriteria, ChargingProfileId, ChargingProfileScope, Component,
-    ConnectorState, ConnectorStatus, DERControlQuery, DeviceModelEvent, DisplayMessageId,
-    DisplayedMessage, EVChargingNeeds, EVChargingScheduleReport, ExternalChargingLimit, IdToken,
-    InstalledChargingProfile, InstalledDERControl, LocalListEntry, MeterSample,
-    NetworkConnectionProfile, NetworkProfileSlot, PendingBatterySwap, PeriodicEventStreamId,
-    PeriodicEventStreamParams, RegistrationStatus, Reservation, ReservationId, ResetKind,
-    ResetTarget, SecurityEvent, SmartChargingNotification, StopReason, Tariff, TariffClearCriteria,
-    TariffScope, Transaction, TransactionId, TriggeredMonitor, Variable, VariableAttributeType,
-    VariableMonitorId, VariableMonitoringEvent,
+    ConnectorState, ConnectorStatus, ContractCertificate, DERControlQuery, DeviceModelEvent,
+    DisplayMessageId, DisplayedMessage, EVChargingNeeds, EVChargingScheduleReport,
+    ExternalChargingLimit, IdToken, InstalledChargingProfile, InstalledDERControl, LocalListEntry,
+    MeterSample, NetworkConnectionProfile, NetworkProfileSlot, PendingBatterySwap,
+    PeriodicEventStreamId, PeriodicEventStreamParams, RegistrationStatus, Reservation,
+    ReservationId, ResetKind, ResetTarget, SecurityEvent, SmartChargingNotification, StopReason,
+    Tariff, TariffClearCriteria, TariffScope, Transaction, TransactionId, TriggeredMonitor,
+    Variable, VariableAttributeType, VariableMonitorId, VariableMonitoringEvent,
 };
 
 /// An event applied to [`crate::state::ChargePointState`], driving its state machine forward.
@@ -541,6 +541,7 @@ impl ConnectorEvent {
             Self::LockConfirmed { .. } => "LockConfirmed",
             Self::UnlockConfirmed { .. } => "UnlockConfirmed",
             Self::IdTokenPresented { .. } => "IdTokenPresented",
+            Self::ContractCertificatePresented { .. } => "ContractCertificatePresented",
             Self::ChargingAuthorized { .. } => "ChargingAuthorized",
             Self::AuthorizationDenied { .. } => "AuthorizationDenied",
             Self::ContactorClosed { .. } => "ContactorClosed",
@@ -620,6 +621,20 @@ pub enum ConnectorEvent {
     /// The driver/EV presented an identifier while the connector is locked; the Authorization
     /// functional block asks the CSMS whether it may start charging.
     IdTokenPresented(IdToken),
+    /// The EV presented an ISO 15118 contract certificate while the connector is locked - Plug &
+    /// Charge, OCPP use case C07. Behaves exactly like [`Self::IdTokenPresented`] with the eMAID
+    /// as the identifier, and additionally carries the certificate material the CSMS validates
+    /// the contract with (see [`ContractCertificate`]).
+    ///
+    /// Sent by the integrator's ISO 15118 stack, which is the only thing that ever sees a
+    /// `CertificateInstallationRes` - this crate neither speaks that protocol nor parses what it
+    /// carries (see [`crate::iso15118`]).
+    ContractCertificatePresented {
+        /// The eMAID from the contract certificate, as the identifier being authorized.
+        id_token: IdToken,
+        /// The certificate material to validate it against.
+        certificate: ContractCertificate,
+    },
     /// The CSMS accepted the presented identifier (or, for the moment, some other decision
     /// producing the same effect - see `docs/ROADMAP.md` §3). Carries the identifier that was
     /// authorized, recorded on the [`Transaction`] this starts.
@@ -835,6 +850,15 @@ pub struct AuthorizationRequested {
     pub connector_id: usize,
     /// The identifier that was presented.
     pub id_token: IdToken,
+    /// The ISO 15118 contract certificate presented with it, for a Plug & Charge authorization
+    /// (OCPP use case C07) - `None` for every other way an identifier arrives, which is most of
+    /// them: a card, an app, a remote start.
+    ///
+    /// Its presence changes the decision rules, not just the request:
+    /// [`crate::authorization::run_authorization_requests`] will not fall back to the
+    /// authorization cache or local list for a contract token when the CSMS is unreachable
+    /// (C07.FR.07).
+    pub contract: Option<ContractCertificate>,
 }
 
 /// A connector's [`ConnectorStatus`] changed, reported to the CSMS via StatusNotification.

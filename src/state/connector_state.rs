@@ -98,6 +98,11 @@ impl ConnectorState {
             (Self::Reserved, ConnectorEvent::ReservationExpired) => (Self::Available, None),
             (Self::Connected, ConnectorEvent::LockConfirmed) => (Self::Locked, None),
             (Self::Locked, ConnectorEvent::IdTokenPresented(_)) => (Self::Authorizing, None),
+            // Plug & Charge takes the identical path: the certificate changes who can answer the
+            // authorization question, not what the connector is waiting for while they do.
+            (Self::Locked, ConnectorEvent::ContractCertificatePresented { .. }) => {
+                (Self::Authorizing, None)
+            }
             (Self::Locked, ConnectorEvent::RemoteUnlockRequested) => {
                 (Self::Unlocking, Some(ConnectorCommand::Unlock))
             }

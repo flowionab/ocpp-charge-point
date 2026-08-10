@@ -1515,7 +1515,13 @@ Plug-and-charge certificate handling for EVs.
   15118 support at the hardware/communication controller level.
 - Status: ✅ **as far as OCPP reaches** - `Get15118EVCertificate` is wired on
   2.0.1 and 2.1 (B4.5, `crate::iso15118`), and `GetCertificateStatus` (B4.4) and
-  `InstallCertificate` (B4.2) came with the certificate block. The hardware
+  `InstallCertificate` (B4.2) came with the certificate block. **Authorizing a
+  driver with a contract certificate** - the other half of Plug & Charge, OCPP
+  use case C07 - is wired too (B4.6, `crate::authorization`): the eMAID and its
+  certificate material go out on `Authorize`, both halves of the CSMS's answer
+  are honoured, and an offline contract presentation is refused rather than
+  answered from the cache (C07.FR.07). 1.6J downgrades to a bare eMAID with a
+  warning, since its `Authorize` has no certificate fields. The hardware
   capability detection this entry anticipated is `Capabilities::iso15118_support`
   (`Iso15118SupportLevel::None`/`Iso15118_2`/`Iso15118_20`): a station with no PLC
   modem never sends the message and reports `ISO15118Ctrlr` unavailable, and one

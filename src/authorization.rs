@@ -20,12 +20,34 @@
 //! compile-time policy - and each is registered as a built-in default rather than left absent
 //! with a guessed fallback, so "what will you do offline?" is a question the CSMS can actually
 //! ask.
+//!
+//! # Plug & Charge (OCPP use case C07)
+//!
+//! An identifier that arrived with an ISO 15118 contract certificate takes a different path
+//! through this module, in both directions (`docs/PRODUCTION-ROADMAP.md` B4.6):
+//!
+//! - **Online**, the `Authorize` additionally carries the eMAID's certificate material -
+//!   [`ContractCertificate`] - and the CSMS answers about the certificate *and* the token. Both
+//!   must be positive; see [`ContractAuthorization::accepted`].
+//! - **Offline, the fallback above does not apply.** C07.FR.07 requires a charge point that
+//!   cannot reach the CSMS to refuse a contract presentation outright unless
+//!   `ISO15118Ctrlr`/`ContractValidationOffline` is set *and* it can validate the certificate
+//!   itself - which this crate never can, since it does no X.509 parsing. So a Plug & Charge
+//!   presentation is denied when the link is down, even for an eMAID sitting accepted in the
+//!   cache or the local list. That is not this crate being cautious beyond the spec: accepting
+//!   would mean starting a transaction on a contract nobody checked for revocation.
+//!
+//! The certificate itself is produced by the integrator's ISO 15118 stack, which presents it via
+//! [`crate::state::ConnectorEvent::ContractCertificatePresented`]
+//! on the same [`crate::hardware::HardwareEventSender`] every other hardware observation arrives
+//! on. This crate never parses it - see [`crate::iso15118`] for where that boundary sits.
 
 use crate::actor::ChargePointActor;
 use crate::clock::{Clock, is_synchronized};
 use crate::state::{
     AuthorizationRequested, AuthorizationStatus, ChargePointEvent, ChargePointState, Component,
-    ConnectorEvent, EvseEvent, IdToken, Variable, VariableAttributeType,
+    ConnectorEvent, ContractCertificate, ContractCertificateStatus, EvseEvent, IdToken, Variable,
+    VariableAttributeType,
 };
 use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
@@ -118,6 +140,41 @@ pub fn offline_decision(
     }
 }
 
+/// What the CSMS answered a Plug & Charge `Authorize` with: its decision about the eMAID, and -
+/// separately - what it made of the contract certificate (OCPP use case C07).
+///
+/// Two answers rather than one because OCPP really does send two, and they are not redundant:
+/// C07.FR.14's note points out a perfectly valid certificate can still be refused on the token
+/// (`ConcurrentTx`, `NotAtThisLocation`), and C07.FR.13 covers the reverse - a valid certificate
+/// whose contract has been cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractAuthorization {
+    /// The CSMS's decision about the eMAID, from `idTokenInfo.status`.
+    pub status: AuthorizationStatus,
+    /// What the CSMS made of the certificate, from `AuthorizeResponse.certificateStatus`.
+    ///
+    /// `None` means the CSMS expressed no opinion - which is the normal answer when no
+    /// certificate material was sent for it to have one about, and the only possible answer from
+    /// a 1.6J CSMS (see this module's `ocpp_1_6` adapter).
+    pub certificate_status: Option<ContractCertificateStatus>,
+}
+
+impl ContractAuthorization {
+    /// Whether charging may start: the eMAID was accepted **and** the certificate was not
+    /// rejected.
+    ///
+    /// Both halves are checked even though C07.FR.13-17 say the CSMS always makes them agree - a
+    /// station that trusted that pairing would start charging on a revoked contract the moment
+    /// one CSMS got it wrong, and the check that prevents that costs nothing. An absent
+    /// `certificate_status` is not a rejection: it means nothing was asked about (see that
+    /// field).
+    #[must_use]
+    pub fn accepted(&self) -> bool {
+        self.status == AuthorizationStatus::Accepted
+            && !matches!(self.certificate_status, Some(status) if status != ContractCertificateStatus::Accepted)
+    }
+}
+
 /// Decides whether an [`IdToken`] may start charging, via Authorize. Implemented per protocol
 /// version (see the `ocpp_2_1` module), mirroring
 /// [`crate::availability::StatusNotifier`].
@@ -129,6 +186,39 @@ pub trait Authorizer {
 
     /// Asks the CSMS whether `id_token` may start charging.
     async fn authorize(&self, id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error>;
+
+    /// Asks the CSMS whether `id_token` may start charging, presenting the ISO 15118 contract
+    /// certificate it came from for validation (OCPP use case C07, `docs/PRODUCTION-ROADMAP.md`
+    /// B4.6).
+    ///
+    /// `contract`'s [`chain_pem`](ContractCertificate::chain_pem) has already been cleared by
+    /// [`run_authorization_requests`] if `ISO15118Ctrlr.CentralContractValidationAllowed` forbids
+    /// sending it (C07.FR.06) - an implementation sends what it is given and makes no policy
+    /// decision of its own.
+    ///
+    /// # Default implementation
+    ///
+    /// Refuses, locally, without asking anyone. A CSMS connection that has not implemented this
+    /// cannot convey the certificate, and an `Authorize` carrying only the eMAID would ask the
+    /// CSMS a question it cannot answer correctly - it would have to decide on an identifier
+    /// whose contract nobody checked. Refusing mirrors
+    /// [`crate::hardware::NoIso15118Controller`]'s honest refusal, and leaves
+    /// `certificate_status` `None` rather than inventing a verdict no CSMS gave.
+    async fn authorize_contract(
+        &self,
+        id_token: &IdToken,
+        contract: &ContractCertificate,
+    ) -> Result<ContractAuthorization, Self::Error> {
+        let _ = (id_token, contract);
+        tracing::warn!(
+            "this CSMS connection cannot carry an ISO 15118 contract certificate; refusing the \
+             Plug & Charge authorization rather than asking on the eMAID alone"
+        );
+        Ok(ContractAuthorization {
+            status: AuthorizationStatus::Rejected,
+            certificate_status: None,
+        })
+    }
 }
 
 /// The outcome of a CSMS-initiated `ClearCache`, matching OCPP's `ClearCacheStatusEnum` (2.x) /
@@ -183,7 +273,7 @@ pub trait ClearCacheHandler {
 /// time the link drops. `clock` stamps those entries; an unsynchronized reading is recorded as
 /// `None`, which makes the entry non-expiring rather than fabricating an age (see
 /// [`crate::state::AuthorizationCacheEntry::cached_at`]).
-pub async fn run_authorization_requests<A: Authorizer, C: Clock>(
+pub async fn run_authorization_requests<A: Authorizer + Sync, C: Clock>(
     mut requests: BroadcastReceiver<AuthorizationRequested>,
     authorizer: &A,
     actor: ChargePointActor,
@@ -192,24 +282,10 @@ pub async fn run_authorization_requests<A: Authorizer, C: Clock>(
     while let Ok(requested) = requests.recv().await {
         let now = clock.now();
         let now = is_synchronized(&now).then_some(now);
-        let decision = match authorizer.authorize(&requested.id_token).await {
-            Ok(status) => {
-                let _ = actor
-                    .send(ChargePointEvent::AuthorizationCached {
-                        id_token: requested.id_token.clone(),
-                        status,
-                        cached_at: now,
-                    })
-                    .await;
-                status
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "authorization request failed; falling back to offline authorization"
-                );
-                offline_decision(&actor.state(), &requested.id_token, now)
-            }
+        let decision = if let Some(contract) = requested.contract.clone() {
+            contract_decision(authorizer, &actor, &requested.id_token, contract, now).await
+        } else {
+            plain_decision(authorizer, &actor, &requested.id_token, now).await
         };
         let event = match decision {
             AuthorizationStatus::Accepted => {
@@ -227,6 +303,129 @@ pub async fn run_authorization_requests<A: Authorizer, C: Clock>(
             })
             .await;
     }
+}
+
+/// The ordinary (card, app, EIM) authorization decision: ask the CSMS, remember what it said, and
+/// fall back to [`offline_decision`] if the call itself failed.
+async fn plain_decision<A: Authorizer + Sync>(
+    authorizer: &A,
+    actor: &ChargePointActor,
+    id_token: &IdToken,
+    now: Option<DateTime<Utc>>,
+) -> AuthorizationStatus {
+    match authorizer.authorize(id_token).await {
+        Ok(status) => {
+            cache_decision(actor, id_token, status, now).await;
+            status
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "authorization request failed; falling back to offline authorization"
+            );
+            offline_decision(&actor.state(), id_token, now)
+        }
+    }
+}
+
+/// The Plug & Charge decision (OCPP use case C07), which differs from [`plain_decision`] in both
+/// directions.
+///
+/// Online, acceptance needs the CSMS to be happy with the certificate as well as the eMAID - see
+/// [`ContractAuthorization::accepted`].
+///
+/// Offline, there is **no fallback at all**: C07.FR.07 requires a charge point to refuse charging
+/// when it cannot reach the CSMS and `ISO15118Ctrlr.ContractValidationOffline` is false, and
+/// FR.08-09 only permit the cache/local-list path after the station has *itself* validated the
+/// contract certificate. This crate never can (no X.509 parsing - see
+/// [`crate::hardware::CertificateHashData`]), so the answer is refusal either way; the variable
+/// is still read so the log names the reason a CSMS could have configured differently.
+async fn contract_decision<A: Authorizer + Sync>(
+    authorizer: &A,
+    actor: &ChargePointActor,
+    id_token: &IdToken,
+    contract: ContractCertificate,
+    now: Option<DateTime<Utc>>,
+) -> AuthorizationStatus {
+    let contract = withhold_chain_unless_allowed(&actor.state(), contract);
+    match authorizer.authorize_contract(id_token, &contract).await {
+        Ok(authorization) => {
+            let status = if authorization.accepted() {
+                AuthorizationStatus::Accepted
+            } else {
+                AuthorizationStatus::Rejected
+            };
+            if let Some(certificate_status) = authorization.certificate_status {
+                tracing::debug!(
+                    certificate_status = certificate_status.name(),
+                    "the CSMS reported a contract certificate status"
+                );
+            }
+            cache_decision(actor, id_token, status, now).await;
+            status
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                contract_validation_offline = boolean_variable(
+                    &actor.state(),
+                    "ISO15118Ctrlr",
+                    "ContractValidationOffline",
+                    false,
+                ),
+                "a Plug & Charge authorization could not reach the CSMS; refusing rather than \
+                 falling back offline, because this charge point cannot validate a contract \
+                 certificate itself"
+            );
+            AuthorizationStatus::Rejected
+        }
+    }
+}
+
+/// Clears the PEM chain unless `ISO15118Ctrlr.CentralContractValidationAllowed` permits sending it
+/// (C07.FR.06), warning when it does not - a station whose HLC stack supplies a chain that is
+/// then withheld will very likely be refused by the CSMS, and the operator should be able to see
+/// why in the log rather than by comparing wire traces.
+///
+/// The OCSP data is never withheld: C07.FR.02 makes it the part every Plug & Charge `Authorize`
+/// carries, and it identifies the certificate rather than reproducing it.
+fn withhold_chain_unless_allowed(
+    state: &ChargePointState,
+    mut contract: ContractCertificate,
+) -> ContractCertificate {
+    if contract.chain_pem.is_some()
+        && !boolean_variable(
+            state,
+            "ISO15118Ctrlr",
+            "CentralContractValidationAllowed",
+            false,
+        )
+    {
+        tracing::warn!(
+            "withholding the contract certificate chain: ISO15118Ctrlr.\
+             CentralContractValidationAllowed is false, so the CSMS is asked to validate from the \
+             OCSP data alone"
+        );
+        contract.chain_pem = None;
+    }
+    contract
+}
+
+/// Records a CSMS decision in the authorization cache - acceptance and rejection alike, for the
+/// reason [`run_authorization_requests`] documents.
+async fn cache_decision(
+    actor: &ChargePointActor,
+    id_token: &IdToken,
+    status: AuthorizationStatus,
+    now: Option<DateTime<Utc>>,
+) {
+    let _ = actor
+        .send(ChargePointEvent::AuthorizationCached {
+            id_token: id_token.clone(),
+            status,
+            cached_at: now,
+        })
+        .await;
 }
 
 #[cfg(test)]
@@ -293,6 +492,7 @@ mod tests {
             evse_id: 0,
             connector_id: 0,
             id_token: test_id_token(),
+            contract: None,
         });
         // Dropping the sender closes the channel, which ends `run_authorization_requests`'s
         // loop once it has processed the request above.
@@ -323,6 +523,7 @@ mod tests {
             evse_id: 0,
             connector_id: 0,
             id_token: test_id_token(),
+            contract: None,
         });
         drop(sender);
 
@@ -336,14 +537,351 @@ mod tests {
 
         assert_eq!(actor.state().evses[0].connectors[0], ConnectorState::Locked);
     }
+
+    // --- C07: authorization using contract certificates -----------------------------------
+
+    use super::{ContractAuthorization, ContractCertificate, ContractCertificateStatus};
+    use crate::hardware::{CertificateHashData, HashAlgorithm, OcspCertificateId};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    fn test_contract() -> ContractCertificate {
+        ContractCertificate {
+            chain_pem: Some("-----BEGIN CERTIFICATE-----".into()),
+            ocsp_data: alloc::vec![OcspCertificateId {
+                hash_data: CertificateHashData {
+                    hash_algorithm: HashAlgorithm::Sha256,
+                    issuer_name_hash: "a".into(),
+                    issuer_key_hash: "b".into(),
+                    serial_number: "01".into(),
+                },
+                responder_url: "http://ocsp.example.com".into(),
+            }],
+        }
+    }
+
+    /// An `Authorizer` that answers contract authorizations with a fixed verdict, records the
+    /// contract it was handed, and fails every *plain* authorization - so a test that ends up on
+    /// the plain path fails loudly rather than passing for the wrong reason.
+    struct RecordingContractAuthorizer {
+        verdict: ContractAuthorization,
+        seen: Arc<std::sync::Mutex<Option<ContractCertificate>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Authorizer for RecordingContractAuthorizer {
+        type Error = core::convert::Infallible;
+
+        async fn authorize(&self, _id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
+            panic!("a contract presentation must not fall through to the plain Authorize path");
+        }
+
+        async fn authorize_contract(
+            &self,
+            _id_token: &IdToken,
+            contract: &ContractCertificate,
+        ) -> Result<ContractAuthorization, Self::Error> {
+            *self.seen.lock().unwrap() = Some(contract.clone());
+            Ok(self.verdict)
+        }
+    }
+
+    /// An `Authorizer` whose contract authorization always fails at the transport layer, standing
+    /// in for an unreachable CSMS.
+    struct OfflineContractAuthorizer;
+
+    #[derive(Debug)]
+    struct Unreachable;
+
+    impl core::fmt::Display for Unreachable {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("the CSMS is unreachable")
+        }
+    }
+
+    impl core::error::Error for Unreachable {}
+
+    #[async_trait::async_trait]
+    impl Authorizer for OfflineContractAuthorizer {
+        type Error = Unreachable;
+
+        async fn authorize(&self, _id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
+            Err(Unreachable)
+        }
+
+        async fn authorize_contract(
+            &self,
+            _id_token: &IdToken,
+            _contract: &ContractCertificate,
+        ) -> Result<ContractAuthorization, Self::Error> {
+            Err(Unreachable)
+        }
+    }
+
+    /// Drives one contract presentation through `run_authorization_requests` and returns the
+    /// connector state it left behind.
+    async fn present_contract<A: Authorizer + Sync>(
+        actor: &ChargePointActor,
+        authorizer: &A,
+    ) -> ConnectorState {
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        sender.send(AuthorizationRequested {
+            evse_id: 0,
+            connector_id: 0,
+            id_token: test_id_token(),
+            contract: Some(test_contract()),
+        });
+        drop(sender);
+
+        run_authorization_requests(
+            receiver,
+            authorizer,
+            actor.clone(),
+            &crate::clock::SystemClock,
+        )
+        .await;
+        actor.state().evses[0].connectors[0]
+    }
+
+    #[tokio::test]
+    async fn a_contract_authorization_starts_charging_when_token_and_certificate_are_both_accepted()
+    {
+        let actor = authorizing_actor().await;
+        let authorizer = RecordingContractAuthorizer {
+            verdict: ContractAuthorization {
+                status: AuthorizationStatus::Accepted,
+                certificate_status: Some(ContractCertificateStatus::Accepted),
+            },
+            seen: Arc::new(std::sync::Mutex::new(None)),
+        };
+
+        assert_eq!(
+            present_contract(&actor, &authorizer).await,
+            ConnectorState::Starting
+        );
+    }
+
+    /// C07.FR.16 pairs a revoked certificate with an `Invalid` token, but a station that only
+    /// read the token half would start charging if a CSMS ever sent `Accepted` alongside a bad
+    /// certificate. It must not.
+    #[tokio::test]
+    async fn a_revoked_certificate_denies_charging_even_if_the_token_was_accepted() {
+        let actor = authorizing_actor().await;
+        let authorizer = RecordingContractAuthorizer {
+            verdict: ContractAuthorization {
+                status: AuthorizationStatus::Accepted,
+                certificate_status: Some(ContractCertificateStatus::CertificateRevoked),
+            },
+            seen: Arc::new(std::sync::Mutex::new(None)),
+        };
+
+        assert_eq!(
+            present_contract(&actor, &authorizer).await,
+            ConnectorState::Locked
+        );
+    }
+
+    /// A CSMS that says nothing about the certificate has no opinion, not a negative one - the
+    /// normal answer when the charge point sent no certificate material to have one about.
+    #[tokio::test]
+    async fn an_absent_certificate_status_defers_to_the_token_decision() {
+        assert!(
+            ContractAuthorization {
+                status: AuthorizationStatus::Accepted,
+                certificate_status: None,
+            }
+            .accepted()
+        );
+        assert!(
+            !ContractAuthorization {
+                status: AuthorizationStatus::Rejected,
+                certificate_status: Some(ContractCertificateStatus::Accepted),
+            }
+            .accepted()
+        );
+    }
+
+    /// C07.FR.07: offline, with no ability to validate the contract locally, the answer is
+    /// refusal - *not* the cache fallback every other kind of token gets. The cache here holds an
+    /// acceptance for this very token, so a station taking the ordinary offline path would start
+    /// charging.
+    #[tokio::test]
+    async fn an_offline_contract_authorization_refuses_instead_of_using_the_cache() {
+        let actor = authorizing_actor().await;
+        actor
+            .send(ChargePointEvent::AuthorizationCached {
+                id_token: test_id_token(),
+                status: AuthorizationStatus::Accepted,
+                cached_at: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            present_contract(&actor, &OfflineContractAuthorizer).await,
+            ConnectorState::Locked
+        );
+    }
+
+    /// The same offline presentation *without* a contract certificate is accepted from that same
+    /// cache - which is what makes the test above a statement about C07 rather than about the
+    /// cache being empty.
+    #[tokio::test]
+    async fn the_same_token_without_a_contract_still_authorizes_offline_from_the_cache() {
+        let actor = authorizing_actor().await;
+        actor
+            .send(ChargePointEvent::AuthorizationCached {
+                id_token: test_id_token(),
+                status: AuthorizationStatus::Accepted,
+                cached_at: None,
+            })
+            .await
+            .unwrap();
+
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        sender.send(AuthorizationRequested {
+            evse_id: 0,
+            connector_id: 0,
+            id_token: test_id_token(),
+            contract: None,
+        });
+        drop(sender);
+
+        run_authorization_requests(
+            receiver,
+            &OfflineContractAuthorizer,
+            actor.clone(),
+            &crate::clock::SystemClock,
+        )
+        .await;
+
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Starting
+        );
+    }
+
+    /// C07.FR.06: the PEM chain goes to the CSMS only when
+    /// `ISO15118Ctrlr.CentralContractValidationAllowed` says so. The OCSP data goes either way -
+    /// it is what C07.FR.02 requires of every Plug & Charge Authorize.
+    #[tokio::test]
+    async fn the_certificate_chain_is_withheld_unless_central_validation_is_allowed() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let authorizer = RecordingContractAuthorizer {
+            verdict: ContractAuthorization {
+                status: AuthorizationStatus::Rejected,
+                certificate_status: None,
+            },
+            seen: seen.clone(),
+        };
+
+        let actor = authorizing_actor().await;
+        present_contract(&actor, &authorizer).await;
+        let withheld = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the authorizer was called");
+        assert_eq!(withheld.chain_pem, None, "withheld by default");
+        assert_eq!(
+            withheld.ocsp_data,
+            test_contract().ocsp_data,
+            "the OCSP data is never withheld"
+        );
+
+        let actor = authorizing_actor().await;
+        set_central_contract_validation(&actor, true).await;
+        present_contract(&actor, &authorizer).await;
+        assert_eq!(
+            seen.lock().unwrap().clone().unwrap().chain_pem,
+            test_contract().chain_pem,
+            "sent once the CSMS allows central validation"
+        );
+    }
+
+    /// An `Authorizer` that has not implemented C07 refuses rather than quietly asking the CSMS
+    /// about a bare eMAID nobody validated.
+    #[tokio::test]
+    async fn the_default_contract_authorization_refuses_locally() {
+        struct PlainOnly;
+
+        #[async_trait::async_trait]
+        impl Authorizer for PlainOnly {
+            type Error = core::convert::Infallible;
+
+            async fn authorize(
+                &self,
+                _id_token: &IdToken,
+            ) -> Result<AuthorizationStatus, Self::Error> {
+                Ok(AuthorizationStatus::Accepted)
+            }
+        }
+
+        let called = Arc::new(AtomicBool::new(false));
+        let _ = &called;
+        let actor = authorizing_actor().await;
+
+        assert_eq!(
+            present_contract(&actor, &PlainOnly).await,
+            ConnectorState::Locked
+        );
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    async fn set_central_contract_validation(actor: &ChargePointActor, allowed: bool) {
+        use crate::state::{
+            Component, DeviceModelEvent, Variable, VariableAttribute, VariableAttributeType,
+            VariableCharacteristics, VariableDataType, VariableMutability,
+        };
+        actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::VariableRegistered {
+                    component: Component {
+                        name: "ISO15118Ctrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: Variable {
+                        name: "CentralContractValidationAllowed".into(),
+                        instance: None,
+                    },
+                    characteristics: VariableCharacteristics {
+                        data_type: VariableDataType::Boolean,
+                        unit: None,
+                        min_limit: None,
+                        max_limit: None,
+                        values_list: None,
+                        supports_monitoring: false,
+                    },
+                    attributes: alloc::vec![VariableAttribute {
+                        attribute_type: VariableAttributeType::Actual,
+                        value: allowed.to_string(),
+                        mutability: VariableMutability::ReadWrite,
+                        persistent: false,
+                        constant: false,
+                        requires_reboot: false,
+                    }],
+                },
+            ))
+            .await
+            .unwrap();
+    }
 }
 
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    use super::Authorizer;
+    use super::{
+        Authorizer, ContractAuthorization, ContractCertificate, ContractCertificateStatus,
+    };
+    use crate::hardware::{HashAlgorithm, OcspCertificateId};
     use crate::state::{AuthorizationStatus, IdToken, IdTokenKind};
     use crate::wire::v21::AuthorizeRequest;
-    use crate::wire::v21::common::{AuthorizationStatusEnum, IdToken as WireIdToken};
+    use crate::wire::v21::common::{
+        AuthorizationStatusEnum, AuthorizeCertificateStatusEnum, HashAlgorithmEnum,
+        IdToken as WireIdToken, OCSPRequestData,
+    };
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
@@ -393,6 +931,95 @@ mod ocpp_2_1 {
         }
     }
 
+    fn wire_hash_algorithm(algorithm: HashAlgorithm) -> HashAlgorithmEnum {
+        match algorithm {
+            HashAlgorithm::Sha256 => HashAlgorithmEnum::SHA256,
+            HashAlgorithm::Sha384 => HashAlgorithmEnum::SHA384,
+            HashAlgorithm::Sha512 => HashAlgorithmEnum::SHA512,
+        }
+    }
+
+    /// One certificate's OCSP data onto the wire, or `None` when a field exceeds its bound -
+    /// mirroring `crate::certificates`' `wire_hash_data`, and dropped rather than truncated for
+    /// the same reason: half a hash identifies nothing.
+    fn wire_ocsp_data(id: &OcspCertificateId) -> Option<OCSPRequestData> {
+        Some(OCSPRequestData {
+            custom_data: None,
+            hash_algorithm: wire_hash_algorithm(id.hash_data.hash_algorithm),
+            issuer_key_hash: heapless::String::try_from(id.hash_data.issuer_key_hash.as_str())
+                .ok()?,
+            issuer_name_hash: heapless::String::try_from(id.hash_data.issuer_name_hash.as_str())
+                .ok()?,
+            responder_u_r_l: id.responder_url.clone(),
+            serial_number: heapless::String::try_from(id.hash_data.serial_number.as_str()).ok()?,
+        })
+    }
+
+    /// The Plug & Charge `Authorize` (C07.FR.02): the plain request plus whatever certificate
+    /// material fits.
+    ///
+    /// Every "does not fit" here is reported and dropped, never truncated or silently omitted: a
+    /// CSMS that receives less than it should answers `CertChainError`, and an operator reading
+    /// the log needs to see that it was this charge point that withheld it.
+    pub(super) fn build_contract_request(
+        id_token: &IdToken,
+        contract: &ContractCertificate,
+    ) -> AuthorizeRequest {
+        let mut request = build_request(id_token);
+        // The chain's own length bound (10000 characters on 2.1) is `ocpp-types`' to enforce at
+        // send time, not this crate's to second-guess - see `docs/UPSTREAM-POLICY.md`.
+        request.certificate = contract.chain_pem.clone();
+
+        let mut hash_data = heapless::Vec::new();
+        for id in &contract.ocsp_data {
+            let Some(wire) = wire_ocsp_data(id) else {
+                tracing::warn!(
+                    "a contract certificate's OCSP data exceeds OCPP's field bounds; omitting \
+                     that certificate from the Authorize"
+                );
+                continue;
+            };
+            if hash_data.push(wire).is_err() {
+                tracing::warn!(
+                    supplied = contract.ocsp_data.len(),
+                    "more contract certificates than OCPP's 4-entry bound allows; the rest are \
+                     omitted from the Authorize"
+                );
+                break;
+            }
+        }
+        request.iso15118_certificate_hash_data = (!hash_data.is_empty()).then_some(hash_data);
+        request
+    }
+
+    /// The CSMS's verdict on the certificate. Exhaustive with no wildcard arm on purpose: an
+    /// added wire status must be a compile error, not a silently-accepted certificate.
+    pub(super) fn map_certificate_status(
+        status: AuthorizeCertificateStatusEnum,
+    ) -> ContractCertificateStatus {
+        match status {
+            AuthorizeCertificateStatusEnum::Accepted => ContractCertificateStatus::Accepted,
+            AuthorizeCertificateStatusEnum::SignatureError => {
+                ContractCertificateStatus::SignatureError
+            }
+            AuthorizeCertificateStatusEnum::CertificateExpired => {
+                ContractCertificateStatus::CertificateExpired
+            }
+            AuthorizeCertificateStatusEnum::CertificateRevoked => {
+                ContractCertificateStatus::CertificateRevoked
+            }
+            AuthorizeCertificateStatusEnum::NoCertificateAvailable => {
+                ContractCertificateStatus::NoCertificateAvailable
+            }
+            AuthorizeCertificateStatusEnum::CertChainError => {
+                ContractCertificateStatus::CertChainError
+            }
+            AuthorizeCertificateStatusEnum::ContractCancelled => {
+                ContractCertificateStatus::ContractCancelled
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl Authorizer for OCPP2_1Client {
         type Error = ClientError<OCPP2_1Error>;
@@ -400,6 +1027,20 @@ mod ocpp_2_1 {
         async fn authorize(&self, id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
             let response = self.send_authorize(build_request(id_token)).await?;
             Ok(map_status(response.id_token_info.status))
+        }
+
+        async fn authorize_contract(
+            &self,
+            id_token: &IdToken,
+            contract: &ContractCertificate,
+        ) -> Result<ContractAuthorization, Self::Error> {
+            let response = self
+                .send_authorize(build_contract_request(id_token, contract))
+                .await?;
+            Ok(ContractAuthorization {
+                status: map_status(response.id_token_info.status),
+                certificate_status: response.certificate_status.map(map_certificate_status),
+            })
         }
     }
 
@@ -418,6 +1059,111 @@ mod ocpp_2_1 {
 
             assert_eq!(request.id_token.id_token, "04A224B2");
             assert_eq!(request.id_token.r#type, "ISO14443");
+        }
+
+        fn test_contract() -> ContractCertificate {
+            use crate::hardware::{CertificateHashData, HashAlgorithm, OcspCertificateId};
+            ContractCertificate {
+                chain_pem: Some("-----BEGIN CERTIFICATE-----".into()),
+                ocsp_data: alloc::vec![OcspCertificateId {
+                    hash_data: CertificateHashData {
+                        hash_algorithm: HashAlgorithm::Sha384,
+                        issuer_name_hash: "name-hash".into(),
+                        issuer_key_hash: "key-hash".into(),
+                        serial_number: "01AF".into(),
+                    },
+                    responder_url: "http://ocsp.example.com".into(),
+                }],
+            }
+        }
+
+        #[test]
+        fn a_contract_request_carries_the_emaid_the_chain_and_the_ocsp_data() {
+            let id_token = IdToken {
+                value: "DE8ACC12E4321".into(),
+                kind: IdTokenKind::EMAID,
+            };
+
+            let request = build_contract_request(&id_token, &test_contract());
+
+            assert_eq!(request.id_token.r#type, "eMAID");
+            assert_eq!(request.certificate, test_contract().chain_pem);
+            let hash_data = request.iso15118_certificate_hash_data.unwrap();
+            assert_eq!(hash_data.len(), 1);
+            assert_eq!(hash_data[0].serial_number, "01AF");
+            assert_eq!(hash_data[0].responder_u_r_l, "http://ocsp.example.com");
+            assert!(matches!(
+                hash_data[0].hash_algorithm,
+                HashAlgorithmEnum::SHA384
+            ));
+        }
+
+        /// OCPP bounds the hash data at four entries. A fifth certificate is dropped, not
+        /// squeezed in over another one, and never silently: the CSMS validates a shorter chain
+        /// than the vehicle presented and the log has to say so.
+        #[test]
+        fn a_fifth_certificate_is_dropped_rather_than_replacing_one_of_the_four() {
+            let id_token = IdToken {
+                value: "DE8ACC12E4321".into(),
+                kind: IdTokenKind::EMAID,
+            };
+            let mut contract = test_contract();
+            let entry = contract.ocsp_data[0].clone();
+            contract.ocsp_data = alloc::vec![entry; 5];
+
+            let request = build_contract_request(&id_token, &contract);
+
+            assert_eq!(request.iso15118_certificate_hash_data.unwrap().len(), 4);
+        }
+
+        /// A contract with no material at all is still a valid Authorize - the CSMS decides on
+        /// the eMAID - and must not send an empty `iso15118CertificateHashData` array, which
+        /// OCPP's own schema forbids.
+        #[test]
+        fn a_contract_with_no_material_sends_neither_field() {
+            let id_token = IdToken {
+                value: "DE8ACC12E4321".into(),
+                kind: IdTokenKind::EMAID,
+            };
+
+            let request = build_contract_request(&id_token, &ContractCertificate::default());
+
+            assert_eq!(request.certificate, None);
+            assert_eq!(request.iso15118_certificate_hash_data, None);
+        }
+
+        #[test]
+        fn every_wire_certificate_status_maps_to_its_own_value() {
+            use ContractCertificateStatus as Status;
+            for (wire, expected) in [
+                (AuthorizeCertificateStatusEnum::Accepted, Status::Accepted),
+                (
+                    AuthorizeCertificateStatusEnum::SignatureError,
+                    Status::SignatureError,
+                ),
+                (
+                    AuthorizeCertificateStatusEnum::CertificateExpired,
+                    Status::CertificateExpired,
+                ),
+                (
+                    AuthorizeCertificateStatusEnum::CertificateRevoked,
+                    Status::CertificateRevoked,
+                ),
+                (
+                    AuthorizeCertificateStatusEnum::NoCertificateAvailable,
+                    Status::NoCertificateAvailable,
+                ),
+                (
+                    AuthorizeCertificateStatusEnum::CertChainError,
+                    Status::CertChainError,
+                ),
+                (
+                    AuthorizeCertificateStatusEnum::ContractCancelled,
+                    Status::ContractCancelled,
+                ),
+            ] {
+                assert_eq!(map_certificate_status(wire), expected);
+            }
         }
 
         #[test]
@@ -463,10 +1209,16 @@ mod ocpp_2_1 {
 /// targeting `OCPP2_0_1Client`.
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
-    use super::Authorizer;
+    use super::{
+        Authorizer, ContractAuthorization, ContractCertificate, ContractCertificateStatus,
+    };
+    use crate::hardware::{HashAlgorithm, OcspCertificateId};
     use crate::state::{AuthorizationStatus, IdToken, IdTokenKind};
     use crate::wire::v201::AuthorizeRequest;
-    use crate::wire::v201::common::{AuthorizationStatusEnum, IdToken as WireIdToken, IdTokenEnum};
+    use crate::wire::v201::common::{
+        AuthorizationStatusEnum, AuthorizeCertificateStatusEnum, HashAlgorithmEnum,
+        IdToken as WireIdToken, IdTokenEnum, OCSPRequestData,
+    };
     use alloc::boxed::Box;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
@@ -518,6 +1270,91 @@ mod ocpp_2_0_1 {
         }
     }
 
+    fn wire_hash_algorithm(algorithm: HashAlgorithm) -> HashAlgorithmEnum {
+        match algorithm {
+            HashAlgorithm::Sha256 => HashAlgorithmEnum::SHA256,
+            HashAlgorithm::Sha384 => HashAlgorithmEnum::SHA384,
+            HashAlgorithm::Sha512 => HashAlgorithmEnum::SHA512,
+        }
+    }
+
+    /// One certificate's OCSP data onto the wire - see [`super::ocpp_2_1`]'s twin for why a value
+    /// that does not fit takes its whole entry with it.
+    fn wire_ocsp_data(id: &OcspCertificateId) -> Option<OCSPRequestData> {
+        Some(OCSPRequestData {
+            custom_data: None,
+            hash_algorithm: wire_hash_algorithm(id.hash_data.hash_algorithm),
+            issuer_key_hash: heapless::String::try_from(id.hash_data.issuer_key_hash.as_str())
+                .ok()?,
+            issuer_name_hash: heapless::String::try_from(id.hash_data.issuer_name_hash.as_str())
+                .ok()?,
+            // 2.0.1 bounds the responder URL at 512 characters where 2.1 leaves it unbounded -
+            // one of the few places the two versions' Authorize really differ.
+            responder_u_r_l: heapless::String::try_from(id.responder_url.as_str()).ok()?,
+            serial_number: heapless::String::try_from(id.hash_data.serial_number.as_str()).ok()?,
+        })
+    }
+
+    /// The Plug & Charge `Authorize`. Identical to 2.1's in every field that matters here - C07
+    /// is one of the few 2.1 use cases that is not new in 2.1 - so see
+    /// [`super::ocpp_2_1::build_contract_request`] for the reasoning; only the PEM length bound
+    /// `ocpp-types` enforces differs (5500 characters here, 10000 on 2.1).
+    pub(super) fn build_contract_request(
+        id_token: &IdToken,
+        contract: &ContractCertificate,
+    ) -> AuthorizeRequest {
+        let mut request = build_request(id_token);
+        request.certificate = contract.chain_pem.clone();
+
+        let mut hash_data = heapless::Vec::new();
+        for id in &contract.ocsp_data {
+            let Some(wire) = wire_ocsp_data(id) else {
+                tracing::warn!(
+                    "a contract certificate's OCSP data exceeds OCPP's field bounds; omitting \
+                     that certificate from the Authorize"
+                );
+                continue;
+            };
+            if hash_data.push(wire).is_err() {
+                tracing::warn!(
+                    supplied = contract.ocsp_data.len(),
+                    "more contract certificates than OCPP's 4-entry bound allows; the rest are \
+                     omitted from the Authorize"
+                );
+                break;
+            }
+        }
+        request.iso15118_certificate_hash_data = (!hash_data.is_empty()).then_some(hash_data);
+        request
+    }
+
+    /// The CSMS's verdict on the certificate - the same seven values 2.1 has, exhaustively.
+    pub(super) fn map_certificate_status(
+        status: AuthorizeCertificateStatusEnum,
+    ) -> ContractCertificateStatus {
+        match status {
+            AuthorizeCertificateStatusEnum::Accepted => ContractCertificateStatus::Accepted,
+            AuthorizeCertificateStatusEnum::SignatureError => {
+                ContractCertificateStatus::SignatureError
+            }
+            AuthorizeCertificateStatusEnum::CertificateExpired => {
+                ContractCertificateStatus::CertificateExpired
+            }
+            AuthorizeCertificateStatusEnum::CertificateRevoked => {
+                ContractCertificateStatus::CertificateRevoked
+            }
+            AuthorizeCertificateStatusEnum::NoCertificateAvailable => {
+                ContractCertificateStatus::NoCertificateAvailable
+            }
+            AuthorizeCertificateStatusEnum::CertChainError => {
+                ContractCertificateStatus::CertChainError
+            }
+            AuthorizeCertificateStatusEnum::ContractCancelled => {
+                ContractCertificateStatus::ContractCancelled
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl Authorizer for OCPP2_0_1Client {
         type Error = ClientError<OCPP2_0_1Error>;
@@ -525,6 +1362,20 @@ mod ocpp_2_0_1 {
         async fn authorize(&self, id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
             let response = self.send_authorize(build_request(id_token)).await?;
             Ok(map_status(response.id_token_info.status))
+        }
+
+        async fn authorize_contract(
+            &self,
+            id_token: &IdToken,
+            contract: &ContractCertificate,
+        ) -> Result<ContractAuthorization, Self::Error> {
+            let response = self
+                .send_authorize(build_contract_request(id_token, contract))
+                .await?;
+            Ok(ContractAuthorization {
+                status: map_status(response.id_token_info.status),
+                certificate_status: response.certificate_status.map(map_certificate_status),
+            })
         }
     }
 
@@ -575,6 +1426,52 @@ mod ocpp_2_0_1 {
             );
         }
 
+        /// 2.0.1 carries the same Plug & Charge material as 2.1 - C07 is not a 2.1 addition -
+        /// with one real difference: its responder URL is bounded, so one that does not fit takes
+        /// its entry with it rather than being truncated into a URL pointing somewhere else.
+        #[test]
+        fn a_contract_request_carries_the_same_material_and_drops_an_oversized_responder_url() {
+            use crate::hardware::{CertificateHashData, HashAlgorithm, OcspCertificateId};
+
+            let id_token = IdToken {
+                value: "DE8ACC12E4321".into(),
+                kind: IdTokenKind::EMAID,
+            };
+            let entry = |responder_url: alloc::string::String| OcspCertificateId {
+                hash_data: CertificateHashData {
+                    hash_algorithm: HashAlgorithm::Sha256,
+                    issuer_name_hash: "name-hash".into(),
+                    issuer_key_hash: "key-hash".into(),
+                    serial_number: "01AF".into(),
+                },
+                responder_url,
+            };
+
+            let request = build_contract_request(
+                &id_token,
+                &ContractCertificate {
+                    chain_pem: Some("-----BEGIN CERTIFICATE-----".into()),
+                    ocsp_data: alloc::vec![entry("http://ocsp.example.com".into())],
+                },
+            );
+            assert!(matches!(request.id_token.r#type, IdTokenEnum::EMAID));
+            assert!(request.certificate.is_some());
+            assert_eq!(request.iso15118_certificate_hash_data.unwrap().len(), 1);
+
+            let too_long = alloc::string::String::from_iter(core::iter::repeat_n('u', 513));
+            let request = build_contract_request(
+                &id_token,
+                &ContractCertificate {
+                    chain_pem: None,
+                    ocsp_data: alloc::vec![entry(too_long)],
+                },
+            );
+            assert_eq!(
+                request.iso15118_certificate_hash_data, None,
+                "the only entry did not fit, so there is nothing to send"
+            );
+        }
+
         #[test]
         fn kinds_with_no_twenty_zero_one_equivalent_fall_back_to_central() {
             assert_eq!(
@@ -618,7 +1515,7 @@ mod ocpp_2_0_1 {
 /// that narrowing doesn't change this mapping's shape at all.
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
-    use super::Authorizer;
+    use super::{Authorizer, ContractAuthorization, ContractCertificate};
     use crate::id_tag::map_id_tag;
     use crate::state::{AuthorizationStatus, IdToken};
     use crate::wire::v16::AuthorizeRequest;
@@ -649,6 +1546,35 @@ mod ocpp_1_6 {
         async fn authorize(&self, id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
             let response = self.send_authorize(build_request(id_token)).await?;
             Ok(map_status(response.id_tag_info.status))
+        }
+
+        /// 1.6J's `Authorize` carries an `idTag` and nothing else - no certificate, no OCSP data,
+        /// no `certificateStatus` to answer with. Plug & Charge as OCPP 2.x defines it (C07)
+        /// simply does not exist here.
+        ///
+        /// This asks anyway, on the eMAID alone, and says so in the log. That is the graceful
+        /// downgrade `CLAUDE.md` asks for - project the 2.1 model onto what the negotiated
+        /// version can express - and it matches what 1.6J sites running Plug & Charge actually
+        /// do: the eMAID becomes an ordinary `idTag` and the CSMS decides on the contract it
+        /// already knows about. **Nobody validates the contract certificate in this exchange**,
+        /// which is exactly why the crate-wide default refuses instead: an `Authorizer` that has
+        /// simply not implemented C07 has made no such decision, where this adapter has, on the
+        /// record, with the protocol's own limits as the reason.
+        async fn authorize_contract(
+            &self,
+            id_token: &IdToken,
+            _contract: &ContractCertificate,
+        ) -> Result<ContractAuthorization, Self::Error> {
+            tracing::warn!(
+                "authorizing an ISO 15118 contract on OCPP 1.6J: the certificate cannot be \
+                 carried, so the CSMS decides on the eMAID alone and nothing validates the \
+                 contract certificate"
+            );
+            let response = self.send_authorize(build_request(id_token)).await?;
+            Ok(ContractAuthorization {
+                status: map_status(response.id_tag_info.status),
+                certificate_status: None,
+            })
         }
     }
 
@@ -776,6 +1702,7 @@ mod loop_tests {
             evse_id: 0,
             connector_id: 0,
             id_token: token(),
+            contract: None,
         });
     }
 

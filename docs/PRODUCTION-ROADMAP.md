@@ -987,10 +987,14 @@ messages missing from 2.0.1 outside certificates. B2.8 gave them one.
 | Message | 1.6J | 2.0.1 | 2.1 |
 |---------|:----:|:-----:|:---:|
 | InstallCertificate / DeleteCertificate / GetInstalledCertificateIds | — | ✅ | ✅ |
-| CertificateSigned / SignCertificate | — | ⬜ | ⬜ |
-| GetCertificateStatus | — | ⬜ | ⬜ |
-| GetCertificateChainStatus | — | — | ⬜ |
-| Get15118EVCertificate | — | ⬜ | ⬜ |
+| CertificateSigned / SignCertificate | — | ✅ | ✅ |
+| GetCertificateStatus | — | ✅ | ✅ |
+| GetCertificateChainStatus | — | — | ✅ |
+| Get15118EVCertificate | — | ✅ | ✅ |
+| Authorize — contract certificate fields (C07) | ↓ | ✅ | ✅ |
+
+↓ = graceful downgrade rather than support: 1.6J's `Authorize` has no certificate fields at all,
+so a contract presentation is sent as a bare eMAID `idTag` with a warning (see B4.6).
 
 - [x] **B4.1** Certificate store abstraction — `hardware::CertificateStore`, with
       `CertificateUse`, `CertificateHashData`, the two outcome enums, a `NoCertificateStore`
@@ -1152,6 +1156,54 @@ messages missing from 2.0.1 outside certificates. B2.8 gave them one.
       but this crate's own test doubles — see [`docs/RELEASE-1.0.md`](RELEASE-1.0.md) §3 item 3,
       where that is a hardware-trait-freeze prerequisite, resolvable either by a real HLC
       integration or by an explicit documented decision that the narrow relay-only scope is final.
+
+- [x] **B4.6** Plug & Charge **authorization** — OCPP use case **C07 - Authorization using
+      Contract Certificates**, on 2.0.1 and 2.1, with a documented downgrade on 1.6J.
+
+      [B4.5](#b4--certificates-and-iso-15118-r1-r13) got a contract certificate *onto* a vehicle;
+      this is the other half, and it was missing entirely — not deferred, unlisted. `Authorize`'s
+      `certificate` and `iso15118CertificateHashData` were hardcoded `None` and the response's
+      `certificateStatus` was dropped, so a station could complete a Plug & Charge handshake and
+      then had no way to authorize the driver except by sending the bare eMAID as an ordinary
+      token, with nobody validating the contract.
+
+      **The presentation is a first-class connector event**, not a side channel:
+      `ConnectorEvent::ContractCertificatePresented { id_token, certificate }` reaches `Authorizing`
+      by the same transition a card tap does, and the certificate material rides on
+      `AuthorizationRequested` to the Authorize. The integrator's HLC stack sends it through the
+      `HardwareEventSender` every other hardware observation already arrives on — no new trait,
+      and in particular **no change to `Iso15118Controller`**, whose scope stays exactly as narrow
+      as [`docs/RELEASE-1.0.md`](RELEASE-1.0.md) §3 found it.
+
+      **Acceptance needs both answers.** `ContractAuthorization` carries the token status and the
+      certificate status separately, because OCPP sends both and they are not redundant (C07.FR.13
+      is a valid certificate with a cancelled contract; FR.14's note is a valid certificate with a
+      refused token). `accepted()` requires the token to be `Accepted` *and* the certificate not to
+      be rejected — checked rather than assumed, since a station reading only the token half would
+      start charging on a revoked contract the first time a CSMS got the pairing wrong.
+
+      **Offline, C07.FR.07 overrides this crate's own offline fallback** ([B1.2](#b1--core-charging)):
+      a contract presentation with no CSMS is refused, and deliberately does *not* consult the
+      authorization cache or local list, even when that eMAID sits accepted in one. FR.08 only
+      permits that path after the station has itself validated the certificate, which needs X.509
+      parsing this crate does not have. A test pins the distinction by authorizing the same token
+      from the same cache when no certificate is involved.
+
+      **Two device-model variables now do real work.** `ContractValidationOffline` (B4.5,
+      required) is read so the refusal above can name the reason in its log.
+      `CentralContractValidationAllowed` is newly registered — optional in the appendix, but this
+      crate *acts* on it: C07.FR.06 makes it the switch permitting a chain the station cannot
+      validate to be forwarded to the CSMS, and it is `false` by default like every other
+      capability-gated value. A withheld chain is logged each time, because a station that never
+      turns it on asks the CSMS to decide from OCSP data alone and an operator should be able to
+      see that in the log rather than in a wire trace.
+
+      **1.6J downgrades rather than refusing.** Its `Authorize` carries an `idTag` and nothing
+      else, so the eMAID goes as a plain token with a warning saying plainly that nothing
+      validated the contract. That is `CLAUDE.md`'s "project the 2.1 model onto the negotiated
+      version" applied honestly, and it is a different thing from the `Authorizer` trait's default
+      method, which *refuses*: an implementation that simply has not been updated has made no
+      decision, where this adapter has made one on the record.
 
 ### B5 — Diagnostics and monitoring (R§14)
 

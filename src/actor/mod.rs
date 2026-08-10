@@ -122,6 +122,7 @@ mod tests {
                     evse_id: 0,
                     connector_id: 0,
                     id_token: id_token.clone(),
+                    contract: None,
                 }),
             ]
         );

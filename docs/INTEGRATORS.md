@@ -62,6 +62,44 @@ particular `KeyStore` implementation rather than a secure element.
 > *plus* `BatterySwapStation` — the list above is the complete, current one. Trust the table,
 > not the historical number.
 
+### Plug & Charge authorization has no trait — it is an event
+
+If you have an ISO 15118 stack, authorizing a driver by contract certificate (OCPP use case C07)
+is not something you implement a trait for. You send an event, on the same
+`hardware::HardwareEventSender` your `ChargePoint::start` already received for cable-connected
+and meter-sample events:
+
+```rust,ignore
+events.send(ChargePointEvent::Evse {
+    evse_id,
+    event: EvseEvent::Connector {
+        connector_id,
+        event: ConnectorEvent::ContractCertificatePresented {
+            // The eMAID from the contract certificate.
+            id_token: IdToken { value: emaid, kind: IdTokenKind::EMAID },
+            certificate: ContractCertificate {
+                // Only needed if the CSMS must validate a chain you cannot - and only sent when
+                // `ISO15118Ctrlr.CentralContractValidationAllowed` is true, which is off by
+                // default.
+                chain_pem: Some(pem),
+                // What the CSMS actually needs: OCSP data for the contract certificate and its
+                // chain, from whoever parsed them. This crate does no X.509 parsing.
+                ocsp_data: vec![/* … */],
+            },
+        },
+    },
+}).await;
+```
+
+Two behaviours worth knowing before you wire this up:
+
+- **Offline, this is refused** — not answered from the authorization cache or local list, the way
+  a card would be. OCPP C07.FR.07 requires it, because nothing checked the contract for
+  revocation. See `crate::authorization`'s module docs.
+- **`hardware::Iso15118Controller` is a different thing** and you may well need both: that trait
+  relays a *new* contract certificate to the vehicle (`Get15118EVCertificate`), while this event
+  uses one the vehicle already holds.
+
 ## 2. Which Cargo features do I pick?
 
 Two independent groups, both listed in full in `Cargo.toml` with a comment justifying each
