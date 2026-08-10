@@ -1,3 +1,5 @@
+use alloc::sync::Arc;
+
 use crate::actor::{ActorError, ChargePointActor};
 use crate::clock::MonotonicClock;
 use crate::executor::Executor;
@@ -14,7 +16,10 @@ use crate::sync::{BroadcastReceiver, WatchReceiver};
 /// CSMS, feeding hardware events in, and subscribing every functional block to the state changes
 /// and effects it cares about.
 pub struct ChargePointRuntime<T = ()> {
-    hardware: T,
+    /// Behind an `Arc` because [`crate::hardware::ChargePoint::start`] takes an `Arc<Self>`
+    /// receiver: the binding's command loop outlives the `start` call, so it needs an owned
+    /// handle, and sharing this one means the integrator does not have to build a second.
+    hardware: Arc<T>,
     actor: ChargePointActor,
 }
 
@@ -43,7 +48,7 @@ impl<T> ChargePointRuntime<T> {
         limits: crate::state::StateLimits,
     ) -> Self {
         Self {
-            hardware,
+            hardware: Arc::new(hardware),
             actor: ChargePointActor::spawn_with_limits(connector_counts, executor, limits),
         }
     }
@@ -149,8 +154,10 @@ impl<T> ChargePointRuntime<T> {
         self.actor.subscribe()
     }
 
-    pub(crate) fn hardware(&self) -> &T {
-        &self.hardware
+    /// The shared handle onto the hardware binding, for calling
+    /// [`crate::hardware::ChargePoint::start`]'s `Arc<Self>` receiver.
+    pub(crate) fn hardware_handle(&self) -> Arc<T> {
+        self.hardware.clone()
     }
 
     /// A cheap-to-clone handle to the underlying actor, independent of `T` - lets background

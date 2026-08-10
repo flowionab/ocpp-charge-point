@@ -4,6 +4,7 @@ use crate::hardware::Evse;
 use crate::hardware::HardwareCommandReceiver;
 use crate::hardware::HardwareEventSender;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 /// The top-level hardware binding an integrator implements to plug real (or simulated) hardware
 /// into this crate. This is the crate's primary integration point: everything else - protocol
@@ -15,15 +16,15 @@ pub trait ChargePoint<E: Evse<C>, C: Connector> {
     type StartError: core::error::Error + Send + Sync + 'static;
 
     /// The charge point's vendor name, reported to the CSMS in `BootNotification`.
-    async fn vendor_name(&self) -> &str;
+    fn vendor_name(&self) -> &str;
 
     /// The charge point's model name, reported to the CSMS in `BootNotification`.
-    async fn model_name(&self) -> &str;
+    fn model_name(&self) -> &str;
 
     /// This charge point's EVSEs, in a fixed order matching `evse_id` addressing throughout this
     /// crate (index 0 is `evse_id` 0, and so on). The set of EVSEs is assumed fixed for the
     /// lifetime of the charge point.
-    async fn evses(&self) -> &[E];
+    fn evses(&self) -> &[E];
 
     /// The fixed, static capabilities of this hardware (see [`Capabilities`]) - what optional
     /// functional blocks and physical/electrical abilities are actually present, so the crate
@@ -37,7 +38,7 @@ pub trait ChargePoint<E: Evse<C>, C: Connector> {
     /// break instead of three). Every existing [`ChargePoint`] implementation must add this
     /// method; `Capabilities::default()` (see its docs) is the conservative starting point for
     /// an integrator that hasn't yet audited which capabilities their hardware actually has.
-    async fn capabilities(&self) -> Capabilities;
+    fn capabilities(&self) -> Capabilities;
 
     /// Brings the hardware up and hands over the two channels that connect it to this crate's
     /// state machine, for as long as the process runs:
@@ -52,17 +53,43 @@ pub trait ChargePoint<E: Evse<C>, C: Connector> {
     ///   emits (lock/unlock a connector, open/close a contactor) and carry them out against the
     ///   matching [`Connector`]. [`crate::hardware::execute_hardware_command`] does this dispatch
     ///   for you, including turning a failed or out-of-range command into the correct
-    ///   fault-reporting event - most implementations should just loop
-    ///   `execute_hardware_command(evses, commands.recv().await?, &events)` for as long as
-    ///   `commands.recv()` keeps returning `Ok`.
+    ///   fault-reporting event.
     ///
-    /// Returns once the hardware has started and both channels are being serviced (typically by
-    /// spawning a background task before returning), or `Err` if startup itself fails - a
-    /// startup failure is fatal to [`setup`](crate::setup), unlike a fault reported after
-    /// startup via `events`, which the state machine handles as a normal (if unwelcome)
-    /// transition.
+    /// # Why the receiver is an `Arc<Self>`
+    ///
+    /// The command loop has to outlive this call - `start` must return promptly, because setup
+    /// waits for it before registering with the CSMS - so it belongs in a spawned task, and that
+    /// task needs to own something that borrows the connectors. With a `&self` receiver every
+    /// implementation had to keep its own `Arc` *inside* the struct purely to have something to
+    /// clone into that task. Taking `Arc<Self>` here means the handle already exists, and the
+    /// whole implementation is:
+    ///
+    /// ```ignore
+    /// async fn start(
+    ///     self: Arc<Self>,
+    ///     events: HardwareEventSender,
+    ///     mut commands: HardwareCommandReceiver,
+    /// ) -> Result<(), Self::StartError> {
+    ///     spawn(async move {
+    ///         while let Ok(command) = commands.recv().await {
+    ///             execute_hardware_command(self.evses(), command, &events).await;
+    ///         }
+    ///     });
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// The crate holds the same `Arc`, so this costs no extra allocation - it is the one the
+    /// runtime already made.
+    ///
+    /// # Errors
+    ///
+    /// Returns once the hardware has started and both channels are being serviced, or `Err` if
+    /// startup itself fails - a startup failure is fatal to [`setup`](crate::setup), unlike a
+    /// fault reported after startup via `events`, which the state machine handles as a normal (if
+    /// unwelcome) transition.
     async fn start(
-        &self,
+        self: Arc<Self>,
         events: HardwareEventSender,
         commands: HardwareCommandReceiver,
     ) -> Result<(), Self::StartError>;

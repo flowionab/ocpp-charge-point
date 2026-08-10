@@ -17,6 +17,7 @@ use ocpp_charge_point::payload_limit::PayloadLimits;
 use ocpp_charge_point::provisioning::TokioBackoff;
 use ocpp_charge_point::state::SecurityEventType;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -35,24 +36,24 @@ struct TestConnector;
 impl ChargePoint<TestEvse, TestConnector> for TestChargePoint {
     type StartError = core::convert::Infallible;
 
-    async fn vendor_name(&self) -> &str {
+    fn vendor_name(&self) -> &str {
         "Acme"
     }
 
-    async fn model_name(&self) -> &str {
+    fn model_name(&self) -> &str {
         "Charger 9000"
     }
 
-    async fn evses(&self) -> &[TestEvse] {
+    fn evses(&self) -> &[TestEvse] {
         &self.evses
     }
 
-    async fn capabilities(&self) -> ocpp_charge_point::hardware::Capabilities {
+    fn capabilities(&self) -> ocpp_charge_point::hardware::Capabilities {
         ocpp_charge_point::hardware::Capabilities::default()
     }
 
     async fn start(
-        &self,
+        self: Arc<Self>,
         _events: ocpp_charge_point::hardware::HardwareEventSender,
         _commands: ocpp_charge_point::hardware::HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
@@ -64,7 +65,7 @@ impl ChargePoint<TestEvse, TestConnector> for TestChargePoint {
 impl Evse<TestConnector> for TestEvse {
     type Error = core::convert::Infallible;
 
-    async fn connectors(&self) -> &[TestConnector] {
+    fn connectors(&self) -> &[TestConnector] {
         &self.connectors
     }
 

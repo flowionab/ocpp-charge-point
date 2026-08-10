@@ -67,6 +67,7 @@ use ocpp_charge_point::state::{
 };
 use ocpp_charge_point::{OcppVersion, connect_and_setup};
 use serde_json::Value;
+use std::sync::Arc;
 
 // --- minimal hardware binding, one connector per EVSE, EVSE count configurable at construction --
 
@@ -81,20 +82,20 @@ struct TestConnector;
 #[async_trait::async_trait]
 impl ChargePoint<TestEvse, TestConnector> for TestChargePoint {
     type StartError = core::convert::Infallible;
-    async fn vendor_name(&self) -> &str {
+    fn vendor_name(&self) -> &str {
         "Acme"
     }
-    async fn model_name(&self) -> &str {
+    fn model_name(&self) -> &str {
         "Charger 9000"
     }
-    async fn evses(&self) -> &[TestEvse] {
+    fn evses(&self) -> &[TestEvse] {
         &self.evses
     }
-    async fn capabilities(&self) -> Capabilities {
+    fn capabilities(&self) -> Capabilities {
         Capabilities::default()
     }
     async fn start(
-        &self,
+        self: Arc<Self>,
         _events: HardwareEventSender,
         _commands: HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
@@ -105,7 +106,7 @@ impl ChargePoint<TestEvse, TestConnector> for TestChargePoint {
 #[async_trait::async_trait]
 impl Evse<TestConnector> for TestEvse {
     type Error = core::convert::Infallible;
-    async fn connectors(&self) -> &[TestConnector] {
+    fn connectors(&self) -> &[TestConnector] {
         &self.connectors
     }
     async fn reboot(&self) -> Result<(), Self::Error> {

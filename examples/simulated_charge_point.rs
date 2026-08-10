@@ -69,7 +69,7 @@ struct SimulatedEvse {
 impl Evse<SimulatedConnector> for SimulatedEvse {
     type Error = core::convert::Infallible;
 
-    async fn connectors(&self) -> &[SimulatedConnector] {
+    fn connectors(&self) -> &[SimulatedConnector] {
         &self.connectors
     }
     async fn reboot(&self) -> Result<(), Self::Error> {
@@ -86,23 +86,23 @@ struct SimulatedChargePoint {
 impl ChargePoint<SimulatedEvse, SimulatedConnector> for SimulatedChargePoint {
     type StartError = core::convert::Infallible;
 
-    async fn vendor_name(&self) -> &str {
+    fn vendor_name(&self) -> &str {
         "Acme"
     }
-    async fn model_name(&self) -> &str {
+    fn model_name(&self) -> &str {
         "Simulator"
     }
-    async fn evses(&self) -> &[SimulatedEvse] {
+    fn evses(&self) -> &[SimulatedEvse] {
         &self.evses
     }
-    async fn capabilities(&self) -> Capabilities {
+    fn capabilities(&self) -> Capabilities {
         // Only what a simulation can actually back. Smart charging is claimed because
         // `set_current_limit` above really is implemented; a display or persistent storage would
         // be a claim with nothing behind it.
         Capabilities::default().with_smart_charging(true)
     }
     async fn start(
-        &self,
+        self: Arc<Self>,
         events: HardwareEventSender,
         mut commands: HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {

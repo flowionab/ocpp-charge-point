@@ -28,6 +28,24 @@ use alloc::vec::Vec;
 /// treat an `Err` here as "persistence unavailable right now" and degrade (continue running
 /// without whatever durability this write/read would have provided, and raise a
 /// diagnostic/security event) rather than propagate the failure into a crash.
+///
+/// # What this crate expects of an implementation, exactly
+///
+/// Two questions every implementor asks, answered here so nobody has to infer them from the
+/// persistence layer:
+///
+/// - **Must `set` be durable by the time it returns?** Yes, as far as this trait is concerned: a
+///   `set` that returned `Ok` and then lost the value on a power cut is a broken implementation,
+///   not a slow one. If the backing medium buffers (a filesystem page cache, a flash driver with
+///   a write queue), flush before returning `Ok`.
+/// - **Must a write be crash-atomic - never leaving a half-written value behind?** **No.** That
+///   is this crate's problem, not yours. Everything durable enough to care goes through
+///   [`AtomicStorage`], which stores each logical key in two alternating physical slots with a
+///   checksum, so a power cut mid-`set` leaves the previous value intact and readable. Implement
+///   the simple thing; do not build a journal underneath one.
+///
+/// Nothing here requires a filesystem, a transaction log, or ordering guarantees between
+/// different keys.
 #[async_trait::async_trait]
 pub trait Storage {
     /// The error type returned by a failed storage operation.

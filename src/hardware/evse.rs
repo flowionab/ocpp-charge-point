@@ -13,7 +13,12 @@ pub trait Evse<C: Connector> {
     /// this crate (index 0 is `connector_id` 0, and so on). The set of connectors is assumed
     /// fixed for the lifetime of the charge point - there is no hook for adding or removing one
     /// at runtime.
-    async fn connectors(&self) -> &[C];
+    ///
+    /// Synchronous, and deliberately so: this is consulted on the path of *every* hardware
+    /// command ([`crate::hardware::execute_hardware_command`]), and an `async fn` returning a
+    /// fixed slice would box a future per contactor operation to await something that never
+    /// yields.
+    fn connectors(&self) -> &[C];
 
     /// Reboots this EVSE's hardware (OCPP `Reset` - see `docs/ROADMAP.md` §2). Requested when a
     /// CSMS-initiated `Reset` targets this EVSE specifically, or the whole charge point (in

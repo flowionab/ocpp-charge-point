@@ -1004,13 +1004,13 @@ so a contract presentation is sent as a bare eMAID `idTag` with a warning (see B
       a private key and will not give it back — it signs on request and the key never leaves the
       chip. Any design where this crate reads a key out of storage and hands it to a TLS stack has
       already given that up. So the store is a **trait the integrator implements**, and the crate
-      never sees a private key at all: the only question it asks is `has_private_key()`, a yes/no,
+      never sees a private key at all: the only question it asks is `has_client_private_key()`, a yes/no,
       because security profile 3 needs to know whether a client certificate *can* be presented and
       nothing above needs the key itself.
 
       `StoredCertificates` is the ready-made implementation over `Storage` for the many charge
       points with no secure element — which is the sense in which B4.1 "depends on E1". It answers
-      `has_private_key()` **false**, and that is not a stub: a key in ordinary flash is a key an
+      `has_client_private_key()` **false**, and that is not a stub: a key in ordinary flash is a key an
       attacker holding the flash has, so a station needing profile 3 wants a secure-element-backed
       implementation of the trait instead. It is bounded (G2.2, 10 by default), replaces rather
       than duplicates on reinstall, survives a reboot, and comes up empty on a corrupt index rather
@@ -3760,6 +3760,47 @@ coupling `CLAUDE.md` asks this crate to absorb. Now re-exported, gated to match 
       more breaking changes is worse than no freeze** — so the document recommends shipping 0.x
       for longer, names the specific work that should precede any freeze, and leaves the call to a
       maintainer. No trait was changed by this task, deliberately.
+
+- [x] **H5.6** Implementability pass over the hardware surface — seven findings from reading all
+      seventeen traits as an integrator would, four of them breaking. Taken while the crate is
+      unpublished, which is the cheapest this will ever be.
+
+      **`ChargePoint::start` now takes `self: Arc<Self>`.** The command loop it spawns must
+      outlive the call, so with a `&self` receiver *every* implementation kept an `Arc` inside its
+      own struct purely to have something to move into that task — both examples did it, with a
+      comment apologising for it. The runtime already holds an `Arc<T>`; handing that same one to
+      `start` deletes the workaround, and bindings hold plain owned fields again.
+
+      **Five accessors became plain `fn`:** `vendor_name`, `model_name`, `evses`, `capabilities`,
+      and `Evse::connectors`. None of them await or fail. `Evse::connectors` is the one that
+      mattered: `execute_hardware_command` calls it for every command, so an `async fn` returning
+      a fixed slice boxed a future per contactor operation, on hardware where that is a real cost.
+
+      **`CertificateStore::has_private_key` → `has_client_private_key`.** A real store holds
+      several keys; only the client certificate's answers the question the crate is asking.
+
+      **`Watchdog` lost its `Send + Sync` supertrait**, the only trait in `crate::hardware` that
+      had one. The requirement now sits where it belongs, on the actor's
+      `Arc<dyn Watchdog + Send + Sync>`.
+
+      Three documentation findings, each closing a place where a plausible reading is wrong:
+
+      - **`Connector`: `Ok` means the hardware moved.** `execute_hardware_command` converts an
+        `Ok(())` from `lock()` straight into `LockConfirmed`, with no second confirmation step —
+        so returning `Ok` when the command has merely been *issued* makes the state machine
+        believe an unlocked connector is locked and start a transaction behind it. This fails
+        **open**, which is exactly what `CLAUDE.md`'s error-handling stance exists to prevent, and
+        nothing in the trait said so.
+      - **`Storage`: the durability contract, stated.** `set` must be durable when it returns;
+        crash-atomicity is *not* required, because [E1](#71-e1--storage-trait)'s `AtomicStorage`
+        provides it. Previously discoverable only by reading `crate::persistence`, which invited
+        implementors to build a journal nobody needed or to ship torn writes.
+      - **`CertificateStore`: what each defaulted method costs.** Three of its seven methods
+        default to "I cannot say", and each silently disables a feature (mutual TLS, complete
+        trust stores, ahead-of-expiry renewal) rather than failing loudly. The trait docs now
+        carry a table saying so. Splitting the parsing-dependent half into a second trait was
+        considered and rejected: it is still one store, and every call site would have to ask
+        whether the other half came with it.
 
 ---
 

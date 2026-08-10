@@ -17,7 +17,7 @@
 //!
 //! [`CertificateStore`] deals in certificates, which are public and safe to hold, list and hand
 //! out. The private key that pairs with the charge point's own certificate is addressed only
-//! indirectly, through [`CertificateStore::has_private_key`] - the crate needs to know whether it
+//! indirectly, through [`CertificateStore::has_client_private_key`] - the crate needs to know whether it
 //! *can* present a client certificate (security profile 3), never what the key is.
 
 use alloc::boxed::Box;
@@ -139,6 +139,26 @@ pub enum DeleteCertificateOutcome {
 /// locked. A failure is surfaced as the protocol-correct refusal rather than a panic - a charge
 /// point that dies because a certificate could not be read is unreachable, which is precisely the
 /// state certificates exist to prevent.
+///
+/// # How much of this you actually have to implement
+///
+/// Four methods are required; three have defaults that answer "I cannot say". Those defaults keep
+/// a minimal store compiling, but each one **silently switches a feature off** rather than
+/// failing loudly, so here is the exact cost of leaving each unimplemented:
+///
+/// | Method | Default | What stays broken if you keep the default |
+/// | --- | --- | --- |
+/// | [`install`](Self::install) / [`delete`](Self::delete) / [`installed`](Self::installed) / [`has_client_private_key`](Self::has_client_private_key) | *required* | — |
+/// | [`certificate_chain_pem`](Self::certificate_chain_pem) | `None` | **Security profile 3 (mutual TLS) cannot come up.** [`crate::mutual_tls`] has no certificate to present, so the charge point falls back to behaving as if it had none. |
+/// | [`all_certificate_chain_pems`](Self::all_certificate_chain_pems) | delegates to the single-value method | A trust store built from one root instead of several ([`crate::trust_store`]): a CSMS whose certificate chains to any *other* installed root fails verification. Never wrong, sometimes incomplete. |
+/// | [`expires_at`](Self::expires_at) | `None` | **No ahead-of-expiry renewal.** [`crate::certificate_renewal`] skips the slot entirely, so the certificate expires mid-service instead of being replaced early. |
+///
+/// The dividing line is whether the implementation can *parse X.509*: all three defaulted methods
+/// need something that reads a certificate's contents, and this crate has no parser (see the
+/// module docs). They are defaulted rather than split into a second trait because a store that
+/// implements them is still one store - an integrator should not have to wire up two objects, and
+/// the crate should not have to ask "did you also bring the parsing half?" at every call site.
+/// [`StoredCertificates`] overrides the first two and not the third, for exactly this reason.
 #[async_trait::async_trait]
 pub trait CertificateStore {
     /// The error type returned by a failed store operation.
@@ -168,14 +188,19 @@ pub trait CertificateStore {
         uses: &[CertificateUse],
     ) -> Result<Vec<InstalledCertificate>, Self::Error>;
 
-    /// Whether this charge point holds a private key it can authenticate with.
+    /// Whether this charge point holds the private key belonging to its **own client
+    /// certificate** - the one it would present to authenticate itself to the CSMS under security
+    /// profile 3, i.e. the key paired with
+    /// [`CertificateUse::ChargingStation`].
     ///
-    /// The one question the crate asks about keys, and it is deliberately a yes/no: security
-    /// profile 3 needs to know whether a client certificate can be presented
+    /// Named for that specific key rather than "a private key" because a real store holds
+    /// several (a V2G certificate's key, a CSR key mid-rotation) and only this one answers the
+    /// question the crate is asking. It is deliberately a yes/no: security profile 3 needs to
+    /// know whether a client certificate can be presented at all
     /// ([`SecurityProfile::is_implemented`](crate::security_profile::SecurityProfile)), and
     /// nothing above needs the key itself. An implementation backed by a secure element answers
     /// this without the key ever leaving the chip.
-    async fn has_private_key(&self) -> Result<bool, Self::Error>;
+    async fn has_client_private_key(&self) -> Result<bool, Self::Error>;
 
     /// The PEM-encoded certificate chain currently installed for `use_for`, or `None` if this
     /// store holds none.
@@ -183,7 +208,7 @@ pub trait CertificateStore {
     /// Additive (default `Ok(None)`) so existing implementors keep compiling without adopting
     /// it. It exists for security profile 3 mutual TLS ([F1.3](crate)):
     /// [`crate::mutual_tls`] needs the actual certificate bytes to offer on a TLS connection,
-    /// not merely [`Self::has_private_key`]'s yes/no or [`Self::installed`]'s hash-only summary.
+    /// not merely [`Self::has_client_private_key`]'s yes/no or [`Self::installed`]'s hash-only summary.
     /// [`StoredCertificates`] overrides this; a secure-element-backed store that keeps
     /// certificates elsewhere should too.
     async fn certificate_chain_pem(
@@ -274,8 +299,8 @@ impl<T: CertificateStore + Send + Sync + ?Sized> CertificateStore for alloc::syn
         (**self).installed(uses).await
     }
 
-    async fn has_private_key(&self) -> Result<bool, Self::Error> {
-        (**self).has_private_key().await
+    async fn has_client_private_key(&self) -> Result<bool, Self::Error> {
+        (**self).has_client_private_key().await
     }
 
     async fn certificate_chain_pem(
@@ -346,7 +371,7 @@ impl CertificateStore for NoCertificateStore {
         Ok(Vec::new())
     }
 
-    async fn has_private_key(&self) -> Result<bool, Self::Error> {
+    async fn has_client_private_key(&self) -> Result<bool, Self::Error> {
         Ok(false)
     }
 }
@@ -355,7 +380,7 @@ impl CertificateStore for NoCertificateStore {
 /// charge points with no secure element, and the reason B4.1 depends on E1.
 ///
 /// Certificates are public, so keeping them in ordinary storage costs nothing in confidentiality.
-/// **It holds no private key**, and [`Self::has_private_key`] therefore answers `false`: a key in
+/// **It holds no private key**, and [`Self::has_client_private_key`] therefore answers `false`: a key in
 /// flash is a key an attacker with the flash has, and this crate will not pretend otherwise. A
 /// charge point that needs security profile 3 wants a secure-element-backed implementation of the
 /// trait instead.
@@ -595,7 +620,7 @@ impl<S: crate::hardware::Storage + Send + Sync> CertificateStore for StoredCerti
             .collect())
     }
 
-    async fn has_private_key(&self) -> Result<bool, Self::Error> {
+    async fn has_client_private_key(&self) -> Result<bool, Self::Error> {
         // Always false, and not a stub: a key in ordinary flash is a key an attacker holding the
         // flash has. A charge point that needs security profile 3 wants a secure-element-backed
         // implementation of this trait, which is why the trait exists.
@@ -787,7 +812,7 @@ mod tests {
         );
         assert!(store.installed(&[]).await.unwrap().is_empty());
         // And it must not claim it can present a client certificate.
-        assert!(!store.has_private_key().await.unwrap());
+        assert!(!store.has_client_private_key().await.unwrap());
     }
 
     use crate::hardware::InMemoryStorage;
@@ -973,7 +998,7 @@ mod tests {
     async fn a_flash_backed_store_never_claims_to_hold_a_private_key() {
         // Not a stub: a key in ordinary flash is a key an attacker holding the flash has. Claiming
         // otherwise would have security profile 3 believe it can present a client certificate.
-        assert!(!store().has_private_key().await.unwrap());
+        assert!(!store().has_client_private_key().await.unwrap());
     }
 
     #[tokio::test]

@@ -108,7 +108,7 @@ mod tests {
     impl Evse<FaultyConnector> for FaultyEvse {
         type Error = FaultError;
 
-        async fn connectors(&self) -> &[FaultyConnector] {
+        fn connectors(&self) -> &[FaultyConnector] {
             &self.connectors
         }
 

@@ -236,9 +236,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         E: Evse<C>,
         C: Connector,
     {
-        let vendor_name = charge_point.vendor_name().await.to_string();
-        let model_name = charge_point.model_name().await.to_string();
-        let capabilities = charge_point.capabilities().await;
+        let vendor_name = charge_point.vendor_name().to_string();
+        let model_name = charge_point.model_name().to_string();
+        let capabilities = charge_point.capabilities();
         // C2.4 (docs/PRODUCTION-ROADMAP.md §5.2): catch a hardware binding that claims a
         // capability whose Cargo feature is compiled out, or that leaves a compiled-in feature's
         // capability unclaimed, as early as possible - logged, never fatal (see
@@ -251,8 +251,8 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         );
 
         let mut connector_counts = Vec::new();
-        for evse in charge_point.evses().await {
-            connector_counts.push(evse.connectors().await.len());
+        for evse in charge_point.evses() {
+            connector_counts.push(evse.connectors().len());
         }
 
         let runtime =
@@ -283,7 +283,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         }
 
         runtime
-            .hardware()
+            .hardware_handle()
             .start(runtime.hardware_events(), runtime.hardware_commands())
             .await?;
 
@@ -2649,41 +2649,43 @@ pub(crate) mod test_support {
     /// can exercise capability-driven behaviour (`docs/PRODUCTION-ROADMAP.md` §5.3, C3) without a
     /// dedicated fixture per capability combination.
     pub(crate) struct WithCapabilities<T> {
-        pub(crate) inner: T,
+        /// Behind an `Arc` so [`ChargePoint::start`]'s `Arc<Self>` receiver can be forwarded to
+        /// the wrapped binding - a wrapper cannot hand out an `Arc` onto a field it merely owns.
+        pub(crate) inner: alloc::sync::Arc<T>,
         pub(crate) capabilities: Capabilities,
     }
 
     #[async_trait::async_trait]
     impl<T, E, C> ChargePoint<E, C> for WithCapabilities<T>
     where
-        T: ChargePoint<E, C> + Sync,
+        T: ChargePoint<E, C> + Send + Sync,
         E: Evse<C>,
         C: Connector,
     {
         type StartError = T::StartError;
 
-        async fn vendor_name(&self) -> &str {
-            self.inner.vendor_name().await
+        fn vendor_name(&self) -> &str {
+            self.inner.vendor_name()
         }
 
-        async fn model_name(&self) -> &str {
-            self.inner.model_name().await
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
         }
 
-        async fn evses(&self) -> &[E] {
-            self.inner.evses().await
+        fn evses(&self) -> &[E] {
+            self.inner.evses()
         }
 
-        async fn capabilities(&self) -> Capabilities {
+        fn capabilities(&self) -> Capabilities {
             self.capabilities
         }
 
         async fn start(
-            &self,
+            self: Arc<Self>,
             events: HardwareEventSender,
             commands: HardwareCommandReceiver,
         ) -> Result<(), Self::StartError> {
-            self.inner.start(events, commands).await
+            self.inner.clone().start(events, commands).await
         }
     }
 
@@ -2719,24 +2721,24 @@ pub(crate) mod test_support {
     impl ChargePoint<TestEvse, TestConnector> for TestChargePoint {
         type StartError = Infallible;
 
-        async fn vendor_name(&self) -> &str {
+        fn vendor_name(&self) -> &str {
             "Test vendor"
         }
 
-        async fn model_name(&self) -> &str {
+        fn model_name(&self) -> &str {
             "Test model"
         }
 
-        async fn evses(&self) -> &[TestEvse] {
+        fn evses(&self) -> &[TestEvse] {
             &self.evses
         }
 
-        async fn capabilities(&self) -> crate::hardware::Capabilities {
+        fn capabilities(&self) -> crate::hardware::Capabilities {
             crate::hardware::Capabilities::default()
         }
 
         async fn start(
-            &self,
+            self: Arc<Self>,
             events: HardwareEventSender,
             mut commands: HardwareCommandReceiver,
         ) -> Result<(), Self::StartError> {
@@ -2759,7 +2761,7 @@ pub(crate) mod test_support {
     impl Evse<TestConnector> for TestEvse {
         type Error = TestConnectorError;
 
-        async fn connectors(&self) -> &[TestConnector] {
+        fn connectors(&self) -> &[TestConnector] {
             &self.connectors
         }
 
@@ -2779,24 +2781,24 @@ pub(crate) mod test_support {
     impl ChargePoint<TestEvse, TestConnector> for IdleTestChargePoint {
         type StartError = Infallible;
 
-        async fn vendor_name(&self) -> &str {
+        fn vendor_name(&self) -> &str {
             "Test vendor"
         }
 
-        async fn model_name(&self) -> &str {
+        fn model_name(&self) -> &str {
             "Test model"
         }
 
-        async fn evses(&self) -> &[TestEvse] {
+        fn evses(&self) -> &[TestEvse] {
             &self.evses
         }
 
-        async fn capabilities(&self) -> crate::hardware::Capabilities {
+        fn capabilities(&self) -> crate::hardware::Capabilities {
             crate::hardware::Capabilities::default()
         }
 
         async fn start(
-            &self,
+            self: Arc<Self>,
             _events: HardwareEventSender,
             _commands: HardwareCommandReceiver,
         ) -> Result<(), Self::StartError> {
@@ -2815,7 +2817,7 @@ pub(crate) mod test_support {
     impl Evse<TestConnector> for TestEvseWithTwoConnectors {
         type Error = TestConnectorError;
 
-        async fn connectors(&self) -> &[TestConnector] {
+        fn connectors(&self) -> &[TestConnector] {
             &self.connectors
         }
 
@@ -2834,24 +2836,24 @@ pub(crate) mod test_support {
     impl ChargePoint<TestEvseWithTwoConnectors, TestConnector> for IdleTwoConnectorTestChargePoint {
         type StartError = Infallible;
 
-        async fn vendor_name(&self) -> &str {
+        fn vendor_name(&self) -> &str {
             "Test vendor"
         }
 
-        async fn model_name(&self) -> &str {
+        fn model_name(&self) -> &str {
             "Test model"
         }
 
-        async fn evses(&self) -> &[TestEvseWithTwoConnectors] {
+        fn evses(&self) -> &[TestEvseWithTwoConnectors] {
             &self.evses
         }
 
-        async fn capabilities(&self) -> crate::hardware::Capabilities {
+        fn capabilities(&self) -> crate::hardware::Capabilities {
             crate::hardware::Capabilities::default()
         }
 
         async fn start(
-            &self,
+            self: Arc<Self>,
             _events: HardwareEventSender,
             _commands: HardwareCommandReceiver,
         ) -> Result<(), Self::StartError> {
@@ -3137,7 +3139,7 @@ mod tests {
     async fn registering_a_display_advertises_the_formats_it_can_actually_render() {
         let (charge_point, _locked) = test_charge_point(true);
         let charge_point = super::test_support::WithCapabilities {
-            inner: charge_point,
+            inner: alloc::sync::Arc::new(charge_point),
             capabilities: crate::hardware::Capabilities {
                 has_display: true,
                 ..Default::default()

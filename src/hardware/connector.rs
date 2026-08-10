@@ -13,6 +13,23 @@ use alloc::boxed::Box;
 /// [`ConnectorState::Faulted`](crate::state::ConnectorState::Faulted) (see `CLAUDE.md`'s
 /// error-handling guidance), which is the correct, OCPP-visible way to surface a hardware
 /// problem. Never let an error here take down the process.
+///
+/// # `Ok` means the hardware moved, not that the command was sent
+///
+/// This is the sharpest contract in this trait, because getting it wrong fails *open*.
+/// [`execute_hardware_command`](crate::hardware::execute_hardware_command) turns an `Ok(())` from
+/// [`lock`](Self::lock) directly into
+/// [`ConnectorEvent::LockConfirmed`](crate::state::ConnectorEvent::LockConfirmed), and the same
+/// for the other three - there is no separate confirmation step. So returning `Ok` once a command
+/// has been *issued*, before the lock pin has actually engaged or the contactor has actually
+/// closed, tells the state machine something untrue: it will believe an unlocked connector is
+/// locked and let a transaction start behind it.
+///
+/// Await whatever confirmation the hardware offers - a limit switch, an auxiliary contact, a
+/// driver acknowledgement - and return `Ok` only once the physical state really is what the
+/// method name says. If the hardware offers no feedback at all, say so in your own
+/// documentation: that is a property of the machine, not something to paper over here. If
+/// confirmation times out, return `Err`, which faults the connector fail-safe.
 #[async_trait::async_trait]
 pub trait Connector {
     /// The error type returned by a failed hardware operation on this connector.

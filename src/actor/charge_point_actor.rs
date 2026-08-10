@@ -134,7 +134,7 @@ impl ChargePointActor {
         connector_counts: impl IntoIterator<Item = usize>,
         executor: &dyn Executor,
         limits: crate::state::StateLimits,
-        watchdog: Arc<dyn crate::hardware::Watchdog>,
+        watchdog: Arc<dyn crate::hardware::Watchdog + Send + Sync>,
     ) -> Self {
         let state = ChargePointState::with_limits(connector_counts, limits);
         let mailbox = Chan::new();
@@ -346,7 +346,7 @@ async fn run(
     mailbox: Chan<Command>,
     updates: crate::sync::WatchSender<ChargePointState>,
     effects: EffectSenders,
-    watchdog: Arc<dyn crate::hardware::Watchdog>,
+    watchdog: Arc<dyn crate::hardware::Watchdog + Send + Sync>,
 ) {
     loop {
         let Command::Event {

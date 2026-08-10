@@ -17,7 +17,7 @@ reproduce that.
 
 ## 1. What must I implement?
 
-`crate::hardware` currently declares eleven traits, plus one crypto helper trait used only by
+`crate::hardware` declares seventeen traits, plus one crypto helper trait used only by
 `SoftKeyStore`. Three are mandatory; the rest are opt-in per capability and come with a `No*`
 (or, for `Storage`, `InMemoryStorage`) default so you can leave them out entirely until your
 hardware actually needs them.
@@ -32,6 +32,22 @@ hardware actually needs them.
 
 There is no default implementation for any of these three — the crate has nothing to charge
 a car with until you provide them, and no "no-op" version would be honest.
+
+Three details of their shape that save time up front:
+
+- **`ChargePoint::start` takes `self: Arc<Self>`,** not `&self`. The command loop it spawns has
+  to outlive the call, and this is the handle it moves — so your struct holds plain owned fields
+  and never needs an `Arc` of its own. It is the same `Arc` the runtime holds, so it costs
+  nothing extra.
+- **The static accessors are plain `fn`,** not `async fn`: `vendor_name`, `model_name`, `evses`,
+  `capabilities`, and `Evse::connectors`. They return facts that cannot fail and never await;
+  `Evse::connectors` in particular is on the path of every hardware command, where a boxed future
+  per contactor operation would be pure waste on an MCU.
+- **`Connector`'s methods must return `Ok` only once the hardware has actually moved.** An `Ok`
+  from `lock()` is converted straight into `LockConfirmed` — there is no second confirmation
+  step — so returning early, when the command has merely been issued, tells the state machine a
+  connector is locked when it is not. Await your limit switch or auxiliary contact, and return
+  `Err` on timeout (which faults the connector fail-safe). See that trait's own docs.
 
 ### Opt-in — implement only what your hardware actually has
 
@@ -56,11 +72,10 @@ or a silent no-op.
 the pluggable crypto backend `SoftKeyStore` itself needs, only relevant if you use that
 particular `KeyStore` implementation rather than a secure element.
 
-> Note on counting: the roadmap item that requested this guide says "eleven hardware traits."
-> That was accurate when it was written; `BatterySwapStation` landed since (roadmap B8.3) and
-> is included above, so the current count read straight from `src/hardware/mod.rs` is eleven
-> *plus* `BatterySwapStation` — the list above is the complete, current one. Trust the table,
-> not the historical number.
+> Note on counting: `grep -c '^pub trait' src/hardware/*.rs` reports seventeen. The opt-in table
+> above lists the ones an integrator picks up deliberately; `FirmwareVerifier`, `OcspChecker`,
+> `PaymentTerminal`, `Iso15118Controller` and `SoftwareCrypto` are the remainder, each reached
+> through the block that needs it rather than chosen on its own.
 
 ### Plug & Charge authorization has no trait — it is an event
 

@@ -40,6 +40,7 @@ use ocpp_charge_point::hardware::{
 };
 use ocpp_charge_point::provisioning::Backoff;
 use ocpp_charge_point::state::{ChargePointEvent, ConnectorEvent, EvseEvent, IdToken, IdTokenKind};
+use std::sync::Arc;
 
 // 1. The critical-section backend. `embassy-sync`'s mutexes need one, and with `std` off nothing
 //    registers it for you. A single-core MCU implements this by disabling interrupts; here we use
@@ -138,7 +139,7 @@ struct SimulatedEvse {
 impl Evse<SimulatedConnector> for SimulatedEvse {
     type Error = core::convert::Infallible;
 
-    async fn connectors(&self) -> &[SimulatedConnector] {
+    fn connectors(&self) -> &[SimulatedConnector] {
         &self.connectors
     }
     async fn reboot(&self) -> Result<(), Self::Error> {
@@ -147,26 +148,23 @@ impl Evse<SimulatedConnector> for SimulatedEvse {
 }
 
 struct SimulatedChargePoint {
-    /// Shared so `start` can hand a `'static` handle to the command loop it spawns. This is the
-    /// shape most bindings end up in: `start` takes `&self`, but the loop it spawns has to outlive
-    /// the call.
-    evses: std::sync::Arc<Vec<SimulatedEvse>>,
+    evses: Vec<SimulatedEvse>,
 }
 
 #[async_trait::async_trait]
 impl ChargePoint<SimulatedEvse, SimulatedConnector> for SimulatedChargePoint {
     type StartError = core::convert::Infallible;
 
-    async fn vendor_name(&self) -> &str {
+    fn vendor_name(&self) -> &str {
         "Acme"
     }
-    async fn model_name(&self) -> &str {
+    fn model_name(&self) -> &str {
         "Embedded Reference"
     }
-    async fn evses(&self) -> &[SimulatedEvse] {
+    fn evses(&self) -> &[SimulatedEvse] {
         &self.evses
     }
-    async fn capabilities(&self) -> Capabilities {
+    fn capabilities(&self) -> Capabilities {
         // Honest: this simulation has no display, no RTC, no persistent storage and no smart
         // charging hardware. Declaring otherwise would make the charge point advertise surfaces it
         // cannot back - see `docs/PRODUCTION-ROADMAP.md`'s capability-honesty criterion.
@@ -180,14 +178,15 @@ impl ChargePoint<SimulatedEvse, SimulatedConnector> for SimulatedChargePoint {
     /// into the right fault-reporting event, which is why almost every binding should loop on it
     /// rather than hand-rolling a match over `HardwareCommand`.
     async fn start(
-        &self,
+        self: Arc<Self>,
         events: HardwareEventSender,
         mut commands: HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
-        let evses = self.evses.clone();
+        // `self` is already the shared handle the spawned loop needs - the runtime holds the same
+        // `Arc` - so a binding keeps its fields as plain owned values.
         ThreadExecutor.spawn(Box::pin(async move {
             while let Ok(command) = commands.recv().await {
-                execute_hardware_command(evses.as_slice(), command, &events).await;
+                execute_hardware_command(self.evses(), command, &events).await;
             }
         }));
         Ok(())
@@ -203,9 +202,9 @@ fn main() {
     // `--no-default-features` a real configuration rather than a compile check, and what makes a
     // charge point testable on a bench with no backend.
     let charge_point = SimulatedChargePoint {
-        evses: std::sync::Arc::new(vec![SimulatedEvse {
+        evses: vec![SimulatedEvse {
             connectors: vec![SimulatedConnector { log: log.clone() }],
-        }]),
+        }],
     };
     // `ChargePointBuilder` is the supported way in: it constructs the runtime *and* calls the
     // binding's `start`, which is what gets the command loop above running. Building a

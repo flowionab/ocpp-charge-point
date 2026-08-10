@@ -97,12 +97,12 @@ impl SecurityProfile {
     /// everything they need. For profile 3, it is exactly `has_charging_station_certificate`:
     /// mutual TLS needs an installed [`CertificateUse::ChargingStation`](
     /// crate::hardware::CertificateUse) chain and a key to sign with
-    /// ([`crate::hardware::CertificateStore::has_private_key`]), and code existing to wire one up
+    /// ([`crate::hardware::CertificateStore::has_client_private_key`]), and code existing to wire one up
     /// (`is_implemented`) says nothing about whether *this* station has actually obtained one -
     /// see [`crate::mutual_tls`]'s module docs for why a station with neither is refused a
     /// profile-3 connection rather than silently handed a weaker one. Callers are expected to
     /// check this (with `has_charging_station_certificate` from
-    /// `CertificateStore::has_private_key`/[`crate::mutual_tls::client_config`]'s success) before
+    /// `CertificateStore::has_client_private_key`/[`crate::mutual_tls::client_config`]'s success) before
     /// choosing to dial with this profile at all.
     pub fn is_usable(&self, has_charging_station_certificate: bool) -> bool {
         match self {

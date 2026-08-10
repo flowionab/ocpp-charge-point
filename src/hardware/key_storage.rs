@@ -20,7 +20,7 @@
 //!
 //! Mirroring [`CertificateStore`](crate::hardware::CertificateStore)'s split between certificates
 //! (public, freely listed) and the one private-key question it asks
-//! ([`CertificateStore::has_private_key`](crate::hardware::CertificateStore::has_private_key)):
+//! ([`CertificateStore::has_client_private_key`](crate::hardware::CertificateStore::has_client_private_key)):
 //! this module deals only in keys, identified by [`KeyHandle`]. A [`KeyHandle`] never contains key
 //! material - only whatever the implementor uses to locate the key again (a secure-element slot
 //! index, a label, a UUID) - so it is safe to persist in ordinary

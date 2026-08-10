@@ -39,6 +39,7 @@ use ocpp_charge_point::tariff::{
     ChangeTransactionTariffHandler, ClearTariffsHandler, GetTariffsHandler, SetDefaultTariffHandler,
 };
 use ocpp_charge_point::transactions::TransactionNotifier;
+use std::sync::Arc;
 
 /// A stand-in for a real CSMS connection. Real deployments pass an `ocpp-client` version
 /// client (e.g. `ocpp_client::connect_2_1`) instead, which already implements `BootNotifier`,
@@ -517,10 +518,7 @@ impl ReconnectHandler for AlwaysAcceptBootNotifier {
 }
 
 struct SampleChargePoint {
-    // `Arc` so `start()` can clone a handle into its spawned command-processing loop while
-    // `evses()` keeps borrowing from `&self` - see `ChargePoint::start`'s docs on why a real
-    // implementation generally can't service `commands` from within `start()` itself.
-    evses: std::sync::Arc<[SampleEvse; 2]>,
+    evses: [SampleEvse; 2],
 }
 
 struct SampleEvse {
@@ -540,7 +538,7 @@ impl SampleEvse {
 impl SampleChargePoint {
     pub fn new() -> Self {
         Self {
-            evses: std::sync::Arc::new([SampleEvse::new(), SampleEvse::new()]),
+            evses: [SampleEvse::new(), SampleEvse::new()],
         }
     }
 }
@@ -549,23 +547,23 @@ impl SampleChargePoint {
 impl ChargePoint<SampleEvse, SampleConnector> for SampleChargePoint {
     type StartError = core::convert::Infallible;
 
-    async fn vendor_name(&self) -> &str {
+    fn vendor_name(&self) -> &str {
         "Test Vendor"
     }
-    async fn model_name(&self) -> &str {
+    fn model_name(&self) -> &str {
         "Test Model"
     }
 
-    async fn evses(&self) -> &[SampleEvse] {
+    fn evses(&self) -> &[SampleEvse] {
         &self.evses[..]
     }
 
-    async fn capabilities(&self) -> ocpp_charge_point::hardware::Capabilities {
+    fn capabilities(&self) -> ocpp_charge_point::hardware::Capabilities {
         ocpp_charge_point::hardware::Capabilities::default()
     }
 
     async fn start(
-        &self,
+        self: Arc<Self>,
         events: ocpp_charge_point::hardware::HardwareEventSender,
         mut commands: ocpp_charge_point::hardware::HardwareCommandReceiver,
     ) -> Result<(), Self::StartError> {
@@ -573,12 +571,17 @@ impl ChargePoint<SampleEvse, SampleConnector> for SampleChargePoint {
         // `execute_hardware_command` dispatches each one to the right `Connector` and reports
         // the outcome back via `events`, including turning a hardware failure into the right
         // fault event. `start()` itself must return promptly (setup() awaits it before
-        // registering with the CSMS), so the loop runs in a spawned task instead.
-        let evses = self.evses.clone();
+        // registering with the CSMS), so the loop runs in a spawned task instead - which is why
+        // the receiver is an `Arc<Self>`: the task moves it, and nothing here needs an `Arc` of
+        // its own.
         tokio::spawn(async move {
             while let Ok(command) = commands.recv().await {
-                ocpp_charge_point::hardware::execute_hardware_command(&evses[..], command, &events)
-                    .await;
+                ocpp_charge_point::hardware::execute_hardware_command(
+                    self.evses(),
+                    command,
+                    &events,
+                )
+                .await;
             }
         });
         Ok(())
@@ -589,8 +592,8 @@ impl ChargePoint<SampleEvse, SampleConnector> for SampleChargePoint {
 impl Evse<SampleConnector> for SampleEvse {
     type Error = core::convert::Infallible;
 
-    async fn connectors(&self) -> &[SampleConnector] {
-        return &self.connectors;
+    fn connectors(&self) -> &[SampleConnector] {
+        &self.connectors
     }
 
     async fn reboot(&self) -> Result<(), Self::Error> {

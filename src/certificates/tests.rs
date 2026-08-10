@@ -213,7 +213,7 @@ impl CertificateStore for AcceptingStore {
         Ok(Vec::new())
     }
 
-    async fn has_private_key(&self) -> Result<bool, Self::Error> {
+    async fn has_client_private_key(&self) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }

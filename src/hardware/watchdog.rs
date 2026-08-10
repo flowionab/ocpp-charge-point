@@ -37,14 +37,19 @@ use alloc::boxed::Box;
 /// slows the whole charge point - and it must not panic, per this crate's error-handling stance
 /// (G4.1/G4.2). There is deliberately no `Result`: there is nothing sensible for the actor to do
 /// about a failed watchdog write except carry on, and the hardware's own timeout is the backstop.
+///
+/// Like every other trait in [`crate::hardware`], this declares no `Send`/`Sync` supertrait: the
+/// requirement belongs to the place that shares the value across tasks, which here is the actor's
+/// `Arc<dyn Watchdog + Send + Sync>`. An implementation used only in a single-threaded test needs
+/// neither.
 #[async_trait::async_trait]
-pub trait Watchdog: Send + Sync {
+pub trait Watchdog {
     /// Records that the charge point's actor is alive and making progress.
     async fn pet(&self);
 }
 
 #[async_trait::async_trait]
-impl<T: Watchdog + ?Sized> Watchdog for alloc::sync::Arc<T> {
+impl<T: Watchdog + Send + Sync + ?Sized> Watchdog for alloc::sync::Arc<T> {
     async fn pet(&self) {
         (**self).pet().await;
     }

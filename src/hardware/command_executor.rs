@@ -59,7 +59,7 @@ pub async fn execute_hardware_command<E: Evse<C>, C: Connector>(
 
     let (evse_id, connector_id) = command_address(command);
     let event = match evses.get(evse_id) {
-        Some(evse) => match evse.connectors().await.get(connector_id) {
+        Some(evse) => match evse.connectors().get(connector_id) {
             Some(connector) => {
                 let outcome = match command {
                     HardwareCommand::LockConnector { .. } => connector

@@ -842,14 +842,14 @@ mod tests {
                 let csms = RecordingCsms::new();
                 let runtime = setup(
                     WithCapabilities {
-                        inner: TestChargePoint {
+                        inner: alloc::sync::Arc::new(TestChargePoint {
                             evses: [TestEvse {
                                 connectors: [TestConnector {
                                     locked: Arc::new(AtomicBool::new(false)),
                                     lock_succeeds: true,
                                 }],
                             }],
-                        },
+                        }),
                         capabilities,
                     },
                     csms.clone(),
