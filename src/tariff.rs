@@ -30,21 +30,27 @@ use crate::state::{
     TariffId, TariffScope, TariffSetRejection, TransactionId,
 };
 
-/// The outcome of a CSMS-initiated `SetDefaultTariff`, matching OCPP's `TariffSetStatusEnum`
-/// minus `ConditionNotSupported` - this crate never models tariff *conditions* (see this module's
-/// docs), so it can never detect one being unsupported.
+/// The outcome of a CSMS-initiated `SetDefaultTariff`, matching OCPP's `TariffSetStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetDefaultTariffOutcome {
-    /// The tariff was installed as the default for the requested scope.
+    /// The tariff was installed as the default for the requested scope (I07.FR.10).
     Accepted,
     /// A tariff with this id is already installed at a different scope - see
-    /// [`crate::state::TariffSetRejection::DuplicateTariffId`].
+    /// [`crate::state::TariffSetRejection::DuplicateTariffId`] (I07.FR.04).
     DuplicateTariffId,
-    /// The store is already at [`crate::state::StateLimits::max_tariffs`] and this tariff isn't
-    /// replacing an existing one.
+    /// Either the tariff carries more price elements in one dimension than
+    /// `TariffCostCtrlr.MaxElements[Tariff]` allows (I07.FR.02), or the store is already at
+    /// [`crate::state::StateLimits::max_tariffs`] and this tariff isn't replacing an existing one.
     TooManyElements,
-    /// The request could not be honoured - tariff and cost isn't available, or it addresses an
-    /// EVSE this charge point doesn't have.
+    /// The tariff uses conditions and this station reports
+    /// `TariffCostCtrlr.ConditionsSupported[Tariff] = false` (I07.FR.03).
+    ConditionNotSupported,
+    /// The request addresses an EVSE this charge point doesn't have (I07.FR.06). OCPP answers
+    /// `Rejected` for this and for [`Self::Rejected`] alike; they are separate variants so the
+    /// adapter can attach the `reasonCode` that tells the two apart.
+    UnknownEvse,
+    /// The request could not be honoured - tariff and cost isn't available (I07.FR.01), or the
+    /// tariff structure is one this station cannot represent (I07.FR.05).
     Rejected,
 }
 
@@ -65,7 +71,13 @@ pub async fn handle_set_default_tariff(
     if let TariffScope::Evse(evse_id) = scope
         && evse_id >= state.evses.len()
     {
-        return SetDefaultTariffOutcome::Rejected;
+        return SetDefaultTariffOutcome::UnknownEvse;
+    }
+    if tariff.max_prices_per_dimension() > max_price_elements(&state) {
+        return SetDefaultTariffOutcome::TooManyElements;
+    }
+    if tariff.has_conditions() && !conditions_supported(&state) {
+        return SetDefaultTariffOutcome::ConditionNotSupported;
     }
     let mut trial = state.tariffs.clone();
     match trial.set_default(scope, tariff.clone()) {
@@ -83,18 +95,75 @@ pub async fn handle_set_default_tariff(
     }
 }
 
-/// The outcome of a CSMS-initiated `ChangeTransactionTariff`, matching a subset of OCPP's
-/// `TariffChangeStatusEnum` - this crate never produces `TooManyElements`,
-/// `ConditionNotSupported` or `NoCurrencyChange`, for the same reason [`SetDefaultTariffOutcome`]
-/// never produces `ConditionNotSupported`.
+/// How many price elements one dimension of a tariff may carry before this station answers
+/// `TooManyElements` - the value it registers as `TariffCostCtrlr.MaxElements[Tariff]`
+/// (I07.FR.02, I11.FR.02).
+///
+/// A bound rather than "as many as `alloc` will hold": a tariff arrives from the network, is kept
+/// for the life of the installation, and is walked once per priced interval on a device with
+/// kilobytes of RAM. Sixteen is twice the largest structure `ocpp-types`' own fixed-capacity
+/// representation carries and several times the most complex worked example in the
+/// specification.
+pub const MAX_TARIFF_PRICE_ELEMENTS: usize = 16;
+
+/// `TariffCostCtrlr.MaxElements[Tariff]`, or [`MAX_TARIFF_PRICE_ELEMENTS`] when it is absent or
+/// unparseable - the variable is registered `ReadOnly`, so the two agree unless a build has
+/// removed it.
+fn max_price_elements(state: &ChargePointState) -> usize {
+    tariff_variable(state, "MaxElements")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(MAX_TARIFF_PRICE_ELEMENTS)
+}
+
+/// `TariffCostCtrlr.ConditionsSupported[Tariff]`. Defaults to `true`, which is what this build
+/// registers: [`crate::pricing`] evaluates every condition OCPP defines.
+fn conditions_supported(state: &ChargePointState) -> bool {
+    tariff_variable(state, "ConditionsSupported")
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+/// The `Actual` value of `TariffCostCtrlr.<variable>[Tariff]`, if registered.
+fn tariff_variable(state: &ChargePointState, variable: &str) -> Option<alloc::string::String> {
+    use crate::state::{Component, Variable, VariableAttributeType};
+    state
+        .device_model
+        .get(
+            &Component {
+                name: "TariffCostCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            &Variable {
+                name: variable.into(),
+                instance: Some("Tariff".into()),
+            },
+        )?
+        .attribute(VariableAttributeType::Actual)
+        .map(|attribute| attribute.value.clone())
+}
+
+/// The outcome of a CSMS-initiated `ChangeTransactionTariff`, matching OCPP's
+/// `TariffChangeStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeTransactionTariffOutcome {
-    /// The tariff was assigned to the named transaction.
+    /// The tariff was assigned to the named transaction (I11.FR.06).
     Accepted,
-    /// No transaction with that id is currently running on this charge point - refused rather
-    /// than silently stored, per `docs/PRODUCTION-ROADMAP.md` B7.1.
+    /// No transaction with that id is currently running on this charge point (I11.FR.04) -
+    /// refused rather than silently stored, per `docs/PRODUCTION-ROADMAP.md` B7.1.
     TxNotFound,
-    /// The request could not be honoured - tariff and cost isn't available.
+    /// The tariff carries more price elements in one dimension than
+    /// `TariffCostCtrlr.MaxElements[Tariff]` allows (I11.FR.02).
+    TooManyElements,
+    /// The tariff uses conditions and this station reports
+    /// `TariffCostCtrlr.ConditionsSupported[Tariff] = false` (I11.FR.03).
+    ConditionNotSupported,
+    /// The new tariff is in a different currency from the one already pricing the transaction
+    /// (I11.FR.05) - switching currency mid-session is not allowed, since the running cost the
+    /// driver has already been shown would silently change meaning.
+    NoCurrencyChange,
+    /// The request could not be honoured - tariff and cost isn't available (I11.FR.01), or the
+    /// tariff structure is one this station cannot represent.
     Rejected,
 }
 
@@ -114,6 +183,34 @@ fn find_transaction(
     })
 }
 
+/// The currency the tariff currently pricing this connector's transaction is stated in, for
+/// I11.FR.05.
+///
+/// The driver tariff wins where there is one; otherwise it is the default tariff installed for
+/// this EVSE. Deliberately does *not* consult a clock to pick between a scope's current and
+/// future default: a currency belongs to an operator's whole tariff set rather than to an
+/// instant, so a scope whose tariffs disagree about it is a CSMS error either way, and the
+/// most recently installed one is the newest instruction.
+fn active_currency(
+    state: &ChargePointState,
+    evse_id: usize,
+    connector_id: usize,
+) -> Option<alloc::string::String> {
+    if let Some(tariff) = state
+        .evses
+        .get(evse_id)
+        .and_then(|evse| evse.transaction_tariffs.get(connector_id))
+        .and_then(Option::as_ref)
+    {
+        return Some(tariff.currency.clone());
+    }
+    state
+        .tariffs
+        .selected_by_evse(Some(evse_id))
+        .last()
+        .map(|installed| installed.tariff.currency.clone())
+}
+
 /// Handles a CSMS-initiated `ChangeTransactionTariff` against `actor`: finds the connector whose
 /// active transaction is `transaction_id` and assigns `tariff` to it as a driver tariff.
 #[tracing::instrument(skip_all)]
@@ -129,13 +226,24 @@ pub async fn handle_change_transaction_tariff(
     let Some((evse_id, connector_id)) = find_transaction(&state, transaction_id) else {
         return ChangeTransactionTariffOutcome::TxNotFound;
     };
+    if tariff.max_prices_per_dimension() > max_price_elements(&state) {
+        return ChangeTransactionTariffOutcome::TooManyElements;
+    }
+    if tariff.has_conditions() && !conditions_supported(&state) {
+        return ChangeTransactionTariffOutcome::ConditionNotSupported;
+    }
+    if active_currency(&state, evse_id, connector_id)
+        .is_some_and(|currency| currency != tariff.currency)
+    {
+        return ChangeTransactionTariffOutcome::NoCurrencyChange;
+    }
 
     let _ = actor
         .send(ChargePointEvent::Evse {
             evse_id,
             event: EvseEvent::Connector {
                 connector_id,
-                event: ConnectorEvent::TariffAssigned(tariff),
+                event: ConnectorEvent::TariffAssigned(alloc::boxed::Box::new(tariff)),
             },
         })
         .await;
@@ -254,9 +362,17 @@ pub struct TariffReport {
     pub tariff_id: TariffId,
     /// Whether this is a default or a driver tariff.
     pub kind: TariffKind,
-    /// Where it applies - the whole charge point, or one EVSE.
-    pub scope: TariffScope,
-    /// When it became active, if the CSMS said.
+    /// Every EVSE this tariff is installed at, as this crate's 0-based ids (I09.FR.04/.05/.06).
+    ///
+    /// A charge-point-wide default is reported against *each* EVSE rather than as a `0`: I07.FR.12
+    /// defines `evseId = 0` as "install at each EVSE", so that is what is installed and that is
+    /// what an honest report shows. Empty only for a driver tariff whose transaction has not
+    /// started yet, which has no EVSE to name.
+    pub evse_ids: Vec<usize>,
+    /// The identifiers this tariff was issued for - a driver tariff's `idTokens` (I09.FR.05).
+    /// Empty for a default tariff, which applies to whoever plugs in.
+    pub id_tokens: Vec<crate::state::IdToken>,
+    /// When it became active, if the CSMS said (I09.FR.07).
     pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -288,7 +404,17 @@ pub fn handle_get_tariffs(actor: &ChargePointActor, evse_id: Option<usize>) -> G
         .map(|installed| TariffReport {
             tariff_id: installed.tariff.id.clone(),
             kind: TariffKind::Default,
-            scope: installed.scope,
+            // I09.FR.04: every EVSE this tariff is installed at. A charge-point-wide default is
+            // installed at all of them (I07.FR.12), narrowed to the requested one when the CSMS
+            // asked about a single EVSE.
+            evse_ids: match installed.scope {
+                TariffScope::ChargePoint => match evse_id {
+                    Some(evse_id) => alloc::vec![evse_id],
+                    None => (0..state.evses.len()).collect(),
+                },
+                TariffScope::Evse(id) => alloc::vec![id],
+            },
+            id_tokens: Vec::new(),
             valid_from: installed.tariff.valid_from,
         })
         .collect();
@@ -296,11 +422,23 @@ pub fn handle_get_tariffs(actor: &ChargePointActor, evse_id: Option<usize>) -> G
         if evse_id.is_some_and(|target| target != id) {
             continue;
         }
-        for tariff in evse.transaction_tariffs.iter().flatten() {
+        for (connector_id, tariff) in evse.transaction_tariffs.iter().enumerate() {
+            let Some(tariff) = tariff else { continue };
             reports.push(TariffReport {
                 tariff_id: tariff.id.clone(),
                 kind: TariffKind::Driver,
-                scope: TariffScope::Evse(id),
+                // I09.FR.06: a driver tariff is reported against the EVSE whose transaction it is
+                // pricing.
+                evse_ids: alloc::vec![id],
+                // I09.FR.05: the identifier the tariff was issued for, which is the one that
+                // authorized the transaction it is assigned to.
+                id_tokens: evse
+                    .transactions
+                    .get(connector_id)
+                    .and_then(Option::as_ref)
+                    .and_then(|transaction| transaction.id_token.clone())
+                    .into_iter()
+                    .collect(),
                 valid_from: tariff.valid_from,
             });
         }
@@ -364,11 +502,7 @@ mod tests {
     }
 
     fn tariff(id: &str) -> Tariff {
-        Tariff {
-            id: TariffId(id.into()),
-            currency: "EUR".into(),
-            valid_from: None,
-        }
+        Tariff::new(TariffId(id.into()), "EUR")
     }
 
     async fn actor_with_capability() -> ChargePointActor {
@@ -440,7 +574,8 @@ mod tests {
 
         let outcome = handle_set_default_tariff(&actor, TariffScope::Evse(99), tariff("t1")).await;
 
-        assert_eq!(outcome, SetDefaultTariffOutcome::Rejected);
+        // I07.FR.06 - `Rejected` on the wire, with the `reasonCode` that says which rejection.
+        assert_eq!(outcome, SetDefaultTariffOutcome::UnknownEvse);
     }
 
     #[tokio::test]
@@ -603,7 +738,11 @@ pub mod ocpp_2_1 {
         handle_get_tariffs, handle_set_default_tariff,
     };
     use crate::actor::ChargePointActor;
-    use crate::state::{Tariff, TariffId, TariffScope, TransactionId};
+    use crate::state::{
+        EnergyComponent, EnergyPrice, EvseKind, FixedComponent, FixedPrice, Money, Price, Tariff,
+        TariffConditions, TariffConditionsFixed, TariffId, TariffScope, TaxPercent, TaxRate,
+        TimeComponent, TimeOfDay, TimePrice, TransactionId, milli_from_decimal,
+    };
     use alloc::boxed::Box;
     use alloc::vec::Vec;
 
@@ -645,39 +784,301 @@ pub mod ocpp_2_1 {
         usize::try_from(evse_id - 1).ok()
     }
 
-    fn wire_tariff(tariff: &crate::wire::v21::common::Tariff) -> Tariff {
-        Tariff {
+    /// Converts one wire `TariffConditionsType`.
+    ///
+    /// Every physical threshold is an OCPP `decimal`, which is where a float would otherwise enter
+    /// the model; [`milli_from_decimal`] converts it once, here, into the thousandths
+    /// [`TariffConditions`] stores. A threshold that is not a finite number the station can hold
+    /// makes the whole tariff invalid rather than silently dropping the restriction - dropping a
+    /// `maxPower` would apply an expensive price to a session that was meant to escape it.
+    fn wire_conditions(
+        conditions: &crate::wire::v21::common::TariffConditions,
+    ) -> Option<TariffConditions> {
+        let milli = |value: Option<f64>| match value {
+            None => Some(None),
+            Some(value) => milli_from_decimal(value).map(Some),
+        };
+        Some(TariffConditions {
+            start_time_of_day: conditions.start_time_of_day.map(wire_time_of_day),
+            end_time_of_day: conditions.end_time_of_day.map(wire_time_of_day),
+            day_of_week: conditions
+                .day_of_week
+                .iter()
+                .flatten()
+                .map(wire_weekday)
+                .collect(),
+            valid_from_date: wire_date(conditions.valid_from_date)?,
+            valid_to_date: wire_date(conditions.valid_to_date)?,
+            evse_kind: conditions.evse_kind.as_ref().map(wire_evse_kind),
+            min_energy_mwh: milli(conditions.min_energy)?,
+            max_energy_mwh: milli(conditions.max_energy)?,
+            min_current_ma: milli(conditions.min_current)?,
+            max_current_ma: milli(conditions.max_current)?,
+            min_power_mw: milli(conditions.min_power)?,
+            max_power_mw: milli(conditions.max_power)?,
+            min_time_secs: conditions.min_time,
+            max_time_secs: conditions.max_time,
+            min_charging_time_secs: conditions.min_charging_time,
+            max_charging_time_secs: conditions.max_charging_time,
+            min_idle_time_secs: conditions.min_idle_time,
+            max_idle_time_secs: conditions.max_idle_time,
+        })
+    }
+
+    fn wire_fixed_conditions(
+        conditions: &crate::wire::v21::common::TariffConditionsFixed,
+    ) -> Option<TariffConditionsFixed> {
+        Some(TariffConditionsFixed {
+            start_time_of_day: conditions.start_time_of_day.map(wire_time_of_day),
+            end_time_of_day: conditions.end_time_of_day.map(wire_time_of_day),
+            day_of_week: conditions
+                .day_of_week
+                .iter()
+                .flatten()
+                .map(wire_weekday)
+                .collect(),
+            valid_from_date: wire_date(conditions.valid_from_date)?,
+            valid_to_date: wire_date(conditions.valid_to_date)?,
+            evse_kind: conditions.evse_kind.as_ref().map(wire_evse_kind),
+            payment_brand: conditions
+                .payment_brand
+                .as_ref()
+                .map(|brand| brand.as_str().into()),
+            payment_recognition: conditions
+                .payment_recognition
+                .as_ref()
+                .map(|kind| kind.as_str().into()),
+        })
+    }
+
+    fn wire_time_of_day(time: crate::wire::OcppTimeOfDay) -> TimeOfDay {
+        // Infallible: `OcppTimeOfDay` validated the `hh:mm` on the way in, so it can only hold an
+        // hour under 24 and a minute under 60 - which is exactly `TimeOfDay`'s own invariant.
+        TimeOfDay {
+            hour: time.hour(),
+            minute: time.minute(),
+        }
+    }
+
+    /// `None` for an absent date; `Some(None)` never occurs, so an unrepresentable date propagates
+    /// as a tariff-level rejection rather than a silently dropped restriction.
+    fn wire_date(date: Option<crate::wire::OcppDate>) -> Option<Option<chrono::NaiveDate>> {
+        match date {
+            None => Some(None),
+            Some(date) => chrono::NaiveDate::from_ymd_opt(
+                i32::from(date.year()),
+                u32::from(date.month()),
+                u32::from(date.day()),
+            )
+            .map(Some),
+        }
+    }
+
+    fn wire_weekday(day: &crate::wire::v21::common::DayOfWeekEnum) -> chrono::Weekday {
+        use crate::wire::v21::common::DayOfWeekEnum;
+        match day {
+            DayOfWeekEnum::Monday => chrono::Weekday::Mon,
+            DayOfWeekEnum::Tuesday => chrono::Weekday::Tue,
+            DayOfWeekEnum::Wednesday => chrono::Weekday::Wed,
+            DayOfWeekEnum::Thursday => chrono::Weekday::Thu,
+            DayOfWeekEnum::Friday => chrono::Weekday::Fri,
+            DayOfWeekEnum::Saturday => chrono::Weekday::Sat,
+            DayOfWeekEnum::Sunday => chrono::Weekday::Sun,
+        }
+    }
+
+    fn wire_evse_kind(kind: &crate::wire::v21::common::EvseKindEnum) -> EvseKind {
+        match kind {
+            crate::wire::v21::common::EvseKindEnum::AC => EvseKind::Ac,
+            crate::wire::v21::common::EvseKindEnum::DC => EvseKind::Dc,
+        }
+    }
+
+    fn wire_tax_rates(
+        rates: Option<&heapless::Vec<crate::wire::v21::common::TaxRate, 5>>,
+    ) -> Option<Vec<TaxRate>> {
+        rates
+            .map(|rates| {
+                rates
+                    .iter()
+                    .map(|rate| {
+                        Some(TaxRate {
+                            kind: rate.r#type.as_str().into(),
+                            percent: TaxPercent::from_decimal(rate.tax)?,
+                            // OCPP defaults an absent `stack` to 0. A negative or absurd stack
+                            // level cannot be honoured, so it invalidates the tariff rather than
+                            // being clamped into a level it was not meant for.
+                            stack: rate
+                                .stack
+                                .map_or(Some(0), |stack| u8::try_from(stack).ok())?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .unwrap_or_else(|| Some(Vec::new()))
+    }
+
+    fn wire_energy(component: &crate::wire::v21::common::TariffEnergy) -> Option<EnergyComponent> {
+        Some(EnergyComponent {
+            prices: component
+                .prices
+                .iter()
+                .map(|price| {
+                    Some(EnergyPrice {
+                        price_per_kwh: Money::from_decimal(price.price_kwh)?,
+                        conditions: match &price.conditions {
+                            None => None,
+                            Some(conditions) => Some(wire_conditions(conditions)?),
+                        },
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            tax_rates: wire_tax_rates(component.tax_rates.as_ref())?,
+        })
+    }
+
+    fn wire_time(component: &crate::wire::v21::common::TariffTime) -> Option<TimeComponent> {
+        Some(TimeComponent {
+            prices: component
+                .prices
+                .iter()
+                .map(|price| {
+                    Some(TimePrice {
+                        price_per_minute: Money::from_decimal(price.price_minute)?,
+                        conditions: match &price.conditions {
+                            None => None,
+                            Some(conditions) => Some(wire_conditions(conditions)?),
+                        },
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            tax_rates: wire_tax_rates(component.tax_rates.as_ref())?,
+        })
+    }
+
+    fn wire_fixed(component: &crate::wire::v21::common::TariffFixed) -> Option<FixedComponent> {
+        Some(FixedComponent {
+            prices: component
+                .prices
+                .iter()
+                .map(|price| {
+                    Some(FixedPrice {
+                        price: Money::from_decimal(price.price_fixed)?,
+                        conditions: match &price.conditions {
+                            None => None,
+                            Some(conditions) => Some(wire_fixed_conditions(conditions)?),
+                        },
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            tax_rates: wire_tax_rates(component.tax_rates.as_ref())?,
+        })
+    }
+
+    fn wire_price(price: &crate::wire::v21::common::Price) -> Option<Price> {
+        let convert = |value: Option<f64>| match value {
+            None => Some(None),
+            Some(value) => Money::from_decimal(value).map(Some),
+        };
+        Some(Price {
+            excl_tax: convert(price.excl_tax)?,
+            incl_tax: convert(price.incl_tax)?,
+        })
+    }
+
+    /// Converts a wire `TariffType` into this crate's [`Tariff`], or `None` when the structure is
+    /// one this station cannot represent - which the caller answers with `Rejected` and a
+    /// `reasonCode` of `InvalidValue` (I07.FR.05).
+    ///
+    /// The whole tariff fails rather than the offending element being dropped. A tariff is a price
+    /// list a driver is charged against: a partially-parsed one would price a session by rules
+    /// neither the CSMS nor the driver ever agreed to, which is worse than refusing it and
+    /// falling back to the CSMS's own cost calculation.
+    fn wire_tariff(tariff: &crate::wire::v21::common::Tariff) -> Option<Tariff> {
+        let component = |component: &Option<crate::wire::v21::common::TariffTime>| match component {
+            None => Some(None),
+            Some(component) => wire_time(component).map(Some),
+        };
+        let fixed = |component: &Option<crate::wire::v21::common::TariffFixed>| match component {
+            None => Some(None),
+            Some(component) => wire_fixed(component).map(Some),
+        };
+        let bound = |price: &Option<crate::wire::v21::common::Price>| match price {
+            None => Some(None),
+            Some(price) => wire_price(price).map(Some),
+        };
+        Some(Tariff {
             id: TariffId(tariff.tariff_id.as_str().into()),
             currency: tariff.currency.as_str().into(),
             // Infallible since `ocpp-types` 0.2.0: `validFrom` arrives as an already-validated
             // `OcppTimestamp`, so the "unparseable becomes absent" fallback has no case left.
             valid_from: tariff.valid_from.map(Into::into),
-        }
+            energy: match &tariff.energy {
+                None => None,
+                Some(energy) => Some(wire_energy(energy)?),
+            },
+            charging_time: component(&tariff.charging_time)?,
+            idle_time: component(&tariff.idle_time)?,
+            fixed_fee: fixed(&tariff.fixed_fee)?,
+            reservation_time: component(&tariff.reservation_time)?,
+            reservation_fixed: fixed(&tariff.reservation_fixed)?,
+            min_cost: bound(&tariff.min_cost)?,
+            max_cost: bound(&tariff.max_cost)?,
+        })
     }
 
     async fn handle_set_default(
         actor: &ChargePointActor,
         request: &SetDefaultTariffRequest,
     ) -> Result<SetDefaultTariffResponse, OCPP2_1Error> {
+        // I07.FR.06 (`UnknownEVSE`) and I07.FR.05 (`InvalidValue`) both answer `Rejected`; the
+        // `statusInfo.reasonCode` is what tells the CSMS which, and OCPP marks it optional
+        // precisely so a station that knows can say.
         let Some(scope) = parse_scope(request.evse_id) else {
-            return Ok(SetDefaultTariffResponse {
-                custom_data: None,
-                status: TariffSetStatusEnum::Rejected,
-                status_info: None,
-            });
+            return Ok(rejected_set(Some(UNKNOWN_EVSE)));
         };
-        let outcome = handle_set_default_tariff(actor, scope, wire_tariff(&request.tariff)).await;
+        let Some(tariff) = wire_tariff(&request.tariff) else {
+            tracing::warn!(
+                tariff_id = request.tariff.tariff_id.as_str(),
+                "refusing a tariff this station cannot represent"
+            );
+            return Ok(rejected_set(Some(INVALID_VALUE)));
+        };
+        let outcome = handle_set_default_tariff(actor, scope, tariff).await;
         let status = match outcome {
             SetDefaultTariffOutcome::Accepted => TariffSetStatusEnum::Accepted,
             SetDefaultTariffOutcome::DuplicateTariffId => TariffSetStatusEnum::DuplicateTariffId,
             SetDefaultTariffOutcome::TooManyElements => TariffSetStatusEnum::TooManyElements,
-            SetDefaultTariffOutcome::Rejected => TariffSetStatusEnum::Rejected,
+            SetDefaultTariffOutcome::ConditionNotSupported => {
+                TariffSetStatusEnum::ConditionNotSupported
+            }
+            SetDefaultTariffOutcome::UnknownEvse => return Ok(rejected_set(Some(UNKNOWN_EVSE))),
+            SetDefaultTariffOutcome::Rejected => return Ok(rejected_set(None)),
         };
         Ok(SetDefaultTariffResponse {
             custom_data: None,
             status,
             status_info: None,
         })
+    }
+
+    /// OCPP's `reasonCode` for a tariff structure this station cannot represent (I07.FR.05).
+    const INVALID_VALUE: &str = "InvalidValue";
+    /// OCPP's `reasonCode` for an `evseId` this charge point does not have (I07.FR.06).
+    const UNKNOWN_EVSE: &str = "UnknownEVSE";
+
+    fn rejected_set(reason: Option<&str>) -> SetDefaultTariffResponse {
+        SetDefaultTariffResponse {
+            custom_data: None,
+            status: TariffSetStatusEnum::Rejected,
+            status_info: reason.and_then(|reason| {
+                Some(crate::wire::v21::common::StatusInfo {
+                    additional_info: None,
+                    custom_data: None,
+                    reason_code: heapless::String::try_from(reason).ok()?,
+                })
+            }),
+        }
     }
 
     #[async_trait::async_trait]
@@ -707,12 +1108,30 @@ pub mod ocpp_2_1 {
                 status_info: None,
             });
         };
-        let outcome =
-            handle_change_transaction_tariff(actor, transaction_id, wire_tariff(&request.tariff))
-                .await;
+        let Some(tariff) = wire_tariff(&request.tariff) else {
+            tracing::warn!(
+                tariff_id = request.tariff.tariff_id.as_str(),
+                "refusing a tariff this station cannot represent"
+            );
+            return Ok(ChangeTransactionTariffResponse {
+                custom_data: None,
+                status: TariffChangeStatusEnum::Rejected,
+                status_info: None,
+            });
+        };
+        let outcome = handle_change_transaction_tariff(actor, transaction_id, tariff).await;
         let status = match outcome {
             ChangeTransactionTariffOutcome::Accepted => TariffChangeStatusEnum::Accepted,
             ChangeTransactionTariffOutcome::TxNotFound => TariffChangeStatusEnum::TxNotFound,
+            ChangeTransactionTariffOutcome::TooManyElements => {
+                TariffChangeStatusEnum::TooManyElements
+            }
+            ChangeTransactionTariffOutcome::ConditionNotSupported => {
+                TariffChangeStatusEnum::ConditionNotSupported
+            }
+            ChangeTransactionTariffOutcome::NoCurrencyChange => {
+                TariffChangeStatusEnum::NoCurrencyChange
+            }
             ChangeTransactionTariffOutcome::Rejected => TariffChangeStatusEnum::Rejected,
         };
         Ok(ChangeTransactionTariffResponse {
@@ -784,11 +1203,24 @@ pub mod ocpp_2_1 {
     fn report_to_wire(report: &super::TariffReport) -> Option<TariffAssignment> {
         Some(TariffAssignment {
             custom_data: None,
-            evse_ids: match report.scope {
-                TariffScope::ChargePoint => None,
-                TariffScope::Evse(id) => Some(alloc::vec![scope_to_wire(TariffScope::Evse(id))]),
-            },
-            id_tokens: None,
+            // I09.FR.04/.05/.06. `+ 1` because OCPP numbers EVSEs from 1 - the same conversion
+            // `scope_to_wire` does for a scope.
+            evse_ids: (!report.evse_ids.is_empty()).then(|| {
+                report
+                    .evse_ids
+                    .iter()
+                    .map(|id| scope_to_wire(TariffScope::Evse(*id)))
+                    .collect()
+            }),
+            // The driver's own identifier, which is exactly what I09.FR.05 asks for. It leaves
+            // this station only towards the CSMS that issued the tariff for it.
+            id_tokens: (!report.id_tokens.is_empty()).then(|| {
+                report
+                    .id_tokens
+                    .iter()
+                    .filter_map(|token| heapless::String::try_from(token.value.as_str()).ok())
+                    .collect()
+            }),
             tariff_id: heapless::String::try_from(report.tariff_id.0.as_str()).ok()?,
             tariff_kind: match report.kind {
                 TariffKind::Default => TariffKindEnum::DefaultTariff,

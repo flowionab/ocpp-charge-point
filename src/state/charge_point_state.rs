@@ -1507,7 +1507,7 @@ impl ChargePointState {
             _ => None,
         };
         let tariff_update = match &event {
-            ConnectorEvent::TariffAssigned(tariff) => Some(tariff.clone()),
+            ConnectorEvent::TariffAssigned(tariff) => Some((**tariff).clone()),
             _ => None,
         };
         let computed_limit = match &event {
@@ -4706,11 +4706,7 @@ mod tests {
     }
 
     fn test_tariff(id: &str) -> crate::state::Tariff {
-        crate::state::Tariff {
-            id: crate::state::TariffId(id.into()),
-            currency: "EUR".into(),
-            valid_from: None,
-        }
+        crate::state::Tariff::new(crate::state::TariffId(id.into()), "EUR")
     }
 
     #[test]
@@ -4775,7 +4771,7 @@ mod tests {
 
         apply_connector_event(
             &mut state,
-            ConnectorEvent::TariffAssigned(test_tariff("t1")),
+            ConnectorEvent::TariffAssigned(alloc::boxed::Box::new(test_tariff("t1"))),
         );
 
         assert_eq!(
@@ -4790,7 +4786,7 @@ mod tests {
 
         apply_connector_event(
             &mut state,
-            ConnectorEvent::TariffAssigned(test_tariff("t1")),
+            ConnectorEvent::TariffAssigned(alloc::boxed::Box::new(test_tariff("t1"))),
         );
 
         assert_eq!(state.evses[0].transaction_tariffs[0], None);
@@ -4807,7 +4803,7 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
         apply_connector_event(
             &mut state,
-            ConnectorEvent::TariffAssigned(test_tariff("t1")),
+            ConnectorEvent::TariffAssigned(alloc::boxed::Box::new(test_tariff("t1"))),
         );
         apply_connector_event(
             &mut state,

@@ -757,7 +757,12 @@ pub enum ConnectorEvent {
     /// [`Self::CostUpdated`] exactly, including how the assignment is cleared the moment the
     /// transaction starts or ends (see `crate::state::EvseState::transaction_tariffs`). See
     /// `docs/ROADMAP.md` §9 and `docs/PRODUCTION-ROADMAP.md` B7.1.
-    TariffAssigned(Tariff),
+    /// Boxed, like `DefaultTariffSet`'s payload above and for the same reason: a priced `Tariff`
+    /// is by far the largest thing any connector event carries (CV8 gave it energy, time, idle
+    /// and fixed-fee components with their conditions), and an enum is as big as its widest
+    /// variant. Unboxed, every `ConnectorEvent` in every queue and broadcast on an MCU would pay
+    /// for a tariff that almost none of them carry.
+    TariffAssigned(alloc::boxed::Box<Tariff>),
     /// A CSMS-initiated `Reset` (`ResetKind::Immediate`) covers this connector. Any state where
     /// a cable is engaged (`Connected`/`Locked`/`Authorizing`/`Starting`/`Charging`) is driven
     /// through the same fail-safe stop already used for a normal charging stop (open the

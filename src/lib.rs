@@ -115,6 +115,11 @@ pub mod payment;
 #[cfg(feature = "periodic-event-stream")]
 pub mod periodic_event_stream;
 pub mod persistence;
+/// Local cost calculation: what a [`state::Tariff`] and a sequence of meter readings add up to
+/// (OCPP 2.1's I12). Unconditional, unlike [`tariff`]/[`cost`], because the tariff *model* it
+/// prices from is part of [`state`] and a build with the messages compiled out can still be asked
+/// what a session cost.
+pub mod pricing;
 pub mod provisioning;
 pub mod publish_firmware;
 pub mod refusal;

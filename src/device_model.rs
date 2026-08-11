@@ -210,9 +210,35 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         instance: None,
         data_type: VariableDataType::String,
         // Empty until configured: a CSMS-reported `CostUpdated` carries no currency, and
-        // inventing one (EUR? USD?) would put a unit on a number this crate never checks.
+        // inventing one (EUR? USD?) would put a unit on a number this crate never checks. A
+        // *tariff* carries its own currency and never consults this.
         value: "",
         mutability: VariableMutability::ReadWrite,
+    },
+    // The two bounds `SetDefaultTariff`/`ChangeTransactionTariff` refuse against (I07.FR.02/.03,
+    // I11.FR.02/.03). Both are `ReadOnly` in the appendix and both are read on the path that
+    // enforces them - see `crate::tariff::max_price_elements`/`conditions_supported` - so unlike
+    // `Currency` above they are live rather than merely registered.
+    CapabilityGatedVariable {
+        component: "TariffCostCtrlr",
+        variable: "MaxElements",
+        instance: Some("Tariff"),
+        data_type: VariableDataType::Integer,
+        // Kept in step with `crate::tariff::MAX_TARIFF_PRICE_ELEMENTS` by a test in that module,
+        // which is where the reasoning for the number itself lives.
+        value: "16",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "TariffCostCtrlr",
+        variable: "ConditionsSupported",
+        instance: Some("Tariff"),
+        data_type: VariableDataType::Boolean,
+        // True, and meant: `crate::pricing` evaluates every field of `TariffConditionsType` and
+        // `TariffConditionsFixedType` that this station can observe, and treats one it cannot
+        // observe as unmet rather than ignoring it.
+        value: "true",
+        mutability: VariableMutability::ReadOnly,
     },
     CapabilityGatedVariable {
         component: "TariffCostCtrlr",
