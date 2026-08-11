@@ -170,6 +170,9 @@ fn full_transaction(index: usize) -> Transaction {
             soc_percent: Some(64),
         }),
         priority_charging: true,
+        remote_start_id: None,
+        reservation_id: None,
+        stop_at_energy_wh: None,
     }
 }
 
@@ -272,6 +275,7 @@ fn full_transaction_queue(capacity: usize) -> OfflineQueue<TransactionEventOccur
                     ocpp_charge_point::state::TransactionUpdateReason::MeterValuePeriodic,
                 ),
                 transaction: full_transaction(index),
+                offline: false,
             })
             .collect(),
     );

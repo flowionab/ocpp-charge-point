@@ -133,10 +133,19 @@ where
 {
     let mut builder = ChargePointBuilder::start(charge_point, executor)
         .await?
-        .provisioning(&csms, backoff.clone(), monotonic)
+        .provisioning(&csms, backoff.clone(), monotonic.clone())
         .await
         .status_notifications(&csms)
         .await
+        // After `status_notifications`, deliberately: a reconnect flushes the queued changes
+        // first, so a full sweep can never overtake an older change it supersedes. See
+        // `ChargePointBuilder::connector_status_resynchronisation` (CV5).
+        .connector_status_resynchronisation(&csms, monotonic.clone())
+        .await
+        // F02.FR.07/.08 (CV2.3): a remote start whose driver never arrives has to be released, or
+        // it would fire for whoever plugs in next. Swept every 5s, so the release lands within
+        // 5s of `TxCtrlr.EVConnectionTimeOut`.
+        .pending_remote_start_timeouts(backoff.clone(), monotonic, 5)
         .transaction_events(&csms)
         .await
         .authorization(&csms, clock.clone())
@@ -389,8 +398,9 @@ mod tests {
             _connector_id: usize,
             _kind: crate::state::TransactionEventKind,
             _transaction: crate::state::Transaction,
-        ) -> Result<(), Self::Error> {
-            Ok(())
+            _offline: bool,
+        ) -> Result<crate::transactions::TransactionEventOutcome, Self::Error> {
+            Ok(crate::transactions::TransactionEventOutcome::acknowledged())
         }
     }
 
@@ -811,6 +821,21 @@ mod tests {
                     },
                     "ocsp_checking" => crate::hardware::Capabilities {
                         ocsp_checking: enabled,
+                        ..Default::default()
+                    },
+                    // CV1.6: three gates share `der_control`/`payment` with the block gates above
+                    // - they exist to hang OCPP's required variables on components the block
+                    // gates do not name, not to add a capability an integrator declares.
+                    "ac_der" | "dc_der" => crate::hardware::Capabilities {
+                        der_control: enabled,
+                        ..Default::default()
+                    },
+                    "web_payments" => crate::hardware::Capabilities {
+                        payment: enabled,
+                        ..Default::default()
+                    },
+                    "v2x_charging" => crate::hardware::Capabilities {
+                        supports_bidirectional_power: enabled,
                         ..Default::default()
                     },
                     "der_control" => crate::hardware::Capabilities {

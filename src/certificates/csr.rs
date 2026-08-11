@@ -170,6 +170,30 @@ pub struct CsrSubject {
     pub country_name: Option<String>,
 }
 
+/// This charge point's `SecurityCtrlr.OrganizationName`, or `None` if it is unset or empty.
+///
+/// Empty is treated as unset deliberately: the variable is registered with an empty default, and an
+/// `O=` RDN containing the empty string is not the same thing as a CA policy that wants no `O=`.
+pub fn organization_name(actor: &crate::actor::ChargePointActor) -> Option<String> {
+    actor
+        .state()
+        .device_model
+        .get(
+            &crate::state::Component {
+                name: "SecurityCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            &crate::state::Variable {
+                name: "OrganizationName".into(),
+                instance: None,
+            },
+        )
+        .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
+        .map(|attribute| attribute.value.clone())
+        .filter(|value| !value.is_empty())
+}
+
 impl CsrSubject {
     /// A subject with only a `commonName` set.
     pub fn new(common_name: impl Into<String>) -> Self {
@@ -185,6 +209,31 @@ impl CsrSubject {
     pub fn with_organization_name(mut self, organization_name: impl Into<String>) -> Self {
         self.organization_name = Some(organization_name.into());
         self
+    }
+
+    /// Fills `organizationName` from `SecurityCtrlr.OrganizationName` if this subject does not
+    /// already carry one (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV2.10).
+    ///
+    /// OCPP defines that variable as the organization name a CSR should be issued under (A02/A03,
+    /// and A00.FR.509 requires the `O=` RDN on every certificate), so a charge point that has been
+    /// told its operator's name should not then send CSRs without one - which is what happened
+    /// before this existed, since nothing read the variable.
+    ///
+    /// **A caller-supplied name always wins.** An integrator who passed one has a CA policy in
+    /// mind that this crate cannot see, and silently overwriting it from a device-model value a
+    /// CSMS can change would let a remote peer redirect which organization the station's next
+    /// certificate is issued under. An empty or absent variable leaves the subject untouched.
+    pub fn with_organization_name_from_device_model(
+        self,
+        actor: &crate::actor::ChargePointActor,
+    ) -> Self {
+        if self.organization_name.is_some() {
+            return self;
+        }
+        match organization_name(actor) {
+            Some(name) => self.with_organization_name(name),
+            None => self,
+        }
     }
 
     /// Sets `organizationalUnitName`.
@@ -722,5 +771,74 @@ mod tests {
             }
         }
         out
+    }
+
+    // --- CV2.10: SecurityCtrlr.OrganizationName reaches the CSR ---
+
+    #[tokio::test]
+    async fn the_organization_name_is_taken_from_the_device_model_when_the_caller_gave_none() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        assert_eq!(
+            CsrSubject::new("CP-0001")
+                .with_organization_name_from_device_model(&actor)
+                .organization_name,
+            None,
+            "an unset variable leaves the subject alone rather than adding an empty O="
+        );
+
+        set_organization_name(&actor, "Flowionab AB").await;
+
+        assert_eq!(
+            CsrSubject::new("CP-0001")
+                .with_organization_name_from_device_model(&actor)
+                .organization_name
+                .as_deref(),
+            Some("Flowionab AB")
+        );
+    }
+
+    /// A caller who supplied one has a CA policy this crate cannot see, and the device-model value
+    /// is writable by the CSMS - so letting it win would let a remote peer redirect which
+    /// organization the station's next certificate is issued under.
+    #[tokio::test]
+    async fn a_caller_supplied_organization_name_is_never_overwritten() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        set_organization_name(&actor, "Someone Else").await;
+
+        assert_eq!(
+            CsrSubject::new("CP-0001")
+                .with_organization_name("Chosen By The Integrator")
+                .with_organization_name_from_device_model(&actor)
+                .organization_name
+                .as_deref(),
+            Some("Chosen By The Integrator")
+        );
+    }
+
+    async fn set_organization_name(actor: &crate::actor::ChargePointActor, value: &str) {
+        actor
+            .send(crate::state::ChargePointEvent::DeviceModel(
+                crate::state::DeviceModelEvent::AttributeValueSet {
+                    component: crate::state::Component {
+                        name: "SecurityCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: crate::state::Variable {
+                        name: "OrganizationName".into(),
+                        instance: None,
+                    },
+                    attribute_type: crate::state::VariableAttributeType::Actual,
+                    value: value.into(),
+                },
+            ))
+            .await
+            .expect("the actor accepts events");
     }
 }

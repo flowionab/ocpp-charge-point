@@ -61,6 +61,33 @@ pub struct EvseState {
     /// hardware-error path, and re-requesting the same failing limit on every state change would
     /// add nothing.
     pub charging_limits: Vec<Option<u32>>,
+    /// An authorized start this connector is waiting for a cable to fulfil - **F02, "Remote Start
+    /// Transaction - Remote Start First"** and **E03, "Start Transaction - IdToken First"**
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV7 and CV2.3).
+    ///
+    /// Both use cases have the same premise: the authorization arrives *before* the driver plugs
+    /// in, so the station accepts it, holds it, and starts the transaction when the cable latches.
+    /// They differ only in where it came from - a CSMS `RequestStartTransaction` (F02) or a card
+    /// presented at the reader and accepted by the CSMS (E03) - and that difference is carried by
+    /// [`PendingRemoteStart::remote_start_id`], not by a second slot. One slot means one dispatch
+    /// path, one timeout, and no way for the two to disagree about which connector is spoken for.
+    ///
+    /// Cleared when the cable arrives and the start is dispatched, when the connector *returns* to
+    /// `Available` without one, or when `TxCtrlr.EVConnectionTimeOut` expires - see
+    /// [`crate::remote_control::run_pending_remote_start_timeouts`], which owns the clock this
+    /// state deliberately does not (F02.FR.07/.08, E03.FR.15).
+    pub pending_remote_starts: Vec<Option<PendingRemoteStart>>,
+    /// The reservation each connector *honoured*, indexed the same as `connectors` - the id of
+    /// the reservation that was in force when the cable arrived, kept until the connector returns
+    /// to `Available` (CV6).
+    ///
+    /// Separate from `reservations` because the two have different lifetimes on purpose: a
+    /// reservation ends the moment it is honoured (the cable arriving is the reservation doing its
+    /// job, so `reservations` clears then), but the transaction that *results* does not exist yet
+    /// and still has to report which reservation it consumed (F02.FR.06, H03). Holding the id here
+    /// bridges that gap without keeping a spent reservation alive in the store, where it would
+    /// look reservable.
+    pub honoured_reservations: Vec<Option<i64>>,
     /// The current limit each connector's hardware most recently *confirmed* applying, in
     /// milliamps, indexed the same as `connectors` - see
     /// [`ConnectorEvent::CurrentLimitConfirmed`](crate::state::ConnectorEvent::CurrentLimitConfirmed).
@@ -95,6 +122,8 @@ impl EvseState {
             transaction_tariffs: vec![None; connector_count],
             latest_meter_samples: vec![None; connector_count],
             charging_limits: vec![None; connector_count],
+            honoured_reservations: vec![None; connector_count],
+            pending_remote_starts: vec![None; connector_count],
             applied_charging_limits: vec![None; connector_count],
         }
     }
@@ -127,4 +156,15 @@ fn set_if_changed<T: PartialEq>(current: &mut T, next: T) -> bool {
         *current = next;
         true
     }
+}
+
+/// A `RequestStartTransaction` accepted before the cable arrived - see
+/// [`EvseState::pending_remote_starts`] (F02, CV7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingRemoteStart {
+    /// The identifier the CSMS supplied for the transaction to run under.
+    pub id_token: crate::state::IdToken,
+    /// The request's `remoteStartId`, recorded on the transaction this eventually starts so it
+    /// can be correlated back (F02.FR.01, CV6).
+    pub remote_start_id: Option<i64>,
 }

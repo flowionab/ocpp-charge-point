@@ -104,6 +104,30 @@ pub async fn reregister_on_reconnect<N, B, M>(
         .await;
 }
 
+/// How long this charge point has been out of contact with the CSMS, in seconds (CV5, B04).
+///
+/// Measured from [`crate::state::ChargePointState::time_sync`]'s anchor: the monotonic instant of
+/// the last BootNotification or Heartbeat response, which are the only two messages that carry the
+/// CSMS's `currentTime` and therefore the only two moments this crate can prove it was in contact.
+///
+/// **The granularity is one heartbeat interval, and that is worth stating rather than hiding.** A
+/// station that was online but idle last heard from the CSMS up to `HeartbeatInterval` seconds ago,
+/// so a genuine outage can read as up to that much longer than it was. B04's threshold is a coarse
+/// "was this a long outage" test and `OfflineThreshold` defaults to the same order of magnitude as
+/// the heartbeat interval, so the overestimate costs at most an unnecessary full
+/// resynchronisation. That is the safe direction to be wrong in: re-reporting a connector is
+/// merely redundant, while failing to re-report one leaves the CSMS with a wrong picture.
+///
+/// `u64::MAX` when there has been no sync at all (a station that has never completed a
+/// BootNotification), which reads as "longer than any threshold" and so re-reports everything -
+/// again the safe direction.
+pub fn outage_seconds<M: MonotonicClock>(actor: &ChargePointActor, monotonic: &M) -> u64 {
+    let Some(anchor) = actor.state().time_sync else {
+        return u64::MAX;
+    };
+    monotonic.now().duration_since(anchor.recorded_at).as_secs()
+}
+
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
     use super::ReconnectHandler;

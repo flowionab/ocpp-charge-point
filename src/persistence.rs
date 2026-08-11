@@ -979,6 +979,10 @@ impl From<PersistedQueuedTransactionEvent> for TransactionEventOccurred {
             connector_id: persisted.connector_id,
             kind: persisted.kind.into(),
             transaction: persisted.transaction,
+            // A restored backlog was, by construction, generated while the CSMS was unreachable
+            // (CV6.1) - `OfflineQueue::restore_backlog` re-stamps it, and this is the honest
+            // starting point for anything that reads the value before that runs.
+            offline: true,
         }
     }
 }
@@ -1106,6 +1110,10 @@ enum PersistedConnectorState {
     FaultedSafe,
     Unlocking,
     Reserved,
+    // Appended rather than filed next to `Stopping`: a record written before this variant existed
+    // encodes the variants that follow it by position in some formats, so inserting one mid-list
+    // would make an older record decode as the wrong state.
+    StoppingLocked,
 }
 
 impl From<ConnectorState> for PersistedConnectorState {
@@ -1120,6 +1128,7 @@ impl From<ConnectorState> for PersistedConnectorState {
             ConnectorState::SuspendedEv => Self::SuspendedEv,
             ConnectorState::SuspendedEvse => Self::SuspendedEvse,
             ConnectorState::Stopping => Self::Stopping,
+            ConnectorState::StoppingLocked => Self::StoppingLocked,
             ConnectorState::Finishing => Self::Finishing,
             ConnectorState::Unavailable => Self::Unavailable,
             ConnectorState::Faulted => Self::Faulted,
@@ -1142,6 +1151,7 @@ impl From<PersistedConnectorState> for ConnectorState {
             PersistedConnectorState::SuspendedEv => Self::SuspendedEv,
             PersistedConnectorState::SuspendedEvse => Self::SuspendedEvse,
             PersistedConnectorState::Stopping => Self::Stopping,
+            PersistedConnectorState::StoppingLocked => Self::StoppingLocked,
             PersistedConnectorState::Finishing => Self::Finishing,
             PersistedConnectorState::Unavailable => Self::Unavailable,
             PersistedConnectorState::Faulted => Self::Faulted,
@@ -3455,6 +3465,9 @@ mod tests {
                 ..Default::default()
             }),
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         }
     }
 
@@ -3464,6 +3477,7 @@ mod tests {
             connector_id: 0,
             kind,
             transaction: test_transaction(energy_wh),
+            offline: false,
         }
     }
 

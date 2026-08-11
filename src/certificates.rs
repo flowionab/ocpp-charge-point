@@ -56,7 +56,7 @@ use crate::hardware::{
 use crate::state::{SecurityEvent, SecurityEventType};
 
 pub mod csr;
-pub use csr::{CsrBuildError, CsrSubject, build_signed_csr};
+pub use csr::{CsrBuildError, CsrSubject, build_signed_csr, organization_name};
 
 /// What a `SignCertificate`/`CertificateSigned` round trip is for - this crate's
 /// protocol-version-independent view of OCPP's `CertificateSigningUseEnum`/`certificateType`.

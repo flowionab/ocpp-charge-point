@@ -8,6 +8,7 @@
 //! `docs/ROADMAP.md` §0.
 
 use crate::sync::BroadcastReceiver;
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use core::cell::RefCell;
 use core::fmt;
@@ -52,6 +53,10 @@ pub enum OverflowPolicy {
     DropNewest,
 }
 
+/// Stamps a message the queue has had to hold - see [`OfflineQueue::marking_offline`]. Named
+/// because the boxed closure's type is otherwise unreadable at every mention.
+type OfflineMark<M> = Box<dyn Fn(&mut M) + Send + Sync>;
+
 /// A FIFO queue of reports whose delivery failed, kept until [`flush_offline_queue`] (called
 /// from [`run_with_offline_queue`] after every new message, and typically also from a
 /// [`crate::connection::ReconnectHandler`] callback) successfully delivers them. Generic over the
@@ -88,6 +93,20 @@ pub struct OfflineQueue<M> {
     /// counts are a property of *this* connection's attempts, and a count restored from before a
     /// reboot would be counting against a CSMS link that no longer exists.
     front_attempts: AtomicU32,
+    /// Whether this queue is currently allowed to *drain* (CV4). `None` means "always", which is
+    /// what a queue built without [`Self::gated_on_registration`] gets.
+    ///
+    /// A property of the queue rather than of each flush call because all four things that can
+    /// start a flush - a new message arriving, a reconnect, the retry timer, and a direct
+    /// [`flush_offline_queue`] - have to honour the same rule, and only some of them hold
+    /// anything that could answer the question. Gating the *drain* rather than the *push* is what
+    /// makes this safe: messages still accumulate normally while the charge point waits to be
+    /// accepted, and go out in order once it is.
+    send_gate: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// Stamps a message this queue has had to *hold* - see [`Self::marking_offline`]. `None` (the
+    /// default) means the message type has nothing to record, which is every queue but the
+    /// transaction one.
+    mark_offline: Option<OfflineMark<M>>,
 }
 
 impl<M> OfflineQueue<M> {
@@ -106,7 +125,62 @@ impl<M> OfflineQueue<M> {
             policy: OverflowPolicy::default(),
             flushing: AtomicBool::new(false),
             front_attempts: AtomicU32::new(0),
+            send_gate: None,
+            mark_offline: None,
         }
+    }
+
+    /// Holds this queue closed until `actor`'s charge point has been accepted by the CSMS
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV4).
+    ///
+    /// B01.FR.08 forbids sending anything but `BootNotification` between power-on and acceptance,
+    /// and names cached messages from prior sessions specifically - so a station that reboots with
+    /// a backlog and is answered `Pending` must hold it. B02.FR.02 and B03.FR.02 say the same for
+    /// `Pending` and `Rejected`.
+    ///
+    /// Nothing is dropped by waiting: [`Self::push`] still accepts messages (subject to the usual
+    /// [`OverflowPolicy`]), and the first flush after acceptance drains them in order.
+    pub fn gated_on_registration(mut self, actor: crate::actor::ChargePointActor) -> Self {
+        self.send_gate = Some(Box::new(move || actor.state().may_send_requests()));
+        self
+    }
+
+    /// Stamps every message this queue has to hold with `mark`, so the encoder can set OCPP's
+    /// `offline` flag on it (E12, `docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV6.1).
+    ///
+    /// The flag means "this event was generated while the CSMS was unreachable", and nothing at
+    /// encoding time can tell: by then the connection is back, which is why the message is being
+    /// encoded at all. The queue is the one component that knows, and it knows it as a fact about
+    /// *delivery*: a message that went out on its first attempt was online, and a message this
+    /// queue has had to keep was not.
+    ///
+    /// So the mark is applied at the moment of retention - a failed attempt, or a flush the
+    /// registration gate refused - to the whole backlog, since everything still queued at that
+    /// point is being held by the same outage. It is applied on restore too: a backlog that
+    /// survived a reboot was unambiguously generated while offline.
+    ///
+    /// A queue whose message type has no such flag simply does not call this, and pays nothing.
+    pub fn marking_offline(mut self, mark: impl Fn(&mut M) + Send + Sync + 'static) -> Self {
+        self.mark_offline = Some(Box::new(mark));
+        self
+    }
+
+    /// Applies [`Self::marking_offline`]'s stamp to everything currently queued. A no-op on a
+    /// queue that never registered one.
+    fn mark_backlog_offline(&self) {
+        let Some(mark) = self.mark_offline.as_ref() else {
+            return;
+        };
+        self.pending.lock(|queue| {
+            for message in queue.borrow_mut().iter_mut() {
+                mark(message);
+            }
+        });
+    }
+
+    /// Whether this queue may drain right now - see [`Self::gated_on_registration`].
+    fn may_flush(&self) -> bool {
+        self.send_gate.as_ref().is_none_or(|gate| gate())
     }
 
     /// Overrides the [`OverflowPolicy`] used once the queue reaches capacity. See that type's
@@ -220,6 +294,9 @@ impl<M: Clone> OfflineQueue<M> {
                 dropped.push(evicted);
             }
         }
+        // Anything that survived a reboot inside this queue was, by definition, generated while
+        // the CSMS could not be reached - see `Self::marking_offline`.
+        self.mark_backlog_offline();
         dropped
     }
 }
@@ -261,6 +338,17 @@ pub async fn flush_offline_queue_with_attempts<M, F, Fut, E>(
     Fut: Future<Output = Result<(), E>>,
     E: fmt::Display,
 {
+    // Not yet accepted by the CSMS: hold everything (CV4, B01.FR.08). Checked before the flush
+    // claim so a blocked flush doesn't lock out the one that will eventually run, and before the
+    // attempt counter so waiting to be accepted never counts against a message's attempts - the
+    // cap is for a CSMS that keeps rejecting a message, not for a charge point that is not
+    // allowed to offer it yet.
+    if !queue.may_flush() {
+        // Held, and for the same reason `offline` exists: the charge point is not in a position to
+        // deliver these, whatever the socket is doing.
+        queue.mark_backlog_offline();
+        return;
+    }
     // A flush already in progress is doing this work; joining in would peek the same front
     // message and send it twice. Returning is safe rather than lossy - the flush that holds the
     // claim drains everything queued, including whatever this caller had just pushed.
@@ -271,6 +359,9 @@ pub async fn flush_offline_queue_with_attempts<M, F, Fut, E>(
         match send(message).await {
             Ok(()) => queue.pop_front(),
             Err(err) => {
+                // The attempt failed, so everything still queued - the front message included - is
+                // now being held through an outage, which is exactly what `offline` reports.
+                queue.mark_backlog_offline();
                 let attempts = queue.record_failed_attempt();
                 match max_attempts {
                     Some(max) if attempts >= max => {
@@ -400,8 +491,24 @@ pub async fn run_offline_queue_retries<M, B, F, Fut, E>(
         if queue.is_empty() {
             continue;
         }
+        // B01.FR.08/B02.FR.02/B03.FR.02 (CV4): a backlog that survived a reboot must not be
+        // flushed until the CSMS has accepted this charge point - the requirement names cached
+        // messages from prior sessions specifically. The queue is left intact, so the next sweep
+        // after acceptance drains it in order; nothing is dropped by waiting.
+        if !may_send_requests(actor) {
+            continue;
+        }
         flush_offline_queue_with_attempts(queue, message_attempts(actor), &mut send).await;
     }
+}
+
+/// Whether `actor`'s charge point may send CSMS-bound requests right now - see
+/// [`crate::state::ChargePointState::may_send_requests`], which is the requirement this wraps.
+///
+/// A free function rather than a method call at each site because the queue paths hold an
+/// [`crate::actor::ChargePointActor`] and not a state snapshot, and taking one costs a lock.
+pub fn may_send_requests(actor: &crate::actor::ChargePointActor) -> bool {
+    actor.state().may_send_requests()
 }
 
 /// Forwards every message from `events` via `send`, queuing (and retrying, in order - see
@@ -843,6 +950,14 @@ mod tests {
         use crate::executor::TokioExecutor;
 
         let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        // The timer refuses to drain a charge point the CSMS has not accepted (CV4,
+        // B01.FR.08) - so accept it, which is the state this test is actually about.
+        actor
+            .send(crate::state::ChargePointEvent::RegistrationStatusReceived(
+                crate::state::RegistrationStatus::Accepted,
+            ))
+            .await
+            .unwrap();
         let queue = alloc::sync::Arc::new(OfflineQueue::new());
         queue.push(7);
         let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -956,5 +1071,163 @@ mod tests {
 
         // Capacity 1, DropOldest by default: pushing 2 evicts 1.
         assert_eq!(*overflowed_rx.borrow(), alloc::vec![1]);
+    }
+
+    // --- CV6.1: OCPP's `offline` flag (E12) ---
+
+    /// The flag means "generated while the CSMS was unreachable", and delivery is what settles it:
+    /// a message that goes out on its first attempt was online, and one this queue has had to keep
+    /// was not. Nothing else in the crate can tell - by encoding time the connection is back.
+    #[tokio::test]
+    async fn only_a_message_the_queue_had_to_hold_is_marked_offline() {
+        let queue: OfflineQueue<(i32, bool)> =
+            OfflineQueue::new().marking_offline(|message: &mut (i32, bool)| message.1 = true);
+        let sent = alloc::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Delivered first time: online.
+        queue.push((1, false));
+        let recorder = sent.clone();
+        flush_offline_queue(&queue, move |message: (i32, bool)| {
+            let recorder = recorder.clone();
+            async move {
+                recorder.lock().unwrap().push(message);
+                Ok::<(), SendError>(())
+            }
+        })
+        .await;
+
+        // The connection drops. This one fails, so it is held - and everything queued behind it.
+        queue.push((2, false));
+        queue.push((3, false));
+        flush_offline_queue(&queue, |_message: (i32, bool)| async {
+            Err::<(), SendError>(SendError)
+        })
+        .await;
+
+        let recorder = sent.clone();
+        flush_offline_queue(&queue, move |message: (i32, bool)| {
+            let recorder = recorder.clone();
+            async move {
+                recorder.lock().unwrap().push(message);
+                Ok::<(), SendError>(())
+            }
+        })
+        .await;
+
+        assert_eq!(
+            *sent.lock().unwrap(),
+            alloc::vec![(1, false), (2, true), (3, true)]
+        );
+    }
+
+    /// A backlog that survived a reboot was unambiguously generated while the CSMS was
+    /// unreachable - there is no other way it got written to storage still undelivered.
+    #[test]
+    fn a_restored_backlog_is_marked_offline() {
+        let queue: OfflineQueue<(i32, bool)> =
+            OfflineQueue::new().marking_offline(|message: &mut (i32, bool)| message.1 = true);
+
+        queue.restore_backlog(alloc::vec![(1, false), (2, false)]);
+
+        assert_eq!(queue.snapshot(), alloc::vec![(1, true), (2, true)]);
+    }
+
+    /// A queue that never registers a mark pays nothing and changes nothing - which is every
+    /// queue in this crate but the transaction one.
+    #[test]
+    fn a_queue_with_no_mark_leaves_its_messages_alone() {
+        let queue: OfflineQueue<i32> = OfflineQueue::new();
+
+        queue.restore_backlog(alloc::vec![1, 2]);
+
+        assert_eq!(queue.snapshot(), alloc::vec![1, 2]);
+    }
+
+    // --- CV4: B01.FR.08 / B02.FR.02 / B03.FR.02 ---
+
+    /// The requirement names cached messages from prior sessions specifically, so this is the
+    /// case it pins: a queue with a backlog, a charge point the CSMS has answered `Pending`, and
+    /// a flush that must send nothing and lose nothing.
+    #[tokio::test]
+    async fn a_queue_gated_on_registration_holds_its_backlog_until_the_csms_accepts() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+        use crate::state::{ChargePointEvent, RegistrationStatus};
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let queue: OfflineQueue<i32> = OfflineQueue::new().gated_on_registration(actor.clone());
+        queue.push(1);
+        queue.push(2);
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = |sent: Arc<std::sync::Mutex<Vec<i32>>>| {
+            move |message: i32| {
+                let sent = sent.clone();
+                async move {
+                    sent.lock().unwrap().push(message);
+                    Ok::<(), SendError>(())
+                }
+            }
+        };
+
+        // Booting: no BootNotification answered at all.
+        flush_offline_queue(&queue, record(sent.clone())).await;
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(queue.len(), 2, "held, not dropped");
+
+        // Pending is still not permission (B02.FR.02).
+        actor
+            .send(ChargePointEvent::RegistrationStatusReceived(
+                RegistrationStatus::Pending,
+            ))
+            .await
+            .unwrap();
+        flush_offline_queue(&queue, record(sent.clone())).await;
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(queue.len(), 2);
+
+        // Accepted: the whole backlog goes, oldest first.
+        actor
+            .send(ChargePointEvent::RegistrationStatusReceived(
+                RegistrationStatus::Accepted,
+            ))
+            .await
+            .unwrap();
+        flush_offline_queue(&queue, record(sent.clone())).await;
+        assert_eq!(*sent.lock().unwrap(), alloc::vec![1, 2]);
+        assert!(queue.is_empty());
+    }
+
+    /// Waiting to be accepted must not count against a message's attempt cap - otherwise a long
+    /// `Pending` would silently eat the backlog it is supposed to be protecting.
+    #[tokio::test]
+    async fn being_unaccepted_does_not_burn_a_queued_messages_attempts() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let queue: OfflineQueue<i32> = OfflineQueue::new().gated_on_registration(actor);
+        queue.push(1);
+
+        for _ in 0..10 {
+            flush_offline_queue_with_attempts(&queue, Some(3), |_message: i32| async {
+                Ok::<(), SendError>(())
+            })
+            .await;
+        }
+
+        assert_eq!(queue.len(), 1, "ten blocked flushes dropped nothing");
+    }
+
+    /// A queue built without the gate is unchanged - the default stays "always allowed", so an
+    /// integrator wiring their own forwarding loop sees no behaviour change from CV4.
+    #[tokio::test]
+    async fn an_ungated_queue_flushes_regardless() {
+        let queue: OfflineQueue<i32> = OfflineQueue::new();
+        queue.push(1);
+
+        flush_offline_queue(&queue, |_message: i32| async { Ok::<(), SendError>(()) }).await;
+
+        assert!(queue.is_empty());
     }
 }

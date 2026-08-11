@@ -67,7 +67,7 @@ pub use self::event::{
     ReservationEndReason, ReservationUpdate, TransactionEventKind, TransactionEventOccurred,
     TransactionUpdateReason,
 };
-pub use self::evse_state::{EvseState, EvseStatus};
+pub use self::evse_state::{EvseState, EvseStatus, PendingRemoteStart};
 pub use self::id_token::{IdToken, IdTokenKind};
 pub use self::limits::{
     DEFAULT_MAX_CHARGING_PROFILES, DEFAULT_MAX_DER_CONTROLS, DEFAULT_MAX_DEVICE_MODEL_VARIABLES,

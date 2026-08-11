@@ -1027,8 +1027,9 @@ pub(crate) mod test_support {
             _connector_id: usize,
             _kind: crate::state::TransactionEventKind,
             _transaction: crate::state::Transaction,
-        ) -> Result<(), Self::Error> {
-            Ok(())
+            _offline: bool,
+        ) -> Result<crate::transactions::TransactionEventOutcome, Self::Error> {
+            Ok(crate::transactions::TransactionEventOutcome::acknowledged())
         }
     }
 

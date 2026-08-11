@@ -458,6 +458,266 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         value: "false",
         mutability: VariableMutability::ReadWrite,
     },
+    // --- CV1.6: the last of OCPP's required capability-gated variables ---
+    //
+    // Each is `Required? = yes` in the 2.1 appendix for a component this crate only advertises
+    // when the matching capability is declared, so they arrive with it and not before.
+    //
+    // **Every value is empty or zero, and that is the point.** These are hardware nameplate
+    // figures and deployment settings - an inverter's manufacturer and power limits, which DER
+    // modes the hardware implements, the QR-code URL a driver is sent to. A plausible-looking
+    // invention would be worse than an obviously-unset value a CSMS can see it must configure.
+    //
+    // `SharedSecret` is `WriteOnly` for the same reason `NetworkConfiguration.BasicAuthPassword`
+    // is (CV1.3): a secret `GetVariables` can read is not a secret.
+    //
+    // The two `TariffCostCtrlr` messages are what a driver is shown when no tariff or no running
+    // cost is available (I04/I05). OCPP instances them per language; the unkeyed instance is the
+    // fallback for any language, which is the only one this crate can offer without a
+    // localisation story.
+    CapabilityGatedVariable {
+        component: "TariffCostCtrlr",
+        variable: "TariffFallbackMessage",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "TariffCostCtrlr",
+        variable: "TotalCostFallbackMessage",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "V2XChargingCtrlr",
+        variable: "Enabled",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "V2XChargingCtrlr",
+        variable: "SupportedOperationModes",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "V2XChargingCtrlr",
+        variable: "SupportedEnergyTransferModes",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "ACDERCtrlr",
+        variable: "ModesSupported",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "InverterManufacturer",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "InverterModel",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "InverterSwVersion",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "InverterHwVersion",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "ModesSupported",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "MaxW",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "MaxVA",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "MaxVar",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "MaxVarNeg",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "MaxChargeRateW",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "MaxChargeRateVA",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "OverExcitedPF",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "OverExcitedW",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "UnderExcitedPF",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "UnderExcitedW",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "DCDERCtrlr",
+        variable: "ReactiveSusceptance",
+        instance: None,
+        data_type: VariableDataType::Decimal,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "WebPaymentsCtrlr",
+        variable: "URLTemplate",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "WebPaymentsCtrlr",
+        variable: "SharedSecret",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::WriteOnly,
+    },
+    CapabilityGatedVariable {
+        component: "WebPaymentsCtrlr",
+        variable: "TOTPVersion",
+        instance: None,
+        data_type: VariableDataType::String,
+        value: "",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "WebPaymentsCtrlr",
+        variable: "Length",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+    },
+    CapabilityGatedVariable {
+        component: "WebPaymentsCtrlr",
+        variable: "ValidityTime",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        value: "0",
+        mutability: VariableMutability::ReadWrite,
+    },
+    // --- CV1.4: MonitoringCtrlr's required message-size variables ---
+    //
+    // Both are `Required? = yes` in the 2.1 appendix for a component this crate advertises
+    // whenever `variable_monitoring` is declared, so they belong here rather than in
+    // `DEFAULT_VARIABLES` - a build with the block compiled out owes neither.
+    //
+    // The figures match `DeviceDataCtrlr`'s (50 items, 8 KiB), which is the same question asked
+    // about a different message. They are *declared* bounds today, not enforced ones: refusing an
+    // oversized `SetVariableMonitoring` with `OccurrenceConstraintViolation`/`FormatViolation` is
+    // CV2.8. Declaring them is still the right move ahead of that - B06.FR.16/17 make the bound
+    // the CSMS's to respect, and a CSMS cannot respect a bound it cannot read.
+    CapabilityGatedVariable {
+        component: "MonitoringCtrlr",
+        variable: "ItemsPerMessage",
+        instance: Some("SetVariableMonitoring"),
+        data_type: VariableDataType::Integer,
+        value: "50",
+        mutability: VariableMutability::ReadOnly,
+    },
+    CapabilityGatedVariable {
+        component: "MonitoringCtrlr",
+        variable: "BytesPerMessage",
+        instance: Some("SetVariableMonitoring"),
+        data_type: VariableDataType::Integer,
+        value: "8192",
+        mutability: VariableMutability::ReadOnly,
+    },
 ];
 
 /// Builds the `DeviceModelEvent::VariableRegistered` events that advertise every
@@ -715,6 +975,18 @@ async fn resolve_and_apply_set(
     if attribute.mutability == VariableMutability::ReadOnly || attribute.constant {
         return SetVariableOutcome::Rejected;
     }
+    // B05.FR.07 (badly formatted) and B05.FR.08 (out of range) - CV3. Both answer `Rejected`;
+    // OCPP's `statusInfo` may carry the detail and is optional, so the reason is logged rather
+    // than put on the wire (see `ValueRejection`).
+    if let Err(rejection) = validate_value(&definition.characteristics, &request.value) {
+        tracing::warn!(
+            component = %request.component.name,
+            variable = %request.variable.name,
+            reason = rejection.reason(),
+            "refusing a SetVariables value the variable cannot hold"
+        );
+        return SetVariableOutcome::Rejected;
+    }
     let requires_reboot = attribute.requires_reboot;
 
     let _ = actor
@@ -735,6 +1007,124 @@ async fn resolve_and_apply_set(
     }
 }
 
+/// Why [`validate_value`] refused a `SetVariables` value. Both map to OCPP's `Rejected`
+/// `attributeStatus`; the distinction is for the log line and for the tests, not for the wire -
+/// B05.FR.07 and B05.FR.08 name the same status and leave the detail to an optional `statusInfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueRejection {
+    /// B05.FR.07 - the value is not a well-formed instance of the variable's `data_type`.
+    Malformed,
+    /// B05.FR.08 - well-formed, but outside `min_limit`/`max_limit`.
+    OutOfRange,
+    /// B05.FR.07 - not one of the variable's `values_list` entries.
+    NotAnAllowedValue,
+}
+
+impl ValueRejection {
+    /// A low-cardinality `&'static str` for the log field - see CLAUDE.md on fields over prose.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::OutOfRange => "out-of-range",
+            Self::NotAnAllowedValue => "not-an-allowed-value",
+        }
+    }
+}
+
+/// Checks a `SetVariables` value against what the variable declares it can hold (CV3).
+///
+/// This is the check whose absence made every `SetVariables` succeed: before it,
+/// `HeartbeatInterval = "banana"` answered `Accepted` and was stored verbatim, so a CSMS had no
+/// way to learn that the charge point had not understood it.
+///
+/// What is checked, in the order a value fails:
+///
+/// - **Type** ([`VariableDataType`]). `Integer`/`Decimal` must parse; `Boolean` must be exactly
+///   `true` or `false` (OCPP's wire spelling - not `1`/`0`, not `True`); `DateTime` must be
+///   RFC 3339. `String` accepts anything, which is the point of the type.
+/// - **Range** (`min_limit`/`max_limit`), for the numeric types only. OCPP overloads `max_limit`
+///   to mean *maximum length* for string-shaped types, so it is applied that way there.
+/// - **Membership** (`values_list`), for `OptionList` (exactly one entry), `MemberList` and
+///   `SequenceList` (a comma-separated subset, every element of which must be an entry).
+///
+/// A characteristic that is absent constrains nothing: a variable with no `values_list` accepts
+/// any string for its list type, and one with no limits accepts any number. That is deliberate -
+/// this crate registers real bounds where OCPP defines them and leaves the rest open rather than
+/// inventing a bound a CSMS would then be refused by.
+fn validate_value(
+    characteristics: &VariableCharacteristics,
+    value: &str,
+) -> Result<(), ValueRejection> {
+    let in_range = |number: f64| -> Result<(), ValueRejection> {
+        if characteristics.min_limit.is_some_and(|min| number < min)
+            || characteristics.max_limit.is_some_and(|max| number > max)
+        {
+            return Err(ValueRejection::OutOfRange);
+        }
+        Ok(())
+    };
+
+    match characteristics.data_type {
+        VariableDataType::Integer => {
+            let parsed: i64 = value
+                .trim()
+                .parse()
+                .map_err(|_| ValueRejection::Malformed)?;
+            in_range(parsed as f64)
+        }
+        VariableDataType::Decimal => {
+            let parsed: f64 = value
+                .trim()
+                .parse()
+                .map_err(|_| ValueRejection::Malformed)?;
+            if !parsed.is_finite() {
+                return Err(ValueRejection::Malformed);
+            }
+            in_range(parsed)
+        }
+        VariableDataType::Boolean => match value {
+            "true" | "false" => Ok(()),
+            _ => Err(ValueRejection::Malformed),
+        },
+        VariableDataType::DateTime => chrono::DateTime::parse_from_rfc3339(value)
+            .map(|_| ())
+            .map_err(|_| ValueRejection::Malformed),
+        VariableDataType::String => {
+            // OCPP reads `max_limit` on a string-shaped variable as its maximum *length*.
+            if characteristics
+                .max_limit
+                .is_some_and(|max| value.chars().count() as f64 > max)
+            {
+                return Err(ValueRejection::OutOfRange);
+            }
+            Ok(())
+        }
+        VariableDataType::OptionList => match &characteristics.values_list {
+            Some(allowed) if !allowed.iter().any(|option| option == value) => {
+                Err(ValueRejection::NotAnAllowedValue)
+            }
+            _ => Ok(()),
+        },
+        VariableDataType::MemberList | VariableDataType::SequenceList => {
+            let Some(allowed) = &characteristics.values_list else {
+                return Ok(());
+            };
+            // An empty list is a legitimate value for both - "no measurands", say - and would
+            // otherwise fail as a single empty-string member.
+            if value.is_empty() {
+                return Ok(());
+            }
+            for member in value.split(',') {
+                let member = member.trim();
+                if !allowed.iter().any(|option| option == member) {
+                    return Err(ValueRejection::NotAnAllowedValue);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Registers this charge point's inbound `SetVariables` handling with the CSMS connection.
 /// Implemented per protocol version (see the `ocpp_2_1` module); OCPP 1.6J projects this onto
 /// `ChangeConfiguration` instead (see the `ocpp_1_6` module).
@@ -749,7 +1139,7 @@ pub trait SetVariablesHandler {
 mod tests {
     use super::{
         GetVariableOutcome, GetVariableRequest, SetVariableOutcome, SetVariableRequest,
-        handle_get_variables, handle_set_variables,
+        ValueRejection, handle_get_variables, handle_set_variables, validate_value,
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
@@ -816,6 +1206,53 @@ mod tests {
             1,
             "only TariffCostCtrlr.Available - a build without tariff support owes no tariff \
              configuration"
+        );
+    }
+
+    /// `MonitoringCtrlr` owes the two message-size variables the 2.1 appendix marks required
+    /// (CV1.4). They are `Required? = yes` on a component this crate only advertises when the
+    /// capability is declared, so they arrive with it and not before.
+    #[test]
+    fn the_required_monitoring_message_size_variables_arrive_with_the_capability() {
+        use super::capability_gate_events;
+        use crate::hardware::Capabilities;
+        use crate::state::{ChargePointEvent, DeviceModelEvent};
+
+        let registered =
+            |capabilities: &Capabilities| -> alloc::vec::Vec<(String, Option<String>)> {
+                capability_gate_events(capabilities)
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        ChargePointEvent::DeviceModel(DeviceModelEvent::VariableRegistered {
+                            component,
+                            variable,
+                            ..
+                        }) if component.name == "MonitoringCtrlr" => {
+                            Some((variable.name, variable.instance))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+
+        let with = registered(&Capabilities {
+            variable_monitoring: true,
+            ..Capabilities::default()
+        });
+        for name in ["ItemsPerMessage", "BytesPerMessage"] {
+            assert!(
+                with.iter().any(|(variable, instance)| {
+                    variable == name && instance.as_deref() == Some("SetVariableMonitoring")
+                }),
+                "MonitoringCtrlr.{name}[SetVariableMonitoring] should arrive with the capability, \
+                 got {with:?}"
+            );
+        }
+
+        let without = registered(&Capabilities::default());
+        assert!(
+            without.iter().all(|(variable, _)| variable == "Available"),
+            "a build without variable monitoring owes no monitoring configuration, got {without:?}"
         );
     }
 
@@ -1230,6 +1667,183 @@ mod tests {
             get_outcomes,
             alloc::vec![GetVariableOutcome::Accepted("new".into())]
         );
+    }
+
+    // --- CV3: B05.FR.07 (malformed) and B05.FR.08 (out of range) ---
+
+    /// The case that made this whole workstream necessary: before CV3, this answered `Accepted`
+    /// and stored `"banana"` as the heartbeat interval, so the CSMS had no way to learn the charge
+    /// point had not understood it.
+    #[tokio::test]
+    async fn a_value_that_is_not_of_the_variables_type_is_rejected_and_not_stored() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: component("OCPPCommCtrlr"),
+                variable: variable("HeartbeatInterval"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "banana".into(),
+            }],
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Rejected]);
+        assert_eq!(
+            actor
+                .state()
+                .device_model
+                .get(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval"))
+                .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+                .map(|attribute| attribute.value.clone()),
+            Some("60".into()),
+            "a refused write must leave the previous value in place"
+        );
+    }
+
+    /// B05.FR.08. The floor is `0` rather than `1` because `0` is meaningful for these
+    /// intervals - see `VARIABLE_BOUNDS`.
+    #[tokio::test]
+    async fn a_numeric_value_below_the_variables_minimum_is_rejected() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let set = |value: &str| SetVariableRequest {
+            component: component("OCPPCommCtrlr"),
+            variable: variable("HeartbeatInterval"),
+            attribute_type: VariableAttributeType::Actual,
+            value: value.into(),
+        };
+
+        assert_eq!(
+            handle_set_variables(&actor, alloc::vec![set("-1")]).await,
+            alloc::vec![SetVariableOutcome::Rejected]
+        );
+        assert_eq!(
+            handle_set_variables(&actor, alloc::vec![set("0")]).await,
+            alloc::vec![SetVariableOutcome::Accepted],
+            "zero is a real setting, not an out-of-range one"
+        );
+    }
+
+    /// A `Boolean` takes OCPP's wire spelling and nothing else - not `1`, not `True`.
+    #[tokio::test]
+    async fn a_boolean_variable_takes_only_true_or_false() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let set = |value: &str| SetVariableRequest {
+            component: component("AuthCacheCtrlr"),
+            variable: variable("Enabled"),
+            attribute_type: VariableAttributeType::Actual,
+            value: value.into(),
+        };
+
+        assert_eq!(
+            handle_set_variables(&actor, alloc::vec![set("false")]).await,
+            alloc::vec![SetVariableOutcome::Accepted]
+        );
+        for bad in ["1", "True", "yes", ""] {
+            assert_eq!(
+                handle_set_variables(&actor, alloc::vec![set(bad)]).await,
+                alloc::vec![SetVariableOutcome::Rejected],
+                "{bad:?} is not a boolean"
+            );
+        }
+    }
+
+    /// A `MemberList` must be a subset of its `values_list`, element by element - so one bad
+    /// member rejects the whole write rather than being silently dropped. Exercised against
+    /// [`validate_value`] directly because the two variables that carry a `values_list` today
+    /// (`TxStartPoint`/`TxStopPoint`) are registered read-only under CV2.1, so a handler-level
+    /// test would be rejected before it reached the value check.
+    #[test]
+    fn a_member_list_is_checked_element_by_element_against_its_allowed_values() {
+        let characteristics = VariableCharacteristics {
+            data_type: VariableDataType::MemberList,
+            unit: None,
+            min_limit: None,
+            max_limit: None,
+            values_list: Some(alloc::vec![
+                "EVConnected".into(),
+                "Authorized".into(),
+                "PowerPathClosed".into()
+            ]),
+            supports_monitoring: false,
+        };
+
+        assert!(validate_value(&characteristics, "EVConnected,Authorized").is_ok());
+        assert_eq!(
+            validate_value(&characteristics, "Authorized,Teleported"),
+            Err(ValueRejection::NotAnAllowedValue),
+            "one member outside the allowed set rejects the whole write"
+        );
+        // An empty list is a real value - "no members" - not a single empty-string member.
+        assert!(validate_value(&characteristics, "").is_ok());
+    }
+
+    /// CV2.1/B05.FR.09: a variable this build does not act on must be *refused*, not accepted and
+    /// ignored. `AuthCtrlr.LocalPreAuthorize` is a good example - OCPP defines it as writable, an
+    /// operator setting it would reasonably believe the station now starts sessions from its local
+    /// list without asking the CSMS, and nothing in this crate reads it (C14, roadmap CV2).
+    #[tokio::test]
+    async fn a_variable_this_build_does_not_act_on_is_refused_rather_than_silently_accepted() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: component("AuthCtrlr"),
+                variable: variable("LocalPreAuthorize"),
+                attribute_type: VariableAttributeType::Actual,
+                // A perfectly well-formed boolean - refused for what this build does with it,
+                // not for what it says.
+                value: "true".into(),
+            }],
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Rejected]);
+    }
+
+    /// The other side of the same contract: a variable that *is* live stays writable, so CV2.1
+    /// cannot be satisfied by simply freezing the whole device model.
+    #[tokio::test]
+    async fn a_variable_this_build_acts_on_is_still_writable() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: component("AuthCtrlr"),
+                variable: variable("LocalAuthorizeOffline"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "false".into(),
+            }],
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Accepted]);
+    }
+
+    /// A variable with no declared bound is unconstrained beyond its type - this crate does not
+    /// invent limits a CSMS could not have predicted. `NetworkConfigurationPriority` is a
+    /// `String` with no `max_limit`, so any string goes.
+    #[tokio::test]
+    async fn a_variable_with_no_declared_bounds_accepts_anything_of_its_type() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: component("OCPPCommCtrlr"),
+                variable: variable("NetworkConfigurationPriority"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "0,1,2".into(),
+            }],
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Accepted]);
     }
 
     #[tokio::test]

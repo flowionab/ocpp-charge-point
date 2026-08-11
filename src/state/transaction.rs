@@ -43,6 +43,10 @@ pub enum StopReason {
     /// [`crate::state::ChargePointEvent::PersistedTransactionsRestored`]. See
     /// `docs/PRODUCTION-ROADMAP.md` §7.4 (E4.1).
     PowerLoss,
+    /// The identifier authorizing the transaction was revoked mid-session and any allowance
+    /// `TxCtrlr.MaxEnergyOnInvalidId` granted has been spent - OCPP's `DeAuthorized` (E05,
+    /// `docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV2.5).
+    DeAuthorized,
 }
 
 /// A charging session tied to one connector, distinct from [`crate::state::ConnectorState`] -
@@ -81,4 +85,39 @@ pub struct Transaction {
     /// priority the CSMS can no longer see it holding.
     #[serde(default)]
     pub priority_charging: bool,
+    /// The `remoteStartId` from the `RequestStartTransaction` that began this transaction, if it
+    /// began that way (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV6).
+    ///
+    /// OCPP requires it on the transaction's `TransactionEvent`s (F01.FR.25, F02.FR.01/.21) - it
+    /// is how a CSMS correlates the transaction it now sees with the request it made, which it
+    /// cannot do from the transaction id alone because the charge point chose that. Also the
+    /// signal for `triggerReason = RemoteStart`: a transaction with one was started remotely, by
+    /// construction.
+    ///
+    /// `#[serde(default)]` so a transaction persisted before this field existed recovers as
+    /// locally started, which is the safe reading - inventing a correlation id the CSMS never
+    /// issued would be worse than reporting none.
+    #[serde(default)]
+    pub remote_start_id: Option<i64>,
+    /// The reservation this transaction consumed, if it started on a reserved connector
+    /// (F02.FR.06, H03).
+    ///
+    /// OCPP expects it on the transaction's events so the CSMS can close the reservation out
+    /// against the session that used it.
+    #[serde(default)]
+    pub reservation_id: Option<i64>,
+    /// The meter reading (Wh) at which this transaction must stop because its identifier was
+    /// **deauthorized mid-session** - OCPP's E05, `TxCtrlr.MaxEnergyOnInvalidId`
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV2.5).
+    ///
+    /// `None` in the ordinary case: either the identifier is still valid, or it was revoked and
+    /// `TxCtrlr.StopTxOnInvalidId` said to stop immediately.
+    ///
+    /// Stored as an **absolute** meter reading rather than a remaining allowance so it cannot
+    /// drift: a remaining-Wh counter would have to be decremented on every sample, and a sample
+    /// that is dropped, duplicated or restored from persistence would change how much free energy
+    /// the driver gets. A target the meter has to reach is the same answer however the samples
+    /// arrive.
+    #[serde(default)]
+    pub stop_at_energy_wh: Option<i64>,
 }

@@ -100,7 +100,16 @@ pub async fn execute_hardware_command<E: Evse<C>, C: Connector>(
                             %error,
                             "a hardware binding call failed; faulting the connector"
                         );
-                        ConnectorEvent::FaultDetected
+                        match command {
+                            // G05 (CV11): the lock is the one binding call OCPP gives a charge
+                            // point a way to *name* when it fails. Both directions count - G05's
+                            // own remark says a lock failure can be reported when unlocking
+                            // fails too - and the connector still faults exactly as before, so
+                            // this only adds the diagnosis, never removes the fail-safe.
+                            HardwareCommand::LockConnector { .. }
+                            | HardwareCommand::UnlockConnector { .. } => ConnectorEvent::LockFailed,
+                            _ => ConnectorEvent::FaultDetected,
+                        }
                     }
                 }
             }

@@ -136,6 +136,20 @@ pub fn offline_decision(
             tracing::info!("authorizing offline from the authorization cache");
             entry.status
         }
+        // C15 (CV2.9): an identifier this charge point has never seen. The list said nothing and
+        // the cache said nothing, so there is no evidence either way - and
+        // `AuthCtrlr.OfflineTxForUnknownIdEnabled` is the operator's answer to "start anyway?".
+        //
+        // Defaults to `false`, and that default is the whole point of the switch: charging an
+        // unknown card offline is a decision to hand out energy that may never be billed, which is
+        // an operator's call to make and not a library's to assume. An operator who wants a site
+        // to keep serving drivers through a CSMS outage turns it on deliberately.
+        None if boolean_variable(state, "AuthCtrlr", "OfflineTxForUnknownIdEnabled", false) => {
+            tracing::info!(
+                "authorizing an unknown identifier offline: OfflineTxForUnknownIdEnabled is set"
+            );
+            AuthorizationStatus::Accepted
+        }
         None => AuthorizationStatus::Rejected,
     }
 }
@@ -1514,7 +1528,7 @@ mod ocpp_2_0_1 {
 /// entirely), but every value it does have already collapses to `Rejected` except `Accepted`, so
 /// that narrowing doesn't change this mapping's shape at all.
 #[cfg(feature = "ocpp_1_6")]
-mod ocpp_1_6 {
+pub(crate) mod ocpp_1_6 {
     use super::{Authorizer, ContractAuthorization, ContractCertificate};
     use crate::id_tag::map_id_tag;
     use crate::state::{AuthorizationStatus, IdToken};
@@ -1532,7 +1546,7 @@ mod ocpp_1_6 {
 
     /// Only `Accepted` maps to our `Accepted` - mirrors [`super::ocpp_2_1::map_status`], just
     /// over 1.6J's narrower 5-value `IdTagInfoStatus`.
-    pub(super) fn map_status(status: IdTagInfoStatus) -> AuthorizationStatus {
+    pub(crate) fn map_status(status: IdTagInfoStatus) -> AuthorizationStatus {
         match status {
             IdTagInfoStatus::Accepted => AuthorizationStatus::Accepted,
             _ => AuthorizationStatus::Rejected,
@@ -1927,6 +1941,50 @@ mod offline_tests {
         assert_eq!(
             offline_decision(&actor.state(), &token("B"), at(1)),
             AuthorizationStatus::Accepted
+        );
+    }
+
+    /// C15 (CV2.9): an identifier neither the list nor the cache knows. Denied by default -
+    /// charging an unknown card offline hands out energy that may never be billed, which is an
+    /// operator's decision - and accepted once the operator opts in.
+    #[tokio::test]
+    async fn an_unknown_identifier_offline_is_denied_unless_the_operator_opted_in() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        assert_eq!(
+            offline_decision(&actor.state(), &token("NEVER-SEEN"), at(1)),
+            AuthorizationStatus::Rejected,
+            "the default is to refuse an identifier nothing knows about"
+        );
+
+        set_variable(&actor, "AuthCtrlr", "OfflineTxForUnknownIdEnabled", "true").await;
+
+        assert_eq!(
+            offline_decision(&actor.state(), &token("NEVER-SEEN"), at(1)),
+            AuthorizationStatus::Accepted
+        );
+    }
+
+    /// The switch does not override the *stronger* signals above it: an identifier the CSMS
+    /// explicitly rejected stays rejected, whatever the unknown-id policy says. It answers only
+    /// the "nothing knows about this one" case.
+    #[tokio::test]
+    async fn opting_in_to_unknown_identifiers_does_not_override_a_known_rejection() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let _ = actor
+            .send(ChargePointEvent::LocalListUpdated {
+                version: 1,
+                entries: alloc::vec![LocalListEntry {
+                    id_token: token("REFUSED"),
+                    status: AuthorizationStatus::Rejected,
+                }],
+            })
+            .await;
+        set_variable(&actor, "AuthCtrlr", "OfflineTxForUnknownIdEnabled", "true").await;
+
+        assert_eq!(
+            offline_decision(&actor.state(), &token("REFUSED"), at(1)),
+            AuthorizationStatus::Rejected
         );
     }
 

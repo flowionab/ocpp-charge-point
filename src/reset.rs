@@ -153,7 +153,10 @@ mod tests {
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
-            ConnectorEvent::RemoteStartRequested(test_id_token()),
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
             ConnectorEvent::ContactorClosed,
         ] {
             actor
@@ -223,7 +226,10 @@ mod tests {
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
-            ConnectorEvent::RemoteStartRequested(test_id_token()),
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
             ConnectorEvent::ContactorClosed,
         ] {
             actor
@@ -340,7 +346,10 @@ mod tests {
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
-            ConnectorEvent::RemoteStartRequested(test_id_token()),
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
             ConnectorEvent::ContactorClosed,
         ] {
             actor

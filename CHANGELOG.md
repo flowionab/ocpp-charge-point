@@ -15,6 +15,44 @@ ones that would break or surprise an integrator, or that materially describe wha
 now do; purely internal refactors, test additions, and documentation-only commits are omitted
 unless they're the easiest way to explain a milestone's scope.
 
+## [Unreleased]
+
+OCPP 2.1 conformance work, planned in [`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md`](docs/OCPP-2.1-COMPLIANCE-ROADMAP.md)
+and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.md`](docs/OCPP-2.1-COMPLIANCE-AUDIT.md).
+
+### Breaking
+
+- `hardware::ChargePoint` gained `electrical()`, returning the phase counts, connector types and
+  per-EVSE power OCPP requires as device-model variables (CV1.5). **Default-implemented**, unlike
+  `capabilities()`, so existing implementations keep compiling — a station that ignores it still
+  registers the required variables, empty.
+- `remote_control::handle_request_start_transaction` takes the request's `remoteStartId`, and
+  `ConnectorEvent::RemoteStartRequested` became a struct variant carrying it (CV6).
+- `TransactionNotifier::notify_transaction_event` takes an `offline` flag and returns a
+  `TransactionEventOutcome`, so a CSMS rejecting an identifier mid-session can drive E05 (CV2.5,
+  CV6.1).
+- New `ConnectorState::StoppingLocked` and `ConnectorEvent::LockFailed` variants; exhaustive
+  matches over either must handle them (CV2.4, CV11).
+- `TriggeredMonitor::monitor_id` is now `Option` — `None` marks a hard-wired notification, which
+  OCPP requires for a lock failure (CV11).
+- Offline queues built through `ChargePointBuilder` no longer drain before the CSMS has accepted
+  the charge point (CV4, B01.FR.08). Nothing is dropped; delivery is deferred until acceptance.
+- A `SetVariables` for a variable this build does not act on is now `Rejected` rather than
+  accepted and ignored (CV2.1, B05.FR.09). A CSMS that relied on the previous silent acceptance
+  will start seeing refusals — which is the point.
+
+### Added
+
+- All 122 device-model variables OCPP 2.1 marks required are now registered (CV1), including the
+  per-EVSE and per-connector components and a per-slot `NetworkConfiguration` mirror.
+- `SetVariables` validates values against their declared type, range and value list (CV3).
+- Connector state is re-reported after a BootNotification is accepted and after a long outage
+  (CV5); `TxStartPoint`/`TxStopPoint`, `EVConnectionTimeOut`, `StopTxOnEVSideDisconnect`,
+  `UnlockOnEVSideDisconnect`, `StopTxOnInvalidId`/`MaxEnergyOnInvalidId` and
+  `OfflineTxForUnknownIdEnabled` are honoured rather than merely stored (CV2).
+- `RequestStartTransaction` with no cable yet is accepted and held until the driver plugs in —
+  OCPP's F02, which previously did not work at all (CV7).
+
 ## [0.1.0] — 2026-08-10
 
 First published release. The **Breaking** entries below are pre-release history — changes made

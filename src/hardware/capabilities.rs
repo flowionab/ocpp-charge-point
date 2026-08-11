@@ -222,6 +222,49 @@ pub const CAPABILITY_GATES: &[CapabilityGate] = &[
         feature_profile_1_6: None,
         has_handler: true,
     },
+    // CV1.6. Three components OCPP requires variables on that had no gate row, so their required
+    // variables had nowhere to hang. Each keys on a capability that already existed - no new
+    // `Capabilities` field, because none of these is a *separate* thing an integrator declares:
+    // a station that does DER control has DER hardware, and one that takes payments has a
+    // terminal.
+    //
+    // `has_handler: false` on all three: they carry required *variables*, not CSMS-initiated
+    // messages of their own - `SetDERControl` and friends register under the `der_control` row
+    // above, and the web-payments block is charge-point-initiated.
+    CapabilityGate {
+        name: "ac_der",
+        cargo_feature: "der-control",
+        enabled: |c| c.der_control,
+        ctrlr_component: Some("ACDERCtrlr"),
+        feature_profile_1_6: None,
+        has_handler: false,
+    },
+    CapabilityGate {
+        name: "dc_der",
+        cargo_feature: "der-control",
+        enabled: |c| c.der_control,
+        ctrlr_component: Some("DCDERCtrlr"),
+        feature_profile_1_6: None,
+        has_handler: false,
+    },
+    CapabilityGate {
+        name: "web_payments",
+        cargo_feature: "payment",
+        enabled: |c| c.payment,
+        ctrlr_component: Some("WebPaymentsCtrlr"),
+        feature_profile_1_6: None,
+        has_handler: false,
+    },
+    // V2X charging is the bidirectional half of smart charging, so it keys on the hardware fact
+    // that the station can actually push power back rather than on a functional-block flag.
+    CapabilityGate {
+        name: "v2x_charging",
+        cargo_feature: "der-control",
+        enabled: |c| c.supports_bidirectional_power,
+        ctrlr_component: Some("V2XChargingCtrlr"),
+        feature_profile_1_6: None,
+        has_handler: false,
+    },
     CapabilityGate {
         name: "smart_charging",
         cargo_feature: "smart-charging",

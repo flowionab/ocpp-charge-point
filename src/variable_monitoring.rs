@@ -548,13 +548,17 @@ pub async fn run_variable_monitor_events<N: VariableMonitorEventNotifier>(
     actor: &ChargePointActor,
 ) {
     while let Ok(event) = events.recv().await {
-        if !actor
-            .state()
-            .variable_monitors
-            .is_reportable(event.severity)
+        // A hard-wired notification has no configured monitor and so no configured severity to
+        // hold against `MonitoringLevel` - suppressing one would drop a report the firmware
+        // raised because it decided the CSMS needs it (G05).
+        if let Some(monitor_id) = event.monitor_id
+            && !actor
+                .state()
+                .variable_monitors
+                .is_reportable(event.severity)
         {
             tracing::debug!(
-                monitor_id = event.monitor_id.0,
+                monitor_id = monitor_id.0,
                 severity = event.severity,
                 "suppressing a variable monitor event below the configured monitoring level"
             );
@@ -563,7 +567,7 @@ pub async fn run_variable_monitor_events<N: VariableMonitorEventNotifier>(
         if let Err(err) = notifier.notify_variable_monitor_event(&event).await {
             tracing::warn!(
                 error = %err,
-                monitor_id = event.monitor_id.0,
+                monitor_id = event.monitor_id.map(|id| id.0),
                 "variable monitor event notification failed"
             );
         }
@@ -613,7 +617,11 @@ pub async fn run_periodic_variable_monitors<
             continue;
         }
         for event in due_periodic_events(&actor.state(), now, &last_reported) {
-            let monitor_id = event.monitor_id;
+            // Every periodic event is built from a configured monitor; a hard-wired
+            // notification is raised by the state machine and never reaches this loop.
+            let Some(monitor_id) = event.monitor_id else {
+                continue;
+            };
             if !actor
                 .state()
                 .variable_monitors
@@ -676,7 +684,7 @@ fn due_periodic_events(
             continue;
         };
         due.push(TriggeredMonitor {
-            monitor_id: monitor.id,
+            monitor_id: Some(monitor.id),
             component: monitor.component.clone(),
             variable: monitor.variable.clone(),
             actual_value: attribute.value.clone(),
@@ -1610,6 +1618,17 @@ mod ocpp_2_1 {
         }
     }
 
+    /// OCPP's `eventNotificationType` for `event`: a monitor a CSMS configured is a
+    /// `CustomMonitor`, and one this firmware raises on its own (G05's lock failure) is a
+    /// `HardWiredNotification`. The distinction is what tells a CSMS whether the report answers
+    /// something it asked for - see [`TriggeredMonitor::monitor_id`].
+    fn event_notification_type(event: &TriggeredMonitor) -> EventNotificationEnum {
+        match event.monitor_id {
+            Some(_) => EventNotificationEnum::CustomMonitor,
+            None => EventNotificationEnum::HardWiredNotification,
+        }
+    }
+
     /// Builds a single-item `NotifyEvent` request for `event`, stamped `event_id`/`now` by the
     /// caller (see [`Ocpp2_1VariableMonitorEventNotifier`]) - always `seqNo` 0 with no `tbc`,
     /// since this crate reports one trigger per `NotifyEvent` rather than batching several into
@@ -1629,7 +1648,7 @@ mod ocpp_2_1 {
                 component: build_component(&event.component),
                 custom_data: None,
                 event_id,
-                event_notification_type: EventNotificationEnum::CustomMonitor,
+                event_notification_type: event_notification_type(event),
                 severity: Some(i64::from(event.severity)),
                 tech_code: None,
                 tech_info: None,
@@ -1637,7 +1656,7 @@ mod ocpp_2_1 {
                 transaction_id: None,
                 trigger: map_trigger(event.trigger),
                 variable: build_variable(&event.variable),
-                variable_monitoring_id: Some(event.monitor_id.0),
+                variable_monitoring_id: event.monitor_id.map(|id| id.0),
             }],
             generated_at: timestamp,
             seq_no: 0,
@@ -2369,6 +2388,17 @@ mod ocpp_2_0_1 {
         }
     }
 
+    /// OCPP's `eventNotificationType` for `event`: a monitor a CSMS configured is a
+    /// `CustomMonitor`, and one this firmware raises on its own (G05's lock failure) is a
+    /// `HardWiredNotification`. The distinction is what tells a CSMS whether the report answers
+    /// something it asked for - see [`TriggeredMonitor::monitor_id`].
+    fn event_notification_type(event: &TriggeredMonitor) -> EventNotificationEnum {
+        match event.monitor_id {
+            Some(_) => EventNotificationEnum::CustomMonitor,
+            None => EventNotificationEnum::HardWiredNotification,
+        }
+    }
+
     fn build_notify_event_request(
         event: &TriggeredMonitor,
         event_id: i64,
@@ -2384,14 +2414,14 @@ mod ocpp_2_0_1 {
                 component: build_component(&event.component),
                 custom_data: None,
                 event_id,
-                event_notification_type: EventNotificationEnum::CustomMonitor,
+                event_notification_type: event_notification_type(event),
                 tech_code: None,
                 tech_info: None,
                 timestamp,
                 transaction_id: None,
                 trigger: map_trigger(event.trigger),
                 variable: build_variable(&event.variable),
-                variable_monitoring_id: Some(event.monitor_id.0),
+                variable_monitoring_id: event.monitor_id.map(|id| id.0),
             }],
             generated_at: timestamp,
             seq_no: 0,

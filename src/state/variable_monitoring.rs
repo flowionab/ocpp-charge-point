@@ -425,17 +425,26 @@ pub enum VariableMonitoringEvent {
     },
 }
 
-/// One monitor firing, reported to the CSMS via `NotifyEvent`.
+/// One `NotifyEvent` the charge point owes the CSMS.
 ///
-/// Produced two ways: [`ChargePointState::apply`](crate::state::ChargePointState::apply) raises
+/// Produced three ways: [`ChargePointState::apply`](crate::state::ChargePointState::apply) raises
 /// this as a [`ChargePointEffect::VariableMonitorTriggered`](crate::state::ChargePointEffect::VariableMonitorTriggered)
 /// for a threshold/delta monitor evaluated against a device-model value change (see
-/// [`VariableMonitorStore::evaluate`]); `crate::variable_monitoring::run_periodic_variable_monitors`
-/// builds one directly, on its own clock, for a periodic monitor.
+/// [`VariableMonitorStore::evaluate`]) and for a hard-wired notification the firmware raises
+/// itself (G05's lock failure - see [`Self::monitor_id`]);
+/// `crate::variable_monitoring::run_periodic_variable_monitors` builds one directly, on its own
+/// clock, for a periodic monitor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggeredMonitor {
-    /// The monitor that fired.
-    pub monitor_id: VariableMonitorId,
+    /// The monitor that fired, or `None` for a **hard-wired notification** - one this firmware
+    /// raises on its own rather than because a CSMS-configured monitor crossed a threshold.
+    ///
+    /// OCPP models the two as different `eventNotificationType`s (`CustomMonitor` against
+    /// `HardWiredNotification`) and makes `variableMonitoringId` optional for exactly this reason.
+    /// A hard-wired notification is not suppressed by `MonitoringLevel` either: nobody configured
+    /// it, so there is no configured severity to compare against - see
+    /// [`VariableMonitorStore::is_reportable`].
+    pub monitor_id: Option<VariableMonitorId>,
     /// The monitored component.
     pub component: Component,
     /// The monitored variable.

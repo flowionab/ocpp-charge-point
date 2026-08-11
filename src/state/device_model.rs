@@ -129,7 +129,9 @@ pub struct VariableCharacteristics {
     /// Whether this variable supports variable monitoring (OCPP `SetVariableMonitoring`).
     /// `crate::variable_monitoring::handle_set_variable_monitoring` refuses (`Rejected`) a
     /// monitor on a variable where this is `false` - see B5.2, `docs/ROADMAP.md` §2/§14. None of
-    /// this crate's own built-in default variables set it `true` today; a hardware binding
+    /// this crate's own [`DEFAULT_VARIABLES`] set it `true`; the one built-in that does is
+    /// `AvailabilityState` (see [`DeviceModel::register_topology_defaults`]), which OCPP expects
+    /// to carry a `Delta` monitor - G01.FR.03 onwards describe exactly that. A hardware binding
     /// registering its own variables (e.g. a temperature or voltage reading worth alerting on)
     /// decides this per variable when it registers one.
     pub supports_monitoring: bool,
@@ -201,11 +203,30 @@ impl DeviceModel {
     /// [`Self::register`] like any other registration, and a caller who sets a limit that can't fit
     /// them gets the documented refusal (and a warning) for the ones that don't fit.
     pub fn with_max_variables(max_variables: usize) -> Self {
+        Self::with_topology(max_variables, &[])
+    }
+
+    /// [`with_max_variables`](Self::with_max_variables), plus the per-EVSE and per-connector
+    /// variables OCPP requires a charge point of this shape to report - see
+    /// [`Self::register_topology_defaults`]. `connector_counts[evse_id]` is that EVSE's connector
+    /// count, the same addressing [`crate::state::ChargePointState::new`] takes.
+    ///
+    /// Topology is a constructor argument rather than something registered afterwards because
+    /// OCPP's `Connector`/`EVSE` components are addressed by the same `(evse_id, connector_id)`
+    /// indices the rest of this state already is: a device model that didn't know the topology
+    /// could not name them, and a `GetBaseReport` issued before some later registration ran would
+    /// under-report the charge point.
+    ///
+    /// Like [`with_max_variables`](Self::with_max_variables), the bound is raised to whatever the
+    /// defaults *and* these occupy if `max_variables` is smaller - a limit that dropped the
+    /// components OCPP requires would bound nothing worth bounding.
+    pub fn with_topology(max_variables: usize, connector_counts: &[usize]) -> Self {
         let mut model = Self {
             components: BTreeMap::new(),
             max_variables: usize::MAX,
         };
         model.register_defaults();
+        model.register_topology_defaults(connector_counts);
         model.max_variables = max_variables.max(model.len()).max(1);
         model
     }
@@ -306,6 +327,22 @@ impl DeviceModel {
         true
     }
 
+    /// Removes every variable registered on `component`, returning whether anything was there.
+    ///
+    /// Needed because some components are not facts about the firmware but about its current
+    /// configuration: a `NetworkConfiguration` instance exists only while its configuration slot
+    /// is occupied (CV1.3), so vacating the slot has to take the component with it. Leaving it
+    /// behind would have `GetVariables` and `GetBaseReport` reporting a CSMS URL the charge point
+    /// no longer holds - worse than not reporting it, because it reads as current.
+    pub fn remove_component(&mut self, component: &Component) -> bool {
+        self.components.remove(component).is_some()
+    }
+
+    /// Every registered component, in the order [`Self::iter`] would visit them.
+    pub fn components(&self) -> impl Iterator<Item = &Component> {
+        self.components.keys()
+    }
+
     /// Iterates every registered `(Component, Variable, VariableDefinition)`, ordered by
     /// component then variable (the order `BTreeMap` already stores them in). Needed by the
     /// future `GetBaseReport` functional block, and by this crate's own OCPP 1.6J
@@ -319,6 +356,177 @@ impl DeviceModel {
         })
     }
 
+    /// Registers the availability variables OCPP requires on every `ChargingStation`, `EVSE` and
+    /// `Connector` component a charge point of this topology owns
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV1.1). `connector_counts[evse_id]` is that EVSE's
+    /// connector count.
+    ///
+    /// Two variables per component, and they mean different things despite the similar names:
+    ///
+    /// - **`Available`** (`Boolean`, constant `true`) is OCPP's *"Component exists"* - a fact about
+    ///   the charge point's construction, not its current state. Registering it `false` would be
+    ///   the way to say a component is fitted but not wired; a component this crate knows about at
+    ///   all is, by construction, one that exists.
+    /// - **`AvailabilityState`** (`OptionList`, `ReadOnly`) is the live one: the same value the
+    ///   connector's `StatusNotification` carries, rolled up per EVSE and per charge point by
+    ///   [`crate::state::ChargePointState`]. `ReadOnly` because it is a projection of the state
+    ///   machine - a CSMS write would be overwritten by the next transition, so accepting one
+    ///   would be exactly the kind of silent lie B05.FR.09 exists to prevent.
+    ///
+    /// The station starts `Unavailable`: a charge point that has not completed its
+    /// BootNotification is not available, and `ChargePointState::apply` moves it on from there.
+    /// EVSEs and connectors start `Available`, matching the state
+    /// [`EvseState::new`](crate::state::EvseState::new) gives them.
+    ///
+    /// B07.FR.09 is what makes these load-bearing rather than decorative: `GetBaseReport`'s
+    /// `SummaryInventory` base is defined as the `AvailabilityState` of the charge point, of each
+    /// EVSE, and of each connector - so without these registered, `crate::reporting`'s summary
+    /// base is structurally empty however healthy the charge point is.
+    fn register_topology_defaults(&mut self, connector_counts: &[usize]) {
+        self.register_availability_pair(
+            AVAILABILITY_COMPONENT_CHARGE_POINT,
+            None,
+            AVAILABILITY_STATE_UNAVAILABLE,
+        );
+        for (evse_id, &connector_count) in connector_counts.iter().enumerate() {
+            self.register_availability_pair(
+                AVAILABILITY_COMPONENT_EVSE,
+                Some((evse_id, None)),
+                AVAILABILITY_STATE_AVAILABLE,
+            );
+            for connector_id in 0..connector_count {
+                self.register_availability_pair(
+                    AVAILABILITY_COMPONENT_CONNECTOR,
+                    Some((evse_id, Some(connector_id))),
+                    AVAILABILITY_STATE_AVAILABLE,
+                );
+                self.register_plug_retention_lock(evse_id, connector_id);
+            }
+        }
+    }
+
+    /// Registers one connector's `ConnectorPlugRetentionLock`/`Problem` variable - **OCPP use
+    /// case G05, "Lock Failure"** (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV11).
+    ///
+    /// G05 names this exact component and variable as the payload of the `NotifyEvent` a lock
+    /// failure produces, and its prerequisites require the component to be *in the device model* -
+    /// so a charge point that only faulted the connector would leave the CSMS unable to tell a
+    /// lock failure from a stuck contactor. `ReadOnly` for the reason `AvailabilityState` is: it
+    /// is a projection of what the hardware reported, and a CSMS write would be overwritten by the
+    /// next lock attempt.
+    ///
+    /// Registered per connector, and not for the EVSE or the station: the lock is a property of
+    /// one physical socket. `false` on a fresh model, which is the honest reading before any lock
+    /// has been asked to do anything.
+    fn register_plug_retention_lock(&mut self, evse_id: usize, connector_id: usize) {
+        self.register(
+            Component {
+                name: PLUG_RETENTION_LOCK_COMPONENT.into(),
+                instance: None,
+                evse: Some((evse_id, Some(connector_id))),
+            },
+            Variable {
+                name: PROBLEM_VARIABLE.into(),
+                instance: None,
+            },
+            VariableCharacteristics {
+                data_type: VariableDataType::Boolean,
+                unit: None,
+                min_limit: None,
+                max_limit: None,
+                values_list: None,
+                // A CSMS may configure its own monitor on top of the hard-wired notification this
+                // crate already raises - G05's prerequisites assume it can.
+                supports_monitoring: true,
+            },
+            vec![VariableAttribute {
+                attribute_type: VariableAttributeType::Actual,
+                value: "false".into(),
+                mutability: VariableMutability::ReadOnly,
+                // Re-derived from the connector's own state on the first event after a reboot, so
+                // a persisted `true` would only report a lock failure that may already be gone.
+                persistent: false,
+                constant: false,
+                requires_reboot: false,
+            }],
+        );
+    }
+
+    /// Registers one component's `AvailabilityState`/`Available` pair - see
+    /// [`Self::register_topology_defaults`] for what each means.
+    fn register_availability_pair(
+        &mut self,
+        component_name: &str,
+        evse: Option<(usize, Option<usize>)>,
+        initial_state: &str,
+    ) {
+        let component = Component {
+            name: component_name.into(),
+            instance: None,
+            evse,
+        };
+        self.register(
+            component.clone(),
+            Variable {
+                name: AVAILABILITY_STATE_VARIABLE.into(),
+                instance: None,
+            },
+            VariableCharacteristics {
+                data_type: VariableDataType::OptionList,
+                unit: None,
+                min_limit: None,
+                max_limit: None,
+                // The value set OCPP's `ConnectorStatusEnumType` defines, which is what
+                // `AvailabilityState` reports at every level (G01.FR.01). Declared here rather
+                // than left `None` so that CV3's `SetVariables` validation - and any CSMS reading
+                // the characteristics - has the real option list to work from.
+                values_list: Some(
+                    AVAILABILITY_STATE_VALUES
+                        .iter()
+                        .map(|value| String::from(*value))
+                        .collect(),
+                ),
+                supports_monitoring: true,
+            },
+            vec![VariableAttribute {
+                attribute_type: VariableAttributeType::Actual,
+                value: initial_state.into(),
+                mutability: VariableMutability::ReadOnly,
+                // Recomputed from the state machine on the first event after a reboot, so
+                // persisting it would only risk reporting a stale value in the window before
+                // that. The *underlying* state that must survive a reboot (an EVSE left
+                // Unavailable by `ChangeAvailability`, B01.FR.07/G01.FR.02) is persisted by
+                // `crate::persistence`, not here.
+                persistent: false,
+                constant: false,
+                requires_reboot: false,
+            }],
+        );
+        self.register(
+            component,
+            Variable {
+                name: AVAILABILITY_EXISTS_VARIABLE.into(),
+                instance: None,
+            },
+            VariableCharacteristics {
+                data_type: VariableDataType::Boolean,
+                unit: None,
+                min_limit: None,
+                max_limit: None,
+                values_list: None,
+                supports_monitoring: false,
+            },
+            vec![VariableAttribute {
+                attribute_type: VariableAttributeType::Actual,
+                value: "true".into(),
+                mutability: VariableMutability::ReadOnly,
+                persistent: false,
+                constant: true,
+                requires_reboot: false,
+            }],
+        );
+    }
+
     /// Registers this crate's minimal built-in default variables - deliberately not exhaustive
     /// (see [`new`](Self::new)'s docs):
     ///
@@ -328,7 +536,11 @@ impl DeviceModel {
     ///   model and is reachable via `GetVariables`/`SetVariables` today.
     /// - `AuthCtrlr`/`AuthorizeRemoteStart` (`Boolean`, `ReadWrite`): whether a CSMS-initiated
     ///   `RequestStartTransaction` still needs an `Authorize` round trip. Not yet consulted by
-    ///   `crate::remote_control` either, for the same reason.
+    ///   `crate::remote_control` either (CV2.1) - registered so it is readable, not because it is
+    ///   honoured.
+    ///
+    /// The per-EVSE and per-connector variables are **not** here: they depend on the topology, so
+    /// they live in [`Self::register_topology_defaults`] instead.
     fn register_defaults(&mut self) {
         for default in DEFAULT_VARIABLES {
             self.register(
@@ -341,18 +553,18 @@ impl DeviceModel {
                     name: default.variable.into(),
                     instance: default.instance.map(Into::into),
                 },
-                VariableCharacteristics {
-                    data_type: default.data_type,
-                    unit: default.unit.map(Into::into),
-                    min_limit: None,
-                    max_limit: None,
-                    values_list: None,
-                    supports_monitoring: false,
-                },
+                default_characteristics(default),
                 vec![VariableAttribute {
                     attribute_type: VariableAttributeType::Actual,
                     value: default.value.into(),
-                    mutability: default.mutability,
+                    // CV2.1: a variable this build does not act on is registered read-only, so a
+                    // `SetVariables` on it is `Rejected` (B05.FR.09) rather than accepted and
+                    // ignored. See `DefaultVariable::honoured`.
+                    mutability: if default.honoured {
+                        default.mutability
+                    } else {
+                        VariableMutability::ReadOnly
+                    },
                     persistent: default.persistent,
                     constant: false,
                     requires_reboot: false,
@@ -361,6 +573,221 @@ impl DeviceModel {
         }
     }
 }
+
+/// The [`VariableCharacteristics`] one [`DefaultVariable`] is registered with, including any
+/// bounds [`VARIABLE_BOUNDS`] declares for it.
+fn default_characteristics(default: &DefaultVariable) -> VariableCharacteristics {
+    let bounds = VARIABLE_BOUNDS.iter().find(|bounds| {
+        bounds.component == default.component
+            && bounds.variable == default.variable
+            && bounds.instance == default.instance
+    });
+    VariableCharacteristics {
+        data_type: default.data_type,
+        unit: default.unit.map(Into::into),
+        min_limit: bounds.and_then(|bounds| bounds.min),
+        max_limit: bounds.and_then(|bounds| bounds.max),
+        values_list: bounds.and_then(|bounds| {
+            bounds
+                .values
+                .map(|values| values.iter().map(|value| String::from(*value)).collect())
+        }),
+        supports_monitoring: false,
+    }
+}
+
+/// A bound OCPP defines on one [`DEFAULT_VARIABLES`] entry, so that `SetVariables` can enforce it
+/// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV3, B05.FR.08).
+///
+/// A separate table rather than three more fields on [`DefaultVariable`] because only a minority
+/// of variables have a bound OCPP actually states, and threading `None, None, None` through every
+/// other row would bury the ones that matter.
+///
+/// **The bar for a row here is that OCPP states the bound, not that it seems sensible.** A limit
+/// this crate invented would be a `Rejected` a CSMS has no way to have predicted - worse than no
+/// limit, because `GetVariables` would report the value it just refused to set.
+pub(crate) struct VariableBounds {
+    /// The 2.x component name, matching a [`DEFAULT_VARIABLES`] row.
+    pub component: &'static str,
+    /// The 2.x variable name.
+    pub variable: &'static str,
+    /// The variable instance, matching the same row.
+    pub instance: Option<&'static str>,
+    /// The minimum value, for numeric types.
+    pub min: Option<f64>,
+    /// The maximum value; for string-shaped types OCPP reads this as a maximum *length*.
+    pub max: Option<f64>,
+    /// The allowed values, for `OptionList`/`MemberList`/`SequenceList` types.
+    pub values: Option<&'static [&'static str]>,
+}
+
+/// The measurands this firmware actually produces - the five fields of
+/// [`MeterSample`](crate::state::MeterSample), and so the only values the measurand variables
+/// accept (CV2.6).
+///
+/// Narrower than OCPP's `MeasurandEnumType` for the same reason `TX_START_STOP_POINTS` is narrower
+/// than its enum: accepting a measurand this crate cannot sample and then not sending it is the
+/// silent lie B05.FR.09 forbids.
+const SUPPORTED_MEASURANDS: &[&str] = &[
+    "Energy.Active.Import.Register",
+    "Power.Active.Import",
+    "Current.Import",
+    "Voltage",
+    "SoC",
+];
+
+/// Every bound this crate can state on a built-in default - see [`VariableBounds`].
+pub(crate) const VARIABLE_BOUNDS: &[VariableBounds] = &[
+    // Intervals: seconds, and never negative. `0` is meaningful for all of these (OCPP's "off"
+    // for `AlignedDataCtrlr.Interval`, "unlimited"/"unset" elsewhere - see each variable's docs),
+    // so the floor is 0 and not 1.
+    VariableBounds {
+        component: "OCPPCommCtrlr",
+        variable: "HeartbeatInterval",
+        instance: None,
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "OCPPCommCtrlr",
+        variable: "OfflineThreshold",
+        instance: None,
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "OCPPCommCtrlr",
+        variable: "MessageTimeout",
+        instance: Some("Default"),
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "OCPPCommCtrlr",
+        variable: "MessageAttemptInterval",
+        instance: Some("TransactionEvent"),
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "OCPPCommCtrlr",
+        variable: "MessageAttempts",
+        instance: Some("TransactionEvent"),
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "AlignedDataCtrlr",
+        variable: "Interval",
+        instance: None,
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "AuthCacheCtrlr",
+        variable: "LifeTime",
+        instance: None,
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "ChargingStation",
+        variable: "MinimumStatusDuration",
+        instance: None,
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "TxCtrlr",
+        variable: "EVConnectionTimeOut",
+        instance: None,
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    // The two transaction points are `MemberList`s over OCPP's `TxStartStopPointEnumType`. Their
+    // value sets are the reason a `SetVariables` naming a point this crate does not implement is
+    // *rejected* rather than stored (CV2.2) - see `TX_START_STOP_POINTS`.
+    VariableBounds {
+        component: "SampledDataCtrlr",
+        variable: "TxStartedMeasurands",
+        instance: None,
+        min: None,
+        max: None,
+        values: Some(SUPPORTED_MEASURANDS),
+    },
+    VariableBounds {
+        component: "SampledDataCtrlr",
+        variable: "TxUpdatedMeasurands",
+        instance: None,
+        min: None,
+        max: None,
+        values: Some(SUPPORTED_MEASURANDS),
+    },
+    VariableBounds {
+        component: "SampledDataCtrlr",
+        variable: "TxEndedMeasurands",
+        instance: None,
+        min: None,
+        max: None,
+        values: Some(SUPPORTED_MEASURANDS),
+    },
+    VariableBounds {
+        component: "AlignedDataCtrlr",
+        variable: "Measurands",
+        instance: None,
+        min: None,
+        max: None,
+        values: Some(SUPPORTED_MEASURANDS),
+    },
+    VariableBounds {
+        component: "AlignedDataCtrlr",
+        variable: "TxEndedMeasurands",
+        instance: None,
+        min: None,
+        max: None,
+        values: Some(SUPPORTED_MEASURANDS),
+    },
+    VariableBounds {
+        component: "TxCtrlr",
+        variable: "TxStartPoint",
+        instance: None,
+        min: None,
+        max: None,
+        values: Some(TX_START_STOP_POINTS),
+    },
+    VariableBounds {
+        component: "TxCtrlr",
+        variable: "TxStopPoint",
+        instance: None,
+        min: None,
+        max: None,
+        values: Some(TX_START_STOP_POINTS),
+    },
+];
+
+/// The subset of OCPP's `TxStartStopPointEnumType` this charge point can actually observe, and so
+/// the only values `TxCtrlr.TxStartPoint` and `TxCtrlr.TxStopPoint` accept (CV2.2).
+///
+/// Shared by both variables because the answer is the same for both: a point this charge point
+/// cannot see *begin* is equally one it cannot see *cease*.
+///
+/// **Deliberately narrower than the enum OCPP defines.** `ParkingBayOccupancy` needs a bay sensor
+/// this crate has no binding for, `DataSigned` needs signed meter values it does not produce, and
+/// `EnergyTransfer` needs a "current is actually flowing" signal distinct from the contactor being
+/// closed. Declaring them would mean accepting a `SetVariables` and then starting transactions at
+/// some other point - the silent-lie failure mode B05.FR.09 forbids. Declaring only these three
+/// makes CV3's validation reject the rest with a reason, and `VariableCharacteristics::values_list`
+/// is exactly where a charge point is supposed to say what it accepts.
+const TX_START_STOP_POINTS: &[&str] = &["EVConnected", "Authorized", "PowerPathClosed"];
 
 impl Default for DeviceModel {
     fn default() -> Self {
@@ -405,6 +832,66 @@ pub enum DeviceModelEvent {
     },
 }
 
+// --- CV1.1: the availability variables, named once ---
+//
+// Kept as constants rather than string literals at each use site because three different modules
+// address the same `(Component, Variable)` pairs - `DeviceModel::register_topology_defaults`
+// registers them, `ChargePointState` keeps them in step with the state machine, and
+// `crate::reporting`'s `SummaryInventory` looks them up by name (B07.FR.09). A typo in any one of
+// those would produce a report that is silently empty rather than an error.
+
+/// OCPP's component name for the charge point as a whole.
+pub(crate) const AVAILABILITY_COMPONENT_CHARGE_POINT: &str = "ChargingStation";
+/// OCPP's component name for one EVSE.
+pub(crate) const AVAILABILITY_COMPONENT_EVSE: &str = "EVSE";
+/// OCPP's component name for one connector.
+pub(crate) const AVAILABILITY_COMPONENT_CONNECTOR: &str = "Connector";
+
+/// OCPP's component name for a connector's plug retention lock (G05, CV11) - see
+/// [`DeviceModel::register_plug_retention_lock`].
+pub(crate) const PLUG_RETENTION_LOCK_COMPONENT: &str = "ConnectorPlugRetentionLock";
+/// OCPP's variable name for a component reporting that something is wrong with it (G05, CV11).
+pub(crate) const PROBLEM_VARIABLE: &str = "Problem";
+/// The live availability variable, present on all three components above.
+pub(crate) const AVAILABILITY_STATE_VARIABLE: &str = "AvailabilityState";
+/// The "this component exists" variable (OCPP's own wording), present on all three.
+pub(crate) const AVAILABILITY_EXISTS_VARIABLE: &str = "Available";
+/// `AvailabilityState`'s `Available` value.
+pub(crate) const AVAILABILITY_STATE_AVAILABLE: &str = "Available";
+/// `AvailabilityState`'s `Unavailable` value.
+pub(crate) const AVAILABILITY_STATE_UNAVAILABLE: &str = "Unavailable";
+/// How many variables [`DeviceModel::register_topology_defaults`] registers per component - the
+/// `AvailabilityState`/`Available` pair. Only the bound-sizing tests count them; nothing in the
+/// crate's own paths needs the number.
+#[cfg(test)]
+pub(crate) const AVAILABILITY_VARIABLES_PER_COMPONENT: usize = 2;
+/// How many variables [`DeviceModel::register_topology_defaults`] registers per *connector* on
+/// top of that pair - the `ConnectorPlugRetentionLock`/`Problem` variable (CV11). Same caveat:
+/// only the bound-sizing tests count them.
+#[cfg(test)]
+pub(crate) const PLUG_RETENTION_LOCK_VARIABLES_PER_CONNECTOR: usize = 1;
+/// How many availability variables a charge point with no EVSEs at all still has: the
+/// `ChargingStation` component's own pair.
+#[cfg(test)]
+pub(crate) const STATION_AVAILABILITY_VARIABLES: usize = AVAILABILITY_VARIABLES_PER_COMPONENT;
+
+/// OCPP's component name for one network configuration slot. The slot number is the component
+/// *instance* - see `ChargePointState::sync_network_configuration_variables`.
+pub(crate) const NETWORK_CONFIGURATION_COMPONENT: &str = "NetworkConfiguration";
+/// OCPP's component name for the clock.
+pub(crate) const CLOCK_COMPONENT: &str = "ClockCtrlr";
+/// The charge point's current date and time (CV1.2) - see [`DEFAULT_VARIABLES`]' entry for it.
+pub(crate) const CLOCK_DATE_TIME_VARIABLE: &str = "DateTime";
+
+/// Every value `AvailabilityState` may take - OCPP's `ConnectorStatusEnumType` (G01.FR.01).
+pub(crate) const AVAILABILITY_STATE_VALUES: &[&str] = &[
+    "Available",
+    "Occupied",
+    "Reserved",
+    "Unavailable",
+    "Faulted",
+];
+
 /// One variable [`DeviceModel::register_defaults`] registers on every charge point.
 ///
 /// The table exists because these are not this crate's inventions: each is a variable OCPP itself
@@ -426,9 +913,25 @@ pub(crate) struct DefaultVariable {
     pub unit: Option<&'static str>,
     /// The value a charge point starts with.
     pub value: &'static str,
-    /// Whether a CSMS may write it. **`ReadWrite` here means the value is writable, not that this
-    /// crate acts on it** - see [`DEFAULT_VARIABLES`]' own docs for which are live.
+    /// What OCPP says about writing this variable - **not** necessarily what a CSMS gets. See
+    /// [`Self::honoured`], which can narrow it.
     pub mutability: VariableMutability,
+    /// Whether this crate actually *acts* on the value
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV2.1).
+    ///
+    /// **`false` forces the registration to `ReadOnly`, whatever [`Self::mutability`] says.** OCPP
+    /// B05.FR.09 requires a `SetVariables` the charge point cannot honour to be `Rejected`, and
+    /// silently accepting a setting that changes nothing is the worst of the three options
+    /// available: worse than rejecting it (which tells the CSMS the truth) and worse than not
+    /// registering the variable at all (which at least answers `UnknownVariable`). An operator who
+    /// sets `StopTxOnEVSideDisconnect` and sees `Accepted` will believe cable removal now suspends
+    /// rather than stops the transaction, and will find out otherwise from a driver.
+    ///
+    /// The two fields are kept separate rather than collapsed into one so the table records
+    /// *both* facts: what OCPP intends, and what this build delivers. Making a variable live is
+    /// then a one-word change here plus the read that justifies it - and the roadmap row that
+    /// tracks it says which.
+    pub honoured: bool,
     /// Whether the value should survive a reboot (see
     /// [`VariableAttribute::persistent`](crate::state::VariableAttribute::persistent) and E2.3).
     ///
@@ -469,6 +972,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "60",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         // The accepted BootNotification interval is written here after registration, and
         // re-learning it costs a CSMS round trip - one of the two values worth keeping.
         persistent: true,
@@ -483,6 +987,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // not start reporting on a drumbeat this crate chose for it.
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -493,6 +998,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "true",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -504,6 +1010,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // 0 = entries don't age out. They are still bounded in number and still clearable.
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -514,6 +1021,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "true",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -524,6 +1032,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: true,
     },
     // --- recorded: readable and writable, but not yet consulted by this crate ---
@@ -538,6 +1047,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // than saying no.
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -548,6 +1058,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        // CV2.9: read by `crate::authorization::offline_decision` (C15).
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -558,6 +1070,9 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "120",
         mutability: VariableMutability::ReadWrite,
+        // CV2.3: read by `crate::remote_control::run_pending_remote_start_timeouts`
+        // (F02.FR.07/.08).
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -568,6 +1083,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "true",
         mutability: VariableMutability::ReadWrite,
+        // CV2.4: read by `ChargePointState::apply_connector_event` (E09 vs E10).
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -578,6 +1095,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "true",
         mutability: VariableMutability::ReadWrite,
+        // CV2.5: read into `ConnectorPolicy` and honoured on E05.
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -588,6 +1107,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("Wh"),
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        // CV2.5: read into `ConnectorPolicy` and honoured on E05.
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -598,6 +1119,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -606,8 +1128,9 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         instance: None,
         data_type: VariableDataType::MemberList,
         unit: None,
-        value: "Energy.Active.Import.Register",
+        value: "Energy.Active.Import.Register,Power.Active.Import",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -618,6 +1141,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "Energy.Active.Import.Register",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -628,6 +1152,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -638,6 +1163,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "Energy.Active.Import.Register",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -648,6 +1174,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "Energy.Active.Import.Register",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -658,6 +1185,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -668,6 +1196,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "3",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -678,6 +1207,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "60",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -690,6 +1220,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // connection actually does rather than a number this crate invented alongside it.
         value: "1",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -703,6 +1234,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // `crate::connect`.
         value: "5",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -718,6 +1250,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // operator did not ask for. An operator running a fleet against one CSMS wants this set.
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -728,6 +1261,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -738,6 +1272,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "1",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -748,6 +1283,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -758,6 +1294,9 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "true",
         mutability: VariableMutability::ReadWrite,
+        // CV2.4: read into `ConnectorPolicy::unlock_on_ev_side_disconnect` and honoured by
+        // `ChargePointState::apply_connector_event` (E09.FR.02 vs E09.FR.03).
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -768,6 +1307,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "true",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     // --- OCPP 2.x required variables (B1.7): recorded, and honest about it ---
@@ -792,6 +1332,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // speaks; one without leaves it empty, which remains the truth.
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -802,6 +1343,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "30",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -816,6 +1358,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // in it is the one `network_switch` connects to.
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -826,6 +1369,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "3",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -836,6 +1380,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "60",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -846,6 +1391,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "Energy.Active.Import.Register",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -858,6 +1404,9 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // token is authorized (see `advance_transaction`), not on plug-in or on energy flow.
         value: "Authorized",
         mutability: VariableMutability::ReadWrite,
+        // CV2.2: read into `ConnectorPolicy::tx_start_point` and honoured by
+        // `advance_transaction`.
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -866,8 +1415,14 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         instance: None,
         data_type: VariableDataType::MemberList,
         unit: None,
-        value: "EVConnected",
+        // What this crate's state machine actually does: the transaction ends when the contactor
+        // confirms open (see `ends_transaction`), which is what it did before the variable was
+        // honoured at all. Registering the point the firmware really uses is what lets an empty or
+        // unparseable value fall back honestly.
+        value: "PowerPathClosed",
         mutability: VariableMutability::ReadWrite,
+        // CV2.2: read into `ConnectorPolicy::tx_stop_point` and honoured by `advance_transaction`.
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -881,6 +1436,32 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // its own `Clock` but does not change where *this* crate's knowledge comes from.
         value: "Heartbeat",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
+        persistent: false,
+    },
+    // CV1.2. Required, and live: refreshed from the CSMS's `currentTime` on every
+    // BootNotification/Heartbeat response (see `ChargePointState::apply`'s `TimeSynced` arm), so
+    // it reports the charge point's own notion of the time rather than a fixed string.
+    //
+    // `ReadOnly`, though OCPP allows a CSMS to write it to set the station clock. This crate has
+    // no settable clock: its notion of time *is* the last `currentTime` it was told (see
+    // `TimeSource` above), so a write would be overwritten by the next heartbeat. B05.FR.09 says
+    // reject what cannot be honoured, and `ReadOnly` is how that is said here - accepting the
+    // write and ignoring it is exactly the failure mode CV2.1 exists to remove.
+    //
+    // Empty until the first sync, which is the truth for a charge point that has not yet spoken
+    // to a CSMS and has no RTC. It is *not* a valid `dateTime`, and deliberately so: a plausible
+    // but wrong timestamp is worse than an obviously absent one on a device whose logs are the
+    // only diagnostic instrument anyone has.
+    DefaultVariable {
+        component: "ClockCtrlr",
+        variable: "DateTime",
+        instance: None,
+        data_type: VariableDataType::DateTime,
+        unit: None,
+        value: "",
+        mutability: VariableMutability::ReadOnly,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -894,6 +1475,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // would advertise security this charge point does not have.
         value: "1",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -907,6 +1489,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // `crate::security_profile::SecurityProfileChange`.
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
         persistent: true,
     },
     DefaultVariable {
@@ -919,6 +1502,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // an obviously-unset one, and this is exactly the kind of value a deployment configures.
         value: "",
         mutability: VariableMutability::ReadWrite,
+        // CV2.10: read by `crate::certificates::organization_name` when building a CSR.
+        honoured: true,
         persistent: true,
     },
     DefaultVariable {
@@ -932,6 +1517,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // implementation holds without being handed one, so the honest default is none.
         value: "0",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -942,6 +1528,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "50",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -952,6 +1539,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "50",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -964,6 +1552,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // `NotifyReport` at, not an aspiration.
         value: "16",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -974,6 +1563,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "8192",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -984,6 +1574,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "8192",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
         persistent: false,
     },
     DefaultVariable {
@@ -994,6 +1585,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "8192",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
         persistent: false,
     },
 ];
@@ -1001,6 +1593,10 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How many variables a `DeviceModel::new()`/`with_max_variables` model starts with: the
+    /// defaults plus the charge-point-level availability pair every topology gets (CV1.1).
+    const FRESH_MODEL_VARIABLES: usize = DEFAULT_VARIABLES.len() + STATION_AVAILABILITY_VARIABLES;
 
     fn component(name: &str) -> Component {
         Component {
@@ -1149,15 +1745,16 @@ mod tests {
         );
         assert_eq!(
             model.len(),
-            DEFAULT_VARIABLES.len(),
-            "every entry in DEFAULT_VARIABLES should be registered, and nothing else"
+            DEFAULT_VARIABLES.len() + STATION_AVAILABILITY_VARIABLES,
+            "every entry in DEFAULT_VARIABLES, plus the charge-point-level availability pair \
+             every topology gets (CV1.1), and nothing else"
         );
     }
 
     #[test]
     fn registering_past_the_maximum_is_refused_and_leaves_the_model_alone() {
         // One slot above the built-in defaults, so exactly one custom registration fits.
-        let mut model = DeviceModel::with_max_variables(DEFAULT_VARIABLES.len() + 1);
+        let mut model = DeviceModel::with_max_variables(FRESH_MODEL_VARIABLES + 1);
         assert!(model.register(
             component("Custom"),
             variable("First"),
@@ -1173,7 +1770,7 @@ mod tests {
         );
 
         assert!(!registered);
-        assert_eq!(model.len(), DEFAULT_VARIABLES.len() + 1);
+        assert_eq!(model.len(), FRESH_MODEL_VARIABLES + 1);
         assert_eq!(model.get(&component("Custom"), &variable("Second")), None);
     }
 
@@ -1181,7 +1778,7 @@ mod tests {
     /// block it - otherwise a full model could never have a value's characteristics corrected.
     #[test]
     fn redefining_an_existing_variable_is_allowed_at_the_maximum() {
-        let mut model = DeviceModel::with_max_variables(DEFAULT_VARIABLES.len());
+        let mut model = DeviceModel::with_max_variables(FRESH_MODEL_VARIABLES);
 
         let registered = model.register(
             component("OCPPCommCtrlr"),
@@ -1191,7 +1788,7 @@ mod tests {
         );
 
         assert!(registered);
-        assert_eq!(model.len(), DEFAULT_VARIABLES.len());
+        assert_eq!(model.len(), FRESH_MODEL_VARIABLES);
         assert_eq!(
             model
                 .get(&component("OCPPCommCtrlr"), &variable("HeartbeatInterval"))
@@ -1209,8 +1806,24 @@ mod tests {
     fn a_maximum_below_the_built_in_defaults_is_raised_to_fit_them() {
         let model = DeviceModel::with_max_variables(0);
 
-        assert_eq!(model.max_variables(), DEFAULT_VARIABLES.len());
-        assert_eq!(model.len(), DEFAULT_VARIABLES.len());
+        assert_eq!(model.max_variables(), FRESH_MODEL_VARIABLES);
+        assert_eq!(model.len(), FRESH_MODEL_VARIABLES);
+    }
+
+    /// The same guarantee as above, for the topology variables: a caller who bounds the model
+    /// below what its own EVSEs and connectors need must still get a model that can name them,
+    /// because a `GetBaseReport` that omits a connector is worse than an unbounded model.
+    #[test]
+    fn a_maximum_below_the_topology_variables_is_raised_to_fit_them_too() {
+        let model = DeviceModel::with_topology(0, &[2, 1]);
+
+        // Three connectors and two EVSEs, each an availability pair, plus a retention-lock
+        // variable per connector, on top of a fresh model.
+        let expected = FRESH_MODEL_VARIABLES
+            + AVAILABILITY_VARIABLES_PER_COMPONENT * 5
+            + PLUG_RETENTION_LOCK_VARIABLES_PER_CONNECTOR * 3;
+        assert_eq!(model.len(), expected);
+        assert_eq!(model.max_variables(), expected);
     }
 
     #[test]
@@ -1243,5 +1856,123 @@ mod tests {
         assert_eq!(names.first(), Some(&"AlignedDataCtrlr"));
         assert_eq!(names.last(), Some(&"Zeta"));
         assert!(names.contains(&"Alpha"));
+    }
+
+    // --- CV1.1: availability variables (docs/OCPP-2.1-COMPLIANCE-ROADMAP.md) ---
+
+    fn scoped(name: &str, evse: Option<(usize, Option<usize>)>) -> Component {
+        Component {
+            name: name.into(),
+            instance: None,
+            evse,
+        }
+    }
+
+    fn actual_value(model: &DeviceModel, component: &Component, name: &str) -> Option<String> {
+        model
+            .get(component, &variable(name))?
+            .attribute(VariableAttributeType::Actual)
+            .map(|attribute| attribute.value.clone())
+    }
+
+    #[test]
+    fn a_topology_registers_the_availability_variables_ocpp_requires_for_each_level() {
+        // Two EVSEs, the first with two connectors - so the per-EVSE and per-connector scoping
+        // are both exercised rather than collapsing onto one another.
+        let model =
+            DeviceModel::with_topology(crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES, &[2, 1]);
+
+        let station = scoped("ChargingStation", None);
+        assert_eq!(
+            actual_value(&model, &station, "AvailabilityState").as_deref(),
+            Some("Unavailable"),
+            "a charge point that has not booted is not yet available"
+        );
+        assert_eq!(
+            actual_value(&model, &station, "Available").as_deref(),
+            Some("true"),
+            "`Available` is OCPP's \"this component exists\", not its current availability"
+        );
+
+        for evse_id in 0..2 {
+            let evse = scoped("EVSE", Some((evse_id, None)));
+            assert_eq!(
+                actual_value(&model, &evse, "AvailabilityState").as_deref(),
+                Some("Available"),
+                "EVSE {evse_id}"
+            );
+            assert_eq!(
+                actual_value(&model, &evse, "Available").as_deref(),
+                Some("true"),
+                "EVSE {evse_id}"
+            );
+        }
+
+        for (evse_id, connector_id) in [(0, 0), (0, 1), (1, 0)] {
+            let connector = scoped("Connector", Some((evse_id, Some(connector_id))));
+            assert_eq!(
+                actual_value(&model, &connector, "AvailabilityState").as_deref(),
+                Some("Available"),
+                "connector {evse_id}/{connector_id}"
+            );
+            assert_eq!(
+                actual_value(&model, &connector, "Available").as_deref(),
+                Some("true"),
+                "connector {evse_id}/{connector_id}"
+            );
+        }
+
+        // The connector that doesn't exist under this topology must not be registered.
+        assert!(
+            model
+                .get(
+                    &scoped("Connector", Some((1, Some(1)))),
+                    &variable("AvailabilityState")
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn availability_state_is_readonly_and_available_is_constant() {
+        let model =
+            DeviceModel::with_topology(crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES, &[1]);
+        let station = scoped("ChargingStation", None);
+
+        let state = model
+            .get(&station, &variable("AvailabilityState"))
+            .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+            .expect("registered");
+        // Writable would be a lie: it is a projection of the state machine, and a CSMS write
+        // would be overwritten by the next transition.
+        assert_eq!(state.mutability, VariableMutability::ReadOnly);
+        assert!(!state.constant, "it changes as the charge point runs");
+
+        let available = model
+            .get(&station, &variable("Available"))
+            .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+            .expect("registered");
+        assert_eq!(available.mutability, VariableMutability::ReadOnly);
+        assert!(available.constant, "a component's existence never changes");
+    }
+
+    #[test]
+    fn a_charge_point_with_no_evses_still_registers_the_station_level_variables() {
+        let model =
+            DeviceModel::with_topology(crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES, &[]);
+
+        assert!(
+            actual_value(
+                &model,
+                &scoped("ChargingStation", None),
+                "AvailabilityState"
+            )
+            .is_some()
+        );
+        assert!(
+            model
+                .get(&scoped("EVSE", Some((0, None))), &variable("Available"))
+                .is_none()
+        );
     }
 }

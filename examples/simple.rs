@@ -38,7 +38,7 @@ use ocpp_charge_point::state::{
 use ocpp_charge_point::tariff::{
     ChangeTransactionTariffHandler, ClearTariffsHandler, GetTariffsHandler, SetDefaultTariffHandler,
 };
-use ocpp_charge_point::transactions::TransactionNotifier;
+use ocpp_charge_point::transactions::{TransactionEventOutcome, TransactionNotifier};
 use std::sync::Arc;
 
 /// A stand-in for a real CSMS connection. Real deployments pass an `ocpp-client` version
@@ -99,8 +99,9 @@ impl TransactionNotifier for AlwaysAcceptBootNotifier {
         _connector_id: usize,
         _kind: TransactionEventKind,
         _transaction: Transaction,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+        _offline: bool,
+    ) -> Result<TransactionEventOutcome, Self::Error> {
+        Ok(TransactionEventOutcome::acknowledged())
     }
 }
 

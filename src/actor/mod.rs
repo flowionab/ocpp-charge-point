@@ -153,6 +153,7 @@ mod tests {
                 ChargePointEffect::TransactionEvent(TransactionEventOccurred {
                     evse_id: 0,
                     connector_id: 0,
+                    offline: false,
                     kind: TransactionEventKind::Started,
                     transaction: Transaction {
                         id: TransactionId(0),
@@ -162,6 +163,9 @@ mod tests {
                         seq_no: 0,
                         last_meter_sample: None,
                         priority_charging: false,
+                        remote_start_id: None,
+                        reservation_id: None,
+                        stop_at_energy_wh: None,
                     },
                 }),
             ]

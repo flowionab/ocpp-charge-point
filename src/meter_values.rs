@@ -51,6 +51,112 @@ pub use self::ocpp_2_1::Ocpp2_1MeterValuesNotifier;
 /// `state()` read, not a wire round trip.
 const DISABLED_POLL_SECS: u32 = 60;
 
+/// Which measurands a message may carry (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV2.6).
+///
+/// OCPP lets a CSMS choose what a charge point samples, per message kind:
+/// `SampledDataCtrlr.Tx{Started,Updated,Ended}Measurands` for the three `TransactionEvent`
+/// shapes and `AlignedDataCtrlr.Measurands` for standalone `MeterValues`. The same stored
+/// [`MeterSample`] feeds all four, which is why the filter lives here - at the point a message is
+/// encoded - rather than where the sample is recorded: one filter at the storage point could not
+/// serve four different selections, and would discard readings this crate needs for itself (the
+/// energy figure `Transaction::stop_at_energy_wh` checks, for one).
+///
+/// A measurand this crate cannot produce is refused at `SetVariables` time by the variable's
+/// declared `values_list` (the route CV2.2 established), so anything reaching here is a name the
+/// firmware can honour. An unrecognised member is skipped rather than failing the whole list: the
+/// device model can also be written by a hardware binding or a persisted restore, neither of which
+/// went through that validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MeasurandSet {
+    /// `Energy.Active.Import.Register`.
+    pub energy: bool,
+    /// `Power.Active.Import`.
+    pub power: bool,
+    /// `Current.Import`.
+    pub current: bool,
+    /// `Voltage`.
+    pub voltage: bool,
+    /// `SoC`.
+    pub soc: bool,
+}
+
+impl MeasurandSet {
+    /// Every measurand this crate can produce - what a [`MeterSample`] carries.
+    pub const ALL: Self = Self {
+        energy: true,
+        power: true,
+        current: true,
+        voltage: true,
+        soc: true,
+    };
+
+    /// The measurands named in a `MemberList` value.
+    ///
+    /// An empty list selects **nothing**, which is the literal reading of an empty `MemberList` and
+    /// the reason this crate registers its measurand variables with real defaults rather than empty
+    /// strings: a CSMS that deliberately clears the list to stop meter data must actually stop
+    /// receiving it.
+    pub fn from_member_list(value: &str) -> Self {
+        let mut set = Self::default();
+        for member in value.split(',') {
+            match member.trim() {
+                "Energy.Active.Import.Register" => set.energy = true,
+                "Power.Active.Import" => set.power = true,
+                "Current.Import" => set.current = true,
+                "Voltage" => set.voltage = true,
+                "SoC" => set.soc = true,
+                _ => {}
+            }
+        }
+        set
+    }
+
+    /// Whether this set selects nothing, in which case a message carries no `sampledValue` at all.
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// Reads a `MemberList` device-model variable into a [`MeasurandSet`].
+pub fn measurand_set(actor: &ChargePointActor, component: &str, variable: &str) -> MeasurandSet {
+    let value = actor
+        .state()
+        .device_model
+        .get(
+            &Component {
+                name: component.into(),
+                instance: None,
+                evse: None,
+            },
+            &Variable {
+                name: variable.into(),
+                instance: None,
+            },
+        )
+        .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+        .map(|attribute| attribute.value.clone())
+        .unwrap_or_default();
+    MeasurandSet::from_member_list(&value)
+}
+
+/// The measurands configured for one `TransactionEvent` shape (CV2.6).
+pub fn transaction_event_measurands(
+    actor: &ChargePointActor,
+    kind: crate::state::TransactionEventKind,
+) -> MeasurandSet {
+    let variable = match kind {
+        crate::state::TransactionEventKind::Started => "TxStartedMeasurands",
+        crate::state::TransactionEventKind::Updated(_) => "TxUpdatedMeasurands",
+        crate::state::TransactionEventKind::Ended => "TxEndedMeasurands",
+    };
+    measurand_set(actor, "SampledDataCtrlr", variable)
+}
+
+/// The measurands configured for standalone, clock-aligned `MeterValues` (CV2.6).
+pub fn aligned_measurands(actor: &ChargePointActor) -> MeasurandSet {
+    measurand_set(actor, "AlignedDataCtrlr", "Measurands")
+}
+
 /// Reports a meter reading to the CSMS via standalone `MeterValues`. Implemented per protocol
 /// version, mirroring [`crate::availability::StatusNotifier`].
 #[async_trait::async_trait]

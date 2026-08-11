@@ -40,6 +40,22 @@ pub trait ChargePoint<E: Evse<C>, C: Connector> {
     /// an integrator that hasn't yet audited which capabilities their hardware actually has.
     fn capabilities(&self) -> Capabilities;
 
+    /// The electrical facts OCPP requires this charge point to report - phase counts, connector
+    /// types and per-EVSE maximum power (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV1.5).
+    ///
+    /// Like [`Self::capabilities`], read once during setup and never polled. Unlike it, this has a
+    /// **default implementation** returning an all-unknown declaration, so adding it is not a
+    /// breaking change: a station that ignores it still registers the required variables, just
+    /// with nothing in them - which is what OCPP asks for and is honest about what the firmware
+    /// was told.
+    ///
+    /// Fill it in if a CSMS should be able to see what your hardware actually is. Guessing is
+    /// worse than leaving it blank: a CSMS reads `ConnectorType` and `SupplyPhases` to decide what
+    /// it can ask this station for.
+    fn electrical(&self) -> crate::hardware::ElectricalCharacteristics {
+        crate::hardware::ElectricalCharacteristics::default()
+    }
+
     /// Brings the hardware up and hands over the two channels that connect it to this crate's
     /// state machine, for as long as the process runs:
     ///

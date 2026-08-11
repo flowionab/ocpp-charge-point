@@ -484,17 +484,50 @@ mod tests {
             names,
             alloc::vec![
                 ("AuthCacheCtrlr", "Enabled"),
+                ("ChargingStation", "AvailabilityState"),
+                ("ChargingStation", "Available"),
                 ("Connector", "Problem"),
                 ("LocalAuthListCtrlr", "Enabled")
             ]
         );
     }
 
-    /// A fresh model has two well-known status/control variables among its built-in defaults -
-    /// `AuthCacheCtrlr.Enabled` (B1.2) and `LocalAuthListCtrlr.Enabled` (B1.6) - so the summary
-    /// report is not empty out of the box. That is the summary working, not leaking: whether the
-    /// authorization cache and the local list are enabled is precisely the control state this
-    /// report is for, while `HeartbeatInterval` and friends are configuration and stay out.
+    /// B07.FR.09 defines the summary base as the `AvailabilityState` of the charge point, of each
+    /// EVSE and of each connector. Before CV1.1 registered those, this report was structurally
+    /// empty of exactly the thing it is defined to carry - so this test guards the property the
+    /// requirement actually states, on a model that has a real topology rather than the
+    /// no-EVSE default.
+    #[test]
+    fn summary_inventory_carries_the_availability_state_of_every_level() {
+        let model =
+            DeviceModel::with_topology(crate::state::DEFAULT_MAX_DEVICE_MODEL_VARIABLES, &[2, 1]);
+
+        let entries = report_base_entries(&model, ReportBase::SummaryInventory);
+
+        let availability: alloc::vec::Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.variable.name == "AvailabilityState")
+            .map(|entry| (entry.component.name.as_str(), entry.component.evse))
+            .collect();
+        assert_eq!(
+            availability,
+            alloc::vec![
+                ("ChargingStation", None),
+                ("Connector", Some((0, Some(0)))),
+                ("Connector", Some((0, Some(1)))),
+                ("Connector", Some((1, Some(0)))),
+                ("EVSE", Some((0, None))),
+                ("EVSE", Some((1, None))),
+            ]
+        );
+    }
+
+    /// A fresh model summarises the charge point's own `AvailabilityState`/`Available` (CV1.1,
+    /// B07.FR.09) plus two well-known control variables among its built-in defaults -
+    /// `AuthCacheCtrlr.Enabled` (B1.2) and `LocalAuthListCtrlr.Enabled` (B1.6). That is the
+    /// summary working, not leaking: whether the authorization cache and the local list are
+    /// enabled is precisely the control state this report is for, while `HeartbeatInterval` and
+    /// friends are configuration and stay out.
     #[test]
     fn a_fresh_device_model_summarises_the_control_variables_it_has() {
         let model = DeviceModel::new();
@@ -509,6 +542,8 @@ mod tests {
             names,
             alloc::vec![
                 ("AuthCacheCtrlr", "Enabled"),
+                ("ChargingStation", "AvailabilityState"),
+                ("ChargingStation", "Available"),
                 ("LocalAuthListCtrlr", "Enabled")
             ]
         );
@@ -698,10 +733,13 @@ mod tests {
         );
     }
 
-    /// `GetBaseReport` is `Accepted` whatever it finds - including nothing. A summary report on a
-    /// charge point whose hardware registers no status variables at all is empty but still
-    /// accepted, which is the case this pins (the built-in `AuthCacheCtrlr.Enabled` is filtered
-    /// out here so the assertion is about emptiness, not about which defaults exist).
+    /// `GetBaseReport` is `Accepted` whatever it finds, and on a charge point whose hardware
+    /// registers no status variables of its own it finds only what this crate registers itself:
+    /// the built-in `Enabled` control variables, the availability variables CV1.1 gives every
+    /// level of the topology, and each connector's `ConnectorPlugRetentionLock`/`Problem` (CV11) -
+    /// which is a diagnostic variable, exactly what the summary base is defined to carry. Pinned
+    /// as "nothing beyond those" rather than as a literal list, so a new built-in status variable
+    /// is a deliberate edit here rather than a silent one.
     #[tokio::test]
     async fn get_base_report_is_always_accepted_even_when_it_finds_almost_nothing() {
         let actor = ChargePointActor::spawn([1], &TokioExecutor);
@@ -712,8 +750,21 @@ mod tests {
             panic!("a base report is always accepted");
         };
         assert!(
-            entries.iter().all(|entry| entry.variable.name == "Enabled"),
-            "nothing but the built-in control variables should be summarised on a fresh model"
+            entries.iter().all(|entry| matches!(
+                entry.variable.name.as_str(),
+                "Enabled" | "AvailabilityState" | "Available" | "Problem"
+            )),
+            "nothing but the built-in control and availability variables should be summarised on \
+             a fresh charge point, got {entries:?}"
+        );
+        // The one EVSE and its one connector both reached the report - the B07.FR.09 property.
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.variable.name == "AvailabilityState")
+                .count(),
+            3,
+            "charge point, its one EVSE, and that EVSE's one connector"
         );
     }
 

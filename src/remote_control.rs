@@ -138,13 +138,23 @@ pub enum RequestStartTransactionOutcome {
         /// The started transaction's identifier.
         transaction_id: TransactionId,
     },
-    /// No matching `Locked` connector was found, or the addressed EVSE doesn't exist.
+    /// The request was accepted, but no transaction exists yet - **F02, "Remote Start First"**
+    /// (CV7). The charge point is holding the request against a connector and will start when the
+    /// driver plugs in, or drop it when `TxCtrlr.EVConnectionTimeOut` expires.
+    ///
+    /// Maps to OCPP's `Accepted` on the wire, same as [`Self::Accepted`] - the distinction is for
+    /// this crate's callers, since there is no `transactionId` to quote yet.
+    AcceptedPendingCable,
+    /// No connector could take the request - see [`find_start_target`] for the conditions
+    /// F01.FR.21-.24 name.
     Rejected,
 }
 
-/// Handles a CSMS-initiated `RequestStartTransaction` request against `actor`: finds a `Locked`
-/// connector (cable connected, no active transaction) on `evse_id` - or, if `evse_id` is
-/// `None`, the first `Locked` connector on any EVSE - and starts a transaction on it directly,
+/// Handles a CSMS-initiated `RequestStartTransaction` request against `actor` (F01/F02, CV7).
+///
+/// Finds a connector that can take the request (see [`find_start_target`]) and either starts the
+/// transaction immediately - if the cable is already latched, F01 - or **holds the request until
+/// the driver plugs in**, which is F02 and did not work at all before CV7. Starts a transaction
 /// without a separate Authorize round-trip (the CSMS's own request is itself the authorization
 /// decision; see `ConnectorEvent::RemoteStartRequested`). `id_token` is the identifier the CSMS
 /// supplied, recorded on the started `Transaction`. Rejects if `evse_id` is out of range, or no
@@ -154,20 +164,73 @@ pub async fn handle_request_start_transaction(
     actor: &ChargePointActor,
     evse_id: Option<usize>,
     id_token: IdToken,
+    remote_start_id: Option<i64>,
 ) -> RequestStartTransactionOutcome {
-    let Some((evse_id, connector_id)) = find_locked_connector(&actor.state(), evse_id) else {
-        // The usual cause of a refused RemoteStart, and invisible until now: the CSMS asked to
-        // start a transaction on a connector with no cable latched.
-        tracing::warn!("refusing RequestStartTransaction: no locked connector is available");
+    // B02.FR.05: while the CSMS has answered `Pending` (or has not answered at all), a remote
+    // start is refused outright - even on a charge point configured to accept local transactions
+    // in that state. A CSMS that wants to drive transactions must accept the station first.
+    if !actor.state().may_send_requests() {
+        tracing::warn!(
+            "refusing RequestStartTransaction: the CSMS has not accepted this charge point yet"
+        );
+        return RequestStartTransactionOutcome::Rejected;
+    }
+    // F01.FR.21-.24 / F02.FR.23-.26 (CV7): the rejection conditions OCPP names, checked
+    // explicitly so each produces a `Rejected` for the reason the spec gives rather than as a
+    // side effect of no connector happening to be latched.
+    let state = actor.state();
+    if let Some(evse_id) = evse_id
+        && state.evses.get(evse_id).is_none()
+    {
+        tracing::warn!(evse_id, "refusing RequestStartTransaction: no such EVSE");
+        return RequestStartTransactionOutcome::Rejected;
+    }
+    let Some((evse_id, connector_id, latched)) = find_start_target(&state, evse_id, &id_token)
+    else {
+        tracing::warn!("refusing RequestStartTransaction: no connector can take it");
         return RequestStartTransactionOutcome::Rejected;
     };
 
+    if !latched {
+        // **F02 - "Remote Start Transaction - Remote Start First"**. The cable is not in yet, and
+        // that is the whole premise of the use case: accept, hold the request against the
+        // connector, and start when the driver plugs in. Before CV7 this was rejected outright,
+        // so F02 did not work at all.
+        //
+        // No transaction exists yet, so there is no `transactionId` to return - which is correct
+        // under this crate's default `TxStartPoint` of `Authorized`. A station configured for
+        // `EVConnected` (CV2.2) creates one at the latch, and F01.FR.13's "return the
+        // transactionId" case belongs to a start point earlier than any this crate observes.
+        let _ = actor
+            .send(ChargePointEvent::Evse {
+                evse_id,
+                event: EvseEvent::Connector {
+                    connector_id,
+                    event: ConnectorEvent::RemoteStartPending(crate::state::PendingRemoteStart {
+                        id_token,
+                        remote_start_id,
+                    }),
+                },
+            })
+            .await;
+        tracing::info!(
+            evse_id,
+            connector_id,
+            "accepted a remote start; waiting for the driver to plug in"
+        );
+        return RequestStartTransactionOutcome::AcceptedPendingCable;
+    }
+
+    // F01: the cable is already latched, so the transaction starts now.
     let _ = actor
         .send(ChargePointEvent::Evse {
             evse_id,
             event: EvseEvent::Connector {
                 connector_id,
-                event: ConnectorEvent::RemoteStartRequested(id_token),
+                event: ConnectorEvent::RemoteStartRequested {
+                    id_token,
+                    remote_start_id,
+                },
             },
         })
         .await;
@@ -176,31 +239,198 @@ pub async fn handle_request_start_transaction(
         Some(transaction) => RequestStartTransactionOutcome::Accepted {
             transaction_id: transaction.id,
         },
-        None => RequestStartTransactionOutcome::Rejected,
+        // The connector moved but no transaction exists yet - a `TxStartPoint` later than
+        // `Authorized` (CV2.2). The request was still accepted; there is simply no id to quote.
+        None => RequestStartTransactionOutcome::AcceptedPendingCable,
     }
 }
 
-/// The first `Locked` connector on `evse_id`, or on any EVSE (in order) if `evse_id` is `None`.
-fn find_locked_connector(
+/// Releases held authorizations whose driver never plugged in - **F02.FR.07/.08** and
+/// **E03.FR.15**, `TxCtrlr.EVConnectionTimeOut` (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV2.3).
+///
+/// Covers both halves of the same problem, because both land in the same slot (see
+/// [`crate::state::EvseState::pending_remote_starts`]): a `RequestStartTransaction` accepted before
+/// the cable arrived (F02), and a card presented at the reader and accepted before the cable
+/// arrived (E03). Without this, an authorization whose driver never arrives is held until the
+/// connector happens to be used, which would let a stale one fire for whoever plugs in next -
+/// E03.FR.15's "SHALL deauthorize" in as many words.
+///
+/// # Why the timing lives here rather than on the held request
+///
+/// The obvious design is a timestamp on [`crate::state::PendingRemoteStart`]. That would need a
+/// clock inside `handle_request_start_transaction`, which is reached from every protocol version's
+/// inbound adapter - so it would push a `MonotonicClock` through three adapter constructions and
+/// their traits, to serve one field. Keeping the deadlines in this loop instead costs one small map
+/// and changes no signature: the loop is the only thing that needs to know when a request was
+/// first seen, because it is the only thing that acts on the answer.
+///
+/// The cost is accuracy: a request is released between `EVConnectionTimeOut` and that plus one
+/// sweep interval after it was accepted. `interval_secs` therefore wants to be a fraction of the
+/// timeout, not equal to it.
+///
+/// Runs forever. `EVConnectionTimeOut` is re-read every sweep, so a CSMS changing it takes effect
+/// without a reboot; `0` means "no timeout" and holds requests indefinitely, matching how this
+/// crate reads every other `0`-valued interval.
+pub async fn run_pending_remote_start_timeouts<B, M>(
+    actor: &ChargePointActor,
+    backoff: &B,
+    monotonic: &M,
+    interval_secs: u32,
+) where
+    B: crate::provisioning::Backoff,
+    M: crate::clock::MonotonicClock,
+{
+    let mut first_seen: alloc::collections::BTreeMap<
+        (usize, usize),
+        crate::clock::MonotonicInstant,
+    > = alloc::collections::BTreeMap::new();
+    loop {
+        backoff.wait(interval_secs.max(1)).await;
+        let now = monotonic.now();
+        let timeout = ev_connection_timeout_secs(actor);
+
+        let held: alloc::vec::Vec<(usize, usize)> = actor
+            .state()
+            .evses
+            .iter()
+            .enumerate()
+            .flat_map(|(evse_id, evse)| {
+                evse.pending_remote_starts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, pending)| pending.is_some())
+                    .map(move |(connector_id, _)| (evse_id, connector_id))
+            })
+            .collect();
+
+        // Forget connectors that are no longer holding anything, so a later request on the same
+        // connector is timed from when *it* arrived rather than from a previous one.
+        first_seen.retain(|address, _| held.contains(address));
+        if timeout == 0 {
+            continue;
+        }
+
+        for address in held {
+            let since = *first_seen.entry(address).or_insert(now);
+            if now.duration_since(since).as_secs() < u64::from(timeout) {
+                continue;
+            }
+            let (evse_id, connector_id) = address;
+            tracing::info!(
+                evse_id,
+                connector_id,
+                timeout,
+                "deauthorizing a held start the driver never plugged in for"
+            );
+            let _ = actor
+                .send(ChargePointEvent::Evse {
+                    evse_id,
+                    event: EvseEvent::Connector {
+                        connector_id,
+                        event: ConnectorEvent::RemoteStartPendingCleared,
+                    },
+                })
+                .await;
+            first_seen.remove(&address);
+        }
+    }
+}
+
+/// `TxCtrlr.EVConnectionTimeOut` in seconds, or `0` (meaning "no timeout") when it is absent or
+/// unparseable.
+pub fn ev_connection_timeout_secs(actor: &ChargePointActor) -> u32 {
+    actor
+        .state()
+        .device_model
+        .get(
+            &crate::state::Component {
+                name: "TxCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            &crate::state::Variable {
+                name: "EVConnectionTimeOut".into(),
+                instance: None,
+            },
+        )
+        .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
+        .and_then(|attribute| attribute.value.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// The connector a `RequestStartTransaction` should act on, and whether its cable is already
+/// latched (CV7).
+///
+/// `true` means start now (F01); `false` means hold the request until the driver plugs in (F02).
+/// `None` means every candidate is excluded by one of F01.FR.21-.24's conditions:
+///
+/// - **Reserved for someone else** (FR.21/.22) - a reservation is a promise to one driver, and a
+///   CSMS start for a different identifier must not break it.
+/// - **Unavailable or faulted** (FR.23) - nothing can be started on it.
+/// - **Occupied by an authorized transaction** (FR.24) - only a connector with no transaction, or
+///   one not yet authorized, can be matched to a new request.
+///
+/// A latched connector is preferred over an idle one so the common case (driver already plugged
+/// in, CSMS starts remotely) still starts immediately rather than waiting for a cable that is
+/// already there.
+fn find_start_target(
     state: &ChargePointState,
     evse_id: Option<usize>,
-) -> Option<(usize, usize)> {
-    match evse_id {
-        Some(evse_id) => {
-            let evse = state.evses.get(evse_id)?;
-            let connector_id = evse
-                .connectors
-                .iter()
-                .position(|connector| *connector == ConnectorState::Locked)?;
-            Some((evse_id, connector_id))
+    id_token: &IdToken,
+) -> Option<(usize, usize, bool)> {
+    let evses: alloc::vec::Vec<usize> = match evse_id {
+        Some(evse_id) => alloc::vec![evse_id],
+        None => (0..state.evses.len()).collect(),
+    };
+    let mut waiting = None;
+    for evse_id in evses {
+        let Some(evse) = state.evses.get(evse_id) else {
+            continue;
+        };
+        for connector_id in 0..evse.connectors.len() {
+            if !can_start_here(state, evse_id, connector_id, id_token) {
+                continue;
+            }
+            if evse.connectors[connector_id] == ConnectorState::Locked {
+                return Some((evse_id, connector_id, true));
+            }
+            if waiting.is_none() && evse.connectors[connector_id] == ConnectorState::Available {
+                waiting = Some((evse_id, connector_id, false));
+            }
         }
-        None => state.evses.iter().enumerate().find_map(|(evse_id, evse)| {
-            evse.connectors
-                .iter()
-                .position(|connector| *connector == ConnectorState::Locked)
-                .map(|connector_id| (evse_id, connector_id))
-        }),
     }
+    waiting
+}
+
+/// Whether one connector passes F01.FR.21-.24 - see [`find_start_target`].
+fn can_start_here(
+    state: &ChargePointState,
+    evse_id: usize,
+    connector_id: usize,
+    id_token: &IdToken,
+) -> bool {
+    let evse = &state.evses[evse_id];
+    if evse.status != crate::state::EvseStatus::Available {
+        return false;
+    }
+    match evse.connectors[connector_id] {
+        ConnectorState::Available | ConnectorState::Locked => {}
+        // FR.23 and everything else mid-session: not a connector a new request can be matched to.
+        _ => return false,
+    }
+    // FR.24: an EVSE whose transaction has already been authorized is taken.
+    if evse.transactions[connector_id].is_some() {
+        return false;
+    }
+    // FR.21/.22: a reservation for a different identifier. This crate models a reservation's
+    // `idToken` only (no group id), so the group-id half of FR.22 is not distinguishable here -
+    // an idToken mismatch already refuses, which is the conservative side of that rule.
+    if let Some(reservation) = evse.reservations[connector_id].as_ref()
+        && reservation.id_token.value != id_token.value
+    {
+        return false;
+    }
+    true
 }
 
 /// Registers this charge point's inbound `RequestStartTransaction` handling with the CSMS
@@ -235,6 +465,13 @@ pub async fn handle_request_stop_transaction(
     transaction_id: TransactionId,
 ) -> RequestStopTransactionOutcome {
     let state = actor.state();
+    // B02.FR.05, the other half - see `handle_request_start_transaction`.
+    if !state.may_send_requests() {
+        tracing::warn!(
+            "refusing RequestStopTransaction: the CSMS has not accepted this charge point yet"
+        );
+        return RequestStopTransactionOutcome::Rejected;
+    }
     let Some((evse_id, connector_id)) = find_transaction(&state, transaction_id) else {
         tracing::warn!("refusing RequestStopTransaction: no such transaction is running here");
         return RequestStopTransactionOutcome::Rejected;
@@ -463,6 +700,23 @@ async fn trigger_status_notification<N: StatusNotifier>(
 
 #[cfg(test)]
 mod tests {
+    /// An actor the CSMS has already accepted.
+    ///
+    /// Every handler in this module refuses outright until the charge point is accepted
+    /// (B02.FR.05, CV4), so "accepted" is the state a remote-control test is actually about -
+    /// spawning a bare actor would test the boot gate over and over instead. The one test that
+    /// *is* about the gate builds its own actor.
+    async fn accepted_actor<const N: usize>(connector_counts: [usize; N]) -> ChargePointActor {
+        let actor = ChargePointActor::spawn(connector_counts, &TokioExecutor);
+        actor
+            .send(ChargePointEvent::RegistrationStatusReceived(
+                crate::state::RegistrationStatus::Accepted,
+            ))
+            .await
+            .expect("the actor accepts events");
+        actor
+    }
+
     use super::{
         RequestStartTransactionOutcome, RequestStopTransactionOutcome, TriggerMessageOutcome,
         TriggerableMessage, UnlockOutcome, handle_request_start_transaction,
@@ -492,8 +746,8 @@ mod tests {
     /// Spawns an actor whose command broadcast is drained by a background task that
     /// immediately confirms every `UnlockConnector` command, standing in for the hardware
     /// executor loop that `setup()` normally wires up.
-    fn actor_with_unlock_confirmed() -> ChargePointActor {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+    async fn actor_with_unlock_confirmed() -> ChargePointActor {
+        let actor = accepted_actor([1]).await;
         let mut commands = actor.subscribe_commands();
         let confirming_actor = actor.clone();
         tokio::spawn(async move {
@@ -522,7 +776,7 @@ mod tests {
     }
 
     async fn locked_actor() -> ChargePointActor {
-        let actor = actor_with_unlock_confirmed();
+        let actor = actor_with_unlock_confirmed().await;
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
@@ -552,7 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_connector_is_reported_as_unknown() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = accepted_actor([1]).await;
 
         assert_eq!(
             handle_unlock_request(&actor, 5, 0).await,
@@ -566,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_connector_with_no_cable_reports_unlock_failed() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = accepted_actor([1]).await;
 
         assert_eq!(
             handle_unlock_request(&actor, 0, 0).await,
@@ -627,10 +881,11 @@ mod tests {
 
     #[tokio::test]
     async fn starting_a_transaction_on_a_locked_connector_succeeds() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = accepted_actor([1]).await;
         lock_connector(&actor, 0, 0).await;
 
-        let outcome = handle_request_start_transaction(&actor, Some(0), test_id_token()).await;
+        let outcome =
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await;
 
         assert_eq!(
             outcome,
@@ -646,10 +901,10 @@ mod tests {
 
     #[tokio::test]
     async fn no_evse_id_picks_the_first_locked_connector_on_any_evse() {
-        let actor = ChargePointActor::spawn([1, 1], &TokioExecutor);
+        let actor = accepted_actor([1, 1]).await;
         lock_connector(&actor, 1, 0).await;
 
-        let outcome = handle_request_start_transaction(&actor, None, test_id_token()).await;
+        let outcome = handle_request_start_transaction(&actor, None, test_id_token(), None).await;
 
         assert_eq!(
             outcome,
@@ -669,33 +924,281 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_evse_is_rejected() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = accepted_actor([1]).await;
         lock_connector(&actor, 0, 0).await;
 
-        let outcome = handle_request_start_transaction(&actor, Some(5), test_id_token()).await;
+        let outcome =
+            handle_request_start_transaction(&actor, Some(5), test_id_token(), None).await;
 
         assert_eq!(outcome, RequestStartTransactionOutcome::Rejected);
     }
 
+    /// CV6: F01.FR.25/F02.FR.01 - the `remoteStartId` the CSMS supplied is recorded on the
+    /// transaction the request starts, so every one of that transaction's events can quote it
+    /// back. Without it the CSMS cannot tell which of its own requests produced the transaction
+    /// it is now being told about; the transaction id is no help, since the charge point chose it.
     #[tokio::test]
-    async fn no_locked_connector_is_rejected() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+    async fn a_remote_start_records_its_remote_start_id_on_the_transaction_it_begins() {
+        let actor = accepted_actor([1]).await;
+        lock_connector(&actor, 0, 0).await;
+
+        let outcome =
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), Some(4242)).await;
+
+        assert!(matches!(
+            outcome,
+            RequestStartTransactionOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.remote_start_id),
+            Some(4242)
+        );
+    }
+
+    /// A locally started transaction carries none - there is nothing to correlate it with, and
+    /// inventing an id the CSMS never issued would be worse than reporting none.
+    #[tokio::test]
+    async fn a_locally_started_transaction_has_no_remote_start_id() {
+        let actor = accepted_actor([1]).await;
+        lock_connector(&actor, 0, 0).await;
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::ChargingAuthorized(test_id_token()),
+                },
+            })
+            .await
+            .unwrap();
 
         assert_eq!(
-            handle_request_start_transaction(&actor, None, test_id_token()).await,
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.remote_start_id),
+            None
+        );
+    }
+
+    /// B02.FR.05 (CV4): while the CSMS has answered `Pending` - or has not answered at all - both
+    /// remote-control requests are refused, *even on a connector that would otherwise be ready*.
+    /// A CSMS that wants to drive transactions has to accept the charge point first.
+    #[tokio::test]
+    async fn remote_start_and_stop_are_rejected_until_the_csms_accepts_the_charge_point() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        lock_connector(&actor, 0, 0).await;
+
+        // Nothing answered yet.
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
             RequestStartTransactionOutcome::Rejected
         );
         assert_eq!(
-            handle_request_start_transaction(&actor, Some(0), test_id_token()).await,
+            handle_request_stop_transaction(&actor, TransactionId(0)).await,
+            RequestStopTransactionOutcome::Rejected
+        );
+
+        // Pending is not permission.
+        actor
+            .send(ChargePointEvent::RegistrationStatusReceived(
+                crate::state::RegistrationStatus::Pending,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            RequestStartTransactionOutcome::Rejected
+        );
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Locked,
+            "a refused remote start must not have moved the connector"
+        );
+
+        // Accepted: the same request now works, so the refusals above were the gate and not
+        // some other precondition.
+        actor
+            .send(ChargePointEvent::RegistrationStatusReceived(
+                crate::state::RegistrationStatus::Accepted,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            RequestStartTransactionOutcome::Accepted {
+                transaction_id: TransactionId(0)
+            }
+        );
+    }
+
+    #[tokio::test]
+    /// **F02, the use case CV7 exists for.** No cable yet is not a refusal - it is the premise:
+    /// the station accepts, holds the request, and starts when the driver plugs in. This used to
+    /// assert `Rejected`, which is precisely the bug.
+    async fn a_remote_start_with_no_cable_yet_is_accepted_and_started_when_the_driver_plugs_in() {
+        let actor = accepted_actor([1]).await;
+
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), Some(77)).await,
+            RequestStartTransactionOutcome::AcceptedPendingCable
+        );
+        assert!(
+            actor.state().evses[0].transactions[0].is_none(),
+            "nothing starts until the cable is in"
+        );
+
+        // The driver plugs in. The held request fires, and the transaction carries the
+        // `remoteStartId` from the original request (CV6).
+        lock_connector(&actor, 0, 0).await;
+
+        let transaction = actor.state().evses[0].transactions[0]
+            .clone()
+            .expect("the cable arriving starts the held request");
+        assert_eq!(transaction.remote_start_id, Some(77));
+        assert_eq!(
+            actor.state().evses[0].pending_remote_starts[0],
+            None,
+            "the held request is consumed, not left to fire again"
+        );
+    }
+
+    /// F02.FR.07/.08 (CV2.3): a held remote start whose driver never plugs in is released, so it
+    /// cannot fire for whoever uses the connector next.
+    #[tokio::test]
+    async fn a_held_remote_start_is_released_once_ev_connection_timeout_passes() {
+        use crate::state::{Component, DeviceModelEvent, Variable, VariableAttributeType};
+
+        let actor = accepted_actor([1]).await;
+        actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: Component {
+                        name: "TxCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: Variable {
+                        name: "EVConnectionTimeOut".into(),
+                        instance: None,
+                    },
+                    attribute_type: VariableAttributeType::Actual,
+                    value: "30".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(super::ev_connection_timeout_secs(&actor), 30);
+
+        let outcome =
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), Some(1)).await;
+        assert_eq!(
+            outcome,
+            RequestStartTransactionOutcome::AcceptedPendingCable
+        );
+        assert!(
+            actor.state().evses[0].pending_remote_starts[0].is_some(),
+            "holding the request has to be a published state change, or nothing downstream - the \
+             timeout sweep included - can see it"
+        );
+
+        // The sweep's own release path, driven directly - the loop is an infinite timer, so what
+        // is worth pinning is that clearing it works and that a later plug-in starts nothing.
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::RemoteStartPendingCleared,
+                },
+            })
+            .await
+            .unwrap();
+
+        assert!(actor.state().evses[0].pending_remote_starts[0].is_none());
+
+        lock_connector(&actor, 0, 0).await;
+        assert!(
+            actor.state().evses[0].transactions[0].is_none(),
+            "a released request must not fire for the next driver"
+        );
+    }
+
+    /// The registered default is OCPP's 120s, not "off" - so a station nobody configured still
+    /// releases a request whose driver never arrives. `0` remains this crate's "no timeout",
+    /// consistent with how it reads every other interval.
+    #[tokio::test]
+    async fn the_default_ev_connection_timeout_is_the_one_ocpp_registers() {
+        let actor = accepted_actor([1]).await;
+
+        // 120s, the value `DEFAULT_VARIABLES` registers - OCPP's own default rather than "off".
+        assert_eq!(super::ev_connection_timeout_secs(&actor), 120);
+    }
+
+    /// F01.FR.23: an EVSE that is out of service takes nothing, cable or no cable.
+    #[tokio::test]
+    async fn a_remote_start_on_an_unavailable_evse_is_rejected() {
+        let actor = accepted_actor([1]).await;
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::SetUnavailable,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            RequestStartTransactionOutcome::Rejected
+        );
+    }
+
+    /// F01.FR.21: a reservation is a promise to one driver. A CSMS start for a *different*
+    /// identifier must not break it - while the same identifier is exactly who the connector was
+    /// being held for.
+    #[tokio::test]
+    async fn a_remote_start_is_rejected_on_a_connector_reserved_for_someone_else() {
+        let actor = accepted_actor([1]).await;
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::Reserved(crate::state::Reservation {
+                        id: crate::state::ReservationId(1),
+                        id_token: crate::state::IdToken {
+                            value: "SOMEONE-ELSE".into(),
+                            kind: crate::state::IdTokenKind::ISO14443,
+                        },
+                        expires_at: None,
+                    }),
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            RequestStartTransactionOutcome::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_evse_is_still_rejected() {
+        let actor = accepted_actor([1]).await;
+
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(9), test_id_token(), None).await,
             RequestStartTransactionOutcome::Rejected
         );
     }
 
     /// Spawns an actor with connector 0 `Charging` on a fresh transaction.
     async fn charging_actor() -> ChargePointActor {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = accepted_actor([1]).await;
         lock_connector(&actor, 0, 0).await;
-        handle_request_start_transaction(&actor, Some(0), test_id_token()).await;
+        handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await;
         actor
             .send(ChargePointEvent::Evse {
                 evse_id: 0,
@@ -733,9 +1236,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_transaction_not_yet_charging_is_rejected() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = accepted_actor([1]).await;
         lock_connector(&actor, 0, 0).await;
-        handle_request_start_transaction(&actor, Some(0), test_id_token()).await;
+        handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await;
         // Still `Starting` here - the contactor hasn't confirmed closed yet.
 
         let outcome = handle_request_stop_transaction(&actor, TransactionId(0)).await;
@@ -835,7 +1338,7 @@ mod tests {
 
     #[tokio::test]
     async fn triggering_a_heartbeat_sends_one_and_accepts() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = accepted_actor([1]).await;
         let (notifier, seen) = RecordingNotifier::new();
 
         let outcome =
@@ -891,7 +1394,7 @@ mod tests {
 
     #[tokio::test]
     async fn triggering_a_status_notification_for_the_whole_charge_point_reports_every_connector() {
-        let actor = ChargePointActor::spawn([1, 1], &TokioExecutor);
+        let actor = accepted_actor([1, 1]).await;
         let (notifier, seen) = RecordingNotifier::new();
 
         let outcome = handle_trigger_message(
@@ -913,7 +1416,7 @@ mod tests {
 
     #[tokio::test]
     async fn triggering_a_status_notification_for_an_unknown_connector_is_rejected() {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let actor = accepted_actor([1]).await;
         let (notifier, seen) = RecordingNotifier::new();
 
         let outcome = handle_trigger_message(
@@ -1218,6 +1721,10 @@ mod ocpp_2_1 {
                         .expect("u64 transaction id always fits in a 36-byte wire field"),
                 ),
             ),
+            // F02: accepted, with no transaction to name yet.
+            RequestStartTransactionOutcome::AcceptedPendingCable => {
+                (RequestStartStopStatusEnum::Accepted, None)
+            }
             RequestStartTransactionOutcome::Rejected => {
                 (RequestStartStopStatusEnum::Rejected, None)
             }
@@ -1245,6 +1752,7 @@ mod ocpp_2_1 {
                                 &actor,
                                 evse_id,
                                 map_id_token(&request.id_token),
+                                Some(request.remote_start_id),
                             )
                             .await
                         }
@@ -1728,6 +2236,10 @@ pub(crate) mod ocpp_2_0_1 {
                         .expect("u64 transaction id always fits in a 36-byte wire field"),
                 ),
             ),
+            // F02: accepted, with no transaction to name yet.
+            RequestStartTransactionOutcome::AcceptedPendingCable => {
+                (RequestStartStopStatusEnum::Accepted, None)
+            }
             RequestStartTransactionOutcome::Rejected => {
                 (RequestStartStopStatusEnum::Rejected, None)
             }
@@ -1753,6 +2265,7 @@ pub(crate) mod ocpp_2_0_1 {
                                 &actor,
                                 evse_id,
                                 map_id_token(&request.id_token),
+                                Some(request.remote_start_id),
                             )
                             .await
                         }
@@ -2368,7 +2881,11 @@ mod ocpp_1_6 {
         outcome: RequestStartTransactionOutcome,
     ) -> RemoteStartTransactionResponseStatus {
         match outcome {
-            RequestStartTransactionOutcome::Accepted { .. } => {
+            // 1.6J's `RemoteStartTransaction` carries no transaction id either way, so the two
+            // accepted shapes project onto the same status - the distinction only exists in this
+            // crate's own outcome type.
+            RequestStartTransactionOutcome::Accepted { .. }
+            | RequestStartTransactionOutcome::AcceptedPendingCable => {
                 RemoteStartTransactionResponseStatus::Accepted
             }
             RequestStartTransactionOutcome::Rejected => {
@@ -2470,6 +2987,10 @@ mod ocpp_1_6 {
                                     &actor,
                                     evse_id,
                                     map_id_token(&request.id_tag),
+                                    // 1.6J's `RemoteStartTransaction` has no `remoteStartId` -
+                                    // the field arrived with 2.0. Nothing to correlate, and
+                                    // nothing downstream reports one on a 1.6J connection.
+                                    None,
                                 )
                                 .await
                             }

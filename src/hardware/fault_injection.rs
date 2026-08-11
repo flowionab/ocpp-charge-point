@@ -212,6 +212,63 @@ mod tests {
         }
     }
 
+    /// **G05 (CV11)**: a lock that will not engage still faults the connector, but it faults it
+    /// *as a lock failure* - the connector's `ConnectorPlugRetentionLock`/`Problem` says so, which
+    /// is what lets a CSMS tell this from the stuck contactor next door.
+    #[tokio::test]
+    async fn a_failing_lock_is_reported_as_a_lock_failure_and_not_a_generic_fault() {
+        for (fault, expected) in [(Fault::Lock, "true"), (Fault::CloseContactor, "false")] {
+            let (hardware, _calls) = evses(fault);
+            let actor = ChargePointActor::spawn([1], &TokioExecutor);
+            // Subscribed before anything is sent - the command channel is a broadcast, so a
+            // subscriber that joins late never sees the command whose failure this test is about.
+            let mut commands = actor.subscribe_commands();
+            let events = HardwareEventSender::new(actor.clone());
+
+            connector_event(&actor, ConnectorEvent::CableConnected).await;
+            connector_event(&actor, ConnectorEvent::LockConfirmed).await;
+            connector_event(&actor, ConnectorEvent::IdTokenPresented(id_token())).await;
+            connector_event(&actor, ConnectorEvent::ChargingAuthorized(id_token())).await;
+            for _ in 0..8 {
+                match tokio::time::timeout(std::time::Duration::from_millis(20), commands.recv())
+                    .await
+                {
+                    Ok(Ok(command)) => execute_hardware_command(&hardware, command, &events).await,
+                    _ => break,
+                }
+            }
+
+            // Either faulted state: which one depends only on whether the contactor has confirmed
+            // open yet, which is not what this test is about.
+            assert!(
+                matches!(
+                    actor.state().evses[0].connectors[0],
+                    ConnectorState::Faulted | ConnectorState::FaultedSafe
+                ),
+                "{fault:?} must still fault the connector"
+            );
+            let problem = actor
+                .state()
+                .device_model
+                .get(
+                    &crate::state::Component {
+                        name: "ConnectorPlugRetentionLock".into(),
+                        instance: None,
+                        evse: Some((0, Some(0))),
+                    },
+                    &crate::state::Variable {
+                        name: "Problem".into(),
+                        instance: None,
+                    },
+                )
+                .and_then(|definition| {
+                    definition.attribute(crate::state::VariableAttributeType::Actual)
+                })
+                .map(|attribute| attribute.value.clone());
+            assert_eq!(problem.as_deref(), Some(expected), "{fault:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_fault_while_charging_opens_the_contactor_before_it_unlocks() {
         // The ordering that makes a fail-safe transition safe. Releasing the latch while current

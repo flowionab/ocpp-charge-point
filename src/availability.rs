@@ -4,12 +4,13 @@
 
 use crate::actor::ChargePointActor;
 use crate::state::{
-    ChargePointEvent, ConnectorEvent, ConnectorState, ConnectorStatus, ConnectorStatusChanged,
-    EvseEvent,
+    ChargePointEvent, ChargePointState, Component, ConnectorEvent, ConnectorState, ConnectorStatus,
+    ConnectorStatusChanged, EvseEvent, Variable, VariableAttributeType,
 };
 use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -260,6 +261,145 @@ pub trait ChangeAvailabilityHandler {
     async fn register_change_availability_handler(&self, actor: ChargePointActor);
 }
 
+/// Every connector this charge point owns, with the status it currently has - the payload of a
+/// resynchronisation sweep (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV5).
+///
+/// A free function on a state snapshot rather than a method, so the decision of *what to report*
+/// is testable without a CSMS, a clock or a connection.
+pub fn all_connector_statuses(state: &ChargePointState) -> Vec<ConnectorStatusChanged> {
+    state
+        .evses
+        .iter()
+        .enumerate()
+        .flat_map(|(evse_id, evse)| {
+            evse.connectors
+                .iter()
+                .enumerate()
+                .map(move |(connector_id, connector)| ConnectorStatusChanged {
+                    evse_id,
+                    connector_id,
+                    status: connector.availability_status(),
+                    connector_state: *connector,
+                })
+        })
+        .collect()
+}
+
+/// Reports the current status of **every** connector to the CSMS (CV5).
+///
+/// Two requirements ask for exactly this sweep, and both are about the CSMS's picture of the
+/// charge point being stale rather than about anything having changed:
+///
+/// - **B01.FR.05** - after a BootNotification is accepted, the CSMS knows nothing about this
+///   station's connectors and has to be told all of them.
+/// - **B04.FR.01** - after an outage *longer than* `OCPPCommCtrlr.OfflineThreshold`, the CSMS's
+///   picture is too old to trust, so everything is re-reported rather than only what changed.
+///
+/// The complementary case, **B04.FR.02** (a *short* outage reports only the connectors that
+/// changed), needs no sweep at all: the status changes that occurred while offline are exactly
+/// what the offline queue is holding, so draining it reports those and only those. That is why
+/// this function is not called on every reconnect - see
+/// [`resynchronise_after_outage`].
+///
+/// Errors are logged per connector and do not stop the sweep: a CSMS that rejects one status is
+/// no reason to leave it ignorant of the rest.
+#[tracing::instrument(skip_all, fields(connectors))]
+pub async fn report_all_connector_statuses<N: StatusNotifier>(
+    actor: &ChargePointActor,
+    notifier: &N,
+) {
+    let statuses = all_connector_statuses(&actor.state());
+    tracing::Span::current().record("connectors", statuses.len());
+    tracing::debug!("reporting every connector's status to the CSMS");
+    for changed in statuses {
+        if let Err(err) = notifier
+            .notify_status(
+                changed.evse_id,
+                changed.connector_id,
+                changed.status,
+                changed.connector_state,
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                evse_id = changed.evse_id,
+                connector_id = changed.connector_id,
+                "a connector's status could not be resynchronised"
+            );
+        }
+    }
+}
+
+/// Whether an outage of `offline_for` seconds was long enough to require re-reporting every
+/// connector (B04.FR.01) rather than only the ones that changed (B04.FR.02).
+///
+/// `threshold` is `OCPPCommCtrlr.OfflineThreshold`. OCPP words the split as *exceeds* the
+/// threshold, so an outage exactly equal to it takes the short path.
+pub fn outage_needs_full_resynchronisation(offline_for_secs: u64, threshold_secs: u64) -> bool {
+    offline_for_secs > threshold_secs
+}
+
+/// The `OCPPCommCtrlr.OfflineThreshold` this charge point is configured with, in seconds.
+///
+/// `fallback` when the variable is absent or unparseable - the same tolerance every other
+/// device-model read in this crate applies.
+pub fn offline_threshold_secs(actor: &ChargePointActor, fallback: u64) -> u64 {
+    actor
+        .state()
+        .device_model
+        .get(
+            &Component {
+                name: "OCPPCommCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            &Variable {
+                name: "OfflineThreshold".into(),
+                instance: None,
+            },
+        )
+        .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+        .and_then(|attribute| attribute.value.parse::<u64>().ok())
+        .unwrap_or(fallback)
+}
+
+/// Runs B04's post-outage decision: re-report every connector if the outage exceeded
+/// `OCPPCommCtrlr.OfflineThreshold`, and otherwise report nothing here (CV5).
+///
+/// "Report nothing" is the *complete* short-outage behaviour, not a stub: the connectors that
+/// changed while offline are already queued, and the flush that follows a reconnect delivers
+/// exactly them (B04.FR.02). Sweeping as well would report connectors that did not change, which
+/// is the thing that requirement forbids.
+///
+/// `offline_for_secs` is how long the CSMS was unreachable. See
+/// [`crate::connection::reregister_on_reconnect`] for where that is measured and how precisely.
+pub async fn resynchronise_after_outage<N: StatusNotifier>(
+    actor: &ChargePointActor,
+    notifier: &N,
+    offline_for_secs: u64,
+) {
+    let threshold = offline_threshold_secs(actor, DEFAULT_OFFLINE_THRESHOLD_SECS);
+    if !outage_needs_full_resynchronisation(offline_for_secs, threshold) {
+        tracing::debug!(
+            offline_for_secs,
+            threshold,
+            "short outage; the queued status changes are the whole report"
+        );
+        return;
+    }
+    tracing::info!(
+        offline_for_secs,
+        threshold,
+        "the CSMS was offline long enough to need every connector re-reported"
+    );
+    report_all_connector_statuses(actor, notifier).await;
+}
+
+/// The `OfflineThreshold` assumed when the device model has none - matches the value
+/// `DEFAULT_VARIABLES` registers, so removing the variable does not silently change behaviour.
+pub const DEFAULT_OFFLINE_THRESHOLD_SECS: u64 = 60;
+
 /// Forwards every connector status change received on `changes` to the CSMS via `notifier`,
 /// forever. Errors are logged and do not stop the loop or drop the change - the actor already
 /// applied it to state; only the CSMS-facing report failed and is not retried. [`setup`](crate::setup)
@@ -287,8 +427,15 @@ pub async fn run_status_notifications<N: StatusNotifier>(
 
 #[cfg(test)]
 mod tests {
-    use super::{StatusNotifier, run_status_notifications};
-    use crate::state::{ConnectorState, ConnectorStatus, ConnectorStatusChanged};
+    use super::{
+        DEFAULT_OFFLINE_THRESHOLD_SECS, StatusNotifier, offline_threshold_secs,
+        outage_needs_full_resynchronisation, report_all_connector_statuses,
+        resynchronise_after_outage, run_status_notifications,
+    };
+    use crate::state::{
+        ChargePointEvent, Component, ConnectorEvent, ConnectorState, ConnectorStatus,
+        ConnectorStatusChanged, EvseEvent, Variable, VariableAttributeType,
+    };
     use crate::sync::broadcast_channel;
     use alloc::boxed::Box;
     use alloc::vec::Vec;
@@ -313,6 +460,118 @@ mod tests {
                 .send_modify(|seen| seen.push((evse_id, connector_id, status, connector_state)));
             Ok(())
         }
+    }
+
+    // --- CV5: B01.FR.05 and B04.FR.01/.02 ---
+
+    /// B01.FR.05: after acceptance the CSMS knows nothing about this station's connectors, so it
+    /// is told every one of them - including the ones sitting quietly at `Available`, which is
+    /// precisely the information a change-driven forwarder would never send.
+    #[tokio::test]
+    async fn a_full_sweep_reports_every_connector_on_every_evse() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([2, 1], &TokioExecutor);
+        // Move one connector off `Available` so the sweep is visibly reporting current state
+        // rather than a constant.
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 1,
+                    event: ConnectorEvent::CableConnected,
+                },
+            })
+            .await
+            .unwrap();
+
+        let (seen_tx, mut seen_rx) = watch::channel(Vec::new());
+        let notifier = RecordingStatusNotifier { seen: seen_tx };
+
+        report_all_connector_statuses(&actor, &notifier).await;
+
+        let seen = seen_rx.borrow_and_update().clone();
+        let addresses: Vec<(usize, usize, ConnectorStatus)> = seen
+            .iter()
+            .map(|(evse_id, connector_id, status, _)| (*evse_id, *connector_id, *status))
+            .collect();
+        assert_eq!(
+            addresses,
+            alloc::vec![
+                (0, 0, ConnectorStatus::Available),
+                (0, 1, ConnectorStatus::Occupied),
+                (1, 0, ConnectorStatus::Available),
+            ]
+        );
+    }
+
+    /// B04's split, as a pure decision. OCPP words it as *exceeds* the threshold, so an outage
+    /// exactly equal to it takes the short path.
+    #[test]
+    fn only_an_outage_longer_than_the_threshold_needs_a_full_resynchronisation() {
+        assert!(!outage_needs_full_resynchronisation(0, 60));
+        assert!(!outage_needs_full_resynchronisation(59, 60));
+        assert!(!outage_needs_full_resynchronisation(60, 60));
+        assert!(outage_needs_full_resynchronisation(61, 60));
+    }
+
+    /// B04.FR.02: a short outage sends **nothing** from this path. Not a stub - the connectors
+    /// that changed while offline are what the offline queue is holding, and sweeping as well
+    /// would report connectors that did not change, which is what the requirement forbids.
+    #[tokio::test]
+    async fn a_short_outage_reports_nothing_and_a_long_one_reports_everything() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let threshold = offline_threshold_secs(&actor, DEFAULT_OFFLINE_THRESHOLD_SECS);
+
+        let (seen_tx, mut seen_rx) = watch::channel(Vec::new());
+        let notifier = RecordingStatusNotifier { seen: seen_tx };
+
+        resynchronise_after_outage(&actor, &notifier, threshold).await;
+        assert!(
+            seen_rx.borrow_and_update().is_empty(),
+            "a short outage leaves the queued changes to speak for themselves"
+        );
+
+        resynchronise_after_outage(&actor, &notifier, threshold + 1).await;
+        assert_eq!(seen_rx.borrow_and_update().len(), 1);
+    }
+
+    /// The threshold is read from the device model, so a CSMS that changes it changes the
+    /// behaviour on the next outage without a reboot - the same contract every other live
+    /// variable in this crate has.
+    #[tokio::test]
+    async fn the_threshold_comes_from_the_device_model() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+        use crate::state::DeviceModelEvent;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        assert_eq!(offline_threshold_secs(&actor, 999), 60);
+
+        actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: Component {
+                        name: "OCPPCommCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: Variable {
+                        name: "OfflineThreshold".into(),
+                        instance: None,
+                    },
+                    attribute_type: VariableAttributeType::Actual,
+                    value: "300".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(offline_threshold_secs(&actor, 999), 300);
     }
 
     #[tokio::test]
@@ -364,7 +623,6 @@ mod deduped_status_notifier_tests {
     use super::{DedupedStatusNotifier, StatusNotifier};
     use crate::state::{ConnectorState, ConnectorStatus, ConnectorStatusChanged};
     use alloc::sync::Arc;
-    use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::watch;
 
@@ -1361,7 +1619,6 @@ mod ocpp_1_6 {
     use crate::wire::v16::StatusNotificationRequest;
     use crate::wire::v16::common::{ErrorCode, StatusNotificationRequestStatus};
     use alloc::boxed::Box;
-    use alloc::vec::Vec;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
 
@@ -1388,9 +1645,10 @@ mod ocpp_1_6 {
             // `chargingState`. B1.5's whole point is that this crate now knows the difference.
             ConnectorState::SuspendedEv => StatusNotificationRequestStatus::SuspendedEV,
             ConnectorState::SuspendedEvse => StatusNotificationRequestStatus::SuspendedEVSE,
-            ConnectorState::Stopping | ConnectorState::Finishing | ConnectorState::Unlocking => {
-                StatusNotificationRequestStatus::Finishing
-            }
+            ConnectorState::Stopping
+            | ConnectorState::StoppingLocked
+            | ConnectorState::Finishing
+            | ConnectorState::Unlocking => StatusNotificationRequestStatus::Finishing,
             ConnectorState::Unavailable => StatusNotificationRequestStatus::Unavailable,
             ConnectorState::Faulted | ConnectorState::FaultedSafe => {
                 StatusNotificationRequestStatus::Faulted

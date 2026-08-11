@@ -12,6 +12,51 @@ pub use self::ocpp_2_0_1::Ocpp2_0_1TransactionNotifier;
 #[cfg(feature = "ocpp_2_1")]
 pub use self::ocpp_2_1::Ocpp2_1TransactionNotifier;
 
+/// What the CSMS said in reply to a `TransactionEvent`, insofar as this crate has to act on it.
+///
+/// A `TransactionEventResponse` is not just an acknowledgement: OCPP lets the CSMS revoke an
+/// identifier mid-session by answering with a rejected `idTokenInfo` (E05), which is a decision the
+/// charge point must carry out rather than log. Returning it from
+/// [`TransactionNotifier::notify_transaction_event`] is what lets the *version adapter* read the
+/// wire field while the *state machine* decides what it means - the same split every other
+/// protocol-facing type in this crate uses.
+///
+/// Non-exhaustive because a response carries more the crate may come to honour (`totalCost`,
+/// `chargingPriority`, `updatedPersonalMessage`); adding one should not break an integrator's own
+/// notifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct TransactionEventOutcome {
+    /// The response's `idTokenInfo.status`, or `None` when it carried no `idTokenInfo` at all -
+    /// which is the ordinary case for an event that quoted no identifier, and is *not* the same as
+    /// a rejection.
+    pub id_token_status: Option<crate::state::AuthorizationStatus>,
+}
+
+impl TransactionEventOutcome {
+    /// A response saying nothing about the identifier - what a notifier that cannot read one
+    /// (OCPP 1.6J's `MeterValues`, say) returns.
+    pub fn acknowledged() -> Self {
+        Self::default()
+    }
+
+    /// A response carrying `idTokenInfo.status`.
+    pub fn with_id_token_status(status: crate::state::AuthorizationStatus) -> Self {
+        Self {
+            id_token_status: Some(status),
+        }
+    }
+
+    /// Whether the CSMS refused the identifier this transaction is running under (E05).
+    ///
+    /// Only an explicit rejection counts. A response with no `idTokenInfo` says nothing about the
+    /// identifier, and treating silence as refusal would cut a driver off mid-session because the
+    /// CSMS chose to answer tersely.
+    pub fn id_token_rejected(&self) -> bool {
+        self.id_token_status == Some(crate::state::AuthorizationStatus::Rejected)
+    }
+}
+
 /// Reports a transaction lifecycle event to the CSMS via TransactionEvent. Implemented per
 /// protocol version (see the `ocpp_2_1` module), mirroring
 /// [`crate::availability::StatusNotifier`].
@@ -22,13 +67,70 @@ pub trait TransactionNotifier {
 
     /// Reports a transaction lifecycle event of `kind` for `transaction`, on the given
     /// connector.
+    ///
+    /// `offline` is OCPP's `offline` flag (E12, `docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV6.1):
+    /// `true` when this event was generated while the CSMS was unreachable and has been sitting in
+    /// [`crate::offline_queue::OfflineQueue`] since. The encoder cannot work that out for itself -
+    /// by the time it runs, the connection is back - so the queue tells it (see
+    /// [`crate::offline_queue::OfflineQueue::marking_offline`]). A notifier for a protocol version
+    /// with no such field ignores it.
+    ///
+    /// Returns what the CSMS said back, so the caller can act on a mid-session deauthorization -
+    /// see [`TransactionEventOutcome`] and [`deliver_transaction_event`].
     async fn notify_transaction_event(
         &self,
         evse_id: usize,
         connector_id: usize,
         kind: TransactionEventKind,
         transaction: crate::state::Transaction,
-    ) -> Result<(), Self::Error>;
+        offline: bool,
+    ) -> Result<TransactionEventOutcome, Self::Error>;
+}
+
+/// Reports `occurred` via `notifier` and applies whatever the CSMS said back to `actor` - the one
+/// place a `TransactionEvent`'s *response* turns into charge-point behaviour.
+///
+/// **E05 (CV2.5).** A CSMS blocklist update lands mid-session as a rejected `idTokenInfo` on the
+/// response to an ordinary `Updated` event. That raises
+/// [`ConnectorEvent::AuthorizationRevoked`](crate::state::ConnectorEvent::AuthorizationRevoked),
+/// whose consequences are the operator's configuration and not this function's business:
+/// `TxCtrlr.StopTxOnInvalidId` stops at once, `TxCtrlr.MaxEnergyOnInvalidId` grants a last
+/// allowance instead. Raised at most once per session, because the state machine ignores a second
+/// revocation on a connector that has already left `Charging`.
+///
+/// A delivery failure is returned unchanged, so an offline queue still queues and retries it.
+pub async fn deliver_transaction_event<N: TransactionNotifier>(
+    notifier: &N,
+    actor: &crate::actor::ChargePointActor,
+    occurred: TransactionEventOccurred,
+) -> Result<(), N::Error> {
+    let (evse_id, connector_id) = (occurred.evse_id, occurred.connector_id);
+    let outcome = notifier
+        .notify_transaction_event(
+            evse_id,
+            connector_id,
+            occurred.kind,
+            occurred.transaction,
+            occurred.offline,
+        )
+        .await?;
+    if outcome.id_token_rejected() {
+        tracing::info!(
+            evse_id,
+            connector_id,
+            "the CSMS refused this transaction's identifier; revoking the authorization"
+        );
+        let _ = actor
+            .send(crate::state::ChargePointEvent::Evse {
+                evse_id,
+                event: crate::state::EvseEvent::Connector {
+                    connector_id,
+                    event: crate::state::ConnectorEvent::AuthorizationRevoked,
+                },
+            })
+            .await;
+    }
+    Ok(())
 }
 
 /// Forwards to the wrapped notifier - see [`crate::availability::StatusNotifier`]'s `Arc` impl for
@@ -43,9 +145,10 @@ impl<N: TransactionNotifier + Send + Sync> TransactionNotifier for alloc::sync::
         connector_id: usize,
         kind: crate::state::TransactionEventKind,
         transaction: crate::state::Transaction,
-    ) -> Result<(), Self::Error> {
+        offline: bool,
+    ) -> Result<TransactionEventOutcome, Self::Error> {
         (**self)
-            .notify_transaction_event(evse_id, connector_id, kind, transaction)
+            .notify_transaction_event(evse_id, connector_id, kind, transaction, offline)
             .await
     }
 }
@@ -57,6 +160,11 @@ impl<N: TransactionNotifier + Send + Sync> TransactionNotifier for alloc::sync::
 /// report rather than just logging it - prefer that for `TransactionEvent`, where a report the
 /// CSMS never receives can mean lost billing/session history; this simpler fire-and-forget
 /// version remains for callers who don't need retry.
+///
+/// The response is discarded, so a mid-session deauthorization (E05) is *not* acted on here: doing
+/// that needs a [`crate::actor::ChargePointActor`] to raise the event against, which this loop
+/// deliberately does not take. Callers who need it use [`deliver_transaction_event`], which
+/// `crate::builder`'s queued path does.
 pub async fn run_transaction_events<N: TransactionNotifier>(
     mut events: BroadcastReceiver<TransactionEventOccurred>,
     notifier: &N,
@@ -68,6 +176,7 @@ pub async fn run_transaction_events<N: TransactionNotifier>(
                 occurred.connector_id,
                 occurred.kind,
                 occurred.transaction,
+                occurred.offline,
             )
             .await
         {
@@ -78,7 +187,7 @@ pub async fn run_transaction_events<N: TransactionNotifier>(
 
 #[cfg(test)]
 mod tests {
-    use super::{TransactionNotifier, run_transaction_events};
+    use super::{TransactionEventOutcome, TransactionNotifier, run_transaction_events};
     use crate::state::{
         Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
         TransactionId,
@@ -88,8 +197,11 @@ mod tests {
     use alloc::vec::Vec;
     use tokio::sync::watch;
 
+    /// One call this notifier saw: `(evse_id, connector_id, kind, transaction, offline)`.
+    type SeenEvent = (usize, usize, TransactionEventKind, Transaction, bool);
+
     struct RecordingTransactionNotifier {
-        seen: watch::Sender<Vec<(usize, usize, TransactionEventKind, Transaction)>>,
+        seen: watch::Sender<Vec<SeenEvent>>,
     }
 
     #[async_trait::async_trait]
@@ -102,10 +214,11 @@ mod tests {
             connector_id: usize,
             kind: TransactionEventKind,
             transaction: Transaction,
-        ) -> Result<(), Self::Error> {
+            offline: bool,
+        ) -> Result<TransactionEventOutcome, Self::Error> {
             self.seen
-                .send_modify(|seen| seen.push((evse_id, connector_id, kind, transaction)));
-            Ok(())
+                .send_modify(|seen| seen.push((evse_id, connector_id, kind, transaction, offline)));
+            Ok(TransactionEventOutcome::acknowledged())
         }
     }
 
@@ -128,12 +241,16 @@ mod tests {
             seq_no: 0,
             last_meter_sample: None,
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         };
         sender.send(TransactionEventOccurred {
             evse_id: 0,
             connector_id: 0,
             kind: TransactionEventKind::Started,
             transaction: transaction.clone(),
+            offline: false,
         });
 
         seen_rx
@@ -146,8 +263,153 @@ mod tests {
 
         assert_eq!(
             *seen_rx.borrow(),
-            alloc::vec![(0, 0, TransactionEventKind::Started, transaction)]
+            alloc::vec![(0, 0, TransactionEventKind::Started, transaction, false)]
         );
+    }
+
+    /// E05 (CV2.5): silence is not refusal. A `TransactionEventResponse` with no `idTokenInfo` is
+    /// the ordinary answer to an event that quoted no identifier, and reading it as a rejection
+    /// would cut a driver off mid-session because the CSMS answered tersely.
+    #[test]
+    fn only_an_explicit_rejection_revokes_the_identifier() {
+        use crate::state::AuthorizationStatus;
+
+        assert!(!TransactionEventOutcome::acknowledged().id_token_rejected());
+        assert!(
+            !TransactionEventOutcome::with_id_token_status(AuthorizationStatus::Accepted)
+                .id_token_rejected()
+        );
+        assert!(
+            TransactionEventOutcome::with_id_token_status(AuthorizationStatus::Rejected)
+                .id_token_rejected()
+        );
+    }
+
+    /// A notifier that answers every event with a fixed outcome - the CSMS half of the E05 test
+    /// below.
+    struct FixedOutcomeNotifier(TransactionEventOutcome);
+
+    #[async_trait::async_trait]
+    impl TransactionNotifier for FixedOutcomeNotifier {
+        type Error = core::convert::Infallible;
+
+        async fn notify_transaction_event(
+            &self,
+            _evse_id: usize,
+            _connector_id: usize,
+            _kind: TransactionEventKind,
+            _transaction: Transaction,
+            _offline: bool,
+        ) -> Result<TransactionEventOutcome, Self::Error> {
+            Ok(self.0)
+        }
+    }
+
+    /// Drives connector 0 of a fresh actor to `Charging` with a transaction running.
+    async fn charging_actor() -> crate::actor::ChargePointActor {
+        use crate::state::{ChargePointEvent, ConnectorEvent, EvseEvent, IdToken, IdTokenKind};
+
+        let actor = crate::actor::ChargePointActor::spawn([1], &crate::executor::TokioExecutor);
+        let id_token = IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        };
+        for event in [
+            ConnectorEvent::CableConnected,
+            ConnectorEvent::LockConfirmed,
+            ConnectorEvent::IdTokenPresented(id_token.clone()),
+            ConnectorEvent::ChargingAuthorized(id_token),
+            ConnectorEvent::ContactorClosed,
+        ] {
+            let _ = actor
+                .send(ChargePointEvent::Evse {
+                    evse_id: 0,
+                    event: EvseEvent::Connector {
+                        connector_id: 0,
+                        event,
+                    },
+                })
+                .await;
+        }
+        actor
+    }
+
+    /// **E05 (CV2.5), the producer this crate was missing.** A CSMS blocklist update arrives as a
+    /// rejected `idTokenInfo` on the response to an ordinary transaction event, and the charge
+    /// point has to act on it rather than log it.
+    #[tokio::test]
+    async fn a_rejected_id_token_on_the_response_stops_the_session() {
+        use crate::state::{AuthorizationStatus, ConnectorState};
+
+        let actor = charging_actor().await;
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Charging
+        );
+        let notifier = FixedOutcomeNotifier(TransactionEventOutcome::with_id_token_status(
+            AuthorizationStatus::Rejected,
+        ));
+
+        super::deliver_transaction_event(
+            &notifier,
+            &actor,
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Updated(
+                    crate::state::TransactionUpdateReason::MeterValuePeriodic,
+                ),
+                transaction: actor.state().evses[0].transactions[0].clone().unwrap(),
+                offline: false,
+            },
+        )
+        .await
+        .expect("the notifier cannot fail");
+
+        // `StopTxOnInvalidId` defaults to `true`, so the stop is immediate and fail-safe.
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Stopping
+        );
+    }
+
+    /// The far more common case, and the one a bug here would break: an accepted (or silent)
+    /// response leaves the session exactly alone.
+    #[tokio::test]
+    async fn an_accepted_response_leaves_the_session_charging() {
+        use crate::state::ConnectorState;
+
+        for outcome in [
+            TransactionEventOutcome::acknowledged(),
+            TransactionEventOutcome::with_id_token_status(
+                crate::state::AuthorizationStatus::Accepted,
+            ),
+        ] {
+            let actor = charging_actor().await;
+            let notifier = FixedOutcomeNotifier(outcome);
+
+            super::deliver_transaction_event(
+                &notifier,
+                &actor,
+                TransactionEventOccurred {
+                    evse_id: 0,
+                    connector_id: 0,
+                    kind: TransactionEventKind::Updated(
+                        crate::state::TransactionUpdateReason::MeterValuePeriodic,
+                    ),
+                    transaction: actor.state().evses[0].transactions[0].clone().unwrap(),
+                    offline: false,
+                },
+            )
+            .await
+            .expect("the notifier cannot fail");
+
+            assert_eq!(
+                actor.state().evses[0].connectors[0],
+                ConnectorState::Charging,
+                "{outcome:?}"
+            );
+        }
     }
 }
 
@@ -193,6 +455,7 @@ pub(crate) mod ocpp_2_1 {
             StopReason::EmergencyStop => ReasonEnum::EmergencyStop,
             StopReason::Reset => ReasonEnum::ImmediateReset,
             StopReason::PowerLoss => ReasonEnum::PowerLoss,
+            StopReason::DeAuthorized => ReasonEnum::DeAuthorized,
         }
     }
 
@@ -204,6 +467,12 @@ pub(crate) mod ocpp_2_1 {
         transaction: &Transaction,
     ) -> TriggerReasonEnum {
         match kind {
+            // F01.FR.19/F02.FR.21 (CV6): a transaction the CSMS asked for reports what actually
+            // triggered it. A `remoteStartId` is only ever set by
+            // `handle_request_start_transaction`, so its presence *is* "this was a RemoteStart".
+            TransactionEventKind::Started if transaction.remote_start_id.is_some() => {
+                TriggerReasonEnum::RemoteStart
+            }
             TransactionEventKind::Started => TriggerReasonEnum::Authorized,
             TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged) => {
                 TriggerReasonEnum::ChargingStateChanged
@@ -221,6 +490,8 @@ pub(crate) mod ocpp_2_1 {
                 // outside the normal flow" case `AbnormalCondition` covers. The precise cause
                 // still reaches the CSMS in `stoppedReason` (`ReasonEnum::PowerLoss`).
                 Some(StopReason::PowerLoss) => TriggerReasonEnum::AbnormalCondition,
+                // E05: the CSMS refused the identifier, so that is what triggered the end.
+                Some(StopReason::DeAuthorized) => TriggerReasonEnum::Deauthorized,
                 Some(StopReason::Local) | None => TriggerReasonEnum::StopAuthorized,
             },
         }
@@ -298,8 +569,9 @@ pub(crate) mod ocpp_2_1 {
         };
         use crate::clock::{Clock, is_synchronized};
         use crate::state::{Transaction, TransactionEventKind};
-        use crate::transactions::TransactionNotifier;
+        use crate::transactions::{TransactionEventOutcome, TransactionNotifier};
         use crate::wire::v21::TransactionEventRequest;
+        use crate::wire::v21::common::AuthorizationStatusEnum;
         use crate::wire::v21::common::{EVSE, Transaction as WireTransaction};
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
@@ -317,6 +589,7 @@ pub(crate) mod ocpp_2_1 {
             connector_id: usize,
             kind: TransactionEventKind,
             transaction: Transaction,
+            offline: bool,
         ) -> TransactionEventRequest {
             let now = clock.now();
             if !is_synchronized(&now) {
@@ -348,16 +621,23 @@ pub(crate) mod ocpp_2_1 {
                     charging_state: Some(map_charging_state(transaction.charging_state)),
                     time_spent_charging: None,
                     stopped_reason: transaction.stop_reason.map(map_stop_reason),
-                    remote_start_id: None,
+                    // CV6: F01.FR.25/F02.FR.01 - the CSMS correlates the transaction it now sees
+                    // with the request it made.
+                    remote_start_id: transaction.remote_start_id,
                     operation_mode: None,
                     tariff_id: None,
                     transaction_limit: None,
                     custom_data: None,
                 },
-                offline: None,
+                // E12 (CV6.1): only stated when it is true. OCPP defaults the field to `false`,
+                // so an event that went out on its first attempt says nothing rather than
+                // asserting a negative.
+                offline: offline.then_some(true),
                 number_of_phases_used: None,
                 cable_max_current: None,
-                reservation_id: None,
+                // CV6: F02.FR.06/H03 - the reservation this session consumed, so the CSMS can
+                // close it out against the transaction that used it.
+                reservation_id: transaction.reservation_id,
                 evse: Some(EVSE {
                     id: evse_id as i64,
                     connector_id: Some(connector_id as i64),
@@ -374,11 +654,39 @@ pub(crate) mod ocpp_2_1 {
             connector_id: usize,
             kind: TransactionEventKind,
             transaction: Transaction,
-        ) -> Result<(), ClientError<OCPP2_1Error>> {
-            let request =
-                build_transaction_event_request(clock, evse_id, connector_id, kind, transaction);
-            client.send_transaction_event(request).await?;
-            Ok(())
+            offline: bool,
+        ) -> Result<TransactionEventOutcome, ClientError<OCPP2_1Error>> {
+            let request = build_transaction_event_request(
+                clock,
+                evse_id,
+                connector_id,
+                kind,
+                transaction,
+                offline,
+            );
+            let response = client.send_transaction_event(request).await?;
+            Ok(read_outcome(&response))
+        }
+
+        /// Reads what a `TransactionEventResponse` says about the identifier (E05, CV2.5).
+        ///
+        /// OCPP's `AuthorizationStatusEnumType` has ten values and this crate's has two - see
+        /// `docs/ROADMAP.md` §3 for why. Everything that is not `Accepted` collapses to
+        /// `Rejected`, which is the conservative direction: `Blocked`, `Expired`, `NoCredit` and
+        /// the rest all mean this identifier may not keep charging.
+        fn read_outcome(
+            response: &crate::wire::v21::TransactionEventResponse,
+        ) -> TransactionEventOutcome {
+            let Some(info) = response.id_token_info.as_ref() else {
+                return TransactionEventOutcome::acknowledged();
+            };
+            TransactionEventOutcome::with_id_token_status(
+                if info.status == AuthorizationStatusEnum::Accepted {
+                    crate::state::AuthorizationStatus::Accepted
+                } else {
+                    crate::state::AuthorizationStatus::Rejected
+                },
+            )
         }
 
         /// Wraps an `OCPP2_1Client` with a caller-supplied [`Clock`] for the TransactionEvent
@@ -416,7 +724,8 @@ pub(crate) mod ocpp_2_1 {
                 connector_id: usize,
                 kind: TransactionEventKind,
                 transaction: Transaction,
-            ) -> Result<(), Self::Error> {
+                offline: bool,
+            ) -> Result<TransactionEventOutcome, Self::Error> {
                 send_transaction_event(
                     &self.client,
                     &self.clock,
@@ -424,6 +733,7 @@ pub(crate) mod ocpp_2_1 {
                     connector_id,
                     kind,
                     transaction,
+                    offline,
                 )
                 .await
             }
@@ -443,7 +753,8 @@ pub(crate) mod ocpp_2_1 {
                 connector_id: usize,
                 kind: TransactionEventKind,
                 transaction: Transaction,
-            ) -> Result<(), Self::Error> {
+                offline: bool,
+            ) -> Result<TransactionEventOutcome, Self::Error> {
                 send_transaction_event(
                     self,
                     &crate::clock::SystemClock,
@@ -451,6 +762,7 @@ pub(crate) mod ocpp_2_1 {
                     connector_id,
                     kind,
                     transaction,
+                    offline,
                 )
                 .await
             }
@@ -481,6 +793,9 @@ pub(crate) mod ocpp_2_1 {
                     seq_no: 0,
                     last_meter_sample: None,
                     priority_charging: false,
+                    remote_start_id: None,
+                    reservation_id: None,
+                    stop_at_energy_wh: None,
                 }
             }
 
@@ -497,6 +812,7 @@ pub(crate) mod ocpp_2_1 {
                     0,
                     TransactionEventKind::Started,
                     transaction(),
+                    false,
                 );
 
                 assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
@@ -516,12 +832,43 @@ pub(crate) mod ocpp_2_1 {
                     0,
                     TransactionEventKind::Started,
                     transaction(),
+                    false,
                 );
 
                 assert_eq!(
                     request.timestamp,
                     crate::wire::OcppTimestamp::from(unset_rtc.0)
                 );
+            }
+
+            /// **E12 (CV6.1)**: the flag says the event was *generated* while the CSMS was
+            /// unreachable, which only the queue that held it knows - so it reaches the encoder as
+            /// an argument. Absent rather than `false` when the event went out online: OCPP
+            /// defaults the field, and a charge point should not assert a negative it was never
+            /// asked about.
+            #[test]
+            fn the_offline_flag_is_stated_only_when_the_event_was_held() {
+                let clock = FixedClock(DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap());
+
+                let held = build_transaction_event_request(
+                    &clock,
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction(),
+                    true,
+                );
+                assert_eq!(held.offline, Some(true));
+
+                let live = build_transaction_event_request(
+                    &clock,
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction(),
+                    false,
+                );
+                assert_eq!(live.offline, None);
             }
         }
     }
@@ -648,6 +995,9 @@ pub(crate) mod ocpp_2_1 {
                 seq_no: 0,
                 last_meter_sample: None,
                 priority_charging: false,
+                remote_start_id: None,
+                reservation_id: None,
+                stop_at_energy_wh: None,
             };
 
             assert_eq!(
@@ -670,6 +1020,38 @@ pub(crate) mod ocpp_2_1 {
             );
         }
 
+        /// CV6: F01.FR.19/F02.FR.21 - a transaction the CSMS asked for reports `RemoteStart`, not
+        /// the `Authorized` a locally presented card produces. The `remoteStartId`'s presence is
+        /// the discriminator, since only `handle_request_start_transaction` ever sets one.
+        #[test]
+        fn a_remotely_started_transaction_reports_remote_start_as_its_trigger() {
+            let transaction = Transaction {
+                id: crate::state::TransactionId(0),
+                id_token: None,
+                charging_state: TransactionChargingState::Charging,
+                stop_reason: None,
+                seq_no: 0,
+                last_meter_sample: None,
+                priority_charging: false,
+                remote_start_id: Some(7),
+                reservation_id: None,
+                stop_at_energy_wh: None,
+            };
+
+            assert_eq!(
+                trigger_reason_for(TransactionEventKind::Started, &transaction),
+                TriggerReasonEnum::RemoteStart
+            );
+            // Only the Started event is about how it began; a later update reports what changed.
+            assert_eq!(
+                trigger_reason_for(
+                    TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged),
+                    &transaction
+                ),
+                TriggerReasonEnum::ChargingStateChanged
+            );
+        }
+
         #[test]
         fn ended_derives_its_trigger_reason_from_the_stop_reason() {
             let base = Transaction {
@@ -680,6 +1062,9 @@ pub(crate) mod ocpp_2_1 {
                 seq_no: 2,
                 last_meter_sample: None,
                 priority_charging: false,
+                remote_start_id: None,
+                reservation_id: None,
+                stop_at_energy_wh: None,
             };
 
             assert_eq!(
@@ -780,6 +1165,7 @@ pub(crate) mod ocpp_2_0_1 {
             StopReason::EmergencyStop => ReasonEnum::EmergencyStop,
             StopReason::Reset => ReasonEnum::ImmediateReset,
             StopReason::PowerLoss => ReasonEnum::PowerLoss,
+            StopReason::DeAuthorized => ReasonEnum::DeAuthorized,
         }
     }
 
@@ -789,6 +1175,12 @@ pub(crate) mod ocpp_2_0_1 {
         transaction: &Transaction,
     ) -> TriggerReasonEnum {
         match kind {
+            // F01.FR.19/F02.FR.21 (CV6): a transaction the CSMS asked for reports what actually
+            // triggered it. A `remoteStartId` is only ever set by
+            // `handle_request_start_transaction`, so its presence *is* "this was a RemoteStart".
+            TransactionEventKind::Started if transaction.remote_start_id.is_some() => {
+                TriggerReasonEnum::RemoteStart
+            }
             TransactionEventKind::Started => TriggerReasonEnum::Authorized,
             TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged) => {
                 TriggerReasonEnum::ChargingStateChanged
@@ -806,6 +1198,8 @@ pub(crate) mod ocpp_2_0_1 {
                 // outside the normal flow" case `AbnormalCondition` covers. The precise cause
                 // still reaches the CSMS in `stoppedReason` (`ReasonEnum::PowerLoss`).
                 Some(StopReason::PowerLoss) => TriggerReasonEnum::AbnormalCondition,
+                // E05: the CSMS refused the identifier, so that is what triggered the end.
+                Some(StopReason::DeAuthorized) => TriggerReasonEnum::Deauthorized,
                 Some(StopReason::Local) | None => TriggerReasonEnum::StopAuthorized,
             },
         }
@@ -874,9 +1268,11 @@ pub(crate) mod ocpp_2_0_1 {
         };
         use crate::clock::{Clock, is_synchronized};
         use crate::state::{Transaction, TransactionEventKind};
-        use crate::transactions::TransactionNotifier;
+        use crate::transactions::{TransactionEventOutcome, TransactionNotifier};
         use crate::wire::v201::TransactionEventRequest;
-        use crate::wire::v201::common::{EVSE, Transaction as WireTransaction};
+        use crate::wire::v201::common::{
+            AuthorizationStatusEnum, EVSE, Transaction as WireTransaction,
+        };
         use alloc::boxed::Box;
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
@@ -889,6 +1285,7 @@ pub(crate) mod ocpp_2_0_1 {
             connector_id: usize,
             kind: TransactionEventKind,
             transaction: Transaction,
+            offline: bool,
         ) -> TransactionEventRequest {
             let now = clock.now();
             if !is_synchronized(&now) {
@@ -917,13 +1314,20 @@ pub(crate) mod ocpp_2_0_1 {
                     charging_state: Some(map_charging_state(transaction.charging_state)),
                     time_spent_charging: None,
                     stopped_reason: transaction.stop_reason.map(map_stop_reason),
-                    remote_start_id: None,
+                    // CV6: F01.FR.25/F02.FR.01 - the CSMS correlates the transaction it now sees
+                    // with the request it made.
+                    remote_start_id: transaction.remote_start_id,
                     custom_data: None,
                 },
-                offline: None,
+                // E12 (CV6.1): only stated when it is true. OCPP defaults the field to `false`,
+                // so an event that went out on its first attempt says nothing rather than
+                // asserting a negative.
+                offline: offline.then_some(true),
                 number_of_phases_used: None,
                 cable_max_current: None,
-                reservation_id: None,
+                // CV6: F02.FR.06/H03 - the reservation this session consumed, so the CSMS can
+                // close it out against the transaction that used it.
+                reservation_id: transaction.reservation_id,
                 evse: Some(EVSE {
                     id: evse_id as i64,
                     connector_id: Some(connector_id as i64),
@@ -940,11 +1344,35 @@ pub(crate) mod ocpp_2_0_1 {
             connector_id: usize,
             kind: TransactionEventKind,
             transaction: Transaction,
-        ) -> Result<(), ClientError<OCPP2_0_1Error>> {
-            let request =
-                build_transaction_event_request(clock, evse_id, connector_id, kind, transaction);
-            client.send_transaction_event(request).await?;
-            Ok(())
+            offline: bool,
+        ) -> Result<TransactionEventOutcome, ClientError<OCPP2_0_1Error>> {
+            let request = build_transaction_event_request(
+                clock,
+                evse_id,
+                connector_id,
+                kind,
+                transaction,
+                offline,
+            );
+            let response = client.send_transaction_event(request).await?;
+            Ok(read_outcome(&response))
+        }
+
+        /// Reads what a `TransactionEventResponse` says about the identifier - the 2.0.1 twin of
+        /// `super::super::ocpp_2_1::with_clock::read_outcome`, including its ten-to-two collapse.
+        fn read_outcome(
+            response: &crate::wire::v201::TransactionEventResponse,
+        ) -> TransactionEventOutcome {
+            let Some(info) = response.id_token_info.as_ref() else {
+                return TransactionEventOutcome::acknowledged();
+            };
+            TransactionEventOutcome::with_id_token_status(
+                if info.status == AuthorizationStatusEnum::Accepted {
+                    crate::state::AuthorizationStatus::Accepted
+                } else {
+                    crate::state::AuthorizationStatus::Rejected
+                },
+            )
         }
 
         /// Wraps an `OCPP2_0_1Client` with a caller-supplied [`Clock`] for the TransactionEvent
@@ -980,7 +1408,8 @@ pub(crate) mod ocpp_2_0_1 {
                 connector_id: usize,
                 kind: TransactionEventKind,
                 transaction: Transaction,
-            ) -> Result<(), Self::Error> {
+                offline: bool,
+            ) -> Result<TransactionEventOutcome, Self::Error> {
                 send_transaction_event(
                     &self.client,
                     &self.clock,
@@ -988,6 +1417,7 @@ pub(crate) mod ocpp_2_0_1 {
                     connector_id,
                     kind,
                     transaction,
+                    offline,
                 )
                 .await
             }
@@ -1007,7 +1437,8 @@ pub(crate) mod ocpp_2_0_1 {
                 connector_id: usize,
                 kind: TransactionEventKind,
                 transaction: Transaction,
-            ) -> Result<(), Self::Error> {
+                offline: bool,
+            ) -> Result<TransactionEventOutcome, Self::Error> {
                 send_transaction_event(
                     self,
                     &crate::clock::SystemClock,
@@ -1015,6 +1446,7 @@ pub(crate) mod ocpp_2_0_1 {
                     connector_id,
                     kind,
                     transaction,
+                    offline,
                 )
                 .await
             }
@@ -1044,6 +1476,9 @@ pub(crate) mod ocpp_2_0_1 {
                     seq_no: 0,
                     last_meter_sample: None,
                     priority_charging: false,
+                    remote_start_id: None,
+                    reservation_id: None,
+                    stop_at_energy_wh: None,
                 }
             }
 
@@ -1060,6 +1495,7 @@ pub(crate) mod ocpp_2_0_1 {
                     0,
                     TransactionEventKind::Started,
                     transaction(),
+                    false,
                 );
 
                 assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
@@ -1076,6 +1512,7 @@ pub(crate) mod ocpp_2_0_1 {
                     0,
                     TransactionEventKind::Started,
                     transaction(),
+                    false,
                 );
 
                 assert_eq!(
@@ -1173,6 +1610,9 @@ pub(crate) mod ocpp_2_0_1 {
                 seq_no: 0,
                 last_meter_sample: None,
                 priority_charging: false,
+                remote_start_id: None,
+                reservation_id: None,
+                stop_at_energy_wh: None,
             };
 
             assert_eq!(
@@ -1205,6 +1645,9 @@ pub(crate) mod ocpp_2_0_1 {
                 seq_no: 2,
                 last_meter_sample: None,
                 priority_charging: false,
+                remote_start_id: None,
+                reservation_id: None,
+                stop_at_energy_wh: None,
             };
 
             assert_eq!(
@@ -1300,6 +1743,8 @@ pub(crate) mod ocpp_1_6 {
             // (mirroring the `Hard`/`Immediate` pairing `crate::reset::ocpp_1_6` uses).
             StopReason::Reset => Reason::HardReset,
             StopReason::PowerLoss => Reason::PowerLoss,
+            // 1.6J spells it the same way.
+            StopReason::DeAuthorized => Reason::DeAuthorized,
         }
     }
 
@@ -1410,7 +1855,7 @@ pub(crate) mod ocpp_1_6 {
         use crate::id_tag::map_id_tag;
         use crate::state::{Transaction, TransactionEventKind};
         use crate::topology::flatten_ocpp_1_6_connector_id;
-        use crate::transactions::TransactionNotifier;
+        use crate::transactions::{TransactionEventOutcome, TransactionNotifier};
         use crate::wire::v16::common::MeterValueItem;
         use crate::wire::v16::{
             MeterValuesRequest, StartTransactionRequest, StopTransactionRequest,
@@ -1443,19 +1888,24 @@ pub(crate) mod ocpp_1_6 {
         impl<C: Clock + Send + Sync> TransactionNotifier for Ocpp1_6TransactionNotifier<C> {
             type Error = ClientError<OCPP1_6Error>;
 
+            /// `offline` is ignored: 1.6J's `StartTransaction`/`MeterValues`/`StopTransaction`
+            /// have no field for it, and inventing one would be a wire extension no CSMS knows
+            /// how to read. The queueing behaviour it describes still happens - only the
+            /// after-the-fact disclosure is 2.x-only.
             async fn notify_transaction_event(
                 &self,
                 evse_id: usize,
                 connector_id: usize,
                 kind: TransactionEventKind,
                 transaction: Transaction,
-            ) -> Result<(), Self::Error> {
+                _offline: bool,
+            ) -> Result<TransactionEventOutcome, Self::Error> {
                 let Some(connector_id) =
                     flatten_ocpp_1_6_connector_id(&self.connector_counts, evse_id, connector_id)
                 else {
                     // Not addressable under 1.6J's flat numbering - see
                     // `Ocpp1_6StatusNotifier::notify_status`'s identical handling.
-                    return Ok(());
+                    return Ok(TransactionEventOutcome::acknowledged());
                 };
                 let now = self.clock.now();
                 if !is_synchronized(&now) {
@@ -1487,13 +1937,18 @@ pub(crate) mod ocpp_1_6 {
                                 .borrow_mut()
                                 .insert(transaction.id, response.transaction_id);
                         });
+                        // 1.6J's `idTagInfo` is where a CSMS refuses the tag a session is running
+                        // under - the same E05 decision 2.x carries on `TransactionEventResponse`.
+                        return Ok(TransactionEventOutcome::with_id_token_status(
+                            crate::authorization::ocpp_1_6::map_status(response.id_tag_info.status),
+                        ));
                     }
                     TransactionEventKind::Updated(_) => {
                         let Some(sample) = transaction.last_meter_sample else {
                             // Nothing sampled yet - a `MeterValues` with no `sampledValue` at all
                             // isn't meaningful, unlike 2.1's `TransactionEvent`, which reports
                             // regardless (see `super::ocpp_2_1`'s `Updated` handling).
-                            return Ok(());
+                            return Ok(TransactionEventOutcome::acknowledged());
                         };
                         let csms_transaction_id = self
                             .csms_transaction_ids
@@ -1517,9 +1972,10 @@ pub(crate) mod ocpp_1_6 {
                             // No `StartTransaction` on record for this transaction - shouldn't
                             // happen (`Started` always precedes `Ended` for the same
                             // transaction), but there's nothing to stop without the CSMS's id.
-                            return Ok(());
+                            return Ok(TransactionEventOutcome::acknowledged());
                         };
-                        self.client
+                        let response = self
+                            .client
                             .send_stop_transaction(StopTransactionRequest {
                                 id_tag: Some(map_id_tag(transaction.id_token.as_ref())),
                                 meter_stop: meter_reading,
@@ -1529,9 +1985,17 @@ pub(crate) mod ocpp_1_6 {
                                 transaction_id: csms_transaction_id,
                             })
                             .await?;
+                        // Optional on a `StopTransaction` response, and moot by then - the
+                        // transaction is already over - but read rather than discarded so the
+                        // three event kinds answer the same question the same way.
+                        if let Some(info) = response.id_tag_info {
+                            return Ok(TransactionEventOutcome::with_id_token_status(
+                                crate::authorization::ocpp_1_6::map_status(info.status),
+                            ));
+                        }
                     }
                 }
-                Ok(())
+                Ok(TransactionEventOutcome::acknowledged())
             }
         }
     }

@@ -57,7 +57,11 @@ fn queued_event(id: TransactionId) -> TransactionEventOccurred {
             seq_no: 0,
             last_meter_sample: None,
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         },
+        offline: false,
     }
 }
 

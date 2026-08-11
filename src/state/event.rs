@@ -255,6 +255,12 @@ pub enum ChargePointEvent {
     /// variables, 1.6J `SupportedFeatureProfiles`) ultimately derives from - see
     /// `docs/PRODUCTION-ROADMAP.md` §5.3 (C3).
     CapabilitiesDeclared(Capabilities),
+    /// The integrator's declaration of this charge point's electrical shape - phase counts,
+    /// connector types and per-EVSE maximum power (CV1.5). Sent once during setup from
+    /// [`crate::hardware::ChargePoint::electrical`].
+    ElectricalCharacteristicsDeclared(
+        alloc::boxed::Box<crate::hardware::ElectricalCharacteristics>,
+    ),
     /// In-flight transactions recovered from durable storage at boot, applied as one atomic
     /// event so recovery can never be observed half-done. See
     /// [`crate::persistence::restore_transactions`] and `docs/PRODUCTION-ROADMAP.md` §7.4 (E4.1).
@@ -467,6 +473,7 @@ impl ChargePointEvent {
             Self::DERControlsCleared { .. } => "DERControlsCleared",
             Self::AfrrSignalReceived { .. } => "AfrrSignalReceived",
             Self::CapabilitiesDeclared { .. } => "CapabilitiesDeclared",
+            Self::ElectricalCharacteristicsDeclared { .. } => "ElectricalCharacteristicsDeclared",
             Self::PersistedTransactionsRestored { .. } => "PersistedTransactionsRestored",
             Self::TimeSynced { .. } => "TimeSynced",
             Self::PersistedLocalAuthorizationListRestored { .. } => {
@@ -540,6 +547,7 @@ impl ConnectorEvent {
             Self::CableDisconnected { .. } => "CableDisconnected",
             Self::LockConfirmed { .. } => "LockConfirmed",
             Self::UnlockConfirmed { .. } => "UnlockConfirmed",
+            Self::LockFailed { .. } => "ConnectorLockFailed",
             Self::IdTokenPresented { .. } => "IdTokenPresented",
             Self::ContractCertificatePresented { .. } => "ContractCertificatePresented",
             Self::ChargingAuthorized { .. } => "ChargingAuthorized",
@@ -548,6 +556,9 @@ impl ConnectorEvent {
             Self::ContactorOpened { .. } => "ContactorOpened",
             Self::RemoteUnlockRequested { .. } => "RemoteUnlockRequested",
             Self::RemoteStartRequested { .. } => "RemoteStartRequested",
+            Self::RemoteStartPending { .. } => "RemoteStartPending",
+            Self::RemoteStartPendingCleared { .. } => "RemoteStartPendingCleared",
+            Self::AuthorizationRevoked { .. } => "AuthorizationRevoked",
             Self::ChargingStopped { .. } => "ChargingStopped",
             Self::ChargingSuspendedByEv { .. } => "ChargingSuspendedByEv",
             Self::ChargingSuspendedByEvse { .. } => "ChargingSuspendedByEvse",
@@ -618,8 +629,29 @@ pub enum ConnectorEvent {
     /// Hardware confirmed the connector unlocked, in response to a
     /// [`HardwareCommand::UnlockConnector`].
     UnlockConfirmed,
-    /// The driver/EV presented an identifier while the connector is locked; the Authorization
-    /// functional block asks the CSMS whether it may start charging.
+    /// The connector's plug retention lock failed to engage or release - **OCPP use case G05,
+    /// "Lock Failure"** (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV11).
+    ///
+    /// Raised by [`crate::hardware::execute_hardware_command`] when a binding's
+    /// [`Connector::lock`](crate::hardware::Connector::lock) or
+    /// [`unlock`](crate::hardware::Connector::unlock) returns an error, and available to a binding
+    /// that detects a lock which reports open while it should be closed.
+    ///
+    /// Drives the connector fail-safe into `Faulted` exactly as [`Self::FaultDetected`] does -
+    /// G05.FR.01 is precisely "SHALL NOT start charging" - but is a *distinct* event because a
+    /// CSMS has to be able to tell a lock failure from any other fault: it also sets the
+    /// connector's `ConnectorPlugRetentionLock`/`Problem` variable and reports it as a hard-wired
+    /// `NotifyEvent` (G05.FR.02).
+    LockFailed,
+    /// The driver/EV presented an identifier; the Authorization functional block asks the CSMS
+    /// whether it may start charging.
+    ///
+    /// Accepted both ways round. With the cable already latched the connector moves to
+    /// [`ConnectorState::Authorizing`](crate::state::ConnectorState::Authorizing) and the
+    /// acceptance starts the transaction. On a connector with **no cable yet** - OCPP's E03,
+    /// "Start Transaction - IdToken First" - the connector cannot move, so the acceptance is held
+    /// against it (see [`crate::state::EvseState::pending_remote_starts`]) and dispatched when the
+    /// driver plugs in, or dropped when `TxCtrlr.EVConnectionTimeOut` expires (E03.FR.15).
     IdTokenPresented(IdToken),
     /// The EV presented an ISO 15118 contract certificate while the connector is locked - Plug &
     /// Charge, OCPP use case C07. Behaves exactly like [`Self::IdTokenPresented`] with the eMAID
@@ -653,9 +685,37 @@ pub enum ConnectorEvent {
     /// The CSMS asked to start a transaction (OCPP `RequestStartTransaction`) while the
     /// connector is `Locked` with no active transaction. Unlike `IdTokenPresented`, this skips
     /// straight to `Starting` without a separate Authorize round-trip - the CSMS's own request
-    /// is itself the authorization decision. Carries the identifier the CSMS supplied, recorded
-    /// on the [`Transaction`] this starts. See `docs/ROADMAP.md` §6.
-    RemoteStartRequested(IdToken),
+    /// is itself the authorization decision. Carries the identifier the CSMS supplied and the
+    /// request's `remoteStartId`, both recorded on the [`Transaction`] this starts - the latter
+    /// is how the CSMS correlates the transaction it gets back with the request it made
+    /// (F01.FR.25, F02.FR.01/.21; CV6). See `docs/ROADMAP.md` §6.
+    RemoteStartRequested {
+        /// The identifier the CSMS supplied for the transaction to run under.
+        id_token: IdToken,
+        /// The request's `remoteStartId`, if it carried one.
+        remote_start_id: Option<i64>,
+    },
+    /// The CSMS asked to start a transaction on a connector that has **no cable yet** - OCPP's
+    /// F02, "Remote Start Transaction - Remote Start First" (CV7).
+    ///
+    /// Unlike [`Self::RemoteStartRequested`] this starts nothing: it records the request against
+    /// the connector, which then behaves exactly as if a card had been presented once the cable
+    /// latches. See [`crate::state::PendingRemoteStart`].
+    RemoteStartPending(crate::state::PendingRemoteStart),
+    /// The identifier authorizing this transaction is **no longer valid** - OCPP's E05.
+    ///
+    /// Raised when the CSMS answers a `TransactionEvent` (or a re-`Authorize`) with a rejected
+    /// `idTokenInfo` for a session already underway. What happens next is the operator's
+    /// configuration, not this crate's choice: `TxCtrlr.StopTxOnInvalidId` stops immediately, and
+    /// otherwise `TxCtrlr.MaxEnergyOnInvalidId` grants a last allowance so the driver is not
+    /// stranded mid-motorway by a CSMS blocklist update. See [`crate::state::Transaction::stop_at_energy_wh`].
+    AuthorizationRevoked,
+    /// The authorization held against this connector is no longer wanted - the cable arrived and
+    /// it was dispatched, or `TxCtrlr.EVConnectionTimeOut` expired without one. Covers both a held
+    /// `RequestStartTransaction` (F02.FR.07/.08) and a card presented before the cable
+    /// (E03.FR.15), which share one slot - see
+    /// [`crate::state::EvseState::pending_remote_starts`].
+    RemoteStartPendingCleared,
     /// Charging has stopped (locally, remotely, or the EV finished) and the contactor should
     /// open. Not used for hardware-fault-driven stops - those go through `FaultDetected`.
     ChargingStopped(StopReason),
@@ -952,6 +1012,16 @@ pub struct TransactionEventOccurred {
     pub kind: TransactionEventKind,
     /// A snapshot of the transaction at the time of this event.
     pub transaction: Transaction,
+    /// OCPP's `offline` flag (E12, `docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV6.1): whether this
+    /// event was generated while the CSMS was unreachable.
+    ///
+    /// **Always `false` when the state machine raises the event, and set later by whatever held
+    /// it.** The charge point's own state has no notion of connectivity - that belongs to the
+    /// connection, not to the transaction - so the fact is only knowable at the point delivery is
+    /// attempted, and it is [`crate::offline_queue::OfflineQueue`] that knows: an event delivered
+    /// on its first attempt went out online, and one the queue has had to hold did not. See
+    /// [`OfflineQueue::marking_offline`](crate::offline_queue::OfflineQueue::marking_offline).
+    pub offline: bool,
 }
 
 /// A hardware command the state machine needs carried out: lock/unlock a connector, or

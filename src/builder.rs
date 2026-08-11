@@ -239,6 +239,7 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let vendor_name = charge_point.vendor_name().to_string();
         let model_name = charge_point.model_name().to_string();
         let capabilities = charge_point.capabilities();
+        let electrical = charge_point.electrical();
         // C2.4 (docs/PRODUCTION-ROADMAP.md §5.2): catch a hardware binding that claims a
         // capability whose Cargo feature is compiled out, or that leaves a compiled-in feature's
         // capability unclaimed, as early as possible - logged, never fatal (see
@@ -281,6 +282,16 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         for event in crate::device_model::capability_gate_events(&capabilities) {
             let _ = runtime.hardware_events().send(event).await;
         }
+        // CV1.5: the electrical facts only the manufacturer knows. Sent after the topology is
+        // established, since the components it values are per-EVSE and per-connector.
+        let _ = runtime
+            .hardware_events()
+            .send(
+                crate::state::ChargePointEvent::ElectricalCharacteristicsDeclared(Box::new(
+                    electrical,
+                )),
+            )
+            .await;
 
         runtime
             .hardware_handle()
@@ -376,6 +387,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                         fallback_interval_secs,
                     ))
                     .await;
+                // B01.FR.08/B02.FR.02/B03.FR.02 (CV4) - see
+                // `crate::offline_queue::may_send_requests`. Every queue this timer drives is a
+                // charge-point-initiated report, so all of them wait together.
+                if !crate::offline_queue::may_send_requests(&actor) {
+                    continue;
+                }
                 for flush in &flushes {
                     flush().await;
                 }
@@ -801,6 +818,100 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Spawns the sweep that releases held remote starts whose driver never plugged in
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV2.3, F02.FR.07/.08).
+    ///
+    /// Only useful alongside [`Self::remote_control`], which is what accepts and holds them in the
+    /// first place. `interval_secs` wants to be a fraction of `TxCtrlr.EVConnectionTimeOut` - see
+    /// [`crate::remote_control::run_pending_remote_start_timeouts`] for the accuracy that buys.
+    pub fn pending_remote_start_timeouts<B, M>(
+        self,
+        backoff: B,
+        monotonic: M,
+        interval_secs: u32,
+    ) -> Self
+    where
+        B: crate::provisioning::Backoff + Send + Sync + 'static,
+        M: MonotonicClock + Send + Sync + 'static,
+    {
+        let actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            crate::remote_control::run_pending_remote_start_timeouts(
+                &actor,
+                &backoff,
+                &monotonic,
+                interval_secs,
+            )
+            .await;
+        }));
+        self
+    }
+
+    /// Reports every connector's current status when the CSMS's picture of this charge point can
+    /// no longer be trusted (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV5).
+    ///
+    /// Two moments, two requirements, one sweep:
+    ///
+    /// - **B01.FR.05** — the CSMS has just accepted a `BootNotification`, so it knows nothing
+    ///   about this station's connectors and is told all of them.
+    /// - **B04.FR.01** — the connection came back after an outage longer than
+    ///   `OCPPCommCtrlr.OfflineThreshold`, so the CSMS's picture is too stale to patch and
+    ///   everything is re-reported.
+    ///
+    /// **B04.FR.02 — a *short* outage reports only what changed — needs nothing from this block**,
+    /// and that is the point of measuring the outage rather than always sweeping: the connectors
+    /// that changed while offline are exactly what [`Self::status_notifications`]' queue is
+    /// holding, so the reconnect flush reports those and only those. Sweeping unconditionally
+    /// would report connectors that did not change, which is what that requirement forbids.
+    ///
+    /// Register this **after** [`Self::status_notifications`] (or its persisted sibling) so the
+    /// reconnect flush of already-queued changes runs first — a full sweep that overtook the
+    /// backlog would deliver a connector's current status ahead of the older change it supersedes.
+    ///
+    /// `monotonic` measures the outage; see [`crate::connection::outage_seconds`] for what it is
+    /// measured from and how precise that is.
+    pub async fn connector_status_resynchronisation<N, M>(self, csms: &N, monotonic: M) -> Self
+    where
+        N: StatusNotifier + ReconnectHandler + Clone + Send + Sync + 'static,
+        M: MonotonicClock + Clone + Send + Sync + 'static,
+    {
+        // B04: on reconnect, decide from the outage length.
+        let reconnect_actor = self.runtime.actor();
+        let reconnect_csms = csms.clone();
+        csms.register_reconnect_handler(move || {
+            let actor = reconnect_actor.clone();
+            let csms = reconnect_csms.clone();
+            let monotonic = monotonic.clone();
+            async move {
+                let offline_for_secs = crate::connection::outage_seconds(&actor, &monotonic);
+                crate::availability::resynchronise_after_outage(&actor, &csms, offline_for_secs)
+                    .await;
+            }
+        })
+        .await;
+
+        // B01.FR.05: on every transition into "accepted", which is what a successful
+        // BootNotification produces - including the one a reconnect's re-registration produces
+        // after a `Pending` spell.
+        let accept_actor = self.runtime.actor();
+        let accept_csms = csms.clone();
+        let mut states = self.runtime.subscribe();
+        self.executor.spawn(Box::pin(async move {
+            let mut was_accepted = states.borrow().may_send_requests();
+            loop {
+                states.changed().await;
+                let accepted = states.borrow().may_send_requests();
+                if accepted && !was_accepted {
+                    crate::availability::report_all_connector_statuses(&accept_actor, &accept_csms)
+                        .await;
+                }
+                was_accepted = accepted;
+            }
+        }));
+
+        self
+    }
+
     /// Registers the Availability functional block's status-forwarding half: every connector
     /// status change is forwarded to `csms` via StatusNotification, deduped so the CSMS only
     /// sees wire-visible status changes (not every internal `ConnectorState` transition), queued
@@ -830,7 +941,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         // `DropOldest` (the default): a queued status is superseded by whatever the connector's
         // status actually is by the time the connection recovers, so keeping the newest is more
         // useful than keeping the oldest - see `OverflowPolicy`'s docs.
-        let status_queue = Arc::new(OfflineQueue::with_capacity(self.offline_queue_capacity));
+        let status_queue = Arc::new(
+            OfflineQueue::with_capacity(self.offline_queue_capacity)
+                .gated_on_registration(self.runtime.actor()),
+        );
         let status_notifier = Arc::new(DedupedStatusNotifier::new(csms.clone()));
         let forwarder_queue = status_queue.clone();
         let forwarder_notifier = status_notifier.clone();
@@ -918,7 +1032,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         };
 
         // `DropOldest` (the default), same reasoning as `Self::status_notifications`.
-        let status_queue = Arc::new(OfflineQueue::with_capacity(self.offline_queue_capacity));
+        let status_queue = Arc::new(
+            OfflineQueue::with_capacity(self.offline_queue_capacity)
+                .gated_on_registration(self.runtime.actor()),
+        );
         // Restore before any live traffic is wired up - so an event that arrives during start-up
         // can never be delivered ahead of an older one the backlog restores.
         restore_status_notification_queue(&status_queue, &store).await;
@@ -1002,27 +1119,29 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         // `OverflowPolicy`'s docs.
         let transaction_queue = Arc::new(
             OfflineQueue::with_capacity(self.offline_queue_capacity)
-                .with_overflow_policy(OverflowPolicy::DropNewest),
+                .with_overflow_policy(OverflowPolicy::DropNewest)
+                .gated_on_registration(self.runtime.actor())
+                // E12 (CV6.1): an event this queue has had to hold was generated while the CSMS
+                // was unreachable, and OCPP wants it to say so when it finally goes out.
+                .marking_offline(|occurred: &mut TransactionEventOccurred| occurred.offline = true),
         );
         // Kept for `Self::get_transaction_status` - see the `transaction_queue` field's docs.
         self.transaction_queue = Some(transaction_queue.clone());
         let forwarder_queue = transaction_queue.clone();
         let forwarder_csms = csms.clone();
         let overflow_actor = self.runtime.actor();
+        // E05 (CV2.5): the send path needs the actor so a rejected `idTokenInfo` on the response
+        // can be turned back into a connector event - see `deliver_transaction_event`.
+        let forwarder_actor = self.runtime.actor();
         self.executor.spawn(Box::pin(async move {
             run_with_offline_queue(
                 transaction_events,
                 &forwarder_queue,
                 move |occurred| {
                     let notifier = forwarder_csms.clone();
+                    let actor = forwarder_actor.clone();
                     async move {
-                        notifier
-                            .notify_transaction_event(
-                                occurred.evse_id,
-                                occurred.connector_id,
-                                occurred.kind,
-                                occurred.transaction,
-                            )
+                        crate::transactions::deliver_transaction_event(&notifier, &actor, occurred)
                             .await
                     }
                 },
@@ -1034,20 +1153,17 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             .await;
         }));
         let reconnect_csms = csms.clone();
+        let reconnect_actor = self.runtime.actor();
         let flush: QueueFlush = Arc::new(move || {
             let queue = transaction_queue.clone();
             let csms = reconnect_csms.clone();
+            let reconnect_actor = reconnect_actor.clone();
             Box::pin(async move {
                 crate::offline_queue::flush_offline_queue(&queue, move |occurred| {
                     let notifier = csms.clone();
+                    let actor = reconnect_actor.clone();
                     async move {
-                        notifier
-                            .notify_transaction_event(
-                                occurred.evse_id,
-                                occurred.connector_id,
-                                occurred.kind,
-                                occurred.transaction,
-                            )
+                        crate::transactions::deliver_transaction_event(&notifier, &actor, occurred)
                             .await
                     }
                 })
@@ -1086,7 +1202,11 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         // `DropNewest`, same reasoning as `Self::transaction_events`.
         let transaction_queue = Arc::new(
             OfflineQueue::with_capacity(self.offline_queue_capacity)
-                .with_overflow_policy(OverflowPolicy::DropNewest),
+                .with_overflow_policy(OverflowPolicy::DropNewest)
+                .gated_on_registration(self.runtime.actor())
+                // E12 (CV6.1): an event this queue has had to hold was generated while the CSMS
+                // was unreachable, and OCPP wants it to say so when it finally goes out.
+                .marking_offline(|occurred: &mut TransactionEventOccurred| occurred.offline = true),
         );
         // Restore before any live traffic is wired up - so an event that arrives during start-up
         // can never be delivered ahead of an older one the backlog restores.
@@ -1098,6 +1218,8 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let forwarder_store = store.clone();
         let forwarder_csms = csms.clone();
         let overflow_actor = self.runtime.actor();
+        // E05 (CV2.5), as above.
+        let forwarder_actor = self.runtime.actor();
         self.executor.spawn(Box::pin(async move {
             run_persisted_transaction_event_queue(
                 transaction_events,
@@ -1105,14 +1227,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                 &forwarder_store,
                 move |occurred| {
                     let notifier = forwarder_csms.clone();
+                    let actor = forwarder_actor.clone();
                     async move {
-                        notifier
-                            .notify_transaction_event(
-                                occurred.evse_id,
-                                occurred.connector_id,
-                                occurred.kind,
-                                occurred.transaction,
-                            )
+                        crate::transactions::deliver_transaction_event(&notifier, &actor, occurred)
                             .await
                     }
                 },
@@ -1124,21 +1241,18 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             .await;
         }));
         let reconnect_csms = csms.clone();
+        let reconnect_actor = self.runtime.actor();
         let flush: QueueFlush = Arc::new(move || {
             let queue = transaction_queue.clone();
             let store = store.clone();
             let csms = reconnect_csms.clone();
+            let reconnect_actor = reconnect_actor.clone();
             Box::pin(async move {
                 flush_and_persist_transaction_event_queue(&queue, &store, move |occurred| {
                     let notifier = csms.clone();
+                    let actor = reconnect_actor.clone();
                     async move {
-                        notifier
-                            .notify_transaction_event(
-                                occurred.evse_id,
-                                occurred.connector_id,
-                                occurred.kind,
-                                occurred.transaction,
-                            )
+                        crate::transactions::deliver_transaction_event(&notifier, &actor, occurred)
                             .await
                     }
                 })
@@ -1401,7 +1515,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             return self;
         };
 
-        let security_queue = Arc::new(OfflineQueue::with_capacity(self.offline_queue_capacity));
+        let security_queue = Arc::new(
+            OfflineQueue::with_capacity(self.offline_queue_capacity)
+                .gated_on_registration(self.runtime.actor()),
+        );
         let forwarder_queue = security_queue.clone();
         let forwarder_csms = csms.clone();
         self.executor.spawn(Box::pin(async move {
@@ -1479,7 +1596,10 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         };
 
         // `DropOldest` (the default), same reasoning as `Self::security_events`.
-        let security_queue = Arc::new(OfflineQueue::with_capacity(self.offline_queue_capacity));
+        let security_queue = Arc::new(
+            OfflineQueue::with_capacity(self.offline_queue_capacity)
+                .gated_on_registration(self.runtime.actor()),
+        );
         // Restore before any live traffic is wired up - so an event that arrives during start-up
         // can never be delivered ahead of an older one the backlog restores.
         restore_security_event_queue(&security_queue, &store).await;
@@ -2570,7 +2690,45 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// Finishes building, handing back the [`ChargePointRuntime`] every registered block is now
     /// wired to.
     pub fn build(self) -> ChargePointRuntime<T> {
+        self.spawn_acceptance_flush();
         self.runtime
+    }
+
+    /// Spawns a task that drains every registered offline queue the moment the CSMS accepts this
+    /// charge point (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV4).
+    ///
+    /// CV4 stops a queue draining before acceptance (B01.FR.08); this is the other half. Without
+    /// it, a station that boots with a backlog would hold it until the *next* thing that happens
+    /// to start a flush - a new report, a reconnect, or a retry sweep if
+    /// [`Self::offline_queue_retries`] was registered - which on a quiet charge point could be a
+    /// long time, and on one that registered no retry timer could be indefinitely. Waiting to be
+    /// allowed to send is correct; staying silent afterwards is not.
+    ///
+    /// Watches the state rather than polling: `ChargePointRuntime::subscribe` already publishes
+    /// every applied state change, and `RegistrationStatusReceived` is one of them.
+    fn spawn_acceptance_flush(&self) {
+        let flushes = self.queue_flushes.clone();
+        if flushes.is_empty() {
+            return;
+        }
+        let mut states = self.runtime.subscribe();
+        self.executor.spawn(Box::pin(async move {
+            let mut was_permitted = states.borrow().may_send_requests();
+            loop {
+                states.changed().await;
+                let permitted = states.borrow().may_send_requests();
+                // Only on the transition into "allowed": a flush per state change would be a
+                // flush per applied event, which is what the retry timer and the forwarders
+                // already cover between them.
+                if permitted && !was_permitted {
+                    tracing::debug!("the CSMS accepted this charge point; draining offline queues");
+                    for flush in &flushes {
+                        flush().await;
+                    }
+                }
+                was_permitted = permitted;
+            }
+        }));
     }
 
     /// Takes the status-change subscription captured in [`Self::start`], or `None` if an earlier
@@ -2895,6 +3053,23 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    /// Tells `runtime`'s charge point the CSMS accepted it.
+    ///
+    /// Every offline queue the builder registers is gated on acceptance (CV4, B01.FR.08), so a
+    /// forwarding test on a charge point that never booted would be testing the gate rather than
+    /// the forwarder. `ChargePointBuilder::start` deliberately does not send a BootNotification -
+    /// that is `crate::provisioning::register_until_accepted`'s job - so tests stand in for it
+    /// here. The tests that *are* about the gate live in `crate::offline_queue`.
+    async fn accept_registration<C>(runtime: &crate::runtime::ChargePointRuntime<C>) {
+        runtime
+            .actor()
+            .send(crate::state::ChargePointEvent::RegistrationStatusReceived(
+                crate::state::RegistrationStatus::Accepted,
+            ))
+            .await
+            .expect("the actor accepts events");
+    }
+
     use super::ChargePointBuilder;
     use super::test_support::{TestChargePoint, TestConnector, TestEvse};
     use crate::executor::TokioExecutor;
@@ -2988,6 +3163,7 @@ mod tests {
             .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         assert_eq!(
             runtime.state().evses[0].connectors[0],
@@ -3017,6 +3193,7 @@ mod tests {
         .await
         .unwrap()
         .build();
+        accept_registration(&runtime).await;
 
         let state = runtime.state();
         assert_eq!(state.local_authorization_list.max_entries, 7);
@@ -3031,6 +3208,7 @@ mod tests {
             .await
             .unwrap()
             .build();
+        accept_registration(&runtime).await;
 
         let state = runtime.state();
         assert_eq!(
@@ -3058,6 +3236,7 @@ mod tests {
             .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         assert_eq!(
             runtime.state().registration,
@@ -3152,6 +3331,7 @@ mod tests {
             .display_messages(&DisplayOnlyCsms, TwoFormatDisplay)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         let state = runtime.state();
         let definition = state
@@ -3234,6 +3414,7 @@ mod tests {
             .status_notifications(&csms)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         // Give the spawned forwarder task(s) a chance to process the `CableConnected` event fired
         // during `start()` before establishing the baseline below.
@@ -3388,6 +3569,7 @@ mod tests {
             .unwrap()
             .status_notifications_persisted(&csms1, QueueStore::new(storage.clone(), "status"))
             .await;
+        accept_registration(&builder1.runtime).await;
         builder1
             .runtime
             .actor()
@@ -3450,6 +3632,7 @@ mod tests {
             .status_notifications_persisted(&csms2, QueueStore::new(storage.clone(), "status"))
             .await
             .build();
+        accept_registration(&runtime2).await;
         runtime2
             .actor()
             .send(crate::state::ChargePointEvent::Evse {
@@ -3519,6 +3702,7 @@ mod tests {
             .unwrap()
             .status_notifications_persisted(&csms1, QueueStore::new(storage.clone(), "status"))
             .await;
+        accept_registration(&builder1.runtime).await;
         builder1
             .runtime
             .actor()
@@ -3551,6 +3735,7 @@ mod tests {
             .status_notifications_persisted(&csms2, QueueStore::new(storage.clone(), "status"))
             .await
             .build();
+        accept_registration(&runtime2).await;
         let _ = &runtime2;
         csms2.fire_reconnect().await;
         for _ in 0..100 {
@@ -3587,6 +3772,7 @@ mod tests {
             .status_notifications_persisted(&csms, QueueStore::new(NoStorage, "status"))
             .await
             .build();
+        accept_registration(&runtime).await;
 
         for _ in 0..100 {
             tokio::task::yield_now().await;
@@ -3695,6 +3881,7 @@ mod tests {
             .offline_queue_capacity(4)
             .security_events(&csms)
             .await;
+        accept_registration(&builder.runtime).await;
 
         report_security_event(
             &builder.runtime.actor(),
@@ -3772,6 +3959,7 @@ mod tests {
             .unwrap()
             .security_events_persisted(&csms1, QueueStore::new(storage.clone(), "security"))
             .await;
+        accept_registration(&builder1.runtime).await;
         report_security_event(&builder1.runtime.actor(), first.clone()).await;
         report_security_event(&builder1.runtime.actor(), second.clone()).await;
         for _ in 0..100 {
@@ -3798,6 +3986,7 @@ mod tests {
             .security_events_persisted(&csms2, QueueStore::new(storage.clone(), "security"))
             .await
             .build();
+        accept_registration(&runtime2).await;
         let _ = &runtime2;
         csms2.fire_reconnect().await;
         for _ in 0..100 {
@@ -3854,6 +4043,7 @@ mod tests {
                 crate::clock::SystemClock,
             )
             .await;
+        accept_registration(&builder1.runtime).await;
         // `StartupOfTheDevice` is not raised by hand any more - `ChargePointBuilder::start`
         // raises it for real (F4.2), so the log below opens with a boot this test did not fake.
         report_security_event(
@@ -3890,6 +4080,7 @@ mod tests {
             )
             .await
             .build();
+        accept_registration(&runtime2).await;
         let _ = &runtime2;
 
         let recovered: alloc::vec::Vec<crate::state::SecurityEventType> = log2
@@ -3897,20 +4088,26 @@ mod tests {
             .into_iter()
             .map(|entry| entry.event.event_type)
             .collect();
+        // The restored history, in order, and then the second charge point's own boot - which
+        // `ChargePointBuilder::start` raises for real (F4.2) just as the first one's did. The
+        // third entry is not noise to be tolerated: a restored log that swallowed the boot that
+        // restored it would be the bug.
         assert_eq!(
             recovered,
             alloc::vec![
                 crate::state::SecurityEventType::StartupOfTheDevice,
-                crate::state::SecurityEventType::TamperDetectionActivated
+                crate::state::SecurityEventType::TamperDetectionActivated,
+                crate::state::SecurityEventType::StartupOfTheDevice,
             ]
         );
 
         // Registering the block restored the log into the caller's handle, not just into some
-        // task-private copy - a later `GetLog`/clear reads this same handle.
+        // task-private copy - a later `GetLog`/clear reads this same handle. Three now, not two:
+        // the second charge point's own boot was persisted alongside the two it restored.
         let restored_again = SecurityEventLog::new();
         assert_eq!(
             restore_security_log(&restored_again, &SecurityLogStore::new(storage)).await,
-            2
+            3
         );
     }
 
@@ -3942,6 +4139,7 @@ mod tests {
             .unwrap()
             .authorization_cache_persistence(storage.clone())
             .await;
+        accept_registration(&builder1.runtime).await;
         let _ = builder1
             .runtime
             .actor()
@@ -3971,6 +4169,7 @@ mod tests {
             .authorization_cache_persistence(storage.clone())
             .await
             .build();
+        accept_registration(&runtime2).await;
 
         assert_eq!(
             offline_decision(
@@ -4044,6 +4243,7 @@ mod tests {
             .unwrap()
             .charging_profile_persistence(storage.clone(), crate::clock::SystemClock)
             .await;
+        accept_registration(&builder1.runtime).await;
         let _ = builder1
             .runtime
             .actor()
@@ -4114,6 +4314,7 @@ mod tests {
             )
             .await
             .build();
+        accept_registration(&runtime2).await;
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
@@ -4162,6 +4363,7 @@ mod tests {
             .unwrap()
             .network_profile_persistence(storage.clone())
             .await;
+        accept_registration(&builder1.runtime).await;
         let _ = builder1
             .runtime
             .actor()
@@ -4191,6 +4393,7 @@ mod tests {
             .network_profile_persistence(storage.clone())
             .await
             .build();
+        accept_registration(&runtime2).await;
 
         let state = runtime2.actor().state();
         assert_eq!(
@@ -4255,6 +4458,7 @@ mod tests {
             .security_events_persisted(&csms, QueueStore::new(NoStorage, "security"))
             .await
             .build();
+        accept_registration(&runtime).await;
 
         report_security_event(
             &runtime.actor(),
@@ -4298,6 +4502,7 @@ mod tests {
         let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
             .await
             .unwrap();
+        accept_registration(&builder.runtime).await;
         // An independent observer subscription, alongside the one
         // `security_events_persisted` consumes below - so this test sees every real security
         // event raised on the actor, including any `MemoryExhaustion` the overflow handler might
@@ -4384,6 +4589,7 @@ mod tests {
             .tariffs(&csms)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         assert_eq!(
             runtime.state().evses[0].connectors[0],
@@ -4423,6 +4629,9 @@ mod tests {
                         ..Default::default()
                     }),
                     priority_charging: false,
+                    remote_start_id: None,
+                    reservation_id: None,
+                    stop_at_energy_wh: None,
                 },
                 started_at: None,
                 meter_start: None,
@@ -4434,6 +4643,7 @@ mod tests {
         let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
             .await
             .unwrap();
+        accept_registration(&builder.runtime).await;
         // Subscribe before the recovery runs, exactly as a registered Transactions block would
         // have (its subscription is taken up front in `start`).
         let mut reported = builder.runtime.subscribe_transaction_events();
@@ -4483,6 +4693,7 @@ mod tests {
             .local_authorization_list_persistence(storage)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         assert_eq!(runtime.state().local_authorization_list.version, 5);
         assert_eq!(
@@ -4526,6 +4737,7 @@ mod tests {
             .reservation_persistence(storage, crate::clock::SystemClock)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         assert_eq!(
             runtime.state().evses[0].connectors[0],
@@ -4566,6 +4778,7 @@ mod tests {
             .device_model_persistence(storage)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         let component = Component {
             name: "OCPPCommCtrlr".into(),
@@ -4712,6 +4925,7 @@ mod tests {
             .boot_reason_persistence(storage.clone())
             .await
             .build();
+        accept_registration(&runtime).await;
 
         // Simulates a CSMS `Reset` (`OnIdle`, since the connector is available and nothing is in
         // progress, this fires immediately) arriving and being accepted, in the same process this
@@ -4760,11 +4974,12 @@ mod tests {
             _connector_id: usize,
             _kind: crate::state::TransactionEventKind,
             _transaction: crate::state::Transaction,
-        ) -> Result<(), FlakyCsmsError> {
+            _offline: bool,
+        ) -> Result<crate::transactions::TransactionEventOutcome, FlakyCsmsError> {
             if self.should_fail.load(Ordering::SeqCst) {
                 return Err(FlakyCsmsError);
             }
-            Ok(())
+            Ok(crate::transactions::TransactionEventOutcome::acknowledged())
         }
     }
 
@@ -4822,6 +5037,7 @@ mod tests {
             .get_transaction_status(&csms)
             .await
             .build();
+        accept_registration(&runtime).await;
 
         // Starts transaction id 0 on the one connector this fixture has.
         for event in [
@@ -4947,6 +5163,7 @@ mod tests {
             .der_control(&csms)
             .await
             .build();
+        accept_registration(&_runtime).await;
 
         assert!(csms.set.load(Ordering::SeqCst));
         assert!(csms.clear.load(Ordering::SeqCst));

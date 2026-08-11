@@ -15,6 +15,7 @@ mod command_executor;
 mod command_receiver;
 mod connector;
 mod display;
+mod electrical;
 mod event_sender;
 mod evse;
 #[cfg(test)]
@@ -79,3 +80,6 @@ pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]
 pub use self::storage::{InMemoryStorage, InMemoryStorageError};
 pub use self::watchdog::{NoWatchdog, Watchdog};
+pub use electrical::{
+    ConnectorElectrical, ElectricalCharacteristics, EvseElectrical, SupplyPhases,
+};

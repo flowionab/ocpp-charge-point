@@ -1,22 +1,209 @@
+use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use chrono::{DateTime, Utc};
 
 use crate::clock::MonotonicInstant;
 use crate::hardware::Capabilities;
-use crate::state::connector_state::ConnectorCommand;
+use crate::state::connector_state::{ConnectorCommand, ConnectorPolicy, TxStartPoint, TxStopPoint};
+use crate::state::device_model::{
+    AVAILABILITY_COMPONENT_CHARGE_POINT, AVAILABILITY_COMPONENT_CONNECTOR,
+    AVAILABILITY_COMPONENT_EVSE, AVAILABILITY_STATE_VARIABLE, CLOCK_COMPONENT,
+    CLOCK_DATE_TIME_VARIABLE, NETWORK_CONFIGURATION_COMPONENT, PLUG_RETENTION_LOCK_COMPONENT,
+    PROBLEM_VARIABLE,
+};
 use crate::state::{
     AfrrSignal, AuthorizationCache, AuthorizationRequested, BatterySwapStore, ChargePointEffect,
     ChargePointEvent, ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent,
-    ConnectorState, ConnectorStatusChanged, DERControlStore, DeviceModel, DeviceModelEvent,
-    DisplayMessageStore, EventTrigger, EvseEvent, EvseState, ExternalChargingLimit,
-    HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry, MeterSample,
-    NetworkProfileStore, PendingReset, PeriodicEventStreamStore, RegistrationStatus,
+    ConnectorState, ConnectorStatus, ConnectorStatusChanged, DERControlStore, DeviceModel,
+    DeviceModelEvent, DisplayMessageStore, EventTrigger, EvseEvent, EvseState, EvseStatus,
+    ExternalChargingLimit, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
+    MeterSample, NetworkProfileStore, PendingReset, PeriodicEventStreamStore, RegistrationStatus,
     ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget, SecurityEvent,
     SecurityEventType, SmartChargingNotification, StateLimits, StopReason, TariffStore,
     Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
-    TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable, VariableAttributeType,
-    VariableMonitorStore, VariableMonitoringEvent,
+    TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable, VariableAttribute,
+    VariableAttributeType, VariableCharacteristics, VariableDataType, VariableMonitorStore,
+    VariableMonitoringEvent, VariableMutability,
 };
+
+/// The wire value OCPP's `AvailabilityState` takes for `status` - the same
+/// `ConnectorStatusEnumType` spelling `StatusNotification` uses, so a CSMS reading the device
+/// model and one reading the notification see the same word (G01.FR.03-.07).
+fn availability_state_value(status: ConnectorStatus) -> &'static str {
+    match status {
+        ConnectorStatus::Available => "Available",
+        ConnectorStatus::Occupied => "Occupied",
+        ConnectorStatus::Reserved => "Reserved",
+        ConnectorStatus::Unavailable => "Unavailable",
+        ConnectorStatus::Faulted => "Faulted",
+    }
+}
+
+/// One network configuration slot's worth of device-model variables, ready to register (CV1.3).
+///
+/// A snapshot type rather than reading the profile inline because the registration borrows the
+/// device model mutably while the profiles it mirrors live on the same struct.
+struct NetworkConnectionProfileSnapshot {
+    csms_url: alloc::string::String,
+    interface: &'static str,
+    transport: &'static str,
+    message_timeout_secs: i64,
+    security_profile: u8,
+}
+
+impl NetworkConnectionProfileSnapshot {
+    fn of(profile: &crate::state::NetworkConnectionProfile) -> Self {
+        Self {
+            csms_url: profile.csms_url.clone(),
+            interface: match profile.interface {
+                // OCPP's `OcppInterfaceEnumType` spellings. The index is part of the value, so a
+                // charge point with two wired interfaces reports which one a profile uses.
+                crate::state::NetworkInterface::Wired(0) => "Wired0",
+                crate::state::NetworkInterface::Wired(1) => "Wired1",
+                crate::state::NetworkInterface::Wired(2) => "Wired2",
+                crate::state::NetworkInterface::Wired(_) => "Wired3",
+                crate::state::NetworkInterface::Wireless(0) => "Wireless0",
+                crate::state::NetworkInterface::Wireless(1) => "Wireless1",
+                crate::state::NetworkInterface::Wireless(2) => "Wireless2",
+                crate::state::NetworkInterface::Wireless(_) => "Wireless3",
+                crate::state::NetworkInterface::Any => "Any",
+            },
+            transport: match profile.transport {
+                crate::state::NetworkTransport::Json => "JSON",
+                crate::state::NetworkTransport::Soap => "SOAP",
+            },
+            message_timeout_secs: profile.message_timeout_secs,
+            security_profile: profile.security_profile,
+        }
+    }
+
+    /// Registers this slot's nine required variables on `NetworkConfiguration[instance]`.
+    fn register_into(&self, model: &mut DeviceModel, instance: &str) {
+        let component = |()| Component {
+            name: NETWORK_CONFIGURATION_COMPONENT.into(),
+            instance: Some(instance.into()),
+            evse: None,
+        };
+        let mut register = |name: &str,
+                            data_type: VariableDataType,
+                            value: alloc::string::String,
+                            mutability: VariableMutability| {
+            model.register(
+                component(()),
+                Variable {
+                    name: name.into(),
+                    instance: None,
+                },
+                VariableCharacteristics {
+                    data_type,
+                    unit: None,
+                    min_limit: None,
+                    max_limit: None,
+                    values_list: None,
+                    supports_monitoring: false,
+                },
+                vec![VariableAttribute {
+                    attribute_type: VariableAttributeType::Actual,
+                    value,
+                    mutability,
+                    persistent: false,
+                    constant: false,
+                    requires_reboot: false,
+                }],
+            );
+        };
+
+        use alloc::string::ToString;
+        // Everything mirrored from the profile is `ReadOnly` here: `SetNetworkProfile` is how
+        // OCPP changes a slot, and accepting a `SetVariables` that this crate would not apply to
+        // the connection is the silent-lie failure mode B05.FR.09 forbids (CV2.1).
+        register(
+            "OcppCsmsUrl",
+            VariableDataType::String,
+            self.csms_url.clone(),
+            VariableMutability::ReadOnly,
+        );
+        register(
+            "OcppInterface",
+            VariableDataType::OptionList,
+            self.interface.to_string(),
+            VariableMutability::ReadOnly,
+        );
+        register(
+            "OcppTransport",
+            VariableDataType::OptionList,
+            self.transport.to_string(),
+            VariableMutability::ReadOnly,
+        );
+        // The appendix's own note: "This field is ignored." This crate negotiates the version on
+        // the connection rather than from the profile, and `NetworkConnectionProfile` does not
+        // carry one - so the honest answer is the empty option rather than a guess.
+        register(
+            "OcppVersion",
+            VariableDataType::OptionList,
+            alloc::string::String::new(),
+            VariableMutability::ReadOnly,
+        );
+        register(
+            "MessageTimeout",
+            VariableDataType::Integer,
+            self.message_timeout_secs.to_string(),
+            VariableMutability::ReadOnly,
+        );
+        register(
+            "SecurityProfile",
+            VariableDataType::Integer,
+            self.security_profile.to_string(),
+            VariableMutability::ReadOnly,
+        );
+        // Write-only by OCPP's own definition, and this crate keeps it that way for a second
+        // reason: an `IdToken` is not the only credential worth not disclosing. `GetVariables`
+        // refuses to read a `WriteOnly` attribute, so the password can never leave the charge
+        // point through the device model (A01.FR.12).
+        //
+        // Registered rather than omitted because A01.FR.02's rotation path is addressed to this
+        // exact variable, and a required key answering `UnknownVariable` is itself a failure. The
+        // write is refused today - applying a new password needs the reconnect plumbing that is
+        // CV10's - and refusing is what B05.FR.09 asks of a variable that cannot be honoured.
+        register(
+            "BasicAuthPassword",
+            VariableDataType::String,
+            alloc::string::String::new(),
+            VariableMutability::WriteOnly,
+        );
+        // This crate models neither VPN nor APN configuration, so both are `false` - which is the
+        // truth about a connection it set up itself, not a placeholder.
+        register(
+            "VpnEnabled",
+            VariableDataType::Boolean,
+            "false".to_string(),
+            VariableMutability::ReadOnly,
+        );
+        register(
+            "ApnEnabled",
+            VariableDataType::Boolean,
+            "false".to_string(),
+            VariableMutability::ReadOnly,
+        );
+    }
+}
+
+/// How an EVSE picks one status to report for several connectors: the most restrictive wins.
+///
+/// The order is "how much does this stop a driver using the EVSE" rather than anything OCPP
+/// states directly - the spec defines the *values*, not how to roll several connectors into one -
+/// so it is written out here as a deliberate choice rather than left to enum ordering, which
+/// would silently change if a variant were ever inserted.
+fn availability_precedence(status: ConnectorStatus) -> u8 {
+    match status {
+        ConnectorStatus::Available => 0,
+        ConnectorStatus::Reserved => 1,
+        ConnectorStatus::Occupied => 2,
+        ConnectorStatus::Unavailable => 3,
+        ConnectorStatus::Faulted => 4,
+    }
+}
 
 /// This charge point's best current estimate of the CSMS's clock, anchored to a
 /// [`MonotonicInstant`] so it can be advanced by elapsed real time without ever consulting a
@@ -150,16 +337,28 @@ impl ChargePointState {
         connector_counts: impl IntoIterator<Item = usize>,
         limits: StateLimits,
     ) -> Self {
+        let connector_counts: Vec<usize> = connector_counts.into_iter().collect();
         Self {
             lifecycle: LifecycleState::Booting,
             registration: None,
-            evses: connector_counts.into_iter().map(EvseState::new).collect(),
+            evses: connector_counts
+                .iter()
+                .copied()
+                .map(EvseState::new)
+                .collect(),
             next_transaction_id: 0,
             local_authorization_list: LocalAuthorizationList::with_max_entries(
                 limits.max_local_authorization_list_entries,
             ),
             pending_reset: None,
-            device_model: DeviceModel::with_max_variables(limits.max_device_model_variables),
+            // Topology-aware: OCPP requires an `AvailabilityState`/`Available` pair on the
+            // charge point, on every EVSE and on every connector (CV1.1), and those components
+            // can only be named once the topology is known. See
+            // `DeviceModel::register_topology_defaults`.
+            device_model: DeviceModel::with_topology(
+                limits.max_device_model_variables,
+                &connector_counts,
+            ),
             capabilities: Capabilities::default(),
             network_profiles: NetworkProfileStore::with_max_slots(limits.max_network_profile_slots),
             authorization_cache: AuthorizationCache::with_max_entries(
@@ -178,6 +377,31 @@ impl ChargePointState {
             afrr_signal: None,
             station_external_charging_limit: None,
         }
+    }
+
+    /// Whether this charge point may send a CSMS-bound request other than `BootNotification`
+    /// right now (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV4).
+    ///
+    /// **B01.FR.08 is the requirement, and it is stricter than it first reads**: between power-on
+    /// and a BootNotification the CSMS answered `Accepted`, the charge point sends nothing else -
+    /// *"This includes cached OCPP messages that are still present in the Charging Station from
+    /// prior sessions."* So a station that reboots with a full offline queue and is answered
+    /// `Pending` must sit on that backlog rather than flush it, which is exactly the case this
+    /// predicate exists to stop. B02.FR.02 says the same for `Pending` and B03.FR.02 for
+    /// `Rejected`.
+    ///
+    /// `None` (no BootNotification answered yet, e.g. still booting or the very first attempt is
+    /// in flight) is `false` for the same reason `Pending` is: nothing has authorised traffic.
+    ///
+    /// # What this deliberately does not cover
+    ///
+    /// B02.FR.02 exempts messages the CSMS itself asked for while `Pending` - a response to
+    /// `TriggerMessage`, `GetBaseReport` or `GetReport`. Those are *responses to an inbound
+    /// request*, so they never travel through the paths this predicate guards (the offline queues,
+    /// which carry charge-point-initiated reports). A caller that does need to send a triggered
+    /// request while `Pending` should send it directly rather than consulting this.
+    pub fn may_send_requests(&self) -> bool {
+        self.registration == Some(RegistrationStatus::Accepted)
     }
 
     /// Applies `event` to this charge point's state machine, mutating it in place and returning
@@ -532,7 +756,7 @@ impl ChargePointState {
                                 };
                                 effects.push(ChargePointEffect::VariableMonitorTriggered(
                                     TriggeredMonitor {
-                                        monitor_id,
+                                        monitor_id: Some(monitor_id),
                                         component: component.clone(),
                                         variable: variable.clone(),
                                         actual_value: value.clone(),
@@ -581,6 +805,8 @@ impl ChargePointState {
                             connector_id: recovered.connector_id,
                             kind: TransactionEventKind::Ended,
                             transaction,
+                            // Set later by whatever holds it - see the field's own docs (CV6.1).
+                            offline: false,
                         },
                     ));
                 }
@@ -652,6 +878,13 @@ impl ChargePointState {
             ChargePointEvent::CapabilitiesDeclared(capabilities) => {
                 set_if_changed(&mut self.capabilities, capabilities)
             }
+            // CV1.5: the integrator's electrical declaration, projected onto the required
+            // `SupplyPhases`/`ConnectorType`/`Power` variables the topology already registered
+            // components for.
+            ChargePointEvent::ElectricalCharacteristicsDeclared(electrical) => {
+                self.register_electrical_variables(&electrical);
+                true
+            }
             ChargePointEvent::DisplayMessageSet(message) => self.display_messages.set(*message),
             ChargePointEvent::DisplayMessageCleared(id) => self.display_messages.clear(id),
             ChargePointEvent::BatterySwapRequested(pending) => self.battery_swaps.insert(pending),
@@ -669,13 +902,35 @@ impl ChargePointState {
             ChargePointEvent::TimeSynced {
                 csms_time,
                 recorded_at,
-            } => set_if_changed(
-                &mut self.time_sync,
-                Some(TimeSyncAnchor {
-                    csms_time,
-                    recorded_at,
-                }),
-            ),
+            } => {
+                // CV1.2: `ClockCtrlr.DateTime` is a required variable, and this is the only
+                // moment this crate learns what time it is - the CSMS's `currentTime` on a
+                // BootNotification or Heartbeat response (G3.2; `ClockCtrlr.TimeSource` says
+                // `Heartbeat` for exactly this reason). Refreshed here rather than recomputed on
+                // every applied event because `apply` has no `MonotonicClock` to advance the
+                // anchor with, so "the CSMS time as of the last sync" is the honest value and
+                // the only one available.
+                self.device_model.set_attribute_value(
+                    &Component {
+                        name: CLOCK_COMPONENT.into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    &Variable {
+                        name: CLOCK_DATE_TIME_VARIABLE.into(),
+                        instance: None,
+                    },
+                    VariableAttributeType::Actual,
+                    csms_time.to_rfc3339(),
+                );
+                set_if_changed(
+                    &mut self.time_sync,
+                    Some(TimeSyncAnchor {
+                        csms_time,
+                        recorded_at,
+                    }),
+                )
+            }
             ChargePointEvent::Evse { evse_id, event } => match event {
                 EvseEvent::Connector {
                     connector_id,
@@ -748,11 +1003,379 @@ impl ChargePointState {
             },
         };
 
+        // Every path above that can move a connector, an EVSE or the charge point itself lands
+        // here, so the device model's `AvailabilityState` is re-derived once per applied event
+        // rather than at each of the several dozen mutation sites - which is what keeps it from
+        // drifting when a new event variant lands. Costs one pass over the connectors; a charge
+        // point has single digits of them.
+        self.sync_availability_variables();
+        self.sync_network_configuration_variables();
         if changed {
             effects.insert(0, ChargePointEffect::StateChanged);
         }
         self.check_pending_reset(&mut effects);
         effects
+    }
+
+    /// Reads a device-model variable's `Actual` value, or the empty string when it is absent -
+    /// which every caller here treats as "not configured".
+    fn string_variable(&self, component: &str, variable: &str) -> alloc::string::String {
+        self.device_model
+            .get(
+                &Component {
+                    name: component.into(),
+                    instance: None,
+                    evse: None,
+                },
+                &Variable {
+                    name: variable.into(),
+                    instance: None,
+                },
+            )
+            .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+            .map(|attribute| attribute.value.clone())
+            .unwrap_or_default()
+    }
+
+    /// Reads a `Boolean` device-model variable, defaulting to `default` when it is absent or
+    /// unparseable - the same tolerance `crate::authorization` applies, kept here so the state
+    /// machine can consult its own configuration without reaching outside `crate::state`.
+    fn boolean_variable(&self, component: &str, variable: &str, default: bool) -> bool {
+        self.device_model
+            .get(
+                &Component {
+                    name: component.into(),
+                    instance: None,
+                    evse: None,
+                },
+                &Variable {
+                    name: variable.into(),
+                    instance: None,
+                },
+            )
+            .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+            .and_then(|attribute| match attribute.value.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(default)
+    }
+
+    /// Re-derives every `AvailabilityState` variable from the current state
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV1.1). Writes only where the value actually
+    /// changed, so a charge point sitting idle does no work beyond the comparison.
+    ///
+    /// The three levels answer three different questions, which is why they are not the same
+    /// computation:
+    ///
+    /// - A **connector** reports exactly what its `StatusNotification` reports - the same
+    ///   [`ConnectorState::availability_status`] projection, so the two can never disagree.
+    /// - An **EVSE** reports its own [`EvseStatus`] where that is decisive (`Faulted`,
+    ///   `Unavailable` - both set by `ChangeAvailability` or a fault, and both meaning the EVSE is
+    ///   out of service whatever its connectors say), and otherwise the busiest of its connectors.
+    ///   OCPP has no "half occupied": an EVSE with a cable in one of its connectors is one a
+    ///   driver cannot walk up to and use.
+    /// - The **charge point** reports its [`LifecycleState`] and nothing else. Rolling EVSE state
+    ///   up to the station would make a single charging connector on a 20-EVSE site report the
+    ///   whole site as `Occupied`, which is not what a CSMS asking about the station means.
+    fn sync_availability_variables(&mut self) {
+        let station = match self.lifecycle {
+            // Not yet booted is not yet available - and the `Unavailable` a `SetUnavailable`
+            // produces is the same thing to a CSMS, so both map to it.
+            LifecycleState::Booting | LifecycleState::Unavailable => ConnectorStatus::Unavailable,
+            LifecycleState::Available => ConnectorStatus::Available,
+            LifecycleState::Faulted => ConnectorStatus::Faulted,
+        };
+        self.set_availability_state(AVAILABILITY_COMPONENT_CHARGE_POINT, None, station);
+
+        for evse_id in 0..self.evses.len() {
+            let statuses: Vec<ConnectorStatus> = self.evses[evse_id]
+                .connectors
+                .iter()
+                .map(|connector| connector.availability_status())
+                .collect();
+            for (connector_id, status) in statuses.iter().enumerate() {
+                self.set_availability_state(
+                    AVAILABILITY_COMPONENT_CONNECTOR,
+                    Some((evse_id, Some(connector_id))),
+                    *status,
+                );
+            }
+
+            let evse = match self.evses[evse_id].status {
+                EvseStatus::Faulted => ConnectorStatus::Faulted,
+                EvseStatus::Unavailable => ConnectorStatus::Unavailable,
+                EvseStatus::Available => statuses
+                    .into_iter()
+                    .max_by_key(|status| availability_precedence(*status))
+                    .unwrap_or(ConnectorStatus::Available),
+            };
+            self.set_availability_state(AVAILABILITY_COMPONENT_EVSE, Some((evse_id, None)), evse);
+        }
+    }
+
+    /// Registers the electrical variables OCPP requires, from the integrator's declaration
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV1.5).
+    ///
+    /// Registered **always**, valued only where declared: OCPP marks all three required, so a
+    /// variable that is absent is a compliance failure while one that is present and empty is an
+    /// honest "this firmware was not told". `EVSE.Power` is the odd one - the appendix requires
+    /// its `maxLimit` *characteristic* and only desires a live value, so the declared maximum
+    /// becomes `max_limit` rather than the reading.
+    fn register_electrical_variables(
+        &mut self,
+        electrical: &crate::hardware::ElectricalCharacteristics,
+    ) {
+        let phases = |phases: crate::hardware::SupplyPhases| {
+            alloc::string::String::from(phases.as_wire_value().unwrap_or(""))
+        };
+        self.register_readonly(
+            AVAILABILITY_COMPONENT_CHARGE_POINT,
+            None,
+            "SupplyPhases",
+            VariableDataType::Integer,
+            phases(electrical.supply_phases),
+            None,
+        );
+        for evse_id in 0..self.evses.len() {
+            let evse = electrical.evse(evse_id);
+            self.register_readonly(
+                AVAILABILITY_COMPONENT_EVSE,
+                Some((evse_id, None)),
+                "SupplyPhases",
+                VariableDataType::Integer,
+                evse.map(|evse| phases(evse.supply_phases))
+                    .unwrap_or_default(),
+                None,
+            );
+            self.register_readonly(
+                AVAILABILITY_COMPONENT_EVSE,
+                Some((evse_id, None)),
+                "Power",
+                VariableDataType::Decimal,
+                // No live reading: this crate learns power per connector from meter samples, not
+                // per EVSE, so quoting one here would be an invention. The required part is the
+                // limit below.
+                alloc::string::String::new(),
+                evse.and_then(|evse| evse.max_power_w),
+            );
+            // `Required? = V2X` in the appendix: required of a station that can discharge and
+            // absent from one that cannot, so it follows the capability rather than being
+            // registered unconditionally like its charge-direction sibling above. Claiming a
+            // discharge figure on a charge-only station would advertise hardware that is not
+            // there.
+            if self.capabilities.supports_bidirectional_power {
+                self.register_readonly(
+                    AVAILABILITY_COMPONENT_EVSE,
+                    Some((evse_id, None)),
+                    "DischargePower",
+                    VariableDataType::Decimal,
+                    alloc::string::String::new(),
+                    evse.and_then(|evse| evse.max_discharge_power_w),
+                );
+            }
+            // `Required? = V2X` in the appendix: required of a station that can discharge and
+            // absent from one that cannot, so it follows the capability rather than being
+            // registered unconditionally like its charge-direction sibling above. Claiming a
+            // discharge figure on a charge-only station would advertise hardware that is not
+            // there.
+            if self.capabilities.supports_bidirectional_power {
+                self.register_readonly(
+                    AVAILABILITY_COMPONENT_EVSE,
+                    Some((evse_id, None)),
+                    "DischargePower",
+                    VariableDataType::Decimal,
+                    alloc::string::String::new(),
+                    evse.and_then(|evse| evse.max_discharge_power_w),
+                );
+            }
+            let connector_count = self.evses[evse_id].connectors.len();
+            for connector_id in 0..connector_count {
+                let connector = electrical.connector(evse_id, connector_id);
+                self.register_readonly(
+                    AVAILABILITY_COMPONENT_CONNECTOR,
+                    Some((evse_id, Some(connector_id))),
+                    "SupplyPhases",
+                    VariableDataType::Integer,
+                    connector
+                        .map(|connector| phases(connector.supply_phases))
+                        .unwrap_or_default(),
+                    None,
+                );
+                self.register_readonly(
+                    AVAILABILITY_COMPONENT_CONNECTOR,
+                    Some((evse_id, Some(connector_id))),
+                    "ConnectorType",
+                    VariableDataType::String,
+                    connector
+                        .map(|connector| connector.connector_type.clone())
+                        .unwrap_or_default(),
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Registers one read-only, hardware-declared variable. `max_limit` carries OCPP's required
+    /// `maxLimit` characteristic where the spec asks for one.
+    fn register_readonly(
+        &mut self,
+        component_name: &str,
+        evse: Option<(usize, Option<usize>)>,
+        variable: &str,
+        data_type: VariableDataType,
+        value: alloc::string::String,
+        max_limit: Option<f64>,
+    ) {
+        self.device_model.register(
+            Component {
+                name: component_name.into(),
+                instance: None,
+                evse,
+            },
+            Variable {
+                name: variable.into(),
+                instance: None,
+            },
+            VariableCharacteristics {
+                data_type,
+                unit: None,
+                min_limit: None,
+                max_limit,
+                values_list: None,
+                supports_monitoring: false,
+            },
+            vec![VariableAttribute {
+                attribute_type: VariableAttributeType::Actual,
+                value,
+                // A fact about the hardware, not a setting: `SetVariables` must refuse it
+                // (B05.FR.09), and `constant` says it never changes at runtime either.
+                mutability: VariableMutability::ReadOnly,
+                persistent: false,
+                constant: true,
+                requires_reboot: false,
+            }],
+        );
+    }
+
+    /// Mirrors every occupied network configuration slot into the device model as a
+    /// `NetworkConfiguration` component (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV1.3).
+    ///
+    /// OCPP addresses these per slot - *"Writing to this variable only sets the password for the
+    /// instance configurationSlot of Component NetworkConfiguration"* - so the slot number is the
+    /// **component instance**, and a charge point with two slots reports two independent sets.
+    /// All nine of the appendix's required variables are registered; the optional VPN/APN detail
+    /// is not, because this crate models neither.
+    ///
+    /// Re-derived per applied event, like the availability variables, and for the same reason: a
+    /// slot can be written, replaced or vacated by `SetNetworkProfile`, by a persisted-profile
+    /// restore, or by the network-switch logic, and one sync point cannot drift where several
+    /// mutation sites would.
+    fn sync_network_configuration_variables(&mut self) {
+        let wanted: Vec<(String, NetworkConnectionProfileSnapshot)> = self
+            .network_profiles
+            .slots()
+            .iter()
+            .map(|slot| {
+                (
+                    alloc::format!("{}", slot.slot),
+                    NetworkConnectionProfileSnapshot::of(&slot.profile),
+                )
+            })
+            .collect();
+
+        // Vacated slots take their whole component with them - a reported CSMS URL the charge
+        // point no longer holds reads as current, which is worse than not reporting one.
+        let stale: Vec<Component> = self
+            .device_model
+            .components()
+            .filter(|component| component.name == NETWORK_CONFIGURATION_COMPONENT)
+            .filter(|component| {
+                !wanted
+                    .iter()
+                    .any(|(instance, _)| component.instance.as_deref() == Some(instance.as_str()))
+            })
+            .cloned()
+            .collect();
+        for component in stale {
+            self.device_model.remove_component(&component);
+        }
+
+        for (instance, snapshot) in wanted {
+            snapshot.register_into(&mut self.device_model, &instance);
+        }
+    }
+
+    /// Writes one component's `AvailabilityState`, if it moved. A component that isn't registered
+    /// (a binding that removed it, or a model bounded too low to hold it) is a no-op, matching
+    /// [`DeviceModel::set_attribute_value`]'s own tolerance.
+    fn set_availability_state(
+        &mut self,
+        component_name: &str,
+        evse: Option<(usize, Option<usize>)>,
+        status: ConnectorStatus,
+    ) {
+        let component = Component {
+            name: component_name.into(),
+            instance: None,
+            evse,
+        };
+        let variable = Variable {
+            name: AVAILABILITY_STATE_VARIABLE.into(),
+            instance: None,
+        };
+        let value = availability_state_value(status);
+        let unchanged = self
+            .device_model
+            .get(&component, &variable)
+            .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+            .is_some_and(|attribute| attribute.value == value);
+        if unchanged {
+            return;
+        }
+        self.device_model.set_attribute_value(
+            &component,
+            &variable,
+            VariableAttributeType::Actual,
+            value.into(),
+        );
+    }
+
+    /// Writes one connector's `ConnectorPlugRetentionLock`/`Problem`, reporting whether it moved
+    /// (G05, CV11). Same tolerance for an unregistered component as
+    /// [`Self::set_availability_state`].
+    fn set_plug_retention_lock_problem(
+        &mut self,
+        evse_id: usize,
+        connector_id: usize,
+        problem: bool,
+    ) -> bool {
+        let component = Component {
+            name: PLUG_RETENTION_LOCK_COMPONENT.into(),
+            instance: None,
+            evse: Some((evse_id, Some(connector_id))),
+        };
+        let variable = Variable {
+            name: PROBLEM_VARIABLE.into(),
+            instance: None,
+        };
+        let value = if problem { "true" } else { "false" };
+        let current = self
+            .device_model
+            .get(&component, &variable)
+            .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+            .map(|attribute| attribute.value.as_str());
+        if current.is_none() || current == Some(value) {
+            return false;
+        }
+        self.device_model.set_attribute_value(
+            &component,
+            &variable,
+            VariableAttributeType::Actual,
+            value.into(),
+        );
+        true
     }
 
     /// Applies a [`ConnectorEvent`] to one `(evse_id, connector_id)`, pushing every resulting
@@ -770,6 +1393,35 @@ impl ChargePointState {
         event: ConnectorEvent,
         effects: &mut Vec<ChargePointEffect>,
     ) -> bool {
+        // CV2.4: read once, before the mutable borrow, so the transition stays a pure function
+        // of (state, event, policy). See `ConnectorPolicy`.
+        let policy = ConnectorPolicy {
+            stop_tx_on_ev_side_disconnect: self.boolean_variable(
+                "TxCtrlr",
+                "StopTxOnEVSideDisconnect",
+                ConnectorPolicy::default().stop_tx_on_ev_side_disconnect,
+            ),
+            tx_start_point: TxStartPoint::from_member_list(
+                &self.string_variable("TxCtrlr", "TxStartPoint"),
+            ),
+            tx_stop_point: TxStopPoint::from_member_list(
+                &self.string_variable("TxCtrlr", "TxStopPoint"),
+            ),
+            unlock_on_ev_side_disconnect: self.boolean_variable(
+                "OCPPCommCtrlr",
+                "UnlockOnEVSideDisconnect",
+                ConnectorPolicy::default().unlock_on_ev_side_disconnect,
+            ),
+            stop_tx_on_invalid_id: self.boolean_variable(
+                "TxCtrlr",
+                "StopTxOnInvalidId",
+                ConnectorPolicy::default().stop_tx_on_invalid_id,
+            ),
+            max_energy_on_invalid_id_wh: self
+                .string_variable("TxCtrlr", "MaxEnergyOnInvalidId")
+                .parse::<i64>()
+                .ok(),
+        };
         let Some(evse) = self.evses.get_mut(evse_id) else {
             return false;
         };
@@ -794,7 +1446,44 @@ impl ChargePointState {
         };
         let authorized_id_token = match &event {
             ConnectorEvent::ChargingAuthorized(id_token)
-            | ConnectorEvent::RemoteStartRequested(id_token) => Some(id_token.clone()),
+            | ConnectorEvent::RemoteStartRequested { id_token, .. } => Some(id_token.clone()),
+            _ => None,
+        };
+        // Narrower than `authorized_id_token`: only a locally presented identifier the CSMS
+        // accepted, which is the one E03 can hold against a connector with no cable (CV2.3).
+        let event_authorized_id_token = match &event {
+            ConnectorEvent::ChargingAuthorized(id_token) => Some(id_token.clone()),
+            _ => None,
+        };
+        // CV6: the `remoteStartId` a CSMS-initiated start carried, recorded on the transaction
+        // it begins so every one of that transaction's events can quote it back (F01.FR.25).
+        let event_remote_start_id = match &event {
+            ConnectorEvent::RemoteStartRequested {
+                remote_start_id, ..
+            } => *remote_start_id,
+            _ => None,
+        };
+        // CV6: the reservation this connector is consuming, if any. Read before the transition,
+        // because entering `Starting` is what ends the reservation - afterwards there is nothing
+        // left to read (F02.FR.06).
+        let active_reservation_id = evse
+            .honoured_reservations
+            .get(connector_id)
+            .copied()
+            .flatten();
+        // Kept because `apply` consumes the event but two later blocks still need to know which
+        // one it was.
+        let event_kind = match &event {
+            ConnectorEvent::AuthorizationRevoked => EventKind::AuthorizationRevoked,
+            ConnectorEvent::MeterValueSampled(_) => EventKind::MeterValueSampled,
+            ConnectorEvent::LockFailed => EventKind::LockFailed,
+            _ => EventKind::Other,
+        };
+        // CV7: `Some(Some(..))` records a pending start, `Some(None)` clears one, `None` means
+        // this event says nothing about it - captured before `apply` consumes the event.
+        let pending_remote_start_change = match &event {
+            ConnectorEvent::RemoteStartPending(pending) => Some(Some(pending.clone())),
+            ConnectorEvent::RemoteStartPendingCleared => Some(None),
             _ => None,
         };
         let meter_sample = match &event {
@@ -825,9 +1514,10 @@ impl ChargePointState {
         // and only they change what the CSMS is told.
         let was_cancelled = matches!(event, ConnectorEvent::ReservationCancelled);
         let was_expired = matches!(event, ConnectorEvent::ReservationExpired);
-        let transition = connector.apply(event);
+        let transition = connector.apply(event, policy);
         let new_state = *connector;
         let mut reservation_ended = None;
+        let mut honoured = None;
         if let Some(slot) = evse.reservations.get_mut(connector_id) {
             if new_state == ConnectorState::Reserved {
                 *slot = reservation_made;
@@ -844,7 +1534,14 @@ impl ChargePointState {
                             let reason = match (was_cancelled, was_expired, new_state) {
                                 (true, _, _) => return None,
                                 (_, true, _) => ReservationEndReason::Expired,
-                                (_, _, ConnectorState::Connected) => return None,
+                                // The cable arriving is the reservation being honoured. Nothing
+                                // to report, but the id has to outlive the reservation itself so
+                                // the transaction this leads to can quote it (CV6) - see
+                                // `EvseState::honoured_reservations`.
+                                (_, _, ConnectorState::Connected) => {
+                                    honoured = Some(id.0);
+                                    return None;
+                                }
                                 _ => ReservationEndReason::Removed,
                             };
                             Some(ReservationUpdate { id, reason })
@@ -852,9 +1549,99 @@ impl ChargePointState {
                 *slot = None;
             }
         }
+        if let Some(slot) = evse.honoured_reservations.get_mut(connector_id) {
+            if honoured.is_some() {
+                *slot = honoured;
+            } else if new_state == ConnectorState::Available {
+                // Back to idle: whatever this connector honoured belonged to the session that has
+                // now ended, and must not leak into whoever plugs in next - the same rule
+                // `running_costs` and `transaction_tariffs` follow.
+                *slot = None;
+            }
+        }
         if let Some(update) = reservation_ended {
             effects.push(ChargePointEffect::ReservationEnded(update));
         }
+        // E05 (CV2.5): revoked, but the operator granted a last allowance rather than cutting
+        // energy at once - so the transaction is told the meter reading it must stop at. The
+        // connector keeps charging until `MeterValueSampled` reaches it, below.
+        if matches!(event_kind, EventKind::AuthorizationRevoked)
+            && !policy.stop_tx_on_invalid_id
+            && let Some(allowance) = policy.max_energy_on_invalid_id_wh.filter(|wh| *wh > 0)
+            && let Some(Some(transaction)) = evse.transactions.get_mut(connector_id)
+            && transaction.stop_at_energy_wh.is_none()
+        {
+            let from = transaction
+                .last_meter_sample
+                .map(|sample| sample.energy_wh)
+                .unwrap_or_default();
+            transaction.stop_at_energy_wh = Some(from + allowance);
+            tracing::info!(
+                evse_id,
+                connector_id,
+                allowance_wh = allowance,
+                "the identifier was revoked; granting the configured last allowance"
+            );
+        }
+        // CV7/F02: the pending remote start's lifecycle. Recorded on request, dispatched the
+        // moment the cable latches, cleared when the connector goes idle without ever being used
+        // (a timeout sweep, a fault clearing) so it cannot fire for whoever plugs in next.
+        let mut dispatch_pending = None;
+        // Recording or releasing a held request is a real state change even though no connector
+        // transition accompanies it - `RemoteStartPending` arrives on an idle connector and moves
+        // nothing. Without saying so, `apply` reports `changed: false` and the actor never
+        // publishes the new state, so nothing downstream (the CSMS-facing snapshot, persistence,
+        // the timeout sweep) can see that a request is being held at all.
+        let mut pending_changed = false;
+        // E03/E03.FR.15 (CV2.3): the CSMS authorized a card presented on a connector with no cable
+        // in it - "Start Transaction - IdToken First". Nothing about the connector can move, so
+        // the authorization is *held* against it exactly as a `RequestStartTransaction` with no
+        // cable is, and is dispatched by the same latch below when the driver plugs in. Holding it
+        // in the same slot is what makes the two use cases share one timeout sweep, which is the
+        // whole of E03.FR.15: a driver who authorizes and then walks away is deauthorized rather
+        // than leaving a live authorization for whoever plugs in next.
+        //
+        // Only a `ChargingAuthorized` counts, never a `RemoteStartRequested`: the latter is F01's
+        // "start now", and OCPP requires a latched cable for it - `RemoteStartPending` is how a
+        // CSMS asks for the held form.
+        let local_hold = match (previous_state, &event_authorized_id_token) {
+            (ConnectorState::Available, Some(id_token)) => Some(id_token.clone()),
+            _ => None,
+        }
+        .map(|id_token| crate::state::PendingRemoteStart {
+            id_token,
+            // Locally presented, so there is no `remoteStartId` - which is exactly what makes
+            // the transaction this eventually starts report `triggerReason = Authorized`
+            // rather than `RemoteStart` (see `trigger_reason_for`).
+            remote_start_id: None,
+        });
+        if let Some(slot) = evse.pending_remote_starts.get_mut(connector_id) {
+            match (&pending_remote_start_change, &local_hold, new_state) {
+                (Some(Some(pending)), _, _) => {
+                    pending_changed = slot.as_ref() != Some(pending);
+                    *slot = Some(pending.clone());
+                }
+                (Some(None), _, _) => {
+                    pending_changed = slot.take().is_some();
+                }
+                (None, Some(hold), _) => {
+                    pending_changed = slot.as_ref() != Some(hold);
+                    *slot = Some(hold.clone());
+                }
+                (None, None, ConnectorState::Locked) => dispatch_pending = slot.take(),
+                // Only when the connector *arrives* at idle, not on every event that finds it
+                // there. A held start is recorded while the connector is already `Available` and
+                // sits there until the cable comes - so clearing on the state alone would let the
+                // next meter sample from that connector's hardware silently drop it.
+                (None, None, ConnectorState::Available)
+                    if previous_state != ConnectorState::Available =>
+                {
+                    pending_changed = slot.take().is_some();
+                }
+                _ => {}
+            }
+        }
+
         if let Some(command) = transition.command {
             effects.push(ChargePointEffect::HardwareCommand(match command {
                 ConnectorCommand::Lock => HardwareCommand::LockConnector {
@@ -894,8 +1681,14 @@ impl ChargePointState {
                 },
             ));
         }
-        if new_state == ConnectorState::Authorizing
-            && let Some((id_token, contract)) = presented_id_token
+        // E03 (CV2.3): `Available` is here because a card presented before the cable arrives has
+        // nowhere for the connector to move to - it is still `Available` afterwards - yet the CSMS
+        // must still be asked, because that answer is what the connector holds until the driver
+        // plugs in (see `local_hold` above).
+        if matches!(
+            new_state,
+            ConnectorState::Authorizing | ConnectorState::Available
+        ) && let Some((id_token, contract)) = presented_id_token
         {
             effects.push(ChargePointEffect::AuthorizationRequested(
                 AuthorizationRequested {
@@ -913,7 +1706,15 @@ impl ChargePointState {
                 previous_state,
                 new_state,
                 stop_reason,
-                authorized_id_token,
+                TransactionOrigin {
+                    id_token: authorized_id_token,
+                    remote_start_id: event_remote_start_id,
+                    reservation_id: active_reservation_id,
+                },
+                TransactionPoints {
+                    tx_start_point: policy.tx_start_point,
+                    tx_stop_point: policy.tx_stop_point,
+                },
             ) {
                 // A new transaction must not inherit a previous one's running cost or driver
                 // tariff, and an ended transaction's cost/tariff is no longer meaningful.
@@ -934,6 +1735,7 @@ impl ChargePointState {
                         connector_id,
                         kind,
                         transaction,
+                        offline: false,
                     },
                 ));
             }
@@ -946,6 +1748,7 @@ impl ChargePointState {
                         connector_id,
                         kind,
                         transaction,
+                        offline: false,
                     },
                 ));
             }
@@ -1016,12 +1819,115 @@ impl ChargePointState {
             }
             false
         });
-        transition.changed
+        // G05 (CV11): a lock failure is reported as more than a fault. The `Problem` variable is
+        // what a CSMS can *read* to tell this apart from a stuck contactor, and the hard-wired
+        // `NotifyEvent` beside it is G05.FR.02 - raised here rather than left to a CSMS-configured
+        // monitor because the requirement is unconditional, and because this crate's monitors only
+        // evaluate numeric values.
+        //
+        // Cleared when the connector reaches `Available` again: that is the far side of the
+        // fail-safe recovery (fault cleared, then unlocked), so the lock has demonstrably worked
+        // since. Nothing is reported for the clear - a `Problem` back to `false` is visible to any
+        // CSMS that asks, and a station recovering is not news.
+        let lock_problem_changed = match (event_kind, new_state) {
+            (EventKind::LockFailed, _) => {
+                let changed = self.set_plug_retention_lock_problem(evse_id, connector_id, true);
+                if changed {
+                    tracing::warn!(
+                        evse_id,
+                        connector_id,
+                        "the connector's plug retention lock failed; faulting the connector"
+                    );
+                    effects.push(ChargePointEffect::VariableMonitorTriggered(
+                        TriggeredMonitor {
+                            // Hard-wired: nobody configured this, so it carries no monitor id and
+                            // is not filtered by `MonitoringLevel`.
+                            monitor_id: None,
+                            component: Component {
+                                name: PLUG_RETENTION_LOCK_COMPONENT.into(),
+                                instance: None,
+                                evse: Some((evse_id, Some(connector_id))),
+                            },
+                            variable: Variable {
+                                name: PROBLEM_VARIABLE.into(),
+                                instance: None,
+                            },
+                            actual_value: "true".into(),
+                            // OCPP's `1-Hardware Failure`: a retention lock that will not move is
+                            // a hardware issue, and it leaves this connector unable to charge
+                            // until someone attends to it.
+                            severity: 1,
+                            trigger: EventTrigger::Alerting,
+                        },
+                    ));
+                }
+                changed
+            }
+            (_, ConnectorState::Available) => {
+                self.set_plug_retention_lock_problem(evse_id, connector_id, false)
+            }
+            _ => false,
+        };
+        let changed = transition.changed
             || cost_recorded
             || tariff_recorded
             || limit_changed
             || limit_confirmed
             || sample_recorded
+            || pending_changed
+            || lock_problem_changed;
+        // E05 (CV2.5): the last allowance ran out. Checked after the sample has been recorded, so
+        // the stop is decided against the reading the CSMS will also see, and dispatched through
+        // the ordinary stop path so the transaction ends exactly as any other does.
+        let allowance_spent = matches!(event_kind, EventKind::MeterValueSampled)
+            && self
+                .evses
+                .get(evse_id)
+                .and_then(|evse| evse.transactions.get(connector_id))
+                .and_then(|transaction| transaction.as_ref())
+                .is_some_and(|transaction| {
+                    transaction.stop_at_energy_wh.is_some_and(|limit| {
+                        transaction
+                            .last_meter_sample
+                            .is_some_and(|sample| sample.energy_wh >= limit)
+                    })
+                });
+        if allowance_spent {
+            tracing::info!(
+                evse_id,
+                connector_id,
+                "the allowance granted after deauthorization is spent; stopping"
+            );
+            self.apply_connector_event(
+                evse_id,
+                connector_id,
+                ConnectorEvent::ChargingStopped(StopReason::DeAuthorized),
+                effects,
+            );
+            return true;
+        }
+        if let Some(pending) = dispatch_pending {
+            // Recursing through `apply_connector_event` rather than reaching into the connector
+            // directly, so a remotely started transaction takes byte-for-byte the same path a
+            // locally started one does - including the transaction bookkeeping, the hardware
+            // command and the status effects.
+            tracing::debug!(
+                evse_id,
+                connector_id,
+                "the cable arrived; dispatching the remote start the CSMS asked for"
+            );
+            self.apply_connector_event(
+                evse_id,
+                connector_id,
+                ConnectorEvent::RemoteStartRequested {
+                    id_token: pending.id_token,
+                    remote_start_id: pending.remote_start_id,
+                },
+                effects,
+            );
+            return true;
+        }
+        changed
     }
 
     /// Every `evse_id` a [`ResetTarget`] covers - every EVSE, for
@@ -1298,43 +2204,204 @@ impl ChargePointState {
     }
 }
 
-/// Advances a connector's transaction alongside its `previous_state` -> `new_state` transition,
-/// returning the TransactionEvent to report, if any. `event_stop_reason` is the `StopReason`
-/// carried by the triggering `ConnectorEvent::ChargingStopped`/`ConnectorEvent::ResetRequested`,
-/// if that's what caused this transition. `event_id_token` is the identifier carried by a
-/// triggering `ChargingAuthorized`/`RemoteStartRequested`, if that's what caused this transition
-/// - recorded on the new `Transaction`.
+/// Which of the events `apply_connector_event` special-cases this one is - captured before
+/// `ConnectorState::apply` consumes it, because two later blocks still need to know (CV2.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    /// The identifier was revoked mid-session (E05).
+    AuthorizationRevoked,
+    /// A meter reading arrived - the thing that can cross an E05 allowance.
+    MeterValueSampled,
+    /// The connector's plug retention lock failed (G05).
+    LockFailed,
+    Other,
+}
+
+/// Where in a session a transaction begins and ends - `TxCtrlr.TxStartPoint`/`TxStopPoint`
+/// (CV2.2), paired because `advance_transaction` needs both on every call and neither means much
+/// without the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransactionPoints {
+    tx_start_point: TxStartPoint,
+    tx_stop_point: TxStopPoint,
+}
+
+/// How a transaction came to exist - everything `advance_transaction` records on a new
+/// [`Transaction`] that describes its origin rather than its progress. Grouped because all three
+/// are read from the same triggering event and are only ever used together (CV6).
+struct TransactionOrigin {
+    /// The identifier that authorized it, from a `ChargingAuthorized`/`RemoteStartRequested`.
+    id_token: Option<IdToken>,
+    /// The `remoteStartId` of the `RequestStartTransaction` that began it, if it began that way.
+    remote_start_id: Option<i64>,
+    /// The reservation it consumed, if the connector had honoured one.
+    reservation_id: Option<i64>,
+}
+
+/// Advances (or starts, or ends) the transaction in `slot` for a connector moving from
+/// `previous_state` to `new_state`, returning the TransactionEvent to report, if any.
+///
+/// `event_stop_reason` is the `StopReason` carried by the triggering
+/// `ConnectorEvent::ChargingStopped`/`ConnectorEvent::ResetRequested`, if that is what caused this
+/// transition. `origin` carries everything recorded on a *new* transaction about how it began -
+/// see [`TransactionOrigin`].
+/// Whether moving from `previous_state` to `new_state` is the moment `tx_start_point` names
+/// (CV2.2).
+///
+/// Each point is one transition, and they are checked exclusively rather than cumulatively: with
+/// `PowerPathClosed` configured, locking the cable and authorizing both happen without a
+/// transaction existing, and the contactor closing is what creates it.
+fn starts_transaction(
+    previous_state: ConnectorState,
+    new_state: ConnectorState,
+    tx_start_point: TxStartPoint,
+) -> bool {
+    match tx_start_point {
+        // The cable is in and latched. Everything after this - including an authorization that
+        // is refused - happens inside a transaction the CSMS already knows about.
+        TxStartPoint::EVConnected => {
+            previous_state == ConnectorState::Connected && new_state == ConnectorState::Locked
+        }
+        // OCPP's default: an identifier was accepted. Reached from `Authorizing` (a card was
+        // presented) or straight from `Locked` (a CSMS `RequestStartTransaction`).
+        TxStartPoint::Authorized => {
+            matches!(
+                previous_state,
+                ConnectorState::Authorizing | ConnectorState::Locked
+            ) && new_state == ConnectorState::Starting
+        }
+        // The contactor closed, so energy can flow.
+        TxStartPoint::PowerPathClosed => {
+            previous_state == ConnectorState::Starting && new_state == ConnectorState::Charging
+        }
+    }
+}
+
+/// Whether moving from `previous_state` to `new_state` is the moment `tx_stop_point` names
+/// (CV2.2).
+///
+/// The counterpart of [`starts_transaction`], and checked the same way - exclusively, one
+/// transition per point. Which transitions those are is what makes each point real:
+///
+/// - **`Authorized`** - entering a stop. This crate's stop path is driven by an explicit
+///   [`ConnectorEvent::ChargingStopped`] (or a `Reset`, or E05's revocation), and *that event
+///   arriving* is the authorization for this session ending; there is no separate "the driver's
+///   permission lapsed" signal to observe.
+/// - **`PowerPathClosed`** - the contactor confirmed open. Both stopping states settle here, and
+///   this is what this crate did unconditionally before `TxStopPoint` was honoured.
+/// - **`EVConnected`** - the cable left the connector, which is the connector returning to
+///   `Available` from `Connected`. The transaction therefore survives the whole unlock, which is
+///   the point: it is billing for the bay being occupied.
+fn ends_transaction(
+    previous_state: ConnectorState,
+    new_state: ConnectorState,
+    tx_stop_point: TxStopPoint,
+) -> bool {
+    match tx_stop_point {
+        TxStopPoint::Authorized => {
+            matches!(
+                previous_state,
+                ConnectorState::Starting
+                    | ConnectorState::Charging
+                    | ConnectorState::SuspendedEv
+                    | ConnectorState::SuspendedEvse
+            ) && matches!(
+                new_state,
+                ConnectorState::Stopping | ConnectorState::StoppingLocked
+            )
+        }
+        TxStopPoint::PowerPathClosed => {
+            (previous_state == ConnectorState::Stopping && new_state == ConnectorState::Finishing)
+                || (previous_state == ConnectorState::StoppingLocked
+                    && new_state == ConnectorState::Locked)
+        }
+        TxStopPoint::EVConnected => {
+            previous_state == ConnectorState::Connected && new_state == ConnectorState::Available
+        }
+    }
+}
+
+/// The charging state a transaction should report when it begins at `state`.
+fn charging_state_for(state: ConnectorState) -> TransactionChargingState {
+    match state {
+        ConnectorState::Charging => TransactionChargingState::Charging,
+        ConnectorState::SuspendedEv => TransactionChargingState::SuspendedEV,
+        ConnectorState::SuspendedEvse => TransactionChargingState::SuspendedEVSE,
+        _ => TransactionChargingState::EvConnected,
+    }
+}
+
 fn advance_transaction(
     slot: &mut Option<Transaction>,
     next_transaction_id: &mut u64,
     previous_state: ConnectorState,
     new_state: ConnectorState,
     event_stop_reason: Option<StopReason>,
-    event_id_token: Option<IdToken>,
+    origin: TransactionOrigin,
+    points: TransactionPoints,
 ) -> Option<(TransactionEventKind, Transaction)> {
+    let TransactionPoints {
+        tx_start_point,
+        tx_stop_point,
+    } = points;
+    // CV2.2: which transition begins a transaction is `TxCtrlr.TxStartPoint`, not a constant.
+    // Checked before the arms below because with an earlier start point the *same* transitions
+    // that used to begin one now merely update one that already exists.
+    if slot.is_none() && starts_transaction(previous_state, new_state, tx_start_point) {
+        let id = TransactionId(*next_transaction_id);
+        *next_transaction_id += 1;
+        let transaction = Transaction {
+            id,
+            id_token: origin.id_token,
+            charging_state: charging_state_for(new_state),
+            stop_reason: None,
+            seq_no: 0,
+            last_meter_sample: None,
+            priority_charging: false,
+            remote_start_id: origin.remote_start_id,
+            reservation_id: origin.reservation_id,
+            stop_at_energy_wh: None,
+        };
+        *slot = Some(transaction.clone());
+        return Some((TransactionEventKind::Started, transaction));
+    }
+    // Recorded the moment the stop begins, whatever `tx_stop_point` says: with a later stop point
+    // the transaction outlives this transition, and by the time it does end the event that caused
+    // the stop is gone. This is why `stoppedReason` survives an `EVConnected` stop point at all.
+    if matches!(
+        previous_state,
+        ConnectorState::Starting
+            | ConnectorState::Charging
+            | ConnectorState::SuspendedEv
+            | ConnectorState::SuspendedEvse
+    ) && matches!(
+        new_state,
+        ConnectorState::Stopping | ConnectorState::StoppingLocked
+    ) && let Some(transaction) = slot.as_mut()
+    {
+        transaction.stop_reason = event_stop_reason;
+    }
+    // CV2.2: which transition ends a transaction is `TxCtrlr.TxStopPoint`. Checked before the
+    // arms below for the same reason `starts_transaction` is: with an earlier stop point, a
+    // transition that used to merely update the transaction is now the one that closes it.
+    if ends_transaction(previous_state, new_state, tx_stop_point) {
+        let mut transaction = slot.take()?;
+        // The bay is only free once the cable is out; every earlier stop point leaves it in.
+        transaction.charging_state = if new_state == ConnectorState::Available {
+            TransactionChargingState::Idle
+        } else {
+            TransactionChargingState::EvConnected
+        };
+        transaction.seq_no += 1;
+        return Some((TransactionEventKind::Ended, transaction));
+    }
     match (previous_state, new_state) {
         // Reached from `Authorizing` (a physically presented id token was authorized) or
         // directly from `Locked` (a CSMS-initiated `RequestStartTransaction` - see
         // `docs/ROADMAP.md` §6) - either way, entering `Starting` from elsewhere always begins a
         // new transaction. Excludes `Starting` -> `Starting` (e.g. a meter sample applied while
         // still `Starting`, which doesn't change connector state) - that must stay a no-op.
-        (ConnectorState::Authorizing | ConnectorState::Locked, ConnectorState::Starting) => {
-            let id = TransactionId(*next_transaction_id);
-            *next_transaction_id += 1;
-            let transaction = Transaction {
-                id,
-                id_token: event_id_token,
-                charging_state: TransactionChargingState::EvConnected,
-                stop_reason: None,
-                seq_no: 0,
-                last_meter_sample: None,
-                // A grant belongs to the transaction that was granted it: a new session starts
-                // without one, whatever the previous session on this connector held.
-                priority_charging: false,
-            };
-            *slot = Some(transaction.clone());
-            Some((TransactionEventKind::Started, transaction))
-        }
+
         // Every move between "energy is flowing" and "energy is paused, by one side or the
         // other" is a charging-state change on the same running transaction - which is how 2.x
         // expresses suspension at all (its connector status has no `SuspendedEV`; 1.6J's does,
@@ -1365,26 +2432,9 @@ fn advance_transaction(
                 transaction.clone(),
             ))
         }
-        // Normally reached only from `Charging` (`ChargingStopped`). A CSMS-initiated `Reset`
-        // (Immediate) can also interrupt a transaction that's still `Starting` (contactor not
-        // yet confirmed closed) - see `ConnectorEvent::ResetRequested`.
-        (
-            ConnectorState::Charging
-            | ConnectorState::SuspendedEv
-            | ConnectorState::SuspendedEvse
-            | ConnectorState::Starting,
-            ConnectorState::Stopping,
-        ) => {
-            let transaction = slot.as_mut()?;
-            transaction.stop_reason = event_stop_reason;
-            None
-        }
-        (ConnectorState::Stopping, ConnectorState::Finishing) => {
-            let mut transaction = slot.take()?;
-            transaction.charging_state = TransactionChargingState::EvConnected;
-            transaction.seq_no += 1;
-            Some((TransactionEventKind::Ended, transaction))
-        }
+        // A fault ends the transaction whatever `TxStopPoint` says: the charge point can no longer
+        // observe the conditions a later stop point is waiting for, so honouring one here would
+        // leave the transaction open on a connector that is out of service.
         (_, ConnectorState::Faulted) => {
             let mut transaction = slot.take()?;
             transaction.stop_reason = Some(StopReason::EmergencyStop);
@@ -1605,7 +2655,10 @@ mod tests {
 
         let effects = apply_connector_event(
             &mut state,
-            ConnectorEvent::RemoteStartRequested(test_id_token()),
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
         );
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
@@ -1628,6 +2681,9 @@ mod tests {
             seq_no: 0,
             last_meter_sample: None,
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -1639,6 +2695,7 @@ mod tests {
                 connector_id: 0,
                 kind: TransactionEventKind::Started,
                 transaction: expected_transaction,
+                offline: false,
             }
         )));
     }
@@ -1649,7 +2706,10 @@ mod tests {
 
         let effects = apply_connector_event(
             &mut state,
-            ConnectorEvent::RemoteStartRequested(test_id_token()),
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
         );
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
@@ -1733,8 +2793,11 @@ mod tests {
         )));
     }
 
+    /// **E03, "Start Transaction - IdToken First"** (CV2.3): a card presented before the cable
+    /// still asks the CSMS. The connector has nowhere to move to - there is nothing plugged in -
+    /// so the presentation itself, not a state change, is what raises the request.
     #[test]
-    fn an_id_token_presented_while_not_locked_is_ignored() {
+    fn an_id_token_presented_before_the_cable_still_asks_the_csms() {
         let mut state = ChargePointState::new([1]);
 
         let effects = apply_connector_event(
@@ -1743,7 +2806,120 @@ mod tests {
         );
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
-        assert!(effects.is_empty());
+        assert!(effects.contains(&ChargePointEffect::AuthorizationRequested(
+            AuthorizationRequested {
+                evse_id: 0,
+                connector_id: 0,
+                id_token: test_id_token(),
+                contract: None,
+            }
+        )));
+        assert!(
+            state.evses[0].pending_remote_starts[0].is_none(),
+            "nothing is held until the CSMS actually accepts it"
+        );
+    }
+
+    /// The other half of E03: the acceptance is held against the connector and dispatched by the
+    /// very same latch a held remote start is, so the transaction that results gets identical
+    /// bookkeeping to one started the ordinary way round.
+    #[test]
+    fn an_accepted_card_presented_before_the_cable_is_held_until_the_driver_plugs_in() {
+        let mut state = ChargePointState::new([1]);
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        assert_eq!(
+            state.evses[0].pending_remote_starts[0]
+                .as_ref()
+                .map(|pending| pending.id_token.clone()),
+            Some(test_id_token())
+        );
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
+        let transaction = state.evses[0].transactions[0]
+            .as_ref()
+            .expect("the cable arriving dispatches the held authorization");
+        assert_eq!(transaction.id_token, Some(test_id_token()));
+        assert_eq!(
+            transaction.remote_start_id, None,
+            "a locally presented card is not a remote start"
+        );
+        assert!(state.evses[0].pending_remote_starts[0].is_none());
+    }
+
+    /// A refusal must leave nothing behind: an identifier the CSMS rejected cannot become a live
+    /// authorization for whoever plugs in next.
+    #[test]
+    fn a_refused_card_presented_before_the_cable_holds_nothing() {
+        let mut state = ChargePointState::new([1]);
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::AuthorizationDenied);
+
+        assert!(state.evses[0].pending_remote_starts[0].is_none());
+    }
+
+    /// The hold has to survive the traffic an idle connector actually produces. Hardware pushes
+    /// meter readings whether or not anything is charging (see `EvseState::latest_meter_samples`),
+    /// and each of those used to find the connector `Available` and drop whatever was held - which
+    /// broke F02's held remote start just as thoroughly as E03's held card.
+    #[test]
+    fn a_held_authorization_survives_meter_samples_from_an_idle_connector() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample(10)));
+
+        assert!(state.evses[0].pending_remote_starts[0].is_some());
+    }
+
+    /// **E03.FR.15**: the driver never plugged in, so the sweep drops the hold - and the next
+    /// driver to plug into that connector gets nothing from it. This is the state-machine half;
+    /// the timing lives in `crate::remote_control::run_pending_remote_start_timeouts`.
+    #[test]
+    fn a_held_card_that_times_out_leaves_no_authorization_behind() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::RemoteStartPendingCleared);
+
+        assert!(state.evses[0].pending_remote_starts[0].is_none());
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        assert_eq!(
+            state.evses[0].connectors[0],
+            ConnectorState::Locked,
+            "a deauthorized hold must not start a session for the next driver"
+        );
+        assert!(state.evses[0].transactions[0].is_none());
     }
 
     #[test]
@@ -1780,6 +2956,9 @@ mod tests {
             seq_no: 0,
             last_meter_sample: None,
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -1791,6 +2970,7 @@ mod tests {
                 connector_id: 0,
                 kind: TransactionEventKind::Started,
                 transaction: expected_transaction,
+                offline: false,
             }
         )));
     }
@@ -1814,6 +2994,9 @@ mod tests {
             seq_no: 1,
             last_meter_sample: None,
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -1825,6 +3008,7 @@ mod tests {
                 connector_id: 0,
                 kind: TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged),
                 transaction: expected_transaction,
+                offline: false,
             }
         )));
     }
@@ -1853,6 +3037,9 @@ mod tests {
             seq_no: 2,
             last_meter_sample: Some(sample),
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -1866,6 +3053,7 @@ mod tests {
                 connector_id: 0,
                 kind: TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic),
                 transaction: expected_transaction,
+                offline: false,
             }
         )));
     }
@@ -1989,6 +3177,9 @@ mod tests {
             seq_no: 2,
             last_meter_sample: None,
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         };
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
         assert_eq!(state.evses[0].transactions[0], None);
@@ -1998,6 +3189,7 @@ mod tests {
                 connector_id: 0,
                 kind: TransactionEventKind::Ended,
                 transaction: expected_transaction,
+                offline: false,
             }
         )));
     }
@@ -2022,6 +3214,9 @@ mod tests {
             seq_no: 2,
             last_meter_sample: None,
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         };
         assert_eq!(state.evses[0].transactions[0], None);
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
@@ -2030,6 +3225,7 @@ mod tests {
                 connector_id: 0,
                 kind: TransactionEventKind::Ended,
                 transaction: expected_transaction,
+                offline: false,
             }
         )));
     }
@@ -2192,6 +3388,925 @@ mod tests {
             id_token: test_id_token(),
             expires_at: None,
         }
+    }
+
+    /// CV7: holding a request is a published state change in its own right - it arrives on an
+    /// idle connector and moves nothing, so without saying so the actor would never publish it.
+    #[test]
+    fn recording_a_held_remote_start_is_itself_a_state_change() {
+        let mut state = ChargePointState::new([1]);
+        state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::Connector {
+                connector_id: 0,
+                event: ConnectorEvent::RemoteStartPending(crate::state::PendingRemoteStart {
+                    id_token: test_id_token(),
+                    remote_start_id: Some(1),
+                }),
+            },
+        });
+        assert!(state.evses[0].pending_remote_starts[0].is_some());
+    }
+
+    // --- CV2.2: TxCtrlr.TxStartPoint ---
+
+    fn set_string(state: &mut ChargePointState, component: &str, variable: &str, value: &str) {
+        state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::AttributeValueSet {
+                component: Component {
+                    name: component.into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: variable.into(),
+                    instance: None,
+                },
+                attribute_type: crate::state::VariableAttributeType::Actual,
+                value: value.into(),
+            },
+        ));
+    }
+
+    /// The default, unchanged: the transaction begins when the identifier is accepted.
+    #[test]
+    fn a_transaction_starts_at_authorization_by_default() {
+        let mut state = ChargePointState::new([1]);
+
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        assert!(
+            state.evses[0].transactions[0].is_none(),
+            "a latched cable is not yet a transaction under the default start point"
+        );
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+
+        assert!(state.evses[0].transactions[0].is_some());
+    }
+
+    /// `EVConnected`: the transaction covers the whole time the bay is occupied, so it exists
+    /// *before* anyone has been authorized - which is the point of the setting, and exactly what
+    /// a CSMS asking for it expects to see.
+    #[test]
+    fn ev_connected_starts_the_transaction_when_the_cable_latches() {
+        let mut state = ChargePointState::new([1]);
+        set_string(&mut state, "TxCtrlr", "TxStartPoint", "EVConnected");
+
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+        assert!(
+            state.evses[0].transactions[0].is_some(),
+            "EVConnected starts the transaction at the latch, before any authorization"
+        );
+        // And authorizing afterwards must not start a *second* one.
+        let id = state.evses[0].transactions[0].as_ref().unwrap().id;
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        assert_eq!(state.evses[0].transactions[0].as_ref().unwrap().id, id);
+    }
+
+    /// `PowerPathClosed`: nothing exists until the contactor closes, so a session that is
+    /// authorized but never energised produces no transaction at all.
+    #[test]
+    fn power_path_closed_starts_the_transaction_only_when_the_contactor_closes() {
+        let mut state = ChargePointState::new([1]);
+        set_string(&mut state, "TxCtrlr", "TxStartPoint", "PowerPathClosed");
+
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        assert!(
+            state.evses[0].transactions[0].is_none(),
+            "authorized is not energised"
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        let transaction = state.evses[0].transactions[0]
+            .as_ref()
+            .expect("the contactor closing starts it");
+        assert_eq!(
+            transaction.charging_state,
+            crate::state::TransactionChargingState::Charging,
+            "a transaction that begins at the contactor begins already charging"
+        );
+    }
+
+    /// OCPP models the start point as a set that must *all* hold, and the three points this
+    /// crate observes are strictly ordered along a session - so a set resolves to its latest
+    /// member.
+    #[test]
+    fn a_set_of_start_points_resolves_to_the_latest_of_them() {
+        let mut state = ChargePointState::new([1]);
+        set_string(
+            &mut state,
+            "TxCtrlr",
+            "TxStartPoint",
+            "EVConnected,Authorized",
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        assert!(
+            state.evses[0].transactions[0].is_none(),
+            "EVConnected alone does not satisfy a set that also names Authorized"
+        );
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        assert!(state.evses[0].transactions[0].is_some());
+    }
+
+    // --- CV2.2: TxCtrlr.TxStopPoint ---
+
+    /// The transaction that `charging_connector` started, or `None` if it has ended.
+    fn transaction(state: &ChargePointState) -> Option<&crate::state::Transaction> {
+        state.evses[0].transactions[0].as_ref()
+    }
+
+    /// The default, and what this crate did before `TxStopPoint` was honoured: the transaction
+    /// ends when the contactor confirms open, not when the stop is asked for.
+    #[test]
+    fn a_transaction_ends_when_the_power_path_opens_by_default() {
+        let mut state = ChargePointState::new([1]);
+        charging_connector(&mut state);
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        assert!(
+            transaction(&state).is_some(),
+            "asking to stop is not the default stop point"
+        );
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+
+        assert!(transaction(&state).is_none());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ChargePointEffect::TransactionEvent(occurred)
+                if occurred.kind == TransactionEventKind::Ended
+        )));
+    }
+
+    /// `Authorized`: the earliest of the three. The stop request itself is the authorization
+    /// ending, so the transaction closes before the contactor has even confirmed open - and the
+    /// `stoppedReason` the request carried still reaches the CSMS.
+    #[test]
+    fn authorized_ends_the_transaction_the_moment_the_stop_is_requested() {
+        let mut state = ChargePointState::new([1]);
+        set_string(&mut state, "TxCtrlr", "TxStopPoint", "Authorized");
+        charging_connector(&mut state);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Remote),
+        );
+
+        assert!(transaction(&state).is_none());
+        let ended = effects
+            .iter()
+            .find_map(|effect| match effect {
+                ChargePointEffect::TransactionEvent(occurred)
+                    if occurred.kind == TransactionEventKind::Ended =>
+                {
+                    Some(&occurred.transaction)
+                }
+                _ => None,
+            })
+            .expect("the stop request ends it under this stop point");
+        assert_eq!(ended.stop_reason, Some(StopReason::Remote));
+
+        // And the contactor confirming open afterwards must not end a second time.
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_))),
+            "the transaction already ended; settling must not report it twice"
+        );
+    }
+
+    /// `EVConnected`: the transaction bills for the bay being occupied, so it survives the whole
+    /// stop - contactor, unlock and all - and ends only when the cable actually leaves.
+    #[test]
+    fn ev_connected_keeps_the_transaction_open_until_the_cable_leaves() {
+        let mut state = ChargePointState::new([1]);
+        set_string(&mut state, "TxCtrlr", "TxStopPoint", "EVConnected");
+        charging_connector(&mut state);
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Connected);
+        assert!(
+            transaction(&state).is_some(),
+            "an unlocked but still-plugged connector is still occupied"
+        );
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+
+        assert!(transaction(&state).is_none());
+        let ended = effects
+            .iter()
+            .find_map(|effect| match effect {
+                ChargePointEffect::TransactionEvent(occurred)
+                    if occurred.kind == TransactionEventKind::Ended =>
+                {
+                    Some(&occurred.transaction)
+                }
+                _ => None,
+            })
+            .expect("the cable leaving ends it under this stop point");
+        assert_eq!(
+            ended.charging_state,
+            crate::state::TransactionChargingState::Idle,
+            "the bay is free, which is more than EVConnected"
+        );
+        assert_eq!(
+            ended.stop_reason,
+            Some(StopReason::Local),
+            "the reason recorded when the stop began must outlive it"
+        );
+    }
+
+    /// A stop point is a condition that *ceases* to hold, so a configured set resolves to its
+    /// **earliest** member - the opposite of `TxStartPoint`, and the one thing about this
+    /// variable worth getting wrong quietly.
+    #[test]
+    fn a_set_of_stop_points_resolves_to_the_earliest_of_them() {
+        let mut state = ChargePointState::new([1]);
+        set_string(
+            &mut state,
+            "TxCtrlr",
+            "TxStopPoint",
+            "EVConnected,Authorized",
+        );
+        charging_connector(&mut state);
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+
+        assert!(
+            transaction(&state).is_none(),
+            "Authorized is the earliest member and must win"
+        );
+    }
+
+    /// A fault ends the transaction whatever the stop point says: the connector is out of
+    /// service, so nothing will ever observe a later condition lapsing.
+    #[test]
+    fn a_fault_ends_the_transaction_whatever_the_stop_point_is() {
+        for stop_point in ["Authorized", "PowerPathClosed", "EVConnected"] {
+            let mut state = ChargePointState::new([1]);
+            set_string(&mut state, "TxCtrlr", "TxStopPoint", stop_point);
+            charging_connector(&mut state);
+
+            apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
+
+            assert!(transaction(&state).is_none(), "{stop_point}");
+        }
+    }
+
+    /// CV1.5: the three required electrical variables are registered on every component whether
+    /// or not the integrator declared anything - OCPP marks them required, so absent is a
+    /// compliance failure while present-and-empty is an honest "this firmware was not told".
+    #[test]
+    fn the_required_electrical_variables_are_registered_even_when_nothing_is_declared() {
+        let mut state = ChargePointState::new([1]);
+
+        state.apply(ChargePointEvent::ElectricalCharacteristicsDeclared(
+            alloc::boxed::Box::default(),
+        ));
+
+        for (component, evse, variable) in [
+            ("ChargingStation", None, "SupplyPhases"),
+            ("EVSE", Some((0, None)), "SupplyPhases"),
+            ("EVSE", Some((0, None)), "Power"),
+            ("Connector", Some((0, Some(0))), "SupplyPhases"),
+            ("Connector", Some((0, Some(0))), "ConnectorType"),
+        ] {
+            let value = state
+                .device_model
+                .get(
+                    &Component {
+                        name: component.into(),
+                        instance: None,
+                        evse,
+                    },
+                    &crate::state::Variable {
+                        name: variable.into(),
+                        instance: None,
+                    },
+                )
+                .and_then(|definition| {
+                    definition.attribute(crate::state::VariableAttributeType::Actual)
+                })
+                .unwrap_or_else(|| panic!("{component}.{variable} must be registered"));
+            assert_eq!(value.value, "", "{component}.{variable}");
+            assert_eq!(value.mutability, crate::state::VariableMutability::ReadOnly);
+        }
+    }
+
+    /// A declaration reaches the wire values - including OCPP's `0` for DC, which means "no
+    /// alternating phases" rather than "no supply", and `EVSE.Power`'s required `maxLimit`
+    /// characteristic rather than a live reading this crate does not have.
+    #[test]
+    fn a_declaration_populates_the_electrical_variables_including_dc_and_the_power_limit() {
+        use crate::hardware::{
+            ConnectorElectrical, ElectricalCharacteristics, EvseElectrical, SupplyPhases,
+        };
+
+        let mut state = ChargePointState::new([1]);
+        state.apply(ChargePointEvent::ElectricalCharacteristicsDeclared(
+            alloc::boxed::Box::new(ElectricalCharacteristics {
+                supply_phases: SupplyPhases::ThreePhaseAc,
+                evses: alloc::vec![EvseElectrical {
+                    supply_phases: SupplyPhases::Dc,
+                    max_power_w: Some(150_000.0),
+                    max_discharge_power_w: None,
+                    connectors: alloc::vec![ConnectorElectrical {
+                        connector_type: "cCCS2".into(),
+                        supply_phases: SupplyPhases::Dc,
+                    }],
+                }],
+            }),
+        ));
+
+        let read = |component: &str, evse, variable: &str| {
+            state
+                .device_model
+                .get(
+                    &Component {
+                        name: component.into(),
+                        instance: None,
+                        evse,
+                    },
+                    &crate::state::Variable {
+                        name: variable.into(),
+                        instance: None,
+                    },
+                )
+                .cloned()
+                .expect("registered")
+        };
+
+        assert_eq!(
+            read("ChargingStation", None, "SupplyPhases")
+                .attribute(crate::state::VariableAttributeType::Actual)
+                .unwrap()
+                .value,
+            "3"
+        );
+        assert_eq!(
+            read("EVSE", Some((0, None)), "SupplyPhases")
+                .attribute(crate::state::VariableAttributeType::Actual)
+                .unwrap()
+                .value,
+            "0",
+            "DC is OCPP's 0, not an absent value"
+        );
+        assert_eq!(
+            read("EVSE", Some((0, None)), "Power")
+                .characteristics
+                .max_limit,
+            Some(150_000.0),
+            "the appendix requires the limit, not the reading"
+        );
+        assert_eq!(
+            read("Connector", Some((0, Some(0))), "ConnectorType")
+                .attribute(crate::state::VariableAttributeType::Actual)
+                .unwrap()
+                .value,
+            "cCCS2"
+        );
+    }
+
+    /// `EVSE.DischargePower` is `Required? = V2X` in the appendix - required of a station that can
+    /// discharge, absent from one that cannot. So it follows the capability rather than being
+    /// registered unconditionally: advertising a discharge figure on a charge-only station would
+    /// claim hardware that is not there.
+    #[test]
+    fn discharge_power_is_registered_only_on_a_station_that_can_discharge() {
+        use crate::hardware::{Capabilities, ElectricalCharacteristics, EvseElectrical};
+
+        let discharge_power = |state: &ChargePointState| {
+            state
+                .device_model
+                .get(
+                    &Component {
+                        name: "EVSE".into(),
+                        instance: None,
+                        evse: Some((0, None)),
+                    },
+                    &crate::state::Variable {
+                        name: "DischargePower".into(),
+                        instance: None,
+                    },
+                )
+                .cloned()
+        };
+
+        let mut charge_only = ChargePointState::new([1]);
+        charge_only.apply(ChargePointEvent::ElectricalCharacteristicsDeclared(
+            alloc::boxed::Box::default(),
+        ));
+        assert!(
+            discharge_power(&charge_only).is_none(),
+            "a charge-only station must not advertise a discharge figure"
+        );
+
+        let mut bidirectional = ChargePointState::new([1]);
+        bidirectional.apply(ChargePointEvent::CapabilitiesDeclared(Capabilities {
+            supports_bidirectional_power: true,
+            ..Default::default()
+        }));
+        bidirectional.apply(ChargePointEvent::ElectricalCharacteristicsDeclared(
+            alloc::boxed::Box::new(ElectricalCharacteristics {
+                evses: alloc::vec![EvseElectrical {
+                    max_discharge_power_w: Some(11_000.0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        ));
+
+        assert_eq!(
+            discharge_power(&bidirectional)
+                .expect("a V2X station owes this variable")
+                .characteristics
+                .max_limit,
+            Some(11_000.0),
+            "the nameplate figure is the limit, like EVSE.Power's"
+        );
+    }
+
+    // --- CV2.5: E05, an identifier revoked mid-session ---
+
+    /// The default: the CSMS refuses the identifier and energy stops at once. Anything else would
+    /// be handing out energy nobody will be billed for.
+    #[test]
+    fn a_revoked_identifier_stops_the_transaction_at_once_by_default() {
+        let mut state = ChargePointState::new([1]);
+        charging_connector(&mut state);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::AuthorizationRevoked);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Stopping);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            crate::state::HardwareCommand::OpenContactor {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+    }
+
+    /// With `StopTxOnInvalidId` off and an allowance configured, the driver gets that much more
+    /// energy and then stops - which is the point of the setting: a CSMS blocklist update should
+    /// not strand someone mid-journey.
+    #[test]
+    fn a_revoked_identifier_gets_the_configured_allowance_before_stopping() {
+        let mut state = ChargePointState::new([1]);
+        set_boolean(&mut state, "TxCtrlr", "StopTxOnInvalidId", "false");
+        set_string(&mut state, "TxCtrlr", "MaxEnergyOnInvalidId", "500");
+        charging_connector(&mut state);
+        apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample(1_000)));
+
+        apply_connector_event(&mut state, ConnectorEvent::AuthorizationRevoked);
+
+        assert_eq!(
+            state.evses[0].connectors[0],
+            ConnectorState::Charging,
+            "the allowance means charging continues for now"
+        );
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.stop_at_energy_wh),
+            Some(1_500),
+            "an absolute target, so a dropped or duplicated sample cannot change the allowance"
+        );
+
+        // Still inside the allowance.
+        apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample(1_400)));
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+
+        // And now it is spent.
+        apply_connector_event(&mut state, ConnectorEvent::MeterValueSampled(sample(1_500)));
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Stopping);
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.stop_reason),
+            Some(crate::state::StopReason::DeAuthorized)
+        );
+    }
+
+    /// `StopTxOnInvalidId` off but no allowance configured is not "charge forever" - there is
+    /// nothing to grant, so it stops like the default.
+    #[test]
+    fn a_revoked_identifier_with_no_allowance_configured_still_stops() {
+        let mut state = ChargePointState::new([1]);
+        set_boolean(&mut state, "TxCtrlr", "StopTxOnInvalidId", "false");
+        charging_connector(&mut state);
+
+        apply_connector_event(&mut state, ConnectorEvent::AuthorizationRevoked);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Stopping);
+    }
+
+    // --- CV11: G05, Lock Failure ---
+
+    /// Connector 0's `ConnectorPlugRetentionLock`/`Problem` value.
+    fn lock_problem(state: &ChargePointState) -> Option<alloc::string::String> {
+        state
+            .device_model
+            .get(
+                &Component {
+                    name: "ConnectorPlugRetentionLock".into(),
+                    instance: None,
+                    evse: Some((0, Some(0))),
+                },
+                &crate::state::Variable {
+                    name: "Problem".into(),
+                    instance: None,
+                },
+            )
+            .and_then(|definition| {
+                definition.attribute(crate::state::VariableAttributeType::Actual)
+            })
+            .map(|attribute| attribute.value.clone())
+    }
+
+    /// **G05.FR.01/.02**: the lock will not engage, so the connector faults fail-safe *and* the
+    /// CSMS is told which lock, by name - the whole point of CV11 being distinct from a fault.
+    #[test]
+    fn a_lock_failure_faults_the_connector_and_names_the_lock() {
+        let mut state = ChargePointState::new([1]);
+        assert_eq!(lock_problem(&state).as_deref(), Some("false"));
+
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        let effects = apply_connector_event(&mut state, ConnectorEvent::LockFailed);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Faulted);
+        assert!(
+            effects.contains(&ChargePointEffect::HardwareCommand(
+                crate::state::HardwareCommand::OpenContactor {
+                    evse_id: 0,
+                    connector_id: 0,
+                }
+            )),
+            "G05.FR.01: nothing may charge through a lock that did not engage"
+        );
+        assert_eq!(lock_problem(&state).as_deref(), Some("true"));
+
+        let reported = effects
+            .iter()
+            .find_map(|effect| match effect {
+                ChargePointEffect::VariableMonitorTriggered(triggered) => Some(triggered),
+                _ => None,
+            })
+            .expect("G05.FR.02: a NotifyEvent must go out");
+        assert_eq!(
+            reported.monitor_id, None,
+            "hard-wired: nobody configured this, so MonitoringLevel must not suppress it"
+        );
+        assert_eq!(reported.component.name, "ConnectorPlugRetentionLock");
+        assert_eq!(reported.component.evse, Some((0, Some(0))));
+        assert_eq!(reported.variable.name, "Problem");
+        assert_eq!(reported.actual_value, "true");
+    }
+
+    /// An ordinary fault must stay ordinary: reporting every stuck contactor as a lock failure
+    /// would make the distinction CV11 exists for worthless.
+    #[test]
+    fn an_ordinary_fault_does_not_claim_the_lock_failed() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::FaultDetected);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Faulted);
+        assert_eq!(lock_problem(&state).as_deref(), Some("false"));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::VariableMonitorTriggered(_)))
+        );
+    }
+
+    /// The problem clears when the connector is usable again - the far side of the fail-safe
+    /// recovery, by which point the lock has demonstrably moved. Silently: a station recovering
+    /// is not news, and the value is readable by any CSMS that asks.
+    #[test]
+    fn the_lock_problem_clears_once_the_connector_recovers() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockFailed);
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        apply_connector_event(&mut state, ConnectorEvent::FaultCleared);
+        assert_eq!(
+            lock_problem(&state).as_deref(),
+            Some("true"),
+            "still unlocking; the lock has not moved yet"
+        );
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+        assert_eq!(lock_problem(&state).as_deref(), Some("false"));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::VariableMonitorTriggered(_)))
+        );
+    }
+
+    fn sample(energy_wh: i64) -> crate::state::MeterSample {
+        crate::state::MeterSample {
+            energy_wh,
+            power_w: None,
+            current_ma: None,
+            voltage_v: None,
+            soc_percent: None,
+        }
+    }
+
+    // --- CV2.4: E09 vs E10, the suspend-or-stop branch on EV-side disconnect ---
+
+    /// Drives a connector to `Charging` so the disconnect tests below start from energy flowing.
+    fn charging_connector(state: &mut ChargePointState) {
+        apply_connector_event(state, ConnectorEvent::CableConnected);
+        apply_connector_event(state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(state, ConnectorEvent::IdTokenPresented(test_id_token()));
+        apply_connector_event(state, ConnectorEvent::ChargingAuthorized(test_id_token()));
+        apply_connector_event(state, ConnectorEvent::ContactorClosed);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+    }
+
+    fn set_boolean(state: &mut ChargePointState, component: &str, variable: &str, value: &str) {
+        state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::AttributeValueSet {
+                component: Component {
+                    name: component.into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: variable.into(),
+                    instance: None,
+                },
+                attribute_type: crate::state::VariableAttributeType::Actual,
+                value: value.into(),
+            },
+        ));
+    }
+
+    /// **E09**, the default: the cable leaving the EV ends the transaction, and it ends the
+    /// fail-safe way - contactor open first, exactly as any other stop.
+    #[test]
+    fn an_ev_side_disconnect_stops_the_transaction_by_default() {
+        let mut state = ChargePointState::new([1]);
+        charging_connector(&mut state);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Stopping);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            crate::state::HardwareCommand::OpenContactor {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+    }
+
+    /// **E10**: with `StopTxOnEVSideDisconnect` off, the same physical event suspends instead.
+    /// The transaction stays open and the connector can resume - which is what a driver
+    /// reseating a connector expects, and the whole reason OCPP makes this configurable.
+    #[test]
+    fn an_ev_side_disconnect_suspends_instead_when_the_operator_configured_it_that_way() {
+        let mut state = ChargePointState::new([1]);
+        charging_connector(&mut state);
+        set_boolean(&mut state, "TxCtrlr", "StopTxOnEVSideDisconnect", "false");
+
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::SuspendedEv);
+        assert!(
+            state.evses[0].transactions[0].is_some(),
+            "E10 suspends the transaction; it must not have ended"
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::ChargingResumed);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+    }
+
+    /// **E09.FR.02**, the default: the station releases its own end too, so the driver can take
+    /// the cable away.
+    #[test]
+    fn an_ev_side_disconnect_releases_the_station_end_by_default() {
+        let mut state = ChargePointState::new([1]);
+        charging_connector(&mut state);
+
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            crate::state::HardwareCommand::UnlockConnector {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+    }
+
+    /// **E09.FR.03**: with `UnlockOnEVSideDisconnect` off the station keeps hold of the cable.
+    /// The stop is otherwise identical - contactor first - and settles to `Locked`, where the
+    /// driver's next identifier (or a CSMS `UnlockConnector`) is what releases it.
+    #[test]
+    fn an_ev_side_disconnect_keeps_the_cable_when_the_operator_configured_it_that_way() {
+        let mut state = ChargePointState::new([1]);
+        charging_connector(&mut state);
+        set_boolean(
+            &mut state,
+            "OCPPCommCtrlr",
+            "UnlockOnEVSideDisconnect",
+            "false",
+        );
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::StoppingLocked);
+        assert!(
+            effects.contains(&ChargePointEffect::HardwareCommand(
+                crate::state::HardwareCommand::OpenContactor {
+                    evse_id: 0,
+                    connector_id: 0,
+                }
+            )),
+            "the fail-safe ordering is not negotiable just because the cable stays locked"
+        );
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Locked);
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                ChargePointEffect::HardwareCommand(
+                    crate::state::HardwareCommand::UnlockConnector { .. }
+                )
+            )),
+            "E09.FR.03 is exactly the requirement not to unlock here"
+        );
+        assert!(
+            state.evses[0].transactions[0].is_none(),
+            "the transaction still ends - only the cable is retained"
+        );
+    }
+
+    /// The retained-cable stop is still a stop: whatever the unlock setting, the transaction
+    /// ends at the same point in the stop and reports the same thing. Only the cable differs.
+    #[test]
+    fn a_retained_cable_stop_reports_the_same_ended_event_an_ordinary_one_does() {
+        fn ended_transaction(retain_cable: bool) -> crate::state::Transaction {
+            let mut state = ChargePointState::new([1]);
+            charging_connector(&mut state);
+            if retain_cable {
+                set_boolean(
+                    &mut state,
+                    "OCPPCommCtrlr",
+                    "UnlockOnEVSideDisconnect",
+                    "false",
+                );
+            }
+            apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+            apply_connector_event(&mut state, ConnectorEvent::ContactorOpened)
+                .into_iter()
+                .find_map(|effect| match effect {
+                    ChargePointEffect::TransactionEvent(occurred)
+                        if occurred.kind == TransactionEventKind::Ended =>
+                    {
+                        Some(occurred.transaction)
+                    }
+                    _ => None,
+                })
+                .expect("the contactor opening ends it under the default stop point")
+        }
+
+        assert_eq!(ended_transaction(true), ended_transaction(false));
+    }
+
+    /// E10 wins over E09's unlock setting: with the transaction suspended rather than stopped
+    /// there is nothing to unlock from, and OCPP calls the other combination undefined.
+    #[test]
+    fn the_unlock_setting_does_not_apply_when_the_disconnect_only_suspends() {
+        let mut state = ChargePointState::new([1]);
+        charging_connector(&mut state);
+        set_boolean(&mut state, "TxCtrlr", "StopTxOnEVSideDisconnect", "false");
+        set_boolean(
+            &mut state,
+            "OCPPCommCtrlr",
+            "UnlockOnEVSideDisconnect",
+            "false",
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::SuspendedEv);
+    }
+
+    /// CV6: F02.FR.06/H03 - a transaction that consumes a reservation carries its id, so the CSMS
+    /// can close the reservation out against the session that used it.
+    ///
+    /// Captured *before* the transition, deliberately: entering `Starting` is what ends the
+    /// reservation, so a lookup after the fact would find nothing.
+    #[test]
+    fn a_transaction_started_on_a_reserved_connector_records_the_reservation_it_consumed() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::Reserved(reservation(9)));
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        assert!(
+            state.evses[0].transactions[0].is_some(),
+            "the transaction this test is about must actually have started"
+        );
+
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.reservation_id),
+            Some(9)
+        );
+    }
+
+    /// A transaction on a connector nobody reserved carries none.
+    #[test]
+    fn a_transaction_on_an_unreserved_connector_records_no_reservation() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        assert!(
+            state.evses[0].transactions[0].is_some(),
+            "the transaction this test is about must actually have started"
+        );
+
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.reservation_id),
+            None
+        );
     }
 
     #[test]
@@ -2771,7 +4886,10 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
         apply_connector_event(
             &mut state,
-            ConnectorEvent::RemoteStartRequested(test_id_token()),
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
         );
         let running = state.evses[0].transactions[0].as_ref().unwrap().id;
         assert!(
@@ -2825,7 +4943,10 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
         apply_connector_event(
             &mut state,
-            ConnectorEvent::RemoteStartRequested(test_id_token()),
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
         );
         let running = state.evses[0].transactions[0].as_ref().unwrap().id;
 
@@ -3069,6 +5190,9 @@ mod tests {
                 ..Default::default()
             }),
             priority_charging: false,
+            remote_start_id: None,
+            reservation_id: None,
+            stop_at_energy_wh: None,
         }
     }
 
@@ -3099,6 +5223,7 @@ mod tests {
                 connector_id: 0,
                 kind: TransactionEventKind::Ended,
                 transaction: expected,
+                offline: false,
             }
         )));
         // Closed out, not resumed - nothing is left occupying the connector's transaction slot.
@@ -3440,5 +5565,295 @@ mod tests {
                 }
             ))
         );
+    }
+
+    // --- CV1.1: AvailabilityState tracks the state machine ---
+    //
+    // (docs/OCPP-2.1-COMPLIANCE-ROADMAP.md CV1.1; B07.FR.09 is what reads these.)
+
+    fn availability_state(
+        state: &ChargePointState,
+        evse: Option<(usize, Option<usize>)>,
+    ) -> String {
+        let name = match evse {
+            None => "ChargingStation",
+            Some((_, None)) => "EVSE",
+            Some((_, Some(_))) => "Connector",
+        };
+        state
+            .device_model
+            .get(
+                &Component {
+                    name: name.into(),
+                    instance: None,
+                    evse,
+                },
+                &crate::state::Variable {
+                    name: "AvailabilityState".into(),
+                    instance: None,
+                },
+            )
+            .and_then(|definition| {
+                definition.attribute(crate::state::VariableAttributeType::Actual)
+            })
+            .map(|attribute| attribute.value.clone())
+            .unwrap_or_else(|| panic!("AvailabilityState should be registered for {evse:?}"))
+    }
+
+    #[test]
+    fn a_connectors_availability_state_follows_its_own_transitions_and_leaves_its_neighbour_alone()
+    {
+        let mut state = ChargePointState::new([2]);
+        assert_eq!(availability_state(&state, Some((0, Some(0)))), "Available");
+
+        state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::Connector {
+                connector_id: 0,
+                event: ConnectorEvent::CableConnected,
+            },
+        });
+
+        assert_eq!(availability_state(&state, Some((0, Some(0)))), "Occupied");
+        assert_eq!(
+            availability_state(&state, Some((0, Some(1)))),
+            "Available",
+            "plugging a cable into one connector says nothing about the other"
+        );
+    }
+
+    #[test]
+    fn the_charge_point_becomes_available_once_the_csms_accepts_it() {
+        let mut state = ChargePointState::new([1]);
+        assert_eq!(
+            availability_state(&state, None),
+            "Unavailable",
+            "a charge point that has not registered is not available"
+        );
+
+        state.apply(ChargePointEvent::RegistrationStatusReceived(
+            RegistrationStatus::Accepted,
+        ));
+
+        assert_eq!(availability_state(&state, None), "Available");
+    }
+
+    #[test]
+    fn a_charge_point_wide_fault_shows_as_faulted_at_every_level() {
+        let mut state = ChargePointState::new([1]);
+        state.apply(ChargePointEvent::RegistrationStatusReceived(
+            RegistrationStatus::Accepted,
+        ));
+
+        state.apply(ChargePointEvent::HardwareFault);
+
+        assert_eq!(availability_state(&state, None), "Faulted");
+        assert_eq!(availability_state(&state, Some((0, None))), "Faulted");
+        assert_eq!(availability_state(&state, Some((0, Some(0)))), "Faulted");
+    }
+
+    #[test]
+    fn an_evse_made_unavailable_reports_unavailable_without_touching_its_sibling() {
+        let mut state = ChargePointState::new([1, 1]);
+        state.apply(ChargePointEvent::RegistrationStatusReceived(
+            RegistrationStatus::Accepted,
+        ));
+
+        state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::SetUnavailable,
+        });
+
+        assert_eq!(availability_state(&state, Some((0, None))), "Unavailable");
+        assert_eq!(availability_state(&state, Some((1, None))), "Available");
+        assert_eq!(
+            availability_state(&state, None),
+            "Available",
+            "one EVSE going out of service does not take the charge point with it"
+        );
+    }
+
+    /// CV1.2: `ClockCtrlr.DateTime` is empty until the charge point has been told the time, then
+    /// tracks every sync. Empty rather than a plausible-but-wrong timestamp - see the variable's
+    /// own docs.
+    #[test]
+    fn the_clocks_date_time_variable_starts_empty_and_follows_every_time_sync() {
+        use crate::clock::MonotonicInstant;
+
+        let mut state = ChargePointState::new([1]);
+        let date_time = |state: &ChargePointState| {
+            state
+                .device_model
+                .get(
+                    &Component {
+                        name: "ClockCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    &crate::state::Variable {
+                        name: "DateTime".into(),
+                        instance: None,
+                    },
+                )
+                .and_then(|definition| {
+                    definition.attribute(crate::state::VariableAttributeType::Actual)
+                })
+                .map(|attribute| attribute.value.clone())
+                .expect("ClockCtrlr.DateTime is registered")
+        };
+
+        assert_eq!(date_time(&state), "");
+
+        let first = "2026-08-11T09:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        state.apply(ChargePointEvent::TimeSynced {
+            csms_time: first,
+            recorded_at: MonotonicInstant::from_ticks(0),
+        });
+        assert_eq!(date_time(&state), first.to_rfc3339());
+
+        // A later heartbeat moves it on, so a `GetVariables` never reports a sync that has since
+        // been superseded.
+        let second = "2026-08-11T09:31:00Z".parse::<DateTime<Utc>>().unwrap();
+        state.apply(ChargePointEvent::TimeSynced {
+            csms_time: second,
+            recorded_at: MonotonicInstant::from_ticks(60_000_000_000),
+        });
+        assert_eq!(date_time(&state), second.to_rfc3339());
+    }
+
+    /// CV1.3: every occupied configuration slot appears as its own `NetworkConfiguration`
+    /// component instance, carrying the nine variables the 2.1 appendix marks required.
+    #[test]
+    fn each_network_configuration_slot_is_mirrored_into_the_device_model() {
+        use crate::state::{NetworkConnectionProfile, NetworkInterface, NetworkTransport};
+
+        let mut state = ChargePointState::new([1]);
+        let read = |state: &ChargePointState, slot: &str, name: &str| -> Option<String> {
+            state
+                .device_model
+                .get(
+                    &Component {
+                        name: "NetworkConfiguration".into(),
+                        instance: Some(slot.into()),
+                        evse: None,
+                    },
+                    &crate::state::Variable {
+                        name: name.into(),
+                        instance: None,
+                    },
+                )
+                .and_then(|definition| {
+                    definition.attribute(crate::state::VariableAttributeType::Actual)
+                })
+                .map(|attribute| attribute.value.clone())
+        };
+
+        state.apply(ChargePointEvent::NetworkProfileSet {
+            slot: 1,
+            profile: alloc::boxed::Box::new(NetworkConnectionProfile {
+                csms_url: "wss://csms.example/ocpp".into(),
+                interface: NetworkInterface::Wireless(0),
+                transport: NetworkTransport::Json,
+                security_profile: 3,
+                message_timeout_secs: 45,
+                identity: None,
+            }),
+        });
+
+        assert_eq!(
+            read(&state, "1", "OcppCsmsUrl").as_deref(),
+            Some("wss://csms.example/ocpp")
+        );
+        assert_eq!(
+            read(&state, "1", "OcppInterface").as_deref(),
+            Some("Wireless0")
+        );
+        assert_eq!(read(&state, "1", "OcppTransport").as_deref(), Some("JSON"));
+        assert_eq!(read(&state, "1", "MessageTimeout").as_deref(), Some("45"));
+        assert_eq!(read(&state, "1", "SecurityProfile").as_deref(), Some("3"));
+        assert_eq!(read(&state, "1", "VpnEnabled").as_deref(), Some("false"));
+        assert_eq!(read(&state, "1", "ApnEnabled").as_deref(), Some("false"));
+        // Required and registered, but never readable - see the registration's docs (A01.FR.12).
+        assert!(
+            state
+                .device_model
+                .get(
+                    &Component {
+                        name: "NetworkConfiguration".into(),
+                        instance: Some("1".into()),
+                        evse: None,
+                    },
+                    &crate::state::Variable {
+                        name: "BasicAuthPassword".into(),
+                        instance: None,
+                    },
+                )
+                .and_then(
+                    |definition| definition.attribute(crate::state::VariableAttributeType::Actual)
+                )
+                .is_some_and(
+                    |attribute| attribute.mutability == crate::state::VariableMutability::WriteOnly
+                )
+        );
+
+        // A slot nobody wrote has no component at all.
+        assert_eq!(read(&state, "2", "OcppCsmsUrl"), None);
+    }
+
+    /// Vacating a slot takes its component with it: a CSMS URL the charge point no longer holds
+    /// must stop being reported, not linger as though it were current.
+    #[test]
+    fn clearing_a_network_configuration_slot_removes_its_component() {
+        use crate::state::{NetworkConnectionProfile, NetworkInterface, NetworkTransport};
+
+        let mut state = ChargePointState::new([1]);
+        let profile = NetworkConnectionProfile {
+            csms_url: "wss://csms.example/ocpp".into(),
+            interface: NetworkInterface::Any,
+            transport: NetworkTransport::Json,
+            security_profile: 2,
+            message_timeout_secs: 30,
+            identity: None,
+        };
+        state.apply(ChargePointEvent::NetworkProfileSet {
+            slot: 1,
+            profile: alloc::boxed::Box::new(profile.clone()),
+        });
+        let component = Component {
+            name: "NetworkConfiguration".into(),
+            instance: Some("1".into()),
+            evse: None,
+        };
+        assert!(state.device_model.has_component(&component));
+
+        state.apply(ChargePointEvent::PersistedNetworkProfilesRestored {
+            slots: alloc::vec![],
+        });
+
+        assert!(
+            !state.device_model.has_component(&component),
+            "a vacated slot leaves nothing behind"
+        );
+    }
+
+    #[test]
+    fn an_evse_rolls_up_the_busiest_of_its_connectors() {
+        let mut state = ChargePointState::new([2]);
+        state.apply(ChargePointEvent::RegistrationStatusReceived(
+            RegistrationStatus::Accepted,
+        ));
+        assert_eq!(availability_state(&state, Some((0, None))), "Available");
+
+        state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::Connector {
+                connector_id: 1,
+                event: ConnectorEvent::CableConnected,
+            },
+        });
+
+        // OCPP has no "half occupied": an EVSE with a cable in one of its connectors is the
+        // EVSE a driver cannot walk up to and use.
+        assert_eq!(availability_state(&state, Some((0, None))), "Occupied");
     }
 }
