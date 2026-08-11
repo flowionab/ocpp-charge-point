@@ -38,6 +38,23 @@ pub struct EvseState {
     /// connector must never inherit a previous driver's tariff. See `docs/ROADMAP.md` §9 and
     /// `docs/PRODUCTION-ROADMAP.md` B7.1.
     pub transaction_tariffs: Vec<Option<Tariff>>,
+    /// This connector's own running-cost calculation, indexed the same as `connectors` (CV8,
+    /// I07/I08/I11/I12) - what [`crate::pricing::TransactionCost`] has priced from the meter
+    /// samples this connector's active transaction has seen, using whichever tariff currently
+    /// prices it (the driver tariff in [`Self::transaction_tariffs`] if one is assigned,
+    /// otherwise the applicable entry from [`crate::state::TariffStore`]). `None` when nothing
+    /// has priced this transaction yet - no tariff has ever applied to it - and cleared on the
+    /// same Started/Ended boundary [`Self::running_costs`] and [`Self::transaction_tariffs`]
+    /// are, for the same reason: a new session on this connector must start unpriced, not
+    /// inherit a total from whoever charged here last.
+    ///
+    /// Distinct from [`Self::running_costs`]: that field is what the CSMS *told* this station
+    /// (`CostUpdated`); this is what the station worked out for itself. Advanced by
+    /// `crate::tariff::advance_running_cost`, which needs a [`crate::clock::Clock`] the state
+    /// machine deliberately does not have (see `crate::clock`'s docs), so - unlike most state -
+    /// this field is never written from inside [`crate::state::ChargePointState::apply`] itself
+    /// on a raw hardware event; it only ever receives the value an adapter already computed.
+    pub running_cost: Vec<Option<crate::pricing::TransactionCost>>,
     /// The most recent meter reading each connector's hardware pushed in, indexed the same as
     /// `connectors` - recorded whether or not a transaction is running on it, unlike
     /// [`Transaction::last_meter_sample`](crate::state::Transaction::last_meter_sample), which is
@@ -120,6 +137,7 @@ impl EvseState {
             reservations: vec![None; connector_count],
             running_costs: vec![None; connector_count],
             transaction_tariffs: vec![None; connector_count],
+            running_cost: vec![None; connector_count],
             latest_meter_samples: vec![None; connector_count],
             charging_limits: vec![None; connector_count],
             honoured_reservations: vec![None; connector_count],

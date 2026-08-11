@@ -1510,6 +1510,10 @@ impl ChargePointState {
             ConnectorEvent::TariffAssigned(tariff) => Some((**tariff).clone()),
             _ => None,
         };
+        let running_cost_update = match &event {
+            ConnectorEvent::RunningCostAdvanced(cost) => Some((**cost).clone()),
+            _ => None,
+        };
         let computed_limit = match &event {
             ConnectorEvent::CurrentLimitComputed(limit_ma) => Some(*limit_ma),
             _ => None,
@@ -1736,6 +1740,9 @@ impl ChargePointState {
                     if let Some(tariff_slot) = evse.transaction_tariffs.get_mut(connector_id) {
                         *tariff_slot = None;
                     }
+                    if let Some(running_cost_slot) = evse.running_cost.get_mut(connector_id) {
+                        *running_cost_slot = None;
+                    }
                 }
                 effects.push(ChargePointEffect::TransactionEvent(
                     TransactionEventOccurred {
@@ -1827,6 +1834,18 @@ impl ChargePointState {
             }
             false
         });
+        let running_cost_recorded = running_cost_update.is_some_and(|cost| {
+            if evse
+                .transactions
+                .get(connector_id)
+                .is_some_and(Option::is_some)
+                && let Some(running_cost_slot) = evse.running_cost.get_mut(connector_id)
+            {
+                *running_cost_slot = Some(cost);
+                return true;
+            }
+            false
+        });
         // G05 (CV11): a lock failure is reported as more than a fault. The `Problem` variable is
         // what a CSMS can *read* to tell this apart from a stuck contactor, and the hard-wired
         // `NotifyEvent` beside it is G05.FR.02 - raised here rather than left to a CSMS-configured
@@ -1879,6 +1898,7 @@ impl ChargePointState {
         let changed = transition.changed
             || cost_recorded
             || tariff_recorded
+            || running_cost_recorded
             || limit_changed
             || limit_confirmed
             || sample_recorded
@@ -4821,6 +4841,77 @@ mod tests {
         );
 
         assert_eq!(state.evses[0].transaction_tariffs[0], None);
+    }
+
+    fn test_running_cost() -> crate::pricing::TransactionCost {
+        let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        crate::pricing::TransactionCost::start(
+            &test_tariff("t1"),
+            &crate::pricing::PricingContext::new(now),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_running_cost_is_recorded_while_a_transaction_is_active() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::RunningCostAdvanced(alloc::boxed::Box::new(test_running_cost())),
+        );
+
+        assert_eq!(state.evses[0].running_cost[0], Some(test_running_cost()));
+    }
+
+    #[test]
+    fn a_running_cost_with_no_active_transaction_is_ignored() {
+        let mut state = ChargePointState::new([1]);
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::RunningCostAdvanced(alloc::boxed::Box::new(test_running_cost())),
+        );
+
+        assert_eq!(state.evses[0].running_cost[0], None);
+    }
+
+    #[test]
+    fn a_new_transaction_does_not_inherit_the_previous_ones_running_cost() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::RunningCostAdvanced(alloc::boxed::Box::new(test_running_cost())),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        assert_eq!(state.evses[0].running_cost[0], None);
+
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+
+        assert_eq!(state.evses[0].running_cost[0], None);
     }
 
     fn test_charging_profile(id: i32) -> crate::state::ChargingProfile {

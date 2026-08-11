@@ -592,32 +592,135 @@ pub(crate) mod ocpp_2_1 {
         use crate::actor::ChargePointActor;
         use crate::clock::{Clock, is_synchronized};
         use crate::meter_values::{MeasurandSet, transaction_event_measurands};
-        use crate::state::{Transaction, TransactionEventKind};
+        use crate::pricing::{DimensionCost, TotalCostKind, TransactionCost};
+        use crate::state::{Tariff, Transaction, TransactionEventKind};
+        use crate::tariff::advance_running_cost;
         use crate::transactions::{TransactionEventOutcome, TransactionNotifier};
         use crate::wire::v21::TransactionEventRequest;
         use crate::wire::v21::common::AuthorizationStatusEnum;
-        use crate::wire::v21::common::{EVSE, Transaction as WireTransaction};
+        use crate::wire::v21::common::{
+            ChargingPeriod, CostDetails, CostDimension, CostDimensionEnum, EVSE, Price,
+            TariffCostEnum, TotalCost, TotalPrice, TotalUsage, Transaction as WireTransaction,
+        };
         use alloc::boxed::Box;
+        use alloc::vec::Vec;
+        use chrono::{DateTime, Utc};
         use ocpp_client::ClientError;
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
 
-        /// Builds the `TransactionEventRequest` for `kind`/`transaction`, timestamped from
-        /// `clock.now()` and carrying only the measurands `measurands` selects. Pure (no network
-        /// I/O, no device-model read), so a fixed [`Clock`] fake can assert the exact timestamp
-        /// that reaches the wire request without needing a live `OCPP2_1Client` - see this
-        /// module's tests. Warns (see `crate::clock::is_synchronized`'s docs) but still builds and
-        /// returns the request when `clock` reads as unsynchronized - never substitutes, clamps, or
-        /// omits the reading.
-        fn build_transaction_event_request<C: Clock>(
-            clock: &C,
+        /// Converts what [`advance_running_cost`] computed into OCPP's `CostDetailsType`, for
+        /// I12's `costDetails` on a `TransactionEventRequest`. `None` only if the tariff's own
+        /// `currency` does not fit ISO 4217's three letters - not reachable through this crate's
+        /// own `SetDefaultTariff`/`ChangeTransactionTariff` handlers, but a malformed value should
+        /// drop the report rather than crash it.
+        fn build_cost_details(cost: &TransactionCost, tariff: &Tariff) -> Option<CostDetails> {
+            let totals = cost.totals(tariff);
+            let usage = cost.usage();
+            let currency = heapless::String::try_from(totals.currency.as_str()).ok()?;
+
+            let price = |amount: DimensionCost| Price {
+                custom_data: None,
+                excl_tax: Some(amount.excl_tax.to_decimal()),
+                incl_tax: Some(amount.incl_tax.to_decimal()),
+                tax_rates: None,
+            };
+            let total_cost = TotalCost {
+                charging_time: totals.charging_time.map(price),
+                currency,
+                custom_data: None,
+                energy: totals.energy.map(price),
+                fixed: totals.fixed.map(price),
+                idle_time: totals.idle_time.map(price),
+                reservation_fixed: totals.reservation_fixed.map(price),
+                reservation_time: totals.reservation_time.map(price),
+                total: TotalPrice {
+                    custom_data: None,
+                    excl_tax: Some(totals.total.excl_tax.to_decimal()),
+                    incl_tax: Some(totals.total.incl_tax.to_decimal()),
+                },
+                type_of_cost: match totals.kind {
+                    TotalCostKind::Normal => TariffCostEnum::NormalCost,
+                    TotalCostKind::Min => TariffCostEnum::MinCost,
+                    TotalCostKind::Max => TariffCostEnum::MaxCost,
+                },
+            };
+            // `Usage`'s energy is in mWh (see `crate::pricing`'s scale docs); the wire wants kWh,
+            // and 10^6 mWh is 1 kWh - the same scale that makes `Money::SCALE` line up with a
+            // whole currency unit.
+            let total_usage = TotalUsage {
+                charging_time: usage.charging_secs,
+                custom_data: None,
+                energy: usage.energy_mwh as f64 / 1_000_000.0,
+                idle_time: usage.idle_secs,
+                reservation_time: usage.reservation_secs,
+            };
+            // Per-period dimensions are limited to what converts unambiguously: energy, charging
+            // time and idle time all share a scale already used elsewhere in this crate. Power and
+            // current would need their own unit conversion this module has not yet verified
+            // against a wire example, so `CostPeriod::min/max_power_mw`/`min/max_current_ma` are
+            // left unreported for now rather than guessed at.
+            let charging_periods = cost
+                .periods()
+                .iter()
+                .map(|period| {
+                    let dimension = |kind, volume| CostDimension {
+                        custom_data: None,
+                        r#type: kind,
+                        volume,
+                    };
+                    ChargingPeriod {
+                        custom_data: None,
+                        dimensions: Some(alloc::vec![
+                            dimension(
+                                CostDimensionEnum::Energy,
+                                period.energy_mwh as f64 / 1_000_000.0
+                            ),
+                            dimension(CostDimensionEnum::ChargingTime, period.charging_secs as f64),
+                            dimension(CostDimensionEnum::IdleTIme, period.idle_secs as f64),
+                        ]),
+                        start_period: period.start.into(),
+                        tariff_id: heapless::String::try_from(period.tariff_id.0.as_str()).ok(),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            Some(CostDetails {
+                charging_periods: (!charging_periods.is_empty()).then_some(charging_periods),
+                custom_data: None,
+                failure_reason: None,
+                failure_to_calculate: None,
+                total_cost,
+                total_usage,
+            })
+        }
+
+        /// Builds the `TransactionEventRequest` for `kind`/`transaction`, timestamped `now` and
+        /// carrying only the measurands `measurands` selects. Pure (no network I/O, no
+        /// device-model read, no clock of its own), so a fixed instant can assert the exact
+        /// timestamp that reaches the wire request without needing a live `OCPP2_1Client` - see
+        /// this module's tests. Warns (see `crate::clock::is_synchronized`'s docs) but still
+        /// builds and returns the request when `now` reads as unsynchronized - never substitutes,
+        /// clamps, or omits it.
+        ///
+        /// `now` is taken rather than read from a [`Clock`] here so the same instant prices
+        /// `cost` (see below) and stamps this request - `send_transaction_event`'s caller reads
+        /// its `Clock` exactly once per event, for both.
+        ///
+        /// `cost` is whatever [`advance_running_cost`] computed for this transaction at `now` -
+        /// `None` when no tariff currently prices it, in which case `costDetails` and
+        /// `transactionInfo.tariffId` are both left unset rather than reporting stale figures
+        /// (I07, I08, I11, I12).
+        #[allow(clippy::too_many_arguments)]
+        fn build_transaction_event_request(
+            now: DateTime<Utc>,
             evse_id: usize,
             connector_id: usize,
             kind: TransactionEventKind,
             transaction: Transaction,
             offline: bool,
             measurands: MeasurandSet,
+            cost: Option<(TransactionCost, Tariff)>,
         ) -> TransactionEventRequest {
-            let now = clock.now();
             if !is_synchronized(&now) {
                 tracing::warn!(
                     timestamp = %now,
@@ -625,9 +728,15 @@ pub(crate) mod ocpp_2_1 {
                 );
             }
             let meter_value = build_meter_values(transaction.last_meter_sample, now, measurands);
+            let cost_details = cost
+                .as_ref()
+                .and_then(|(cost, tariff)| build_cost_details(cost, tariff));
+            let tariff_id = cost
+                .as_ref()
+                .and_then(|(_, tariff)| heapless::String::try_from(tariff.id.0.as_str()).ok());
             TransactionEventRequest {
                 custom_data: None,
-                cost_details: None,
+                cost_details,
                 event_type: map_event_type(kind),
                 evse_sleep: None,
                 meter_value: if meter_value.is_empty() {
@@ -651,7 +760,8 @@ pub(crate) mod ocpp_2_1 {
                     // with the request it made.
                     remote_start_id: transaction.remote_start_id,
                     operation_mode: None,
-                    tariff_id: None,
+                    // I11/I12: which tariff is (or just priced) this transaction.
+                    tariff_id,
                     transaction_limit: None,
                     custom_data: None,
                 },
@@ -674,24 +784,26 @@ pub(crate) mod ocpp_2_1 {
         }
 
         #[allow(clippy::too_many_arguments)]
-        async fn send_transaction_event<C: Clock>(
+        async fn send_transaction_event(
             client: &OCPP2_1Client,
-            clock: &C,
+            now: DateTime<Utc>,
             evse_id: usize,
             connector_id: usize,
             kind: TransactionEventKind,
             transaction: Transaction,
             offline: bool,
             measurands: MeasurandSet,
+            cost: Option<(TransactionCost, Tariff)>,
         ) -> Result<TransactionEventOutcome, ClientError<OCPP2_1Error>> {
             let request = build_transaction_event_request(
-                clock,
+                now,
                 evse_id,
                 connector_id,
                 kind,
                 transaction,
                 offline,
                 measurands,
+                cost,
             );
             let response = client.send_transaction_event(request).await?;
             Ok(read_outcome(&response))
@@ -792,15 +904,22 @@ pub(crate) mod ocpp_2_1 {
                 transaction: Transaction,
                 offline: bool,
             ) -> Result<TransactionEventOutcome, Self::Error> {
+                // Read once and reused for both the cost calculation and the request's own
+                // timestamp - see `build_transaction_event_request`'s docs on why.
+                let now = self.clock.now();
+                let cost =
+                    advance_running_cost(&self.actor, evse_id, connector_id, now, &transaction)
+                        .await;
                 send_transaction_event(
                     &self.client,
-                    &self.clock,
+                    now,
                     evse_id,
                     connector_id,
                     kind,
                     transaction,
                     offline,
                     transaction_event_measurands(&self.actor, kind),
+                    cost,
                 )
                 .await
             }
@@ -810,9 +929,10 @@ pub(crate) mod ocpp_2_1 {
         /// (sourcing its timestamp from [`crate::clock::SystemClock`]) so existing callers that
         /// pass a bare client - e.g. [`crate::connect::connect_and_setup`] - need no source change.
         ///
-        /// **This impl cannot honour `SampledDataCtrlr`'s measurand lists** and does not pretend
-        /// to: a bare client has no [`ChargePointActor`] to ask, so it reports every measurand the
-        /// sample carries ([`MeasurandSet::ALL`]). A station that must honour J01/J02 wires
+        /// **This impl cannot honour `SampledDataCtrlr`'s measurand lists, nor I07/I08/I11/I12's
+        /// `costDetails`** and does not pretend to: a bare client has no [`ChargePointActor`] to
+        /// ask, so it reports every measurand the sample carries ([`MeasurandSet::ALL`]) and no
+        /// cost at all. A station that must honour J01/J02 or report a running cost wires
         /// [`Ocpp2_1TransactionNotifier`] through [`crate::builder::ChargePointBuilder`] instead.
         #[cfg(feature = "std")]
         #[async_trait::async_trait]
@@ -829,13 +949,15 @@ pub(crate) mod ocpp_2_1 {
             ) -> Result<TransactionEventOutcome, Self::Error> {
                 send_transaction_event(
                     self,
-                    &crate::clock::SystemClock,
+                    crate::clock::SystemClock.now(),
                     evse_id,
                     connector_id,
                     kind,
                     transaction,
                     offline,
                     MeasurandSet::ALL,
+                    // No actor, so no tariff to price against - see this impl's docs.
+                    None,
                 )
                 .await
             }
@@ -880,13 +1002,14 @@ pub(crate) mod ocpp_2_1 {
                 let clock = FixedClock(fixed);
 
                 let request = build_transaction_event_request(
-                    &clock,
+                    clock.now(),
                     0,
                     0,
                     TransactionEventKind::Started,
                     transaction(),
                     false,
                     MeasurandSet::ALL,
+                    None,
                 );
 
                 assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
@@ -901,13 +1024,14 @@ pub(crate) mod ocpp_2_1 {
                 // unsynchronized reading must reach the built request unchanged, never
                 // substituted, clamped, or omitted.
                 let request = build_transaction_event_request(
-                    &unset_rtc,
+                    unset_rtc.now(),
                     0,
                     0,
                     TransactionEventKind::Started,
                     transaction(),
                     false,
                     MeasurandSet::ALL,
+                    None,
                 );
 
                 assert_eq!(
@@ -926,24 +1050,26 @@ pub(crate) mod ocpp_2_1 {
                 let clock = FixedClock(DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap());
 
                 let held = build_transaction_event_request(
-                    &clock,
+                    clock.now(),
                     0,
                     0,
                     TransactionEventKind::Started,
                     transaction(),
                     true,
                     MeasurandSet::ALL,
+                    None,
                 );
                 assert_eq!(held.offline, Some(true));
 
                 let live = build_transaction_event_request(
-                    &clock,
+                    clock.now(),
                     0,
                     0,
                     TransactionEventKind::Started,
                     transaction(),
                     false,
                     MeasurandSet::ALL,
+                    None,
                 );
                 assert_eq!(live.offline, None);
             }
@@ -969,7 +1095,7 @@ pub(crate) mod ocpp_2_1 {
                 let clock = FixedClock(DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap());
 
                 let request = build_transaction_event_request(
-                    &clock,
+                    clock.now(),
                     0,
                     0,
                     TransactionEventKind::Started,
@@ -980,6 +1106,7 @@ pub(crate) mod ocpp_2_1 {
                         voltage: true,
                         ..MeasurandSet::default()
                     },
+                    None,
                 );
 
                 let values = &request.meter_value.expect("a selected measurand")[0].sampled_value;
@@ -998,13 +1125,14 @@ pub(crate) mod ocpp_2_1 {
                 let clock = FixedClock(DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap());
 
                 let request = build_transaction_event_request(
-                    &clock,
+                    clock.now(),
                     0,
                     0,
                     TransactionEventKind::Ended,
                     transaction_with_sample(),
                     false,
                     MeasurandSet::default(),
+                    None,
                 );
 
                 assert_eq!(request.meter_value, None);
@@ -1013,6 +1141,79 @@ pub(crate) mod ocpp_2_1 {
                     crate::wire::v21::common::TransactionEventEnum::Ended,
                     "the event still reports the transaction ending"
                 );
+            }
+
+            fn priced_tariff() -> Tariff {
+                let mut tariff = Tariff::new(crate::state::TariffId("t1".into()), "EUR");
+                tariff.energy = Some(crate::state::EnergyComponent {
+                    prices: alloc::vec![crate::state::EnergyPrice {
+                        price_per_kwh: crate::state::Money(250_000),
+                        conditions: None,
+                    }],
+                    tax_rates: Vec::new(),
+                });
+                tariff
+            }
+
+            // I07/I11/I12: whatever `advance_running_cost` computed reaches both `costDetails`
+            // and `transactionInfo.tariffId` on the wire.
+            #[test]
+            fn cost_details_are_attached_when_a_tariff_priced_the_transaction() {
+                let start = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let tariff = priced_tariff();
+                let mut cost = TransactionCost::start(
+                    &tariff,
+                    &crate::pricing::PricingContext::new(start),
+                    None,
+                );
+                let later = start + chrono::TimeDelta::hours(1);
+                cost.advance(
+                    &tariff,
+                    &crate::pricing::PricingContext {
+                        energy_mwh: 10_000_000,
+                        charging: true,
+                        ..crate::pricing::PricingContext::new(later)
+                    },
+                );
+
+                let request = build_transaction_event_request(
+                    later,
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction(),
+                    false,
+                    MeasurandSet::ALL,
+                    Some((cost, tariff)),
+                );
+
+                let details = request
+                    .cost_details
+                    .expect("a tariff priced this transaction");
+                assert_eq!(details.total_cost.currency.as_str(), "EUR");
+                // 10 kWh @ 0.25/kWh.
+                assert_eq!(details.total_cost.energy.unwrap().excl_tax, Some(2.5));
+                assert_eq!(details.total_usage.energy, 10.0);
+                assert_eq!(request.transaction_info.tariff_id.as_deref(), Some("t1"));
+            }
+
+            #[test]
+            fn cost_details_are_absent_without_a_tariff() {
+                let request = build_transaction_event_request(
+                    Utc::now(),
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction(),
+                    false,
+                    MeasurandSet::ALL,
+                    None,
+                );
+
+                assert_eq!(request.cost_details, None);
+                assert_eq!(request.transaction_info.tariff_id, None);
             }
         }
     }

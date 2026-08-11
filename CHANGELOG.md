@@ -46,6 +46,9 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   CV6.1).
 - New `ConnectorState::StoppingLocked` and `ConnectorEvent::LockFailed` variants; exhaustive
   matches over either must handle them (CV2.4, CV11).
+- New `ConnectorEvent::RunningCostAdvanced` variant, carrying the boxed
+  `pricing::TransactionCost` the local cost engine computed for a connector's transaction (CV8,
+  I07/I08/I11/I12); exhaustive matches over `ConnectorEvent` must handle it.
 - `TriggeredMonitor::monitor_id` is now `Option` — `None` marks a hard-wired notification, which
   OCPP requires for a lock failure (CV11).
 - Offline queues built through `ChargePointBuilder` no longer drain before the CSMS has accepted
@@ -123,6 +126,17 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   and the actor does not exist until the charge point starts. `setup` itself is unchanged and
   passes `csms` for both — which means **`setup` called directly with a bare client does not filter
   measurands**, since such a client has no device model to read.
+- A charge point with a tariff assigned now prices its own running cost locally, from the meter
+  samples its transactions already record, using the `pricing` engine CV8 landed earlier —
+  whichever tariff currently applies: a default tariff (`SetDefaultTariff`, I07), a driver tariff
+  (`ChangeTransactionTariff`, I08), or one replaced mid-session by either (I11). New
+  `EvseState::running_cost`, advanced by `tariff::advance_running_cost` and reported by
+  `Ocpp2_1TransactionNotifier` as a `TransactionEvent`'s `costDetails` and
+  `transactionInfo.tariffId` (I12). No tariff means no report, exactly as before. **Not covered**:
+  a fixed fee or reservation dimension is only charged when a tariff was already assigned at a
+  transaction's true start (no meter history exists to back-price against once it wasn't), and the
+  bare `OCPP2_1Client` `TransactionNotifier` impl has no `ChargePointActor` to price against and
+  reports no cost at all, mirroring its existing measurand-list limitation.
 
 ## [0.1.0] — 2026-08-10
 

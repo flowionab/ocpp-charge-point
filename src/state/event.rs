@@ -569,6 +569,7 @@ impl ConnectorEvent {
             Self::ReservationExpired { .. } => "ReservationExpired",
             Self::CostUpdated { .. } => "CostUpdated",
             Self::TariffAssigned { .. } => "TariffAssigned",
+            Self::RunningCostAdvanced { .. } => "RunningCostAdvanced",
             Self::ResetRequested { .. } => "ConnectorResetRequested",
             Self::SetAvailable { .. } => "ConnectorSetAvailable",
             Self::SetUnavailable { .. } => "ConnectorSetUnavailable",
@@ -763,6 +764,22 @@ pub enum ConnectorEvent {
     /// variant. Unboxed, every `ConnectorEvent` in every queue and broadcast on an MCU would pay
     /// for a tariff that almost none of them carry.
     TariffAssigned(alloc::boxed::Box<Tariff>),
+    /// This connector's local running-cost calculation was advanced to a new instant (CV8,
+    /// I07/I08/I11/I12). Ignored if there's no active transaction - mirrors [`Self::CostUpdated`]
+    /// exactly, including how it is cleared the moment the transaction starts or ends (see
+    /// [`crate::state::EvseState::running_cost`]).
+    ///
+    /// Unlike almost every other event this connector receives, this one is never raised from
+    /// inside the state machine's own `apply` - it needs a [`crate::clock::Clock`] reading and
+    /// the tariff currently pricing the transaction, both of which live outside the clock-free
+    /// core (see `crate::clock`'s docs). `crate::tariff::advance_running_cost` computes the new
+    /// value in the adapter that already has both (the same one building the `TransactionEvent`
+    /// this pricing is reported alongside) and sends it back as this event, purely to be stored.
+    ///
+    /// Boxed for the same reason [`Self::TariffAssigned`] is: [`crate::pricing::TransactionCost`]
+    /// carries a growing list of charging periods, easily the largest payload any connector event
+    /// not already boxed would carry.
+    RunningCostAdvanced(alloc::boxed::Box<crate::pricing::TransactionCost>),
     /// A CSMS-initiated `Reset` (`ResetKind::Immediate`) covers this connector. Any state where
     /// a cable is engaged (`Connected`/`Locked`/`Authorizing`/`Starting`/`Charging`) is driven
     /// through the same fail-safe stop already used for a normal charging stop (open the

@@ -5,13 +5,14 @@
 //! **2.1-only.** 1.6J and 2.0.1 have no tariff messages at all - a spec boundary this crate
 //! reflects by never registering these handlers under those versions, not a gap to close.
 //!
-//! This module **stores and reports** tariffs; it does not **compute** a cost from one. OCPP's
-//! wire `Tariff` carries priced structure (energy/time/fixed-fee components, each with its own
-//! conditions) this crate deliberately does not model - see [`crate::state::Tariff`]'s docs for
-//! why - so there is no running cost derived from an assigned tariff here. `docs/ROADMAP.md` §9
-//! already tracks that as open (outbound cost reporting needs a real pricing model); this block
-//! does not change that. [`crate::cost::handle_cost_updated`] - the CSMS *telling* this charge
-//! point a running cost - is unrelated and keeps working exactly as before.
+//! This module **stores and reports** tariffs, and - since CV8 - drives [`crate::pricing`] from
+//! whichever one currently prices a transaction: [`effective_tariff`] resolves it (the driver
+//! tariff below if one is assigned, otherwise [`crate::state::TariffStore`]'s applicable default)
+//! and [`advance_running_cost`] feeds the engine from the transaction's own meter samples,
+//! storing the result on [`crate::state::EvseState::running_cost`] for `crate::transactions` to
+//! report as `costDetails` (I07, I08, I11, I12). [`crate::cost::handle_cost_updated`] - the CSMS
+//! *telling* this charge point a running cost, rather than the station working it out - is
+//! unrelated and keeps working exactly as before.
 //!
 //! A default tariff (`SetDefaultTariff`) is scoped to one EVSE or the whole charge point and
 //! lives in [`crate::state::TariffStore`]. A driver tariff (`ChangeTransactionTariff`) is scoped
@@ -27,8 +28,10 @@ use alloc::vec::Vec;
 use crate::actor::ChargePointActor;
 use crate::state::{
     ChargePointEvent, ChargePointState, ConnectorEvent, EvseEvent, Tariff, TariffClearCriteria,
-    TariffId, TariffScope, TariffSetRejection, TransactionId,
+    TariffId, TariffScope, TariffSetRejection, Transaction, TransactionChargingState,
+    TransactionId,
 };
+use chrono::{DateTime, Utc};
 
 /// The outcome of a CSMS-initiated `SetDefaultTariff`, matching OCPP's `TariffSetStatusEnum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +490,123 @@ pub trait GetTariffsHandler {
     async fn register_get_tariffs_handler(&self, actor: ChargePointActor);
 }
 
+/// The tariff currently pricing `connector_id`'s transaction on `evse_id`, at `now` - the driver
+/// tariff in [`crate::state::EvseState::transaction_tariffs`] if `ChangeTransactionTariff` has
+/// assigned one (I08, I11), otherwise whichever of [`crate::state::TariffStore`]'s tariffs is
+/// [`crate::state::TariffStore::effective_at`] this EVSE right now (I07). `None` when neither
+/// applies, which is not an error: a transaction with no tariff simply costs nothing to report.
+///
+/// Re-resolved on every call rather than pinned at the transaction's start, which is what lets a
+/// default tariff installed with a future `validFrom` (I07's scenario #3) take over automatically
+/// at the instant it becomes valid, mid-session, with no `ChangeTransactionTariff` needed -
+/// [`crate::pricing::TransactionCost::advance`] already detects the tariff id changing and seals
+/// what was charged under the old one. The cost is that a `ClearTariffs` removing the *only*
+/// tariff a transaction is using this way freezes its running cost rather than continuing under
+/// a tariff this station no longer holds a copy of; a driver tariff never has this problem, since
+/// assigning one does not touch the store at all.
+pub(crate) fn effective_tariff(
+    state: &ChargePointState,
+    evse_id: usize,
+    connector_id: usize,
+    now: DateTime<Utc>,
+) -> Option<Tariff> {
+    if let Some(driver) = state
+        .evses
+        .get(evse_id)?
+        .transaction_tariffs
+        .get(connector_id)?
+        .clone()
+    {
+        return Some(driver);
+    }
+    state.tariffs.effective_at(evse_id, now).cloned()
+}
+
+/// What [`effective_tariff`] can see of a transaction's own progress, translated into
+/// [`crate::pricing::PricingContext`] (I12).
+///
+/// Only what [`crate::state::Transaction`] already records: local time offset, EVSE kind and
+/// payment brand/recognition are not tracked anywhere in this crate's state yet, so every
+/// condition that depends on one of them is correctly evaluated as unmet rather than guessed -
+/// see `crate::pricing`'s own docs on an unevaluable condition.
+fn pricing_context(
+    transaction: &Transaction,
+    now: DateTime<Utc>,
+) -> crate::pricing::PricingContext {
+    let sample = transaction.last_meter_sample;
+    crate::pricing::PricingContext {
+        // `MeterSample` is in Wh/W/mA; `PricingContext` wants mWh/mW/mA - see
+        // `crate::state::Money::milli_from_decimal`'s docs for the same thousandths convention.
+        energy_mwh: sample
+            .map(|s| s.energy_wh.saturating_mul(1_000))
+            .unwrap_or(0),
+        power_mw: sample
+            .and_then(|s| s.power_w)
+            .map(|w| w.saturating_mul(1_000)),
+        current_ma: sample.and_then(|s| s.current_ma),
+        charging: transaction.charging_state == TransactionChargingState::Charging,
+        ..crate::pricing::PricingContext::new(now)
+    }
+}
+
+/// Advances `evse_id`/`connector_id`'s local running-cost calculation to `now` (I07, I08, I11,
+/// I12), storing the result on [`crate::state::EvseState::running_cost`] and returning it
+/// alongside the tariff that produced it - `crate::transactions` reads both, because
+/// `min_cost`/`max_cost` live on [`Tariff`] rather than on
+/// [`crate::pricing::TransactionCost`] itself (see `TransactionCost::totals`'s signature).
+///
+/// `None` when no tariff currently prices this transaction - see [`effective_tariff`] - in which
+/// case nothing is stored and any previously computed total is left exactly as it was, not
+/// cleared: a transaction that briefly has no tariff (say, between one ending and the next being
+/// installed) should not lose the total it already earned.
+///
+/// Takes `now` and reads the actor's state rather than being folded into
+/// [`crate::state::ChargePointState::apply`] itself, because the state machine is deliberately
+/// clock-free (see `crate::clock`'s docs) - this is meant to be called from the same adapter that
+/// is about to timestamp a `TransactionEvent` with its own [`crate::clock::Clock`], so the two
+/// timestamps agree.
+pub(crate) async fn advance_running_cost(
+    actor: &ChargePointActor,
+    evse_id: usize,
+    connector_id: usize,
+    now: DateTime<Utc>,
+    transaction: &Transaction,
+) -> Option<(crate::pricing::TransactionCost, Tariff)> {
+    let state = actor.state();
+    let tariff = effective_tariff(&state, evse_id, connector_id, now)?;
+    let context = pricing_context(transaction, now);
+    let existing = state
+        .evses
+        .get(evse_id)?
+        .running_cost
+        .get(connector_id)?
+        .clone();
+    let cost = match existing {
+        // I11: a tariff change - driver-assigned, or a scheduled default taking over - is
+        // detected and sealed inside `advance` itself; see `TransactionCost::advance`'s docs.
+        Some(mut cost) => {
+            cost.advance(&tariff, &context);
+            cost
+        }
+        // No tariff has priced this transaction before now - either it just started, or one
+        // only became available partway through. Either way pricing starts *from here*, never
+        // retroactively: I12.FR.30's fixed fee and I12.FR.07/.08's reservation dimensions are
+        // therefore only charged when a tariff was already assigned at the transaction's true
+        // start - there is no meter history to back-price them against once it wasn't.
+        None => crate::pricing::TransactionCost::start(&tariff, &context, None),
+    };
+    let _ = actor
+        .send(ChargePointEvent::Evse {
+            evse_id,
+            event: EvseEvent::Connector {
+                connector_id,
+                event: ConnectorEvent::RunningCostAdvanced(Box::new(cost.clone())),
+            },
+        })
+        .await;
+    Some((cost, tariff))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +841,194 @@ mod tests {
         assert_eq!(
             handle_get_tariffs(&actor, Some(0)),
             GetTariffsOutcome::Rejected
+        );
+    }
+
+    fn energy_priced_tariff(id: &str, price_per_kwh: crate::state::Money) -> Tariff {
+        let mut tariff = tariff(id);
+        tariff.energy = Some(crate::state::EnergyComponent {
+            prices: alloc::vec![crate::state::EnergyPrice {
+                price_per_kwh,
+                conditions: None,
+            }],
+            tax_rates: Vec::new(),
+        });
+        tariff
+    }
+
+    /// Drives connector 0 of EVSE 0 all the way to `Charging` and records one meter sample -
+    /// what `advance_running_cost` needs `crate::state::Transaction::last_meter_sample` to hold.
+    async fn actor_with_charging_transaction(energy_wh: i64) -> ChargePointActor {
+        let actor = actor_with_active_transaction().await;
+        for event in [
+            ConnectorEvent::ContactorClosed,
+            ConnectorEvent::MeterValueSampled(crate::state::MeterSample {
+                energy_wh,
+                ..Default::default()
+            }),
+        ] {
+            actor
+                .send(ChargePointEvent::Evse {
+                    evse_id: 0,
+                    event: EvseEvent::Connector {
+                        connector_id: 0,
+                        event,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        actor
+    }
+
+    #[tokio::test]
+    async fn effective_tariff_prefers_the_driver_tariff_over_the_default() {
+        let actor = actor_with_active_transaction().await;
+        handle_set_default_tariff(&actor, TariffScope::Evse(0), tariff("default")).await;
+        handle_change_transaction_tariff(&actor, TransactionId(0), tariff("driver")).await;
+
+        let resolved = effective_tariff(&actor.state(), 0, 0, Utc::now());
+
+        assert_eq!(resolved, Some(tariff("driver")));
+    }
+
+    #[tokio::test]
+    async fn effective_tariff_falls_back_to_the_default_tariff() {
+        let actor = actor_with_active_transaction().await;
+        handle_set_default_tariff(&actor, TariffScope::Evse(0), tariff("default")).await;
+
+        let resolved = effective_tariff(&actor.state(), 0, 0, Utc::now());
+
+        assert_eq!(resolved, Some(tariff("default")));
+    }
+
+    #[tokio::test]
+    async fn effective_tariff_is_none_without_either() {
+        let actor = actor_with_active_transaction().await;
+
+        assert_eq!(effective_tariff(&actor.state(), 0, 0, Utc::now()), None);
+    }
+
+    /// Records another meter sample against connector 0 of EVSE 0, mirroring what hardware
+    /// pushes in mid-session - see `actor_with_charging_transaction`.
+    async fn send_meter_sample(actor: &ChargePointActor, energy_wh: i64) {
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::MeterValueSampled(crate::state::MeterSample {
+                        energy_wh,
+                        ..Default::default()
+                    }),
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn current_transaction(actor: &ChargePointActor) -> Transaction {
+        actor.state().evses[0].transactions[0].clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn advancing_the_running_cost_without_a_tariff_computes_nothing() {
+        let actor = actor_with_charging_transaction(10_000).await;
+
+        let transaction = current_transaction(&actor).await;
+        let result = advance_running_cost(&actor, 0, 0, Utc::now(), &transaction).await;
+
+        assert_eq!(result, None);
+        assert_eq!(actor.state().evses[0].running_cost[0], None);
+    }
+
+    // I07: a default tariff, with nothing driver-assigned, prices the energy a transaction
+    // delivers *after* it becomes available - see `advance_running_cost`'s docs on why the
+    // energy already on the meter when a tariff first applies is not charged retroactively.
+    #[tokio::test]
+    async fn advancing_the_running_cost_prices_from_the_default_tariff() {
+        let actor = actor_with_charging_transaction(0).await;
+        handle_set_default_tariff(
+            &actor,
+            TariffScope::Evse(0),
+            energy_priced_tariff("default", crate::state::Money(250_000)),
+        )
+        .await;
+        // Establishes the pricing baseline at the meter's current (zero) reading.
+        advance_running_cost(&actor, 0, 0, Utc::now(), &current_transaction(&actor).await)
+            .await
+            .expect("a default tariff is installed");
+
+        send_meter_sample(&actor, 10_000).await;
+        let (cost, tariff_used) =
+            advance_running_cost(&actor, 0, 0, Utc::now(), &current_transaction(&actor).await)
+                .await
+                .expect("a default tariff is installed");
+
+        assert_eq!(tariff_used.id, TariffId("default".into()));
+        // 10 kWh @ 0.25/kWh.
+        assert_eq!(
+            cost.totals(&tariff_used).energy.unwrap().excl_tax,
+            crate::state::Money(2_500_000)
+        );
+        assert_eq!(actor.state().evses[0].running_cost[0].as_ref(), Some(&cost));
+    }
+
+    // I08: a driver tariff assigned mid-session outprices the default from that point on.
+    #[tokio::test]
+    async fn advancing_the_running_cost_prefers_the_driver_tariff() {
+        let actor = actor_with_charging_transaction(10_000).await;
+        handle_set_default_tariff(
+            &actor,
+            TariffScope::Evse(0),
+            energy_priced_tariff("default", crate::state::Money(250_000)),
+        )
+        .await;
+        handle_change_transaction_tariff(
+            &actor,
+            TransactionId(0),
+            energy_priced_tariff("driver", crate::state::Money(1_000_000)),
+        )
+        .await;
+
+        let transaction = current_transaction(&actor).await;
+        let (_, tariff_used) = advance_running_cost(&actor, 0, 0, Utc::now(), &transaction)
+            .await
+            .expect("a driver tariff is assigned");
+
+        assert_eq!(tariff_used.id, TariffId("driver".into()));
+    }
+
+    // Two later calls, each with more energy delivered, both advance the same accumulator
+    // rather than restarting it - restarting would silently drop what the first already priced.
+    #[tokio::test]
+    async fn later_advances_accumulate_rather_than_restarting() {
+        let actor = actor_with_charging_transaction(0).await;
+        handle_set_default_tariff(
+            &actor,
+            TariffScope::Evse(0),
+            energy_priced_tariff("default", crate::state::Money(250_000)),
+        )
+        .await;
+        advance_running_cost(&actor, 0, 0, Utc::now(), &current_transaction(&actor).await)
+            .await
+            .unwrap();
+
+        send_meter_sample(&actor, 5_000).await;
+        advance_running_cost(&actor, 0, 0, Utc::now(), &current_transaction(&actor).await)
+            .await
+            .unwrap();
+
+        send_meter_sample(&actor, 10_000).await;
+        let (cost, tariff_used) =
+            advance_running_cost(&actor, 0, 0, Utc::now(), &current_transaction(&actor).await)
+                .await
+                .unwrap();
+
+        // 10 kWh total @ 0.25/kWh across both advances, not just the last one's 5 kWh delta.
+        assert_eq!(
+            cost.totals(&tariff_used).energy.unwrap().excl_tax,
+            crate::state::Money(2_500_000)
         );
     }
 }
