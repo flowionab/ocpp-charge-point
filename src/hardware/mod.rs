@@ -74,7 +74,8 @@ pub use self::ocsp::{
 };
 #[cfg(feature = "payment")]
 pub use self::payment_terminal::{
-    NoPaymentTerminal, NoPaymentTerminalError, PaymentTerminal, PaymentTerminalInfo,
+    MerchantIdentity, NoPaymentTerminal, NoPaymentTerminalError, PaymentTerminal,
+    PaymentTerminalInfo, PaymentTerminalStatus,
 };
 pub use self::storage::{AtomicStorage, NoStorage, NoStorageError, Storage};
 #[cfg(feature = "std")]

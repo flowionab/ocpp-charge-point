@@ -18,7 +18,9 @@
 
 use crate::ChargePointRuntime;
 use crate::authorization::{Authorizer, run_authorization_requests};
-use crate::availability::{ChangeAvailabilityHandler, DedupedStatusNotifier, StatusNotifier};
+use crate::availability::{
+    ChangeAvailabilityHandler, DedupedStatusNotifier, MinimumStatusDurationNotifier, StatusNotifier,
+};
 use crate::clock::MonotonicClock;
 use crate::connection::{ReconnectHandler, reregister_on_reconnect};
 #[cfg(feature = "tariff-cost")]
@@ -107,7 +109,7 @@ use alloc::vec::Vec;
 ///
 /// Each registration method (`provisioning`, `status_notifications`, ...) consumes and returns
 /// `Self`, so calls chain: `Builder::start(hw, ex).await?.provisioning(&csms, backoff,
-/// monotonic).await.status_notifications(&csms).await....build()`. Blocks may be registered in any
+/// monotonic).await.status_notifications(&csms, backoff).await....build()`. Blocks may be registered in any
 /// combination and any order relative to each other (registering the same block twice, or
 /// skipping it, never panics) with one exception worth calling out: the four event subscriptions
 /// (status/transaction/authorization/security) are taken once, up front, in [`Self::start`] -
@@ -400,6 +402,30 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         }));
 
         self
+    }
+
+    /// A handle onto the actor this builder started.
+    ///
+    /// Exists for the version adapters that must read charge-point state *as they encode a
+    /// message* and therefore cannot be constructed before [`Self::start`] — today that is the
+    /// measurand filter (CV2.6, J01/J02), where
+    /// [`Ocpp2_1TransactionNotifier`](crate::transactions::Ocpp2_1TransactionNotifier) and
+    /// [`Ocpp2_1MeterValuesNotifier`](crate::meter_values::Ocpp2_1MeterValuesNotifier) each take a
+    /// [`ChargePointActor`](crate::actor::ChargePointActor) so a CSMS narrowing
+    /// `SampledDataCtrlr`/`AlignedDataCtrlr` takes effect on the next message. Build them between
+    /// `start` and the block registration that consumes them:
+    ///
+    /// ```ignore
+    /// let builder = ChargePointBuilder::start(charge_point, executor).await?;
+    /// let transactions = Ocpp2_1TransactionNotifier::new(client.clone(), builder.actor());
+    /// let builder = builder.transaction_events(&transactions).await;
+    /// ```
+    ///
+    /// This is a *handle*, not ownership: the actor outlives any number of clones, and sending it
+    /// events from outside the blocks registered here is supported (it is how a hardware binding
+    /// reaches the state machine at all).
+    pub fn actor(&self) -> crate::actor::ChargePointActor {
+        self.runtime.actor()
     }
 
     /// This charge point's connector topology - `connector_counts[evse_id]` is that EVSE's
@@ -913,12 +939,19 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     }
 
     /// Registers the Availability functional block's status-forwarding half: every connector
-    /// status change is forwarded to `csms` via StatusNotification, deduped so the CSMS only
-    /// sees wire-visible status changes (not every internal `ConnectorState` transition), queued
-    /// and retried in order if the connection is currently down, and flushed on reconnect.
-    pub async fn status_notifications<N>(mut self, csms: &N) -> Self
+    /// status change is forwarded to `csms` via StatusNotification, debounced against
+    /// `ChargingStation.MinimumStatusDuration` so a bouncing connector cannot flood the CSMS (G01),
+    /// deduped so the CSMS only sees wire-visible status changes (not every internal
+    /// `ConnectorState` transition), queued and retried in order if the connection is currently
+    /// down, and flushed on reconnect.
+    ///
+    /// `backoff` is what the debounce waits on. It is only ever used when a CSMS has actually set
+    /// `MinimumStatusDuration` to something other than its default `0` - see
+    /// [`MinimumStatusDurationNotifier`] for what that changes and what it costs.
+    pub async fn status_notifications<N, B>(mut self, csms: &N, backoff: B) -> Self
     where
         N: StatusNotifier + ReconnectHandler + Clone + Send + Sync + 'static,
+        B: crate::provisioning::Backoff + Send + Sync + 'static,
     {
         let Some(status_changes) = self.take_status_changes() else {
             return self;
@@ -945,7 +978,14 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             OfflineQueue::with_capacity(self.offline_queue_capacity)
                 .gated_on_registration(self.runtime.actor()),
         );
-        let status_notifier = Arc::new(DedupedStatusNotifier::new(csms.clone()));
+        // G01 (CV2.7) on the outside of the dedup, not the inside: the debounce *drops* a status
+        // that did not hold, and a drop underneath the dedup cache would be recorded as if it had
+        // been sent - see `MinimumStatusDurationNotifier`'s docs.
+        let status_notifier = Arc::new(MinimumStatusDurationNotifier::new(
+            DedupedStatusNotifier::new(csms.clone()),
+            self.runtime.actor(),
+            backoff,
+        ));
         let forwarder_queue = status_queue.clone();
         let forwarder_notifier = status_notifier.clone();
         let overflow_actor = self.runtime.actor();
@@ -1018,14 +1058,16 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// harmless, while the alternative (persisting the dedup cache too, to suppress that resend)
     /// risks silently dropping a status the CSMS never actually received - the wrong failure mode
     /// for a durability feature to introduce.
-    pub async fn status_notifications_persisted<N, S>(
+    pub async fn status_notifications_persisted<N, S, B>(
         mut self,
         csms: &N,
         store: QueueStore<S>,
+        backoff: B,
     ) -> Self
     where
         N: StatusNotifier + ReconnectHandler + Clone + Send + Sync + 'static,
         S: crate::hardware::Storage + Send + Sync + 'static,
+        B: crate::provisioning::Backoff + Send + Sync + 'static,
     {
         let Some(status_changes) = self.take_status_changes() else {
             return self;
@@ -1040,7 +1082,12 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         // can never be delivered ahead of an older one the backlog restores.
         restore_status_notification_queue(&status_queue, &store).await;
         let store = Arc::new(store);
-        let status_notifier = Arc::new(DedupedStatusNotifier::new(csms.clone()));
+        // Same composition as `Self::status_notifications` - see there.
+        let status_notifier = Arc::new(MinimumStatusDurationNotifier::new(
+            DedupedStatusNotifier::new(csms.clone()),
+            self.runtime.actor(),
+            backoff,
+        ));
         let forwarder_queue = status_queue.clone();
         let forwarder_store = store.clone();
         let forwarder_notifier = status_notifier.clone();
@@ -2552,6 +2599,52 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
                 );
             }
         }
+        // CV2.11: the live half, applied once here so a station reports its terminal's real
+        // reachability from the moment it registers rather than from the first sweep. A binding
+        // that does not implement `status()` writes the default, which says `Connected = false`
+        // and nothing else - the honest reading for a firmware that was told nothing.
+        match terminal.status().await {
+            Ok(status) => {
+                crate::payment::apply_payment_terminal_status(&self.runtime.actor(), &status).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to read payment terminal status - PaymentCtrlr keeps its placeholder values"
+                );
+            }
+        }
+        self
+    }
+
+    /// Keeps `PaymentCtrlr`'s live variables in step with `terminal` by re-reading it every
+    /// `interval_secs` seconds (CV2.11, C18-C24).
+    ///
+    /// Separate from [`Self::payment`] rather than folded into it, for the same reason
+    /// [`Self::reservation_status_updates`] is separate from `reservation`: a sweep needs a
+    /// [`Backoff`](crate::provisioning::Backoff) and a cadence, and an integrator whose terminal
+    /// SDK already pushes changes into their own code has no use for either - they can call
+    /// [`crate::payment::apply_payment_terminal_status`] when something actually changes and skip
+    /// this entirely.
+    ///
+    /// See [`crate::payment::run_payment_terminal_status_updates`] for what a failed read does
+    /// (nothing - the last reported values stand) and why.
+    #[cfg(feature = "payment")]
+    pub fn payment_status_updates<P, B>(self, terminal: P, backoff: B, interval_secs: u32) -> Self
+    where
+        P: crate::hardware::PaymentTerminal + Send + Sync + 'static,
+        B: crate::provisioning::Backoff + Send + Sync + 'static,
+    {
+        let actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            crate::payment::run_payment_terminal_status_updates(
+                &actor,
+                &terminal,
+                &backoff,
+                interval_secs,
+            )
+            .await;
+        }));
         self
     }
 
@@ -3409,9 +3502,9 @@ mod tests {
         let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
             .await
             .unwrap()
-            .status_notifications(&csms)
+            .status_notifications(&csms, TokioBackoff)
             .await
-            .status_notifications(&csms)
+            .status_notifications(&csms, TokioBackoff)
             .await
             .build();
         accept_registration(&runtime).await;
@@ -3567,7 +3660,11 @@ mod tests {
         let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
             .await
             .unwrap()
-            .status_notifications_persisted(&csms1, QueueStore::new(storage.clone(), "status"))
+            .status_notifications_persisted(
+                &csms1,
+                QueueStore::new(storage.clone(), "status"),
+                TokioBackoff,
+            )
             .await;
         accept_registration(&builder1.runtime).await;
         builder1
@@ -3629,7 +3726,11 @@ mod tests {
         let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
             .await
             .unwrap()
-            .status_notifications_persisted(&csms2, QueueStore::new(storage.clone(), "status"))
+            .status_notifications_persisted(
+                &csms2,
+                QueueStore::new(storage.clone(), "status"),
+                TokioBackoff,
+            )
             .await
             .build();
         accept_registration(&runtime2).await;
@@ -3700,7 +3801,11 @@ mod tests {
         let builder1 = ChargePointBuilder::start(charge_point1, TokioExecutor)
             .await
             .unwrap()
-            .status_notifications_persisted(&csms1, QueueStore::new(storage.clone(), "status"))
+            .status_notifications_persisted(
+                &csms1,
+                QueueStore::new(storage.clone(), "status"),
+                TokioBackoff,
+            )
             .await;
         accept_registration(&builder1.runtime).await;
         builder1
@@ -3732,7 +3837,11 @@ mod tests {
         let runtime2 = ChargePointBuilder::start(charge_point2, TokioExecutor)
             .await
             .unwrap()
-            .status_notifications_persisted(&csms2, QueueStore::new(storage.clone(), "status"))
+            .status_notifications_persisted(
+                &csms2,
+                QueueStore::new(storage.clone(), "status"),
+                TokioBackoff,
+            )
             .await
             .build();
         accept_registration(&runtime2).await;
@@ -3767,9 +3876,17 @@ mod tests {
         let runtime = ChargePointBuilder::start(charge_point, TokioExecutor)
             .await
             .unwrap()
-            .status_notifications_persisted(&csms, QueueStore::new(NoStorage, "status"))
+            .status_notifications_persisted(
+                &csms,
+                QueueStore::new(NoStorage, "status"),
+                TokioBackoff,
+            )
             .await
-            .status_notifications_persisted(&csms, QueueStore::new(NoStorage, "status"))
+            .status_notifications_persisted(
+                &csms,
+                QueueStore::new(NoStorage, "status"),
+                TokioBackoff,
+            )
             .await
             .build();
         accept_registration(&runtime).await;
@@ -4564,7 +4681,7 @@ mod tests {
             .unwrap()
             .provisioning(&csms, TokioBackoff, crate::clock::SystemMonotonicClock)
             .await
-            .status_notifications(&csms)
+            .status_notifications(&csms, TokioBackoff)
             .await
             .transaction_events(&csms)
             .await

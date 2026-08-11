@@ -530,6 +530,24 @@ mod ocpp_2_1 {
             self.on_send_local_list(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // D01.FR.11 (CV2.8): the list a single `SendLocalList` may carry is bounded by
+                    // `LocalAuthListCtrlr`, which declares one ceiling for the block rather than
+                    // one per message - hence no instance.
+                    if let Err(violation) = crate::message_limits::check_message_size(
+                        &actor,
+                        "LocalAuthListCtrlr",
+                        None,
+                        request
+                            .local_authorization_list
+                            .as_ref()
+                            .map_or(0, Vec::len),
+                        &request,
+                    ) {
+                        return Err(crate::message_limits::ocpp_2_1_too_large(
+                            "SendLocalList",
+                            violation,
+                        ));
+                    }
                     let update = parse_update(&request);
                     let outcome =
                         handle_send_local_list(&actor, request.version_number, update).await;
@@ -818,6 +836,24 @@ mod ocpp_2_0_1 {
             self.on_send_local_list(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // D01.FR.11 (CV2.8): the list a single `SendLocalList` may carry is bounded by
+                    // `LocalAuthListCtrlr`, which declares one ceiling for the block rather than
+                    // one per message - hence no instance.
+                    if let Err(violation) = crate::message_limits::check_message_size(
+                        &actor,
+                        "LocalAuthListCtrlr",
+                        None,
+                        request
+                            .local_authorization_list
+                            .as_ref()
+                            .map_or(0, Vec::len),
+                        &request,
+                    ) {
+                        return Err(crate::message_limits::ocpp_2_0_1_too_large(
+                            "SendLocalList",
+                            violation,
+                        ));
+                    }
                     let update = parse_update(&request);
                     let outcome =
                         handle_send_local_list(&actor, request.version_number, update).await;

@@ -124,6 +124,170 @@ impl<N: StatusNotifier + Sync> StatusNotifier for DedupedStatusNotifier<N> {
     }
 }
 
+/// The `(Component, Variable)` of `ChargingStation.MinimumStatusDuration`.
+fn minimum_status_duration_variable() -> (Component, Variable) {
+    (
+        Component {
+            name: "ChargingStation".into(),
+            instance: None,
+            evse: None,
+        },
+        Variable {
+            name: "MinimumStatusDuration".into(),
+            instance: None,
+        },
+    )
+}
+
+/// Reads `ChargingStation.MinimumStatusDuration` - how long a connector's status must hold before
+/// it is worth telling the CSMS about (G01, CV2.7), in whole seconds.
+///
+/// `0` (the registered default) means no debouncing at all, and is returned for an absent or
+/// unparseable value too - the same tolerance every other device-model read in this crate applies.
+pub fn minimum_status_duration_secs(actor: &ChargePointActor) -> u32 {
+    let (component, variable) = minimum_status_duration_variable();
+    actor
+        .state()
+        .device_model
+        .get(&component, &variable)
+        .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+        .and_then(|attribute| attribute.value.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Wraps any [`StatusNotifier`] to hold a status change back until the connector has actually
+/// settled on it for `ChargingStation.MinimumStatusDuration` seconds (G01, CV2.7).
+///
+/// # Why a charge point needs this
+///
+/// A connector that bounces - a sticky latch, a driver reseating a plug, a contactor chattering -
+/// produces a genuine state transition per bounce, and this crate reports every one of them. On a
+/// flaky connector that is a `StatusNotification` flood on a link that may be metered GPRS, all
+/// describing a station that ended up exactly where it started. OCPP's answer is a variable: report
+/// a status only once it has held.
+///
+/// # How it decides
+///
+/// Two rules, in order, both consulted per call:
+///
+/// 1. **A superseded status is dropped at once, without waiting.** If the connector's *current*
+///    status already differs from the one being reported, that report describes a moment that has
+///    passed - and the change which replaced it is already queued behind this one. Dropping it
+///    immediately is what stops a burst of bounces from costing one full wait each, which is the
+///    difference between debouncing a flapping connector and merely delaying it.
+/// 2. **Otherwise the call waits out the remainder of the window and re-checks.** If the status
+///    still holds, it is forwarded; if it changed while waiting, it is dropped by rule 1's
+///    reasoning.
+///
+/// The wait happens inline, so the forwarder task this is registered on reports nothing else
+/// while a status settles. That is deliberate and bounded: rule 1 means at most one call per
+/// connector can be waiting at a time, and a station that has not configured the variable never
+/// waits at all.
+///
+/// # What it deliberately does not cover
+///
+/// **`MinimumStatusDuration` of `0` - the registered default - disables this entirely**, down to
+/// the superseded check: an unconfigured station keeps byte-for-byte the reporting it had before
+/// this existed. That matters most for the offline queue this is normally composed with, where
+/// suppressing a superseded status also suppresses a *historical* transition the CSMS never saw.
+/// An operator who sets the variable has asked for exactly that trade; one who has not has not.
+///
+/// Nor does it cover the post-outage and post-boot resynchronisation sweeps
+/// ([`report_all_connector_statuses`]), which call the CSMS directly. Those report what a connector
+/// *is* rather than that it changed, so there is nothing to debounce - and B01.FR.05 wants them
+/// prompt.
+///
+/// # Composition
+///
+/// Wrap this **outside** [`DedupedStatusNotifier`], not inside. Dedup records what it has sent, and
+/// records it only on success; a drop decided underneath it would be indistinguishable from a
+/// successful send and would poison the cache against the same status arriving again for real.
+pub struct MinimumStatusDurationNotifier<N, B> {
+    inner: N,
+    actor: ChargePointActor,
+    backoff: B,
+}
+
+impl<N, B> MinimumStatusDurationNotifier<N, B> {
+    /// Wraps `inner`, reading the window from `actor`'s device model on every call - so a CSMS
+    /// `SetVariables` on `MinimumStatusDuration` takes effect on the next status change - and
+    /// waiting it out with `backoff`.
+    pub fn new(inner: N, actor: ChargePointActor, backoff: B) -> Self {
+        Self {
+            inner,
+            actor,
+            backoff,
+        }
+    }
+
+    /// The connector's status right now, or `None` if `(evse_id, connector_id)` does not address a
+    /// connector on this charge point.
+    fn current_status(&self, evse_id: usize, connector_id: usize) -> Option<ConnectorStatus> {
+        self.actor
+            .state()
+            .evses
+            .get(evse_id)?
+            .connectors
+            .get(connector_id)
+            .map(ConnectorState::availability_status)
+    }
+}
+
+#[async_trait::async_trait]
+impl<N, B> StatusNotifier for MinimumStatusDurationNotifier<N, B>
+where
+    N: StatusNotifier + Sync,
+    B: crate::provisioning::Backoff + Sync,
+{
+    type Error = N::Error;
+
+    async fn notify_status(
+        &self,
+        evse_id: usize,
+        connector_id: usize,
+        status: ConnectorStatus,
+        connector_state: ConnectorState,
+    ) -> Result<(), Self::Error> {
+        let window = minimum_status_duration_secs(&self.actor);
+        if window == 0 {
+            return self
+                .inner
+                .notify_status(evse_id, connector_id, status, connector_state)
+                .await;
+        }
+
+        // A connector this charge point does not have cannot be checked against a current status,
+        // so it is forwarded rather than silently swallowed - refusing to report something is a
+        // decision that needs evidence.
+        let settled = |expected: ConnectorStatus| {
+            self.current_status(evse_id, connector_id)
+                .is_none_or(|current| current == expected)
+        };
+        if !settled(status) {
+            tracing::debug!(
+                evse_id,
+                connector_id,
+                "dropping a superseded status change: the connector has already moved on"
+            );
+            return Ok(());
+        }
+
+        self.backoff.wait(window).await;
+
+        if !settled(status) {
+            tracing::debug!(
+                evse_id,
+                connector_id,
+                "dropping a status change that did not hold for MinimumStatusDuration"
+            );
+            return Ok(());
+        }
+        self.inner
+            .notify_status(evse_id, connector_id, status, connector_state)
+            .await
+    }
+}
+
 /// The scope of a CSMS-initiated `ChangeAvailability` request - OCPP's optional `evse`/
 /// `connectorId` addressing collapsed to one of the three levels the internal state model
 /// tracks availability at.
@@ -460,6 +624,179 @@ mod tests {
                 .send_modify(|seen| seen.push((evse_id, connector_id, status, connector_state)));
             Ok(())
         }
+    }
+
+    // --- CV2.7: G01, `ChargingStation.MinimumStatusDuration` ---
+
+    /// A [`crate::provisioning::Backoff`] that records what it was asked to wait for and returns
+    /// immediately, so the debounce's *intended* schedule is assertable without a test sleeping.
+    #[derive(Clone, Default)]
+    struct RecordingBackoff {
+        waits: alloc::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::Backoff for RecordingBackoff {
+        async fn wait(&self, seconds: u32) {
+            self.waits.lock().unwrap().push(seconds);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Sets `ChargingStation.MinimumStatusDuration`, the way a CSMS `SetVariables` would.
+    async fn set_minimum_status_duration(actor: &crate::actor::ChargePointActor, secs: &str) {
+        let (component, variable) = super::minimum_status_duration_variable();
+        actor
+            .send(ChargePointEvent::DeviceModel(
+                crate::state::DeviceModelEvent::AttributeValueSet {
+                    component,
+                    variable,
+                    attribute_type: VariableAttributeType::Actual,
+                    value: secs.into(),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_minimum_status_duration_comes_from_the_device_model_and_defaults_to_no_debounce() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        assert_eq!(super::minimum_status_duration_secs(&actor), 0);
+
+        set_minimum_status_duration(&actor, "30").await;
+        assert_eq!(super::minimum_status_duration_secs(&actor), 30);
+
+        // A value a CSMS could write that does not parse must not be honoured as some other
+        // number - a wrong debounce window is worse than none.
+        set_minimum_status_duration(&actor, "half a minute").await;
+        assert_eq!(super::minimum_status_duration_secs(&actor), 0);
+    }
+
+    /// The default, and the property every existing deployment depends on: an unconfigured station
+    /// forwards exactly what it always did, without so much as consulting the clock.
+    #[tokio::test]
+    async fn a_zero_window_forwards_everything_and_never_waits() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let backoff = RecordingBackoff::default();
+        let (seen_tx, mut seen_rx) = watch::channel(Vec::new());
+        let notifier = super::MinimumStatusDurationNotifier::new(
+            RecordingStatusNotifier { seen: seen_tx },
+            actor.clone(),
+            backoff.clone(),
+        );
+
+        // Deliberately a status the connector is *not* currently in: with no window configured
+        // there is nothing to check it against.
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await
+            .unwrap();
+
+        assert_eq!(seen_rx.borrow_and_update().len(), 1);
+        assert!(backoff.waits.lock().unwrap().is_empty());
+    }
+
+    /// G01: a status that still holds after the window is reported - once the window has actually
+    /// been waited out.
+    #[tokio::test]
+    async fn a_status_that_holds_for_the_window_is_reported() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        set_minimum_status_duration(&actor, "30").await;
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::CableConnected,
+                },
+            })
+            .await
+            .unwrap();
+
+        let backoff = RecordingBackoff::default();
+        let (seen_tx, mut seen_rx) = watch::channel(Vec::new());
+        let notifier = super::MinimumStatusDurationNotifier::new(
+            RecordingStatusNotifier { seen: seen_tx },
+            actor.clone(),
+            backoff.clone(),
+        );
+
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await
+            .unwrap();
+
+        assert_eq!(seen_rx.borrow_and_update().len(), 1);
+        assert_eq!(*backoff.waits.lock().unwrap(), alloc::vec![30]);
+    }
+
+    /// G01, and the whole point of the row: a connector that bounced back to where it started
+    /// reports the transient to nobody. The `Occupied` here is a real transition the state machine
+    /// made and then unmade, so it reaches the notifier - and is dropped, without waiting, because
+    /// the connector has already moved on.
+    #[tokio::test]
+    async fn a_status_the_connector_has_already_left_is_dropped_without_waiting() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        set_minimum_status_duration(&actor, "30").await;
+
+        let backoff = RecordingBackoff::default();
+        let (seen_tx, mut seen_rx) = watch::channel(Vec::new());
+        let notifier = super::MinimumStatusDurationNotifier::new(
+            RecordingStatusNotifier { seen: seen_tx },
+            actor.clone(),
+            backoff.clone(),
+        );
+
+        // The connector is back at `Available`; this call describes the moment in between.
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await
+            .unwrap();
+
+        assert!(seen_rx.borrow_and_update().is_empty());
+        assert!(
+            backoff.waits.lock().unwrap().is_empty(),
+            "a superseded status must not cost a full window - that is what turns debouncing a \
+             flapping connector into merely delaying it"
+        );
+    }
+
+    /// A connector index this charge point does not have has no current status to check against,
+    /// so the report goes out rather than being silently swallowed.
+    #[tokio::test]
+    async fn a_status_for_an_unknown_connector_is_still_forwarded() {
+        use crate::actor::ChargePointActor;
+        use crate::executor::TokioExecutor;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        set_minimum_status_duration(&actor, "30").await;
+
+        let (seen_tx, mut seen_rx) = watch::channel(Vec::new());
+        let notifier = super::MinimumStatusDurationNotifier::new(
+            RecordingStatusNotifier { seen: seen_tx },
+            actor.clone(),
+            RecordingBackoff::default(),
+        );
+
+        notifier
+            .notify_status(9, 9, ConnectorStatus::Available, ConnectorState::Available)
+            .await
+            .unwrap();
+
+        assert_eq!(seen_rx.borrow_and_update().len(), 1);
     }
 
     // --- CV5: B01.FR.05 and B04.FR.01/.02 ---

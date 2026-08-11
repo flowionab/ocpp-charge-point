@@ -279,6 +279,104 @@ pub async fn validate_vat_number<N: PaymentNotifier>(
         .map_err(PaymentError::Notifier)
 }
 
+/// The `PaymentCtrlr` variables a [`PaymentTerminalStatus`] fills in, as
+/// `(variable, instance, value)` (CV2.11).
+///
+/// Kept as one list rather than eleven writes so the projection is a pure function of the status -
+/// there is exactly one place that decides which OCPP name each hardware fact answers to, and a
+/// test can read it without an actor.
+fn payment_status_variables(
+    status: &crate::hardware::PaymentTerminalStatus,
+) -> [(&'static str, Option<&'static str>, String); 9] {
+    let boolean = |value: bool| String::from(if value { "true" } else { "false" });
+    [
+        ("Connected", None, boolean(status.connected)),
+        ("Problem", None, boolean(status.problem)),
+        ("ICCID", None, status.iccid.clone()),
+        ("IMSI", None, status.imsi.clone()),
+        ("Merchant", Some("Id"), status.merchant.id.clone()),
+        ("Merchant", Some("TaxId"), status.merchant.tax_id.clone()),
+        ("Merchant", Some("Name"), status.merchant.name.clone()),
+        ("Merchant", Some("Address"), status.merchant.address.clone()),
+        ("Merchant", Some("City"), status.merchant.city.clone()),
+    ]
+}
+
+/// Writes `status` onto `actor`'s `PaymentCtrlr` variables (CV2.11).
+///
+/// Silent about personal data by construction: a merchant tax identifier and address are exactly
+/// the settlement identifiers `CLAUDE.md` forbids logging, so this reports *that* it applied a
+/// status and never what was in it.
+pub async fn apply_payment_terminal_status(
+    actor: &ChargePointActor,
+    status: &crate::hardware::PaymentTerminalStatus,
+) {
+    for (variable, instance, value) in payment_status_variables(status) {
+        let _ = actor
+            .send(crate::state::ChargePointEvent::DeviceModel(
+                crate::state::DeviceModelEvent::AttributeValueSet {
+                    component: crate::state::Component {
+                        name: "PaymentCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: crate::state::Variable {
+                        name: variable.into(),
+                        instance: instance.map(Into::into),
+                    },
+                    attribute_type: crate::state::VariableAttributeType::Actual,
+                    value,
+                },
+            ))
+            .await;
+    }
+    tracing::debug!(
+        connected = status.connected,
+        problem = status.problem,
+        "applied payment terminal status to PaymentCtrlr"
+    );
+}
+
+/// Re-reads `terminal`'s status every `interval_secs` seconds and writes it onto `PaymentCtrlr` -
+/// forever (CV2.11, C18-C24).
+///
+/// # Why a poll rather than a declaration
+///
+/// [`crate::hardware::PaymentTerminalInfo`] is declared once because a serial number does not
+/// change. `Connected` does: a terminal loses its modem, is unplugged for servicing, or comes back
+/// after a power cut, and a CSMS that dispatched a driver to a station whose card reader died an
+/// hour ago has been told something false. There is no event the terminal can raise into this
+/// crate - `PaymentTerminal` is a read interface by design, so that an integrator can implement it
+/// over a vendor SDK that only offers polling - so the crate asks.
+///
+/// # A failed read changes nothing
+///
+/// An `Err` is logged and the previously reported values stay. A terminal that could not be read
+/// *this second* is not the same fact as a terminal that is not there, and overwriting
+/// `Connected` with `false` on a transient SDK timeout would flap the variable a CSMS is meant to
+/// alarm on. A terminal that is genuinely gone is reported by the binding returning
+/// `Ok(connected: false)` - which is a statement, where an error is only the absence of one.
+pub async fn run_payment_terminal_status_updates<T, B>(
+    actor: &ChargePointActor,
+    terminal: &T,
+    backoff: &B,
+    interval_secs: u32,
+) where
+    T: crate::hardware::PaymentTerminal + Sync,
+    B: crate::provisioning::Backoff,
+{
+    loop {
+        backoff.wait(interval_secs.max(1)).await;
+        match terminal.status().await {
+            Ok(status) => apply_payment_terminal_status(actor, &status).await,
+            Err(err) => tracing::warn!(
+                error = %err,
+                "failed to read payment terminal status - PaymentCtrlr keeps what it last reported"
+            ),
+        }
+    }
+}
+
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1;
 
@@ -307,14 +405,163 @@ mod tests {
 
     async fn spawn_with_payment<const N: usize>(evses: [usize; N]) -> ChargePointActor {
         let actor = ChargePointActor::spawn(evses, &TokioExecutor);
+        let capabilities = Capabilities {
+            payment: true,
+            ..Default::default()
+        };
         actor
-            .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
-                payment: true,
-                ..Default::default()
-            }))
+            .send(ChargePointEvent::CapabilitiesDeclared(capabilities))
             .await
             .unwrap();
+        // The same gate events `ChargePointBuilder::start_with_limits` sends, so `PaymentCtrlr`'s
+        // placeholders exist to be overwritten - a bare actor registers no gated component.
+        for event in crate::device_model::capability_gate_events(&capabilities) {
+            actor.send(event).await.unwrap();
+        }
         actor
+    }
+
+    /// Reads one `PaymentCtrlr` variable's `Actual` value.
+    fn payment_variable(
+        actor: &ChargePointActor,
+        variable: &str,
+        instance: Option<&str>,
+    ) -> Option<String> {
+        actor
+            .state()
+            .device_model
+            .get(
+                &crate::state::Component {
+                    name: "PaymentCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                &crate::state::Variable {
+                    name: variable.into(),
+                    instance: instance.map(Into::into),
+                },
+            )
+            .and_then(|definition| {
+                definition.attribute(crate::state::VariableAttributeType::Actual)
+            })
+            .map(|attribute| attribute.value.clone())
+    }
+
+    // --- CV2.11: PaymentCtrlr live status ---
+
+    /// C18-C24: a real terminal's status reaches every variable OCPP names for it, including the
+    /// five `Merchant` instances - the part a one-variable-at-a-time projection gets wrong.
+    #[tokio::test]
+    async fn a_terminals_status_reaches_every_payment_ctrlr_variable_it_names() {
+        let actor = spawn_with_payment([1]).await;
+
+        apply_payment_terminal_status(
+            &actor,
+            &crate::hardware::PaymentTerminalStatus {
+                connected: true,
+                problem: false,
+                iccid: "8931086014000000000".into(),
+                imsi: "234157816548305".into(),
+                merchant: crate::hardware::MerchantIdentity {
+                    id: "M-4711".into(),
+                    tax_id: "GB123456789".into(),
+                    name: "Acme Charging".into(),
+                    address: "1 Test Street".into(),
+                    city: "Springfield".into(),
+                },
+            },
+        )
+        .await;
+
+        assert_eq!(
+            payment_variable(&actor, "Connected", None).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            payment_variable(&actor, "Problem", None).as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            payment_variable(&actor, "ICCID", None).as_deref(),
+            Some("8931086014000000000")
+        );
+        assert_eq!(
+            payment_variable(&actor, "IMSI", None).as_deref(),
+            Some("234157816548305")
+        );
+        for (instance, expected) in [
+            ("Id", "M-4711"),
+            ("TaxId", "GB123456789"),
+            ("Name", "Acme Charging"),
+            ("Address", "1 Test Street"),
+            ("City", "Springfield"),
+        ] {
+            assert_eq!(
+                payment_variable(&actor, "Merchant", Some(instance)).as_deref(),
+                Some(expected),
+                "Merchant[{instance}]"
+            );
+        }
+    }
+
+    /// The honesty property: a station whose binding never implemented `status()` reports a
+    /// terminal it cannot see as absent, rather than leaving a placeholder that reads like a
+    /// working one.
+    #[tokio::test]
+    async fn a_station_with_no_terminal_status_reports_not_connected() {
+        let actor = spawn_with_payment([1]).await;
+
+        apply_payment_terminal_status(&actor, &crate::hardware::PaymentTerminalStatus::default())
+            .await;
+
+        assert_eq!(
+            payment_variable(&actor, "Connected", None).as_deref(),
+            Some("false")
+        );
+        assert_eq!(payment_variable(&actor, "ICCID", None).as_deref(), Some(""));
+        assert_eq!(
+            payment_variable(&actor, "Merchant", Some("Id")).as_deref(),
+            Some("")
+        );
+    }
+
+    /// A terminal that goes away is reported as gone: the projection overwrites, it does not merge,
+    /// so a `Connected` that was once `true` cannot get stuck there.
+    #[tokio::test]
+    async fn a_terminal_that_drops_off_is_reported_as_disconnected() {
+        let actor = spawn_with_payment([1]).await;
+
+        apply_payment_terminal_status(
+            &actor,
+            &crate::hardware::PaymentTerminalStatus {
+                connected: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            payment_variable(&actor, "Connected", None).as_deref(),
+            Some("true")
+        );
+
+        apply_payment_terminal_status(
+            &actor,
+            &crate::hardware::PaymentTerminalStatus {
+                connected: false,
+                problem: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            payment_variable(&actor, "Connected", None).as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            payment_variable(&actor, "Problem", None).as_deref(),
+            Some("true")
+        );
     }
 
     /// A [`PaymentNotifier`] that always succeeds, recording what it was called with.

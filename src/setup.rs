@@ -36,6 +36,33 @@ use crate::variable_monitoring::{
     SetMonitoringLevelHandler, SetVariableMonitoringHandler, VariableMonitorEventNotifier,
 };
 
+/// [`setup`], but with the two blocks that carry meter data - `TransactionEvent` and standalone
+/// `MeterValues` - driven by notifiers of the caller's choosing rather than by `csms` itself.
+///
+/// # Why this exists, and when you want it over [`setup`]
+///
+/// Honouring `SampledDataCtrlr`/`AlignedDataCtrlr`'s measurand lists (J01/J02, CV2.6) means the
+/// notifier has to read the device model as it encodes each message, which means holding a
+/// [`ChargePointActor`](crate::actor::ChargePointActor). A bare CSMS client cannot: it is
+/// constructed from a transport, long before this crate has an actor to give it. So the version
+/// adapters that *can* honour those lists
+/// ([`Ocpp2_1TransactionNotifier`](crate::transactions::Ocpp2_1TransactionNotifier),
+/// [`Ocpp2_1MeterValuesNotifier`](crate::meter_values::Ocpp2_1MeterValuesNotifier) and their 2.0.1
+/// siblings) take one at construction - and the actor does not exist until the charge point starts,
+/// which happens inside this function.
+///
+/// That is the whole reason the two notifiers arrive as **factories** rather than as values: there
+/// is no moment before this call at which a caller could have built one.
+/// [`crate::connect::connect_and_setup`] uses exactly this to give its 2.1 and 2.0.1 sessions
+/// measurand filtering, which is why a CSMS that narrows a measurand list on a stock charge point
+/// sees it take effect.
+///
+/// [`setup`] itself passes `csms` for both, which is correct for a caller who handed it one object
+/// that is everything - and means such a caller gets no measurand filtering, because there is
+/// nothing in that object that could do it.
+///
+/// Every other block, and every word of the behaviour below, is [`setup`]'s.
+///
 /// Starts the hardware, then runs the Provisioning functional block's BootNotification
 /// exchange (retrying with `backoff` on `Pending`/`Rejected` or a transport failure - see
 /// [`ChargePointRuntime::register_until_accepted`]). Once accepted, uses `executor` to spawn
@@ -65,9 +92,15 @@ use crate::variable_monitoring::{
 /// this round closes is that its *body* used to register the Variable Monitoring block regardless
 /// of what hardware declared, unlike every other optional block below it (see the
 /// `if capabilities.variable_monitoring` branch added by this change).
-pub async fn setup<T, E, C, N, X, B, M, K>(
+// Eight, because it is [`setup`]'s six plus the two notifiers that are the entire point of this
+// function existing. Bundling them into a struct would hide which of them is the one a caller
+// actually has to think about.
+#[allow(clippy::too_many_arguments)]
+pub async fn setup_with_meter_data_notifiers<T, E, C, N, X, B, M, K, TN, MN>(
     charge_point: T,
     csms: N,
+    transaction_notifier: impl FnOnce(&crate::actor::ChargePointActor) -> TN,
+    meter_values_notifier: impl FnOnce(&crate::actor::ChargePointActor) -> MN,
     executor: X,
     backoff: B,
     monotonic: M,
@@ -77,6 +110,8 @@ where
     T: ChargePoint<E, C>,
     E: Evse<C>,
     C: Connector,
+    TN: TransactionNotifier + ReconnectHandler + Clone + Send + Sync + 'static,
+    MN: crate::meter_values::MeterValuesNotifier + Clone + Send + Sync + 'static,
     N: BootNotifier
         + crate::authorization::ClearCacheHandler
         + crate::network_profile::SetNetworkProfileHandler
@@ -131,11 +166,17 @@ where
     M: MonotonicClock + Clone + Send + Sync + 'static,
     K: crate::clock::Clock + Clone + Send + Sync + 'static,
 {
-    let mut builder = ChargePointBuilder::start(charge_point, executor)
-        .await?
+    let builder = ChargePointBuilder::start(charge_point, executor).await?;
+    // CV2.6: both meter-data notifiers need the actor whose device model carries the measurand
+    // lists, and the actor does not exist until `start`. Building them from a factory here - rather
+    // than taking them ready-made - is what lets a caller supply an actor-aware notifier at all,
+    // since there is nothing to hand it before this point.
+    let transactions = transaction_notifier(&builder.actor());
+    let meter_values = meter_values_notifier(&builder.actor());
+    let mut builder = builder
         .provisioning(&csms, backoff.clone(), monotonic.clone())
         .await
-        .status_notifications(&csms)
+        .status_notifications(&csms, backoff.clone())
         .await
         // After `status_notifications`, deliberately: a reconnect flushes the queued changes
         // first, so a full sweep can never overtake an older change it supersedes. See
@@ -146,7 +187,7 @@ where
         // it would fire for whoever plugs in next. Swept every 5s, so the release lands within
         // 5s of `TxCtrlr.EVConnectionTimeOut`.
         .pending_remote_start_timeouts(backoff.clone(), monotonic, 5)
-        .transaction_events(&csms)
+        .transaction_events(&transactions)
         .await
         .authorization(&csms, clock.clone())
         .await
@@ -166,7 +207,7 @@ where
         .await
         .device_model(&csms)
         .await
-        .meter_values(&csms, backoff.clone(), clock.clone())
+        .meter_values(&meter_values, backoff.clone(), clock.clone())
         .await;
 
     // C3.1 (docs/PRODUCTION-ROADMAP.md §5.3): each of these blocks is only registered when the
@@ -240,6 +281,99 @@ where
     let runtime = builder.offline_queue_retries(backoff, 60).build();
     tracing::info!("the charge point session is up");
     Ok(runtime)
+}
+
+/// The "everything on" wrapper: registers every functional block
+/// [`ChargePointBuilder`] exposes against a single `csms` that implements all of them.
+///
+/// See [`setup_with_meter_data_notifiers`] for the full behaviour - this is that function with
+/// `csms` supplied for the two meter-data blocks as well.
+///
+/// **Measurand configuration is not honoured on this path**, and cannot be: a `csms` that is one
+/// object for all 45 traits has no [`ChargePointActor`](crate::actor::ChargePointActor) to read
+/// `SampledDataCtrlr`/`AlignedDataCtrlr` from, so every measurand a sample carries is reported
+/// (CV2.6). A charge point that must honour J01/J02 should reach for
+/// [`crate::connect::connect_and_setup`], which does, or for
+/// [`setup_with_meter_data_notifiers`] with the version adapter for its protocol.
+pub async fn setup<T, E, C, N, X, B, M, K>(
+    charge_point: T,
+    csms: N,
+    executor: X,
+    backoff: B,
+    monotonic: M,
+    clock: K,
+) -> Result<ChargePointRuntime<T>, T::StartError>
+where
+    T: ChargePoint<E, C>,
+    E: Evse<C>,
+    C: Connector,
+    N: BootNotifier
+        + crate::authorization::ClearCacheHandler
+        + crate::network_profile::SetNetworkProfileHandler
+        + HeartbeatSender
+        + StatusNotifier
+        + TransactionNotifier
+        + crate::authorization::Authorizer
+        + UnlockConnectorHandler
+        + ChangeAvailabilityHandler
+        + RequestStartTransactionHandler
+        + RequestStopTransactionHandler
+        + TriggerMessageHandler
+        + ReserveNowHandler
+        + CancelReservationHandler
+        + crate::reservation::ReservationStatusNotifier
+        + ResetHandler
+        + SendLocalListHandler
+        + GetLocalListVersionHandler
+        + GetVariablesHandler
+        + SetVariablesHandler
+        + GetBaseReportHandler
+        + GetReportHandler
+        + SecurityEventNotifier
+        + CostUpdatedHandler
+        + SetDefaultTariffHandler
+        + ChangeTransactionTariffHandler
+        + ClearTariffsHandler
+        + GetTariffsHandler
+        + crate::meter_values::MeterValuesNotifier
+        + SetChargingProfileHandler
+        + ClearChargingProfileHandler
+        + GetCompositeScheduleHandler
+        + GetChargingProfilesHandler
+        + SetVariableMonitoringHandler
+        + ClearVariableMonitoringHandler
+        + VariableMonitorEventNotifier
+        + SetMonitoringBaseHandler
+        + SetMonitoringLevelHandler
+        + GetMonitoringReportHandler
+        + OpenPeriodicEventStreamHandler
+        + ClosePeriodicEventStreamHandler
+        + AdjustPeriodicEventStreamHandler
+        + GetPeriodicEventStreamHandler
+        + PeriodicEventStreamNotifier
+        + ReconnectHandler
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    X: Executor,
+    B: Backoff + Clone + Send + Sync + 'static,
+    M: MonotonicClock + Clone + Send + Sync + 'static,
+    K: crate::clock::Clock + Clone + Send + Sync + 'static,
+{
+    let transactions = csms.clone();
+    let meter_values = csms.clone();
+    setup_with_meter_data_notifiers(
+        charge_point,
+        csms,
+        move |_| transactions,
+        move |_| meter_values,
+        executor,
+        backoff,
+        monotonic,
+        clock,
+    )
+    .await
 }
 
 #[cfg(test)]

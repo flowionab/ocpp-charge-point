@@ -31,7 +31,6 @@ use crate::hardware::{ChargePoint, Connector, Evse};
 use crate::network_switch::ConnectionTarget;
 use crate::payload_limit::PayloadLimits;
 use crate::provisioning::Backoff;
-use crate::setup::setup;
 use crate::state::{Component, DeviceModel, Variable, VariableAttributeType};
 use core::fmt;
 use ocpp_client::{ConnectOptions, NegotiatedClient, OcppVersion};
@@ -210,9 +209,29 @@ where
     X: Executor + Clone,
     B: Backoff + Clone + Send + Sync + 'static,
 {
-    let runtime = setup(
+    // CV2.6 (J01/J02): the two meter-data blocks get the actor-aware 2.1 adapters rather than the
+    // bare client, so `SampledDataCtrlr`/`AlignedDataCtrlr`'s measurand lists are read per message
+    // and a CSMS narrowing one sees it take effect. They are built from the actor `setup` creates,
+    // which is why they arrive as factories - see `setup_with_meter_data_notifiers`.
+    let transactions_client = client.clone();
+    let meter_values_client = client.clone();
+    let runtime = crate::setup::setup_with_meter_data_notifiers(
         charge_point,
         client.clone(),
+        move |actor| {
+            crate::transactions::Ocpp2_1TransactionNotifier::with_clock(
+                transactions_client,
+                SystemClock,
+                actor.clone(),
+            )
+        },
+        move |actor| {
+            crate::meter_values::Ocpp2_1MeterValuesNotifier::with_clock(
+                meter_values_client,
+                SystemClock,
+                actor.clone(),
+            )
+        },
         executor.clone(),
         backoff.clone(),
         SystemMonotonicClock,
@@ -391,14 +410,27 @@ where
     X: Executor,
     B: Backoff + Clone + Send + Sync + 'static,
 {
-    let mut builder = ChargePointBuilder::start(charge_point, executor)
+    let builder = ChargePointBuilder::start(charge_point, executor)
         .await
-        .map_err(ConnectAndSetupError::Start)?
+        .map_err(ConnectAndSetupError::Start)?;
+    // CV2.6 (J01/J02), mirroring the 2.1 path: the meter-data blocks get the actor-aware adapters
+    // so the measurand lists are honoured rather than merely settable.
+    let transactions = crate::transactions::Ocpp2_0_1TransactionNotifier::with_clock(
+        client.clone(),
+        SystemClock,
+        builder.actor(),
+    );
+    let meter_values = crate::meter_values::Ocpp2_0_1MeterValuesNotifier::with_clock(
+        client.clone(),
+        SystemClock,
+        builder.actor(),
+    );
+    let mut builder = builder
         .provisioning(&client, backoff.clone(), SystemMonotonicClock)
         .await
-        .status_notifications(&client)
+        .status_notifications(&client, backoff.clone())
         .await
-        .transaction_events(&client)
+        .transaction_events(&transactions)
         .await
         .authorization(&client, SystemClock)
         .await
@@ -416,7 +448,7 @@ where
         .await
         .device_model(&client)
         .await
-        .meter_values(&client, backoff.clone(), SystemClock)
+        .meter_values(&meter_values, backoff.clone(), SystemClock)
         .await
         // F4.4: 2.0.1 reports security events now. This registration was absent because
         // `ocpp-client` 0.2.0 generated no 2.0.1 action for `SecurityEventNotification` at all;
@@ -511,7 +543,7 @@ where
     let mut builder = builder
         .provisioning(&client, backoff.clone(), SystemMonotonicClock)
         .await
-        .status_notifications(&status)
+        .status_notifications(&status, backoff.clone())
         .await
         .transaction_events(&transactions)
         .await

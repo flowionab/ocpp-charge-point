@@ -1352,6 +1352,20 @@ mod ocpp_2_1 {
                         let actor = actor.clone();
                         let clock = clock.clone();
                         async move {
+                            // B08.FR.17/.18 (CV2.8): `GetReport`'s ceiling counts the
+                            // `componentVariable` elements, which is what a report has to expand.
+                            if let Err(violation) = crate::message_limits::check_message_size(
+                                &actor,
+                                "DeviceDataCtrlr",
+                                Some("GetReport"),
+                                request.component_variable.as_ref().map_or(0, Vec::len),
+                                &request,
+                            ) {
+                                return Err(crate::message_limits::ocpp_2_1_too_large(
+                                    "GetReport",
+                                    violation,
+                                ));
+                            }
                             let criteria: Vec<_> = request
                                 .component_criteria
                                 .as_ref()
@@ -1420,6 +1434,19 @@ mod ocpp_2_1 {
                 self.on_get_report(move |request, client| {
                     let actor = actor.clone();
                     async move {
+                        // B08.FR.17/.18 (CV2.8) - see the `with_clock` handler above.
+                        if let Err(violation) = crate::message_limits::check_message_size(
+                            &actor,
+                            "DeviceDataCtrlr",
+                            Some("GetReport"),
+                            request.component_variable.as_ref().map_or(0, Vec::len),
+                            &request,
+                        ) {
+                            return Err(crate::message_limits::ocpp_2_1_too_large(
+                                "GetReport",
+                                violation,
+                            ));
+                        }
                         let criteria: Vec<_> = request
                             .component_criteria
                             .as_ref()
@@ -1879,6 +1906,19 @@ mod ocpp_2_0_1 {
                         let actor = actor.clone();
                         let clock = clock.clone();
                         async move {
+                            // B08.FR.17/.18 (CV2.8) - mirrors 2.1's.
+                            if let Err(violation) = crate::message_limits::check_message_size(
+                                &actor,
+                                "DeviceDataCtrlr",
+                                Some("GetReport"),
+                                request.component_variable.as_ref().map_or(0, Vec::len),
+                                &request,
+                            ) {
+                                return Err(crate::message_limits::ocpp_2_0_1_too_large(
+                                    "GetReport",
+                                    violation,
+                                ));
+                            }
                             let criteria: Vec<_> = request
                                 .component_criteria
                                 .as_ref()
@@ -1947,6 +1987,19 @@ mod ocpp_2_0_1 {
                 self.on_get_report(move |request, client| {
                     let actor = actor.clone();
                     async move {
+                        // B08.FR.17/.18 (CV2.8) - mirrors 2.1's.
+                        if let Err(violation) = crate::message_limits::check_message_size(
+                            &actor,
+                            "DeviceDataCtrlr",
+                            Some("GetReport"),
+                            request.component_variable.as_ref().map_or(0, Vec::len),
+                            &request,
+                        ) {
+                            return Err(crate::message_limits::ocpp_2_0_1_too_large(
+                                "GetReport",
+                                violation,
+                            ));
+                        }
                         let criteria: Vec<_> = request
                             .component_criteria
                             .as_ref()

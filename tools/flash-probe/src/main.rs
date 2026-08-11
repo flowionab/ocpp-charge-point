@@ -430,7 +430,7 @@ fn wire_ocpp_2_1(actor: &ChargePointActor) {
     );
 
     let status = Ocpp2_1StatusNotifier::with_clock(client.clone(), Probe);
-    let transactions = Ocpp2_1TransactionNotifier::with_clock(client.clone(), Probe);
+    let transactions = Ocpp2_1TransactionNotifier::with_clock(client.clone(), Probe, actor.clone());
     let security = Ocpp2_1SecurityEventNotifier::with_clock(client.clone(), Probe);
 
     let status_changes = actor.subscribe_status_notifications();
@@ -560,7 +560,7 @@ fn wire_ocpp_2_0_1(actor: &ChargePointActor) {
     );
 
     let status = Ocpp2_0_1StatusNotifier::with_clock(client.clone(), Probe);
-    let transactions = Ocpp2_0_1TransactionNotifier::with_clock(client.clone(), Probe);
+    let transactions = Ocpp2_0_1TransactionNotifier::with_clock(client.clone(), Probe, actor.clone());
 
     let status_changes = actor.subscribe_status_notifications();
     Probe.spawn(Box::pin(async move {

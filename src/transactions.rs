@@ -417,6 +417,7 @@ mod tests {
 pub(crate) mod ocpp_2_1 {
     pub use with_clock::Ocpp2_1TransactionNotifier;
 
+    use crate::meter_values::MeasurandSet;
     use crate::state::{
         MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
         TransactionUpdateReason,
@@ -497,33 +498,43 @@ pub(crate) mod ocpp_2_1 {
         }
     }
 
-    /// Builds one `sampledValue` per measurand present in `sample` - always the energy register,
-    /// plus power/current/voltage/SoC when the hardware reported them.
+    /// Builds one `sampledValue` per measurand that `sample` carries **and** `measurands` selects -
+    /// the energy register plus power/current/voltage/SoC where the hardware reported them (J01,
+    /// J02, CV2.6).
+    ///
+    /// The two conditions are separate on purpose. What the hardware reported is a fact about this
+    /// station; what `measurands` selects is what the CSMS asked to be told about. A measurand the
+    /// CSMS did not ask for is dropped even when the meter produced it, and one it did ask for is
+    /// still absent when the meter did not - inventing a reading to satisfy a configured list would
+    /// be worse than omitting it.
     ///
     /// Shared with [`crate::meter_values`]' standalone `MeterValues` adapter through
     /// `build_meter_values`: a reading is a reading, and two mappings of the same measurands into
     /// the same wire type would be two places for a unit bug to hide.
-    fn sampled_values(sample: MeterSample) -> Vec<SampledValue> {
-        let mut values = vec![sampled_value(
-            sample.energy_wh as f64,
-            MeasurandEnum::EnergyActiveImportRegister,
-        )];
-        if let Some(power_w) = sample.power_w {
+    fn sampled_values(sample: MeterSample, measurands: MeasurandSet) -> Vec<SampledValue> {
+        let mut values = Vec::new();
+        if measurands.energy {
+            values.push(sampled_value(
+                sample.energy_wh as f64,
+                MeasurandEnum::EnergyActiveImportRegister,
+            ));
+        }
+        if let Some(power_w) = sample.power_w.filter(|_| measurands.power) {
             values.push(sampled_value(
                 power_w as f64,
                 MeasurandEnum::PowerActiveImport,
             ));
         }
-        if let Some(current_ma) = sample.current_ma {
+        if let Some(current_ma) = sample.current_ma.filter(|_| measurands.current) {
             values.push(sampled_value(
                 current_ma as f64 / 1_000.0,
                 MeasurandEnum::CurrentImport,
             ));
         }
-        if let Some(voltage_v) = sample.voltage_v {
+        if let Some(voltage_v) = sample.voltage_v.filter(|_| measurands.voltage) {
             values.push(sampled_value(voltage_v as f64, MeasurandEnum::Voltage));
         }
-        if let Some(soc_percent) = sample.soc_percent {
+        if let Some(soc_percent) = sample.soc_percent.filter(|_| measurands.soc) {
             values.push(sampled_value(soc_percent as f64, MeasurandEnum::SoC));
         }
         values
@@ -544,17 +555,28 @@ pub(crate) mod ocpp_2_1 {
 
     /// Builds the TransactionEvent `meterValue` list from a transaction's most recent sample -
     /// empty if it never got one (e.g. `Started`, or a transaction that ended before charging
-    /// began). See `docs/ROADMAP.md` §10.
+    /// began), and empty if `measurands` selects nothing. See `docs/ROADMAP.md` §10.
+    ///
+    /// A cleared measurand list produces **no `MeterValue` at all** rather than one carrying an
+    /// empty `sampledValue` list (CV2.6): the latter reports a timestamp and nothing else, which
+    /// tells the CSMS nothing it did not already know while still costing it a message to parse.
+    /// Staying a pure function of its arguments is what lets the caller read the configuration
+    /// fresh per message without this function needing to know a device model exists.
     pub(crate) fn build_meter_values(
         sample: Option<MeterSample>,
         timestamp: DateTime<Utc>,
+        measurands: MeasurandSet,
     ) -> Vec<MeterValue> {
         let Some(sample) = sample else {
             return Vec::new();
         };
+        let sampled_value = sampled_values(sample, measurands);
+        if sampled_value.is_empty() {
+            return Vec::new();
+        }
         vec![MeterValue {
             timestamp: timestamp.into(),
-            sampled_value: sampled_values(sample),
+            sampled_value,
             custom_data: None,
         }]
     }
@@ -567,7 +589,9 @@ pub(crate) mod ocpp_2_1 {
             build_meter_values, map_charging_state, map_event_type, map_stop_reason,
             trigger_reason_for,
         };
+        use crate::actor::ChargePointActor;
         use crate::clock::{Clock, is_synchronized};
+        use crate::meter_values::{MeasurandSet, transaction_event_measurands};
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::{TransactionEventOutcome, TransactionNotifier};
         use crate::wire::v21::TransactionEventRequest;
@@ -578,11 +602,12 @@ pub(crate) mod ocpp_2_1 {
         use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
 
         /// Builds the `TransactionEventRequest` for `kind`/`transaction`, timestamped from
-        /// `clock.now()`. Pure (no network I/O), so a fixed [`Clock`] fake can assert the exact
-        /// timestamp that reaches the wire request without needing a live `OCPP2_1Client` - see
-        /// this module's tests. Warns (see `crate::clock::is_synchronized`'s docs) but still
-        /// builds and returns the request when `clock` reads as unsynchronized - never
-        /// substitutes, clamps, or omits the reading.
+        /// `clock.now()` and carrying only the measurands `measurands` selects. Pure (no network
+        /// I/O, no device-model read), so a fixed [`Clock`] fake can assert the exact timestamp
+        /// that reaches the wire request without needing a live `OCPP2_1Client` - see this
+        /// module's tests. Warns (see `crate::clock::is_synchronized`'s docs) but still builds and
+        /// returns the request when `clock` reads as unsynchronized - never substitutes, clamps, or
+        /// omits the reading.
         fn build_transaction_event_request<C: Clock>(
             clock: &C,
             evse_id: usize,
@@ -590,6 +615,7 @@ pub(crate) mod ocpp_2_1 {
             kind: TransactionEventKind,
             transaction: Transaction,
             offline: bool,
+            measurands: MeasurandSet,
         ) -> TransactionEventRequest {
             let now = clock.now();
             if !is_synchronized(&now) {
@@ -598,7 +624,7 @@ pub(crate) mod ocpp_2_1 {
                     "TransactionEvent timestamp sourced from an unsynchronized clock"
                 );
             }
-            let meter_value = build_meter_values(transaction.last_meter_sample, now);
+            let meter_value = build_meter_values(transaction.last_meter_sample, now, measurands);
             TransactionEventRequest {
                 custom_data: None,
                 cost_details: None,
@@ -647,6 +673,7 @@ pub(crate) mod ocpp_2_1 {
             }
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn send_transaction_event<C: Clock>(
             client: &OCPP2_1Client,
             clock: &C,
@@ -655,6 +682,7 @@ pub(crate) mod ocpp_2_1 {
             kind: TransactionEventKind,
             transaction: Transaction,
             offline: bool,
+            measurands: MeasurandSet,
         ) -> Result<TransactionEventOutcome, ClientError<OCPP2_1Error>> {
             let request = build_transaction_event_request(
                 clock,
@@ -663,6 +691,7 @@ pub(crate) mod ocpp_2_1 {
                 kind,
                 transaction,
                 offline,
+                measurands,
             );
             let response = client.send_transaction_event(request).await?;
             Ok(read_outcome(&response))
@@ -690,27 +719,64 @@ pub(crate) mod ocpp_2_1 {
         }
 
         /// Wraps an `OCPP2_1Client` with a caller-supplied [`Clock`] for the TransactionEvent
-        /// timestamp - the no_std-reachable counterpart to this module's `std`-only `OCPP2_1Client`
-        /// impl below, which exists alongside this (not instead of it) so no existing `std` caller
-        /// needs a source change.
+        /// timestamp, and the [`ChargePointActor`] whose device model says which measurands each
+        /// event may carry - the no_std-reachable counterpart to this module's `std`-only
+        /// `OCPP2_1Client` impl below.
+        ///
+        /// **The actor is read at send time, not at construction (CV2.6).** That is what makes
+        /// `SampledDataCtrlr.Tx{Started,Updated,Ended}Measurands` behave like every other live
+        /// variable in this crate: a CSMS `SetVariables` narrowing the list takes effect on the
+        /// very next event, with no reconnect and no reboot. Holding a handle rather than a
+        /// snapshot is the whole point - a snapshot would freeze the configuration at whatever it
+        /// was when the session was wired up.
+        ///
+        /// `Clone` (and the [`ReconnectHandler`](crate::connection::ReconnectHandler) delegation
+        /// below) so this can be registered through
+        /// [`ChargePointBuilder::transaction_events`](crate::builder::ChargePointBuilder::transaction_events),
+        /// which is what puts it on the path [`crate::connect::connect_and_setup`] actually uses -
+        /// the same shape `Ocpp1_6TransactionNotifier` has always had.
+        #[derive(Clone)]
         pub struct Ocpp2_1TransactionNotifier<C> {
             client: OCPP2_1Client,
             clock: C,
+            actor: ChargePointActor,
+        }
+
+        /// Delegates to the wrapped client, so wrapping a client to filter its measurands does not
+        /// cost the offline queue its reconnect flush.
+        #[async_trait::async_trait]
+        impl<C: Clock + Send + Sync> crate::connection::ReconnectHandler for Ocpp2_1TransactionNotifier<C> {
+            async fn register_reconnect_handler<F, FF>(&self, callback: F)
+            where
+                F: FnMut() -> FF + Send + Sync + 'static,
+                FF: core::future::Future<Output = ()> + Send + 'static,
+            {
+                crate::connection::ReconnectHandler::register_reconnect_handler(
+                    &self.client,
+                    callback,
+                )
+                .await;
+            }
         }
 
         impl<C: Clock> Ocpp2_1TransactionNotifier<C> {
-            /// Wraps `client`, sourcing every TransactionEvent timestamp from `clock`.
-            pub fn with_clock(client: OCPP2_1Client, clock: C) -> Self {
-                Self { client, clock }
+            /// Wraps `client`, sourcing every TransactionEvent timestamp from `clock` and every
+            /// event's measurand selection from `actor`'s device model.
+            pub fn with_clock(client: OCPP2_1Client, clock: C, actor: ChargePointActor) -> Self {
+                Self {
+                    client,
+                    clock,
+                    actor,
+                }
             }
         }
 
         #[cfg(feature = "std")]
         impl Ocpp2_1TransactionNotifier<crate::clock::SystemClock> {
             /// Wraps `client`, sourcing every TransactionEvent timestamp from
-            /// [`crate::clock::SystemClock`].
-            pub fn new(client: OCPP2_1Client) -> Self {
-                Self::with_clock(client, crate::clock::SystemClock)
+            /// [`crate::clock::SystemClock`] and its measurand selection from `actor`.
+            pub fn new(client: OCPP2_1Client, actor: ChargePointActor) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock, actor)
             }
         }
 
@@ -734,6 +800,7 @@ pub(crate) mod ocpp_2_1 {
                     kind,
                     transaction,
                     offline,
+                    transaction_event_measurands(&self.actor, kind),
                 )
                 .await
             }
@@ -742,6 +809,11 @@ pub(crate) mod ocpp_2_1 {
         /// The `std` convenience: `OCPP2_1Client` itself implements `TransactionNotifier` directly
         /// (sourcing its timestamp from [`crate::clock::SystemClock`]) so existing callers that
         /// pass a bare client - e.g. [`crate::connect::connect_and_setup`] - need no source change.
+        ///
+        /// **This impl cannot honour `SampledDataCtrlr`'s measurand lists** and does not pretend
+        /// to: a bare client has no [`ChargePointActor`] to ask, so it reports every measurand the
+        /// sample carries ([`MeasurandSet::ALL`]). A station that must honour J01/J02 wires
+        /// [`Ocpp2_1TransactionNotifier`] through [`crate::builder::ChargePointBuilder`] instead.
         #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl TransactionNotifier for OCPP2_1Client {
@@ -763,6 +835,7 @@ pub(crate) mod ocpp_2_1 {
                     kind,
                     transaction,
                     offline,
+                    MeasurandSet::ALL,
                 )
                 .await
             }
@@ -813,6 +886,7 @@ pub(crate) mod ocpp_2_1 {
                     TransactionEventKind::Started,
                     transaction(),
                     false,
+                    MeasurandSet::ALL,
                 );
 
                 assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
@@ -833,6 +907,7 @@ pub(crate) mod ocpp_2_1 {
                     TransactionEventKind::Started,
                     transaction(),
                     false,
+                    MeasurandSet::ALL,
                 );
 
                 assert_eq!(
@@ -857,6 +932,7 @@ pub(crate) mod ocpp_2_1 {
                     TransactionEventKind::Started,
                     transaction(),
                     true,
+                    MeasurandSet::ALL,
                 );
                 assert_eq!(held.offline, Some(true));
 
@@ -867,8 +943,76 @@ pub(crate) mod ocpp_2_1 {
                     TransactionEventKind::Started,
                     transaction(),
                     false,
+                    MeasurandSet::ALL,
                 );
                 assert_eq!(live.offline, None);
+            }
+
+            /// A transaction carrying a full meter sample, so the measurand filter has something
+            /// to filter.
+            fn transaction_with_sample() -> Transaction {
+                Transaction {
+                    last_meter_sample: Some(crate::state::MeterSample {
+                        energy_wh: 4_200,
+                        power_w: Some(7_400),
+                        voltage_v: Some(230),
+                        ..Default::default()
+                    }),
+                    ..transaction()
+                }
+            }
+
+            /// CV2.6/J01: `SampledDataCtrlr`'s list decides what a `TransactionEvent` reports,
+            /// even where the meter produced more than the CSMS asked for.
+            #[test]
+            fn only_the_configured_measurands_reach_a_transaction_event() {
+                let clock = FixedClock(DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap());
+
+                let request = build_transaction_event_request(
+                    &clock,
+                    0,
+                    0,
+                    TransactionEventKind::Started,
+                    transaction_with_sample(),
+                    false,
+                    MeasurandSet {
+                        energy: true,
+                        voltage: true,
+                        ..MeasurandSet::default()
+                    },
+                );
+
+                let values = &request.meter_value.expect("a selected measurand")[0].sampled_value;
+                assert_eq!(values.len(), 2);
+                assert!(
+                    values.iter().all(|value| value.measurand
+                        != Some(crate::wire::v21::common::MeasurandEnum::PowerActiveImport)),
+                    "power was sampled but not selected"
+                );
+            }
+
+            /// CV2.6: a cleared list produces no `meterValue` member at all. The event itself is a
+            /// lifecycle fact and still goes out - it is the *readings* the CSMS declined.
+            #[test]
+            fn an_empty_measurand_set_leaves_a_transaction_event_with_no_meter_value() {
+                let clock = FixedClock(DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap());
+
+                let request = build_transaction_event_request(
+                    &clock,
+                    0,
+                    0,
+                    TransactionEventKind::Ended,
+                    transaction_with_sample(),
+                    false,
+                    MeasurandSet::default(),
+                );
+
+                assert_eq!(request.meter_value, None);
+                assert_eq!(
+                    request.event_type,
+                    crate::wire::v21::common::TransactionEventEnum::Ended,
+                    "the event still reports the transaction ending"
+                );
             }
         }
     }
@@ -888,7 +1032,7 @@ pub(crate) mod ocpp_2_1 {
                 .unwrap()
                 .with_timezone(&Utc);
 
-            let values = build_meter_values(Some(sample), timestamp);
+            let values = build_meter_values(Some(sample), timestamp, MeasurandSet::ALL);
 
             assert_eq!(values.len(), 1);
             assert_eq!(values[0].sampled_value.len(), 1);
@@ -912,7 +1056,7 @@ pub(crate) mod ocpp_2_1 {
                 .unwrap()
                 .with_timezone(&Utc);
 
-            let values = build_meter_values(Some(sample), timestamp);
+            let values = build_meter_values(Some(sample), timestamp, MeasurandSet::ALL);
 
             assert_eq!(values.len(), 1);
             let sampled = &values[0].sampled_value;
@@ -940,7 +1084,10 @@ pub(crate) mod ocpp_2_1 {
                 .unwrap()
                 .with_timezone(&Utc);
 
-            assert_eq!(build_meter_values(None, timestamp), Vec::new());
+            assert_eq!(
+                build_meter_values(None, timestamp, MeasurandSet::ALL),
+                Vec::new()
+            );
         }
 
         #[test]
@@ -1127,6 +1274,8 @@ pub(crate) mod ocpp_2_1 {
 pub(crate) mod ocpp_2_0_1 {
     pub use with_clock::Ocpp2_0_1TransactionNotifier;
 
+    use crate::meter_values::MeasurandSet;
+
     use crate::state::{
         MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
         TransactionUpdateReason,
@@ -1205,27 +1354,32 @@ pub(crate) mod ocpp_2_0_1 {
         }
     }
 
-    fn sampled_values(sample: MeterSample) -> Vec<SampledValue> {
-        let mut values = vec![sampled_value(
-            sample.energy_wh as f64,
-            MeasurandEnum::EnergyActiveImportRegister,
-        )];
-        if let Some(power_w) = sample.power_w {
+    /// Mirrors [`super::ocpp_2_1::sampled_values`], including its CV2.6 measurand filter - see
+    /// there for why what the meter reported and what the CSMS selected are separate conditions.
+    fn sampled_values(sample: MeterSample, measurands: MeasurandSet) -> Vec<SampledValue> {
+        let mut values = Vec::new();
+        if measurands.energy {
+            values.push(sampled_value(
+                sample.energy_wh as f64,
+                MeasurandEnum::EnergyActiveImportRegister,
+            ));
+        }
+        if let Some(power_w) = sample.power_w.filter(|_| measurands.power) {
             values.push(sampled_value(
                 power_w as f64,
                 MeasurandEnum::PowerActiveImport,
             ));
         }
-        if let Some(current_ma) = sample.current_ma {
+        if let Some(current_ma) = sample.current_ma.filter(|_| measurands.current) {
             values.push(sampled_value(
                 current_ma as f64 / 1_000.0,
                 MeasurandEnum::CurrentImport,
             ));
         }
-        if let Some(voltage_v) = sample.voltage_v {
+        if let Some(voltage_v) = sample.voltage_v.filter(|_| measurands.voltage) {
             values.push(sampled_value(voltage_v as f64, MeasurandEnum::Voltage));
         }
-        if let Some(soc_percent) = sample.soc_percent {
+        if let Some(soc_percent) = sample.soc_percent.filter(|_| measurands.soc) {
             values.push(sampled_value(soc_percent as f64, MeasurandEnum::SoC));
         }
         values
@@ -1244,16 +1398,23 @@ pub(crate) mod ocpp_2_0_1 {
         }
     }
 
+    /// Mirrors [`super::ocpp_2_1::build_meter_values`], including its CV2.6 rule that a measurand
+    /// set selecting nothing produces no `MeterValue` at all.
     pub(crate) fn build_meter_values(
         sample: Option<MeterSample>,
         timestamp: DateTime<Utc>,
+        measurands: MeasurandSet,
     ) -> Vec<MeterValue> {
         let Some(sample) = sample else {
             return Vec::new();
         };
+        let sampled_value = sampled_values(sample, measurands);
+        if sampled_value.is_empty() {
+            return Vec::new();
+        }
         vec![MeterValue {
             timestamp: timestamp.into(),
-            sampled_value: sampled_values(sample),
+            sampled_value,
             custom_data: None,
         }]
     }
@@ -1266,7 +1427,9 @@ pub(crate) mod ocpp_2_0_1 {
             build_meter_values, map_charging_state, map_event_type, map_stop_reason,
             trigger_reason_for,
         };
+        use crate::actor::ChargePointActor;
         use crate::clock::{Clock, is_synchronized};
+        use crate::meter_values::{MeasurandSet, transaction_event_measurands};
         use crate::state::{Transaction, TransactionEventKind};
         use crate::transactions::{TransactionEventOutcome, TransactionNotifier};
         use crate::wire::v201::TransactionEventRequest;
@@ -1278,7 +1441,8 @@ pub(crate) mod ocpp_2_0_1 {
         use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
 
         /// Mirrors `super::ocpp_2_1::with_clock::build_transaction_event_request` - pure, so a
-        /// fixed [`Clock`] fake can assert the exact timestamp reaching the wire request.
+        /// fixed [`Clock`] fake can assert the exact timestamp reaching the wire request, and
+        /// carrying only the measurands `measurands` selects (CV2.6).
         fn build_transaction_event_request<C: Clock>(
             clock: &C,
             evse_id: usize,
@@ -1286,6 +1450,7 @@ pub(crate) mod ocpp_2_0_1 {
             kind: TransactionEventKind,
             transaction: Transaction,
             offline: bool,
+            measurands: MeasurandSet,
         ) -> TransactionEventRequest {
             let now = clock.now();
             if !is_synchronized(&now) {
@@ -1294,7 +1459,7 @@ pub(crate) mod ocpp_2_0_1 {
                     "TransactionEvent timestamp sourced from an unsynchronized clock"
                 );
             }
-            let meter_value = build_meter_values(transaction.last_meter_sample, now);
+            let meter_value = build_meter_values(transaction.last_meter_sample, now, measurands);
             TransactionEventRequest {
                 custom_data: None,
                 event_type: map_event_type(kind),
@@ -1337,6 +1502,7 @@ pub(crate) mod ocpp_2_0_1 {
             }
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn send_transaction_event<C: Clock>(
             client: &OCPP2_0_1Client,
             clock: &C,
@@ -1345,6 +1511,7 @@ pub(crate) mod ocpp_2_0_1 {
             kind: TransactionEventKind,
             transaction: Transaction,
             offline: bool,
+            measurands: MeasurandSet,
         ) -> Result<TransactionEventOutcome, ClientError<OCPP2_0_1Error>> {
             let request = build_transaction_event_request(
                 clock,
@@ -1353,6 +1520,7 @@ pub(crate) mod ocpp_2_0_1 {
                 kind,
                 transaction,
                 offline,
+                measurands,
             );
             let response = client.send_transaction_event(request).await?;
             Ok(read_outcome(&response))
@@ -1376,25 +1544,53 @@ pub(crate) mod ocpp_2_0_1 {
         }
 
         /// Wraps an `OCPP2_0_1Client` with a caller-supplied [`Clock`] for the TransactionEvent
-        /// timestamp - mirrors `super::ocpp_2_1::with_clock::Ocpp2_1TransactionNotifier`.
+        /// timestamp and the [`ChargePointActor`] holding the measurand configuration - mirrors
+        /// `super::ocpp_2_1::with_clock::Ocpp2_1TransactionNotifier`, including its CV2.6 rule
+        /// that the device model is read per event rather than at construction, and its `Clone`/
+        /// `ReconnectHandler` so it is registrable through `ChargePointBuilder`.
+        #[derive(Clone)]
         pub struct Ocpp2_0_1TransactionNotifier<C> {
             client: OCPP2_0_1Client,
             clock: C,
+            actor: ChargePointActor,
+        }
+
+        /// Delegates to the wrapped client - mirrors 2.1's.
+        #[async_trait::async_trait]
+        impl<C: Clock + Send + Sync> crate::connection::ReconnectHandler
+            for Ocpp2_0_1TransactionNotifier<C>
+        {
+            async fn register_reconnect_handler<F, FF>(&self, callback: F)
+            where
+                F: FnMut() -> FF + Send + Sync + 'static,
+                FF: core::future::Future<Output = ()> + Send + 'static,
+            {
+                crate::connection::ReconnectHandler::register_reconnect_handler(
+                    &self.client,
+                    callback,
+                )
+                .await;
+            }
         }
 
         impl<C: Clock> Ocpp2_0_1TransactionNotifier<C> {
-            /// Wraps `client`, sourcing every TransactionEvent timestamp from `clock`.
-            pub fn with_clock(client: OCPP2_0_1Client, clock: C) -> Self {
-                Self { client, clock }
+            /// Wraps `client`, sourcing every TransactionEvent timestamp from `clock` and every
+            /// event's measurand selection from `actor`'s device model.
+            pub fn with_clock(client: OCPP2_0_1Client, clock: C, actor: ChargePointActor) -> Self {
+                Self {
+                    client,
+                    clock,
+                    actor,
+                }
             }
         }
 
         #[cfg(feature = "std")]
         impl Ocpp2_0_1TransactionNotifier<crate::clock::SystemClock> {
             /// Wraps `client`, sourcing every TransactionEvent timestamp from
-            /// [`crate::clock::SystemClock`].
-            pub fn new(client: OCPP2_0_1Client) -> Self {
-                Self::with_clock(client, crate::clock::SystemClock)
+            /// [`crate::clock::SystemClock`] and its measurand selection from `actor`.
+            pub fn new(client: OCPP2_0_1Client, actor: ChargePointActor) -> Self {
+                Self::with_clock(client, crate::clock::SystemClock, actor)
             }
         }
 
@@ -1418,6 +1614,7 @@ pub(crate) mod ocpp_2_0_1 {
                     kind,
                     transaction,
                     offline,
+                    transaction_event_measurands(&self.actor, kind),
                 )
                 .await
             }
@@ -1425,7 +1622,9 @@ pub(crate) mod ocpp_2_0_1 {
 
         /// The `std` convenience: `OCPP2_0_1Client` itself implements `TransactionNotifier`
         /// directly (sourcing its timestamp from [`crate::clock::SystemClock`]) so existing
-        /// callers that pass a bare client need no source change.
+        /// callers that pass a bare client need no source change. Like 2.1's, it has no
+        /// [`ChargePointActor`] to read a measurand list from and so reports every measurand the
+        /// sample carries - see `super::super::ocpp_2_1::with_clock`'s note.
         #[cfg(feature = "std")]
         #[async_trait::async_trait]
         impl TransactionNotifier for OCPP2_0_1Client {
@@ -1447,6 +1646,7 @@ pub(crate) mod ocpp_2_0_1 {
                     kind,
                     transaction,
                     offline,
+                    MeasurandSet::ALL,
                 )
                 .await
             }
@@ -1496,6 +1696,7 @@ pub(crate) mod ocpp_2_0_1 {
                     TransactionEventKind::Started,
                     transaction(),
                     false,
+                    MeasurandSet::ALL,
                 );
 
                 assert_eq!(request.timestamp, crate::wire::OcppTimestamp::from(fixed));
@@ -1513,6 +1714,7 @@ pub(crate) mod ocpp_2_0_1 {
                     TransactionEventKind::Started,
                     transaction(),
                     false,
+                    MeasurandSet::ALL,
                 );
 
                 assert_eq!(
@@ -1538,7 +1740,7 @@ pub(crate) mod ocpp_2_0_1 {
                 .unwrap()
                 .with_timezone(&Utc);
 
-            let values = build_meter_values(Some(sample), timestamp);
+            let values = build_meter_values(Some(sample), timestamp, MeasurandSet::ALL);
 
             assert_eq!(values.len(), 1);
             assert_eq!(values[0].sampled_value.len(), 1);
@@ -1555,7 +1757,10 @@ pub(crate) mod ocpp_2_0_1 {
                 .unwrap()
                 .with_timezone(&Utc);
 
-            assert_eq!(build_meter_values(None, timestamp), Vec::new());
+            assert_eq!(
+                build_meter_values(None, timestamp, MeasurandSet::ALL),
+                Vec::new()
+            );
         }
 
         #[test]

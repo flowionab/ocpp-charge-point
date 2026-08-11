@@ -381,6 +381,150 @@ mod tests {
         let _: &VariableAttribute = attribute;
     }
 
+    /// Writes a `MemberList` measurand variable through the actor, the way a CSMS `SetVariables`
+    /// would.
+    async fn set_measurands(
+        actor: &ChargePointActor,
+        component: &str,
+        variable: &str,
+        value: &str,
+    ) {
+        let _ = actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: Component {
+                        name: component.into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: Variable {
+                        name: variable.into(),
+                        instance: None,
+                    },
+                    attribute_type: VariableAttributeType::Actual,
+                    value: value.into(),
+                },
+            ))
+            .await;
+    }
+
+    /// CV2.6/J01: each `TransactionEvent` shape reads *its own* `SampledDataCtrlr` list, so a CSMS
+    /// can ask for a rich `Updated` and a bare `Ended` - which is the whole point of OCPP giving
+    /// them three variables rather than one.
+    #[tokio::test]
+    async fn each_transaction_event_shape_reads_its_own_measurand_list() {
+        use crate::state::{TransactionEventKind, TransactionUpdateReason};
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        set_measurands(&actor, "SampledDataCtrlr", "TxStartedMeasurands", "Voltage").await;
+        set_measurands(
+            &actor,
+            "SampledDataCtrlr",
+            "TxUpdatedMeasurands",
+            "Power.Active.Import",
+        )
+        .await;
+        set_measurands(&actor, "SampledDataCtrlr", "TxEndedMeasurands", "").await;
+
+        assert_eq!(
+            transaction_event_measurands(&actor, TransactionEventKind::Started),
+            MeasurandSet {
+                voltage: true,
+                ..MeasurandSet::default()
+            }
+        );
+        assert_eq!(
+            transaction_event_measurands(
+                &actor,
+                TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic)
+            ),
+            MeasurandSet {
+                power: true,
+                ..MeasurandSet::default()
+            }
+        );
+        assert!(
+            transaction_event_measurands(&actor, TransactionEventKind::Ended).is_empty(),
+            "a cleared list selects nothing"
+        );
+    }
+
+    /// CV2.6/J02: standalone `MeterValues` reads `AlignedDataCtrlr.Measurands`, not
+    /// `SampledDataCtrlr`'s - the two configure different messages from the same stored sample.
+    #[tokio::test]
+    async fn standalone_meter_values_read_the_aligned_list_and_default_to_energy() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+
+        assert_eq!(
+            aligned_measurands(&actor),
+            MeasurandSet {
+                energy: true,
+                ..MeasurandSet::default()
+            },
+            "the registered default is what this firmware always samples"
+        );
+
+        set_measurands(
+            &actor,
+            "AlignedDataCtrlr",
+            "Measurands",
+            "Energy.Active.Import.Register,SoC",
+        )
+        .await;
+        assert_eq!(
+            aligned_measurands(&actor),
+            MeasurandSet {
+                energy: true,
+                soc: true,
+                ..MeasurandSet::default()
+            }
+        );
+    }
+
+    /// CV2.6: the four lists a message kind can be configured with are writable, because this
+    /// build acts on them (`DefaultVariable::honoured`). The `*Interval` variables next to them
+    /// are deliberately still refused - nothing drives them yet.
+    #[tokio::test]
+    async fn the_measurand_variables_are_writable_and_the_intervals_are_not() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let state = actor.state();
+        let mutability = |component: &str, variable: &str| {
+            state
+                .device_model
+                .get(
+                    &Component {
+                        name: component.into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    &Variable {
+                        name: variable.into(),
+                        instance: None,
+                    },
+                )
+                .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+                .map(|attribute| attribute.mutability)
+                .expect("a built-in default")
+        };
+
+        for (component, variable) in [
+            ("SampledDataCtrlr", "TxStartedMeasurands"),
+            ("SampledDataCtrlr", "TxUpdatedMeasurands"),
+            ("SampledDataCtrlr", "TxEndedMeasurands"),
+            ("AlignedDataCtrlr", "Measurands"),
+        ] {
+            assert_eq!(
+                mutability(component, variable),
+                VariableMutability::ReadWrite,
+                "{component}.{variable}"
+            );
+        }
+        assert_eq!(
+            mutability("SampledDataCtrlr", "TxUpdatedInterval"),
+            VariableMutability::ReadOnly
+        );
+    }
+
     #[tokio::test]
     async fn only_connectors_with_a_reading_are_reported() {
         let actor = ChargePointActor::spawn([2], &TokioExecutor);
@@ -540,7 +684,8 @@ mod tests {
 /// OCPP 2.1's standalone `MeterValues`.
 #[cfg(feature = "ocpp_2_1")]
 mod ocpp_2_1 {
-    use super::MeterValuesNotifier;
+    use super::{MeasurandSet, MeterValuesNotifier, aligned_measurands};
+    use crate::actor::ChargePointActor;
     use crate::clock::{Clock, is_synchronized};
     use crate::state::MeterSample;
     use crate::wire::v21::MeterValuesRequest;
@@ -548,49 +693,71 @@ mod ocpp_2_1 {
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_1::{OCPP2_1Client, OCPP2_1Error};
 
-    /// Builds the wire request for one reading. The `meterValue` body itself comes from
-    /// [`crate::transactions`]' own builder rather than a second copy - see that function's docs.
+    /// Builds the wire request for one reading, or `None` when `measurands` selects nothing.
+    ///
+    /// The `meterValue` body itself comes from [`crate::transactions`]' own builder rather than a
+    /// second copy - see that function's docs. `None` rather than a request carrying an empty
+    /// `meterValue` list because `MeterValuesRequest.meterValue` is a *required* field with no
+    /// useful empty form (CV2.6): a CSMS that cleared `AlignedDataCtrlr.Measurands` asked not to be
+    /// told, and sending it a reading-free reading would ignore that at the cost of a round trip.
     fn build_meter_values_request<C: Clock>(
         clock: &C,
         evse_id: usize,
         sample: MeterSample,
-    ) -> MeterValuesRequest {
+        measurands: MeasurandSet,
+    ) -> Option<MeterValuesRequest> {
         let now = clock.now();
+        let meter_value =
+            crate::transactions::ocpp_2_1::build_meter_values(Some(sample), now, measurands);
+        if meter_value.is_empty() {
+            return None;
+        }
         if !is_synchronized(&now) {
             tracing::warn!(
                 timestamp = %now,
                 "MeterValues timestamp sourced from an unsynchronized clock"
             );
         }
-        MeterValuesRequest {
+        Some(MeterValuesRequest {
             custom_data: None,
             // 2.x numbers EVSEs from 1; `0` addresses the charge point itself, which cannot have
             // taken a connector reading.
             evse_id: evse_id as i64 + 1,
-            meter_value: crate::transactions::ocpp_2_1::build_meter_values(Some(sample), now),
-        }
+            meter_value,
+        })
     }
 
     /// Wraps an [`OCPP2_1Client`] with the [`Clock`] that stamps each reading - the same
     /// `with_clock` shape every other timestamped adapter in this crate uses, and reachable
-    /// without `std` for the same reason (G3.1).
+    /// without `std` for the same reason (G3.1) - plus the [`ChargePointActor`] whose
+    /// `AlignedDataCtrlr.Measurands` says which readings a clock-aligned message may carry.
+    ///
+    /// The actor is read per message, not at construction (CV2.6), so a CSMS narrowing or clearing
+    /// the list takes effect on the next aligned cycle.
+    #[derive(Clone)]
     pub struct Ocpp2_1MeterValuesNotifier<C> {
         client: OCPP2_1Client,
         clock: C,
+        actor: ChargePointActor,
     }
 
     impl<C: Clock> Ocpp2_1MeterValuesNotifier<C> {
-        /// Wraps `client`, stamping every reading from `clock`.
-        pub fn with_clock(client: OCPP2_1Client, clock: C) -> Self {
-            Self { client, clock }
+        /// Wraps `client`, stamping every reading from `clock` and selecting its measurands from
+        /// `actor`'s device model.
+        pub fn with_clock(client: OCPP2_1Client, clock: C, actor: ChargePointActor) -> Self {
+            Self {
+                client,
+                clock,
+                actor,
+            }
         }
     }
 
     #[cfg(feature = "std")]
     impl Ocpp2_1MeterValuesNotifier<crate::clock::SystemClock> {
         /// [`Self::with_clock`] with [`crate::clock::SystemClock`].
-        pub fn new(client: OCPP2_1Client) -> Self {
-            Self::with_clock(client, crate::clock::SystemClock)
+        pub fn new(client: OCPP2_1Client, actor: ChargePointActor) -> Self {
+            Self::with_clock(client, crate::clock::SystemClock, actor)
         }
     }
 
@@ -607,14 +774,24 @@ mod ocpp_2_1 {
             // 2.x's `MeterValuesRequest` addresses an EVSE, with no connector field at all - a
             // multi-connector EVSE's readings are therefore indistinguishable on this wire, which
             // is the spec's shape rather than a simplification made here.
-            self.client
-                .send_meter_values(build_meter_values_request(&self.clock, evse_id, sample))
-                .await?;
+            let Some(request) = build_meter_values_request(
+                &self.clock,
+                evse_id,
+                sample,
+                aligned_measurands(&self.actor),
+            ) else {
+                return Ok(());
+            };
+            self.client.send_meter_values(request).await?;
             Ok(())
         }
     }
 
     /// The `std` convenience: a bare client stamps from [`crate::clock::SystemClock`].
+    ///
+    /// It has no [`ChargePointActor`] to read `AlignedDataCtrlr.Measurands` from, so it reports
+    /// every measurand the sample carries. Honouring J02 needs
+    /// [`Ocpp2_1MeterValuesNotifier`] - see [`crate::transactions`]' matching note.
     #[cfg(feature = "std")]
     #[async_trait::async_trait]
     impl MeterValuesNotifier for OCPP2_1Client {
@@ -626,12 +803,15 @@ mod ocpp_2_1 {
             _connector_id: usize,
             sample: MeterSample,
         ) -> Result<(), Self::Error> {
-            self.send_meter_values(build_meter_values_request(
+            let Some(request) = build_meter_values_request(
                 &crate::clock::SystemClock,
                 evse_id,
                 sample,
-            ))
-            .await?;
+                MeasurandSet::ALL,
+            ) else {
+                return Ok(());
+            };
+            self.send_meter_values(request).await?;
             Ok(())
         }
     }
@@ -665,7 +845,9 @@ mod ocpp_2_1 {
                     power_w: Some(7_400),
                     ..Default::default()
                 },
-            );
+                MeasurandSet::ALL,
+            )
+            .expect("a non-empty measurand set produces a request");
 
             assert_eq!(request.evse_id, 1, "2.x numbers EVSEs from 1");
             assert_eq!(request.meter_value.len(), 1);
@@ -682,11 +864,64 @@ mod ocpp_2_1 {
             let unset_rtc = FixedClock(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
             assert!(!is_synchronized(&unset_rtc.now()));
 
-            let request = build_meter_values_request(&unset_rtc, 0, MeterSample::default());
+            let request = build_meter_values_request(
+                &unset_rtc,
+                0,
+                MeterSample::default(),
+                MeasurandSet::ALL,
+            )
+            .expect("a non-empty measurand set produces a request");
 
             assert_eq!(
                 request.meter_value[0].timestamp,
                 crate::wire::OcppTimestamp::from(unset_rtc.0)
+            );
+        }
+
+        /// CV2.6/J02: a CSMS that clears `AlignedDataCtrlr.Measurands` asked for no clock-aligned
+        /// data, and gets none - not a message reporting a timestamp and nothing else.
+        #[test]
+        fn an_empty_measurand_set_produces_no_request_at_all() {
+            assert!(
+                build_meter_values_request(
+                    &FixedClock(fixed()),
+                    0,
+                    MeterSample {
+                        energy_wh: 4_200,
+                        power_w: Some(7_400),
+                        ..Default::default()
+                    },
+                    MeasurandSet::default(),
+                )
+                .is_none()
+            );
+        }
+
+        /// CV2.6/J02: the configured list narrows what a reading reports, even where the meter
+        /// produced more.
+        #[test]
+        fn only_the_configured_measurands_reach_the_wire() {
+            let request = build_meter_values_request(
+                &FixedClock(fixed()),
+                0,
+                MeterSample {
+                    energy_wh: 4_200,
+                    power_w: Some(7_400),
+                    voltage_v: Some(230),
+                    ..Default::default()
+                },
+                MeasurandSet {
+                    power: true,
+                    ..MeasurandSet::default()
+                },
+            )
+            .expect("a non-empty measurand set produces a request");
+
+            let values = &request.meter_value[0].sampled_value;
+            assert_eq!(values.len(), 1);
+            assert_eq!(
+                values[0].measurand,
+                Some(crate::wire::v21::common::MeasurandEnum::PowerActiveImport)
             );
         }
     }
@@ -696,7 +931,8 @@ mod ocpp_2_1 {
 /// mirrors `super::ocpp_2_1` exactly.
 #[cfg(feature = "ocpp_2_0_1")]
 mod ocpp_2_0_1 {
-    use super::MeterValuesNotifier;
+    use super::{MeasurandSet, MeterValuesNotifier, aligned_measurands};
+    use crate::actor::ChargePointActor;
     use crate::clock::{Clock, is_synchronized};
     use crate::state::MeterSample;
     use crate::wire::v201::MeterValuesRequest;
@@ -704,43 +940,58 @@ mod ocpp_2_0_1 {
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_2_0_1::{OCPP2_0_1Client, OCPP2_0_1Error};
 
+    /// Mirrors 2.1's, including its CV2.6 `None` for a measurand set that selects nothing.
     fn build_meter_values_request<C: Clock>(
         clock: &C,
         evse_id: usize,
         sample: MeterSample,
-    ) -> MeterValuesRequest {
+        measurands: MeasurandSet,
+    ) -> Option<MeterValuesRequest> {
         let now = clock.now();
+        let meter_value =
+            crate::transactions::ocpp_2_0_1::build_meter_values(Some(sample), now, measurands);
+        if meter_value.is_empty() {
+            return None;
+        }
         if !is_synchronized(&now) {
             tracing::warn!(
                 timestamp = %now,
                 "MeterValues timestamp sourced from an unsynchronized clock"
             );
         }
-        MeterValuesRequest {
+        Some(MeterValuesRequest {
             custom_data: None,
             evse_id: evse_id as i64 + 1,
-            meter_value: crate::transactions::ocpp_2_0_1::build_meter_values(Some(sample), now),
-        }
+            meter_value,
+        })
     }
 
-    /// Wraps an [`OCPP2_0_1Client`] with the [`Clock`] that stamps each reading.
+    /// Wraps an [`OCPP2_0_1Client`] with the [`Clock`] that stamps each reading and the
+    /// [`ChargePointActor`] holding `AlignedDataCtrlr.Measurands` - mirrors 2.1's.
+    #[derive(Clone)]
     pub struct Ocpp2_0_1MeterValuesNotifier<C> {
         client: OCPP2_0_1Client,
         clock: C,
+        actor: ChargePointActor,
     }
 
     impl<C: Clock> Ocpp2_0_1MeterValuesNotifier<C> {
-        /// Wraps `client`, stamping every reading from `clock`.
-        pub fn with_clock(client: OCPP2_0_1Client, clock: C) -> Self {
-            Self { client, clock }
+        /// Wraps `client`, stamping every reading from `clock` and selecting its measurands from
+        /// `actor`'s device model.
+        pub fn with_clock(client: OCPP2_0_1Client, clock: C, actor: ChargePointActor) -> Self {
+            Self {
+                client,
+                clock,
+                actor,
+            }
         }
     }
 
     #[cfg(feature = "std")]
     impl Ocpp2_0_1MeterValuesNotifier<crate::clock::SystemClock> {
         /// [`Self::with_clock`] with [`crate::clock::SystemClock`].
-        pub fn new(client: OCPP2_0_1Client) -> Self {
-            Self::with_clock(client, crate::clock::SystemClock)
+        pub fn new(client: OCPP2_0_1Client, actor: ChargePointActor) -> Self {
+            Self::with_clock(client, crate::clock::SystemClock, actor)
         }
     }
 
@@ -754,14 +1005,21 @@ mod ocpp_2_0_1 {
             _connector_id: usize,
             sample: MeterSample,
         ) -> Result<(), Self::Error> {
-            self.client
-                .send_meter_values(build_meter_values_request(&self.clock, evse_id, sample))
-                .await?;
+            let Some(request) = build_meter_values_request(
+                &self.clock,
+                evse_id,
+                sample,
+                aligned_measurands(&self.actor),
+            ) else {
+                return Ok(());
+            };
+            self.client.send_meter_values(request).await?;
             Ok(())
         }
     }
 
-    /// The `std` convenience, mirroring 2.1's.
+    /// The `std` convenience, mirroring 2.1's - including its inability to honour
+    /// `AlignedDataCtrlr.Measurands` without an actor to read it from.
     #[cfg(feature = "std")]
     #[async_trait::async_trait]
     impl MeterValuesNotifier for OCPP2_0_1Client {
@@ -773,12 +1031,15 @@ mod ocpp_2_0_1 {
             _connector_id: usize,
             sample: MeterSample,
         ) -> Result<(), Self::Error> {
-            self.send_meter_values(build_meter_values_request(
+            let Some(request) = build_meter_values_request(
                 &crate::clock::SystemClock,
                 evse_id,
                 sample,
-            ))
-            .await?;
+                MeasurandSet::ALL,
+            ) else {
+                return Ok(());
+            };
+            self.send_meter_values(request).await?;
             Ok(())
         }
     }
@@ -809,7 +1070,9 @@ mod ocpp_2_0_1 {
                     energy_wh: 4_200,
                     ..Default::default()
                 },
-            );
+                MeasurandSet::ALL,
+            )
+            .expect("a non-empty measurand set produces a request");
 
             assert_eq!(request.evse_id, 3);
             assert_eq!(

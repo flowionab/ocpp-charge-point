@@ -26,6 +26,19 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   per-EVSE power OCPP requires as device-model variables (CV1.5). **Default-implemented**, unlike
   `capabilities()`, so existing implementations keep compiling — a station that ignores it still
   registers the required variables, empty.
+- The four OCPP 2.x meter-data notifiers — `transactions::Ocpp2_1TransactionNotifier`,
+  `transactions::Ocpp2_0_1TransactionNotifier`, `meter_values::Ocpp2_1MeterValuesNotifier` and
+  `meter_values::Ocpp2_0_1MeterValuesNotifier` — take a `ChargePointActor` on `with_clock` and
+  `new` (CV2.6). They read `SampledDataCtrlr`/`AlignedDataCtrlr`'s measurand lists per message, so
+  a CSMS narrowing or clearing one takes effect on the next event rather than the next boot. The
+  1.6J notifiers are unchanged: `MeterValuesSampledData` is a different mechanism.
+- `ChargePointBuilder::status_notifications` and `status_notifications_persisted` take a `Backoff`
+  (CV2.7). Honouring `MinimumStatusDuration` means holding a status back until it has settled, and
+  holding something back needs a timer — this crate's only `no_std`-friendly one is `Backoff`. The
+  alternatives were an implicit dependency on `provisioning()` having been called first, or a
+  second set of debounced-variant methods; both trade a compile error for a station that silently
+  ignores the variable, which is the failure mode CV2 exists to remove. Untouched on a station
+  that has not set the variable.
 - `remote_control::handle_request_start_transaction` takes the request's `remoteStartId`, and
   `ConnectorEvent::RemoteStartRequested` became a struct variant carrying it (CV6).
 - `TransactionNotifier::notify_transaction_event` takes an `offline` flag and returns a
@@ -52,6 +65,34 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   `OfflineTxForUnknownIdEnabled` are honoured rather than merely stored (CV2).
 - `RequestStartTransaction` with no cable yet is accepted and held until the driver plugs in —
   OCPP's F02, which previously did not work at all (CV7).
+- `PaymentCtrlr`'s live status variables are driven by real hardware (CV2.11, C18–C24). New
+  **default-implemented** `hardware::PaymentTerminal::status()` returns a `PaymentTerminalStatus`
+  — `Connected`, `Problem`, `ICCID`, `IMSI` and the five `Merchant` instances — applied at
+  `ChargePointBuilder::payment` registration and refreshed by the new
+  `ChargePointBuilder::payment_status_updates`. Default-implemented, so no existing binding
+  breaks; a station that does not implement it reports `Connected = false`, which is what this
+  firmware actually knows.
+- Message-size limits are enforced rather than merely declared (CV2.8). A `GetVariables`,
+  `SetVariables`, `GetReport`, `SendLocalList` or `SetVariableMonitoring` carrying more items than
+  `ItemsPerMessage` allows is refused with `OccurrenceConstraintViolation`, and one larger than
+  `BytesPerMessage` allows with `FormatViolation` (B06.FR.16/.17, B08.FR.17/.18, D01.FR.11,
+  N04.FR.09). The refusal names the variable and both numbers. New `message_limits` module.
+- `ChargingStation.MinimumStatusDuration` is honoured (CV2.7, G01): a connector status is reported
+  only once it has held for the configured window, so a bouncing latch no longer floods the CSMS
+  with transitions that cancelled each other out. `0` — the default — keeps the previous
+  report-everything behaviour exactly.
+- Measurand configuration is honoured on OCPP 2.x (CV2.6, J01/J02): each `TransactionEvent` shape
+  reports what its own `SampledDataCtrlr.Tx*Measurands` list names, standalone `MeterValues`
+  reports what `AlignedDataCtrlr.Measurands` names, and a list cleared to empty produces no
+  `meterValue` — and no standalone message at all — rather than a reading-free reading.
+  `connect_and_setup` wires the actor-aware notifiers on both 2.1 and 2.0.1, so this is live on the
+  default path: a CSMS `SetVariables` narrowing a list takes effect on the very next event.
+- New `setup_with_meter_data_notifiers`, which is `setup` with the `TransactionEvent` and
+  `MeterValues` blocks driven by notifiers the caller supplies. They arrive as factories taking the
+  `ChargePointActor`, because a notifier that honours measurand configuration must hold the actor
+  and the actor does not exist until the charge point starts. `setup` itself is unchanged and
+  passes `csms` for both — which means **`setup` called directly with a bare client does not filter
+  measurands**, since such a client has no device model to read.
 
 ## [0.1.0] — 2026-08-10
 

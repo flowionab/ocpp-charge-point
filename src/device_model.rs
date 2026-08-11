@@ -74,6 +74,8 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         value: "0",
         mutability: VariableMutability::ReadOnly,
     },
+    // D01.FR.11: one ceiling for the whole block rather than one per message, hence no instance.
+    // Enforced by `crate::message_limits` on every `SendLocalList` (CV2.8).
     CapabilityGatedVariable {
         component: "LocalAuthListCtrlr",
         variable: "ItemsPerMessage",
@@ -698,10 +700,9 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
     // `DEFAULT_VARIABLES` - a build with the block compiled out owes neither.
     //
     // The figures match `DeviceDataCtrlr`'s (50 items, 8 KiB), which is the same question asked
-    // about a different message. They are *declared* bounds today, not enforced ones: refusing an
-    // oversized `SetVariableMonitoring` with `OccurrenceConstraintViolation`/`FormatViolation` is
-    // CV2.8. Declaring them is still the right move ahead of that - B06.FR.16/17 make the bound
-    // the CSMS's to respect, and a CSMS cannot respect a bound it cannot read.
+    // about a different message. Enforced since CV2.8: a `SetVariableMonitoring` over either
+    // ceiling is refused with `OccurrenceConstraintViolation`/`FormatViolation` (N04.FR.09) rather
+    // than attempted - see `crate::message_limits`.
     CapabilityGatedVariable {
         component: "MonitoringCtrlr",
         variable: "ItemsPerMessage",
@@ -2027,6 +2028,20 @@ mod ocpp_2_1 {
             self.on_get_variables(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // B06.FR.16/.17 (CV2.8): refuse before decoding a request larger than the
+                    // ceiling `DeviceDataCtrlr` publishes for this message.
+                    if let Err(violation) = crate::message_limits::check_message_size(
+                        &actor,
+                        "DeviceDataCtrlr",
+                        Some("GetVariables"),
+                        request.get_variable_data.len(),
+                        &request,
+                    ) {
+                        return Err(crate::message_limits::ocpp_2_1_too_large(
+                            "GetVariables",
+                            violation,
+                        ));
+                    }
                     let parsed: Vec<GetVariableRequest> = request
                         .get_variable_data
                         .iter()
@@ -2055,6 +2070,19 @@ mod ocpp_2_1 {
             self.on_set_variables(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // B05.FR.11 + B06.FR.16/.17 (CV2.8), same ceiling under a different instance.
+                    if let Err(violation) = crate::message_limits::check_message_size(
+                        &actor,
+                        "DeviceDataCtrlr",
+                        Some("SetVariables"),
+                        request.set_variable_data.len(),
+                        &request,
+                    ) {
+                        return Err(crate::message_limits::ocpp_2_1_too_large(
+                            "SetVariables",
+                            violation,
+                        ));
+                    }
                     let parsed: Vec<SetVariableRequest> = request
                         .set_variable_data
                         .iter()
@@ -2354,6 +2382,20 @@ mod ocpp_2_0_1 {
             self.on_get_variables(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // B06.FR.16/.17 (CV2.8): refuse before decoding a request larger than the
+                    // ceiling `DeviceDataCtrlr` publishes for this message.
+                    if let Err(violation) = crate::message_limits::check_message_size(
+                        &actor,
+                        "DeviceDataCtrlr",
+                        Some("GetVariables"),
+                        request.get_variable_data.len(),
+                        &request,
+                    ) {
+                        return Err(crate::message_limits::ocpp_2_0_1_too_large(
+                            "GetVariables",
+                            violation,
+                        ));
+                    }
                     let parsed: Vec<GetVariableRequest> = request
                         .get_variable_data
                         .iter()
@@ -2382,6 +2424,19 @@ mod ocpp_2_0_1 {
             self.on_set_variables(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // B05.FR.11 + B06.FR.16/.17 (CV2.8), same ceiling under a different instance.
+                    if let Err(violation) = crate::message_limits::check_message_size(
+                        &actor,
+                        "DeviceDataCtrlr",
+                        Some("SetVariables"),
+                        request.set_variable_data.len(),
+                        &request,
+                    ) {
+                        return Err(crate::message_limits::ocpp_2_0_1_too_large(
+                            "SetVariables",
+                            violation,
+                        ));
+                    }
                     let parsed: Vec<SetVariableRequest> = request
                         .set_variable_data
                         .iter()

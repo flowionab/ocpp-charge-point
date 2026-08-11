@@ -83,6 +83,7 @@ pub mod iso15118;
 pub mod keepalive;
 #[cfg(feature = "local-auth-list")]
 pub mod local_authorization_list;
+pub mod message_limits;
 pub mod meter_values;
 /// Security profile 3 (mutual TLS): builds a `rustls::ClientConfig` presenting this charge
 /// point's installed client certificate, signed through `hardware::KeyStore` without ever
@@ -193,7 +194,7 @@ pub use self::runtime::ChargePointRuntime;
     feature = "smart-charging",
     feature = "variable-monitoring"
 ))]
-pub use self::setup::setup;
+pub use self::setup::{setup, setup_with_meter_data_notifiers};
 /// The OCPP versions [`connect_and_setup`] can be asked to offer.
 ///
 /// Re-exported because [`connect_and_setup`]'s signature names it: without this, no caller outside

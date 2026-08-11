@@ -1130,7 +1130,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "Energy.Active.Import.Register,Power.Active.Import",
         mutability: VariableMutability::ReadWrite,
-        honoured: false,
+        // CV2.6: read per `TransactionEvent(Updated)` by `transaction_event_measurands`.
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1141,7 +1142,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "Energy.Active.Import.Register",
         mutability: VariableMutability::ReadWrite,
-        honoured: false,
+        // CV2.6: read per `TransactionEvent(Ended)` by `transaction_event_measurands`.
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1163,7 +1165,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "Energy.Active.Import.Register",
         mutability: VariableMutability::ReadWrite,
-        honoured: false,
+        // CV2.6: read per standalone `MeterValues` by `aligned_measurands`.
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1283,7 +1286,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: Some("s"),
         value: "0",
         mutability: VariableMutability::ReadWrite,
-        honoured: false,
+        // CV2.7: read per status change by `MinimumStatusDurationNotifier` (G01).
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1391,7 +1395,8 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "Energy.Active.Import.Register",
         mutability: VariableMutability::ReadWrite,
-        honoured: false,
+        // CV2.6: read per `TransactionEvent(Started)` by `transaction_event_measurands`.
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1528,7 +1533,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "50",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1539,7 +1544,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "50",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1552,7 +1557,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         // `NotifyReport` at, not an aspiration.
         value: "16",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1563,7 +1568,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "8192",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1574,7 +1579,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "8192",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
         persistent: false,
     },
     DefaultVariable {
@@ -1585,7 +1590,7 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "8192",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
         persistent: false,
     },
 ];

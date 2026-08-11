@@ -1670,6 +1670,20 @@ mod ocpp_2_1 {
             self.on_set_variable_monitoring(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // N04.FR.09 (CV2.8): CV1.4 registered these two as declared-but-unenforced
+                    // bounds; this is what makes them real.
+                    if let Err(violation) = crate::message_limits::check_message_size(
+                        &actor,
+                        "MonitoringCtrlr",
+                        Some("SetVariableMonitoring"),
+                        request.set_monitoring_data.len(),
+                        &request,
+                    ) {
+                        return Err(crate::message_limits::ocpp_2_1_too_large(
+                            "SetVariableMonitoring",
+                            violation,
+                        ));
+                    }
                     let parsed: Vec<SetMonitorRequest> = request
                         .set_monitoring_data
                         .iter()
@@ -2435,6 +2449,20 @@ mod ocpp_2_0_1 {
             self.on_set_variable_monitoring(move |request, _client| {
                 let actor = actor.clone();
                 async move {
+                    // N04.FR.09 (CV2.8): CV1.4 registered these two as declared-but-unenforced
+                    // bounds; this is what makes them real.
+                    if let Err(violation) = crate::message_limits::check_message_size(
+                        &actor,
+                        "MonitoringCtrlr",
+                        Some("SetVariableMonitoring"),
+                        request.set_monitoring_data.len(),
+                        &request,
+                    ) {
+                        return Err(crate::message_limits::ocpp_2_0_1_too_large(
+                            "SetVariableMonitoring",
+                            violation,
+                        ));
+                    }
                     let parsed: Vec<SetMonitorRequest> = request
                         .set_monitoring_data
                         .iter()
