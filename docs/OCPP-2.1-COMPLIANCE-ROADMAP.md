@@ -345,7 +345,7 @@ either of these is possible:
 - Any running cost derived locally (I07–I12), which in turn is what I01–I06 display.
 
 Sequenced last among the behavioural items because nothing else depends on it and it is the only one
-that needs a new domain model rather than a new read of an existing one. Status: **partial** — the model and the engine landed (commit `42ccfdb`); the wiring did not.
+that needs a new domain model rather than a new read of an existing one. Status: **done** — model and engine in `42ccfdb`, wiring in `c837fa1`.
 
 `state::Tariff` now carries the priced structure, so `SetDefaultTariff` → `GetTariffs` round-trips
 (I09), and `crate::pricing` turns a tariff plus meter readings into totals, usage and the
@@ -353,17 +353,29 @@ that needs a new domain model rather than a new read of an existing one. Status:
 fraction never overcharges; the three genuinely ambiguous readings in the spec are resolved and
 marked in the module docs.
 
-**What remains: connecting it.** `TransactionEventRequest.cost_details` is still `None`, so I12's
-reporting and the running cost I02 displays are not wired. The engine they call exists and is
-tested (24 tests in `crate::pricing`). I07/I08/I11 need the assigned tariff driven through it per
-transaction; `TariffCostCtrlr.Currency` and the two fallback messages are still `honoured: false`.
+**Wired.** `cost_details` and `transactionInfo.tariffId` are populated, and `EvseState::running_cost`
+holds the station's own figure alongside the CSMS-told `running_costs`. `effective_tariff` resolves
+the driver tariff first and the store's default otherwise, re-resolved per event rather than pinned
+at transaction start — one mechanism covering I07, I08 and I11, including a scheduled default whose
+`validFrom` falls mid-session.
+
+Four scope cuts, each documented where the code makes them: reservation-time dimensions are never
+charged (nothing tracks how long a reservation preceded the transaction that honoured it); a tariff
+arriving mid-session prices only what follows, there being no meter history to back-price against;
+power/current cost dimensions are unreported, having no verified wire example for the unit
+conversion; and clearing the only tariff pricing a transaction freezes its cost rather than
+continuing.
+
+`TariffCostCtrlr.Currency` and the two fallback messages remain unhonoured — this work gave them no
+consumer. They feed I04/I05, which is what a driver *display* shows, and this crate renders nothing
+itself.
 
 ## CV9–CV11 — contained items
 
 | ID | Item | Requirements | Status |
 |---|---|---|---|
-| **CV9** | `SignCertificate` retry discipline: resend after `CertSigningWaitMinimum`, doubling the back-off, stopping at `CertSigningRepeatTimes` until a `TriggerMessage` restarts it. Register both variables. `MaxCertificateChainSize` (a MAY) alongside. | A02.FR.17–.19, A03.FR.17–.19 | open |
-| **CV10** | Make `NetworkConfiguration.BasicAuthPassword` writable — apply a new password to the connection and reconnect (A01.FR.02) — and log the change in the security log without disclosing the value. CV1.3 registered the variable and refuses the write; this is what makes the write real. | A01.FR.02, A01.FR.11/.12 | open |
+| **CV9** (done) | `SignCertificate` retry discipline: resend after `CertSigningWaitMinimum`, doubling the back-off, stopping at `CertSigningRepeatTimes` until a `TriggerMessage` restarts it. Register both variables. `MaxCertificateChainSize` (a MAY) alongside. | A02.FR.17–.19, A03.FR.17–.19 | open |
+| **CV10** | **done** — make `NetworkConfiguration.BasicAuthPassword` writable — apply a new password to the connection and reconnect (A01.FR.02) — and log the change in the security log without disclosing the value. CV1.3 registered the variable and refuses the write; this is what makes the write real. | A01.FR.02, A01.FR.04, A01.FR.11/.12 | **done** |
 | **CV11** | A lock-failure signal distinct from a generic fault. | G05 | open |
 
 ## CV12 — Requirement-level sweeps for the unverified blocks

@@ -228,9 +228,14 @@ Related unimplemented switches: `AuthCtrlr.AuthorizeRemoteStart` (F01.FR.01/.02,
 authorize-or-not branch) *is* registered but is never consulted, as its own doc comment at
 `src/state/device_model.rs:329` says. `DisableRemoteAuthorization` is absent entirely.
 
-### 2.8 High · local cost calculation is absent (I01–I12) [READ]
+### 2.8 ~~High~~ **Closed by CV8** · local cost calculation (I01–I12) [READ]
 
-`src/state/tariff.rs` deliberately models a tariff as `{id, currency, valid_from}` and drops the
+**Fixed.** `state::Tariff` carries the priced structure, `GetTariffs` round-trips (I09), and
+`crate::pricing` prices a session locally — fixed-point, truncating so an ambiguous fraction never
+overcharges. I07/I08/I11/I12 are closed. I01–I06 remain a *product* claim: they are what a driver
+display shows, and this crate ships no display. Original finding follows.
+
+`src/state/tariff.rs` deliberately modelled a tariff as `{id, currency, valid_from}` and dropped the
 priced structure (energy/time/fixed-fee components and their conditions). Consequences:
 
 - **I07–I12** (the entire "Local Cost Calculation" group) are unimplemented — no running cost is
@@ -250,7 +255,10 @@ restarts it — is not implemented, and neither variable is registered.
 
 `MaxCertificateChainSize` (A02.FR.16/A03.FR.16) is also absent; that one is a `MAY`.
 
-### 2.10 Medium · security log entry on credential change (A01.FR.11) [READ]
+### 2.10 ~~Medium~~ **Closed by CV10** · security log entry on credential change (A01.FR.11) [READ]
+
+**Fixed.** Rotation is real, persisted through `KeyStore`, applied on next connect, rolled back on
+repeated failure, and logged without the value. Original finding follows.
 
 A `SetVariables` writing `SecurityCtrlr.BasicAuthPassword` must be logged in the security log
 (A01.FR.11) without disclosing the value (A01.FR.12). No such event is raised. The redaction half is
