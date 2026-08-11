@@ -345,7 +345,18 @@ either of these is possible:
 - Any running cost derived locally (I07–I12), which in turn is what I01–I06 display.
 
 Sequenced last among the behavioural items because nothing else depends on it and it is the only one
-that needs a new domain model rather than a new read of an existing one. Status: **open**.
+that needs a new domain model rather than a new read of an existing one. Status: **partial** — the model and the engine landed (commit `42ccfdb`); the wiring did not.
+
+`state::Tariff` now carries the priced structure, so `SetDefaultTariff` → `GetTariffs` round-trips
+(I09), and `crate::pricing` turns a tariff plus meter readings into totals, usage and the
+`CostDetailsType` breakdown. Fixed-point throughout, truncating toward zero so an ambiguous
+fraction never overcharges; the three genuinely ambiguous readings in the spec are resolved and
+marked in the module docs.
+
+**What remains: connecting it.** `TransactionEventRequest.cost_details` is still `None`, so I12's
+reporting and the running cost I02 displays are not wired. The engine they call exists and is
+tested (24 tests in `crate::pricing`). I07/I08/I11 need the assigned tariff driven through it per
+transaction; `TariffCostCtrlr.Currency` and the two fallback messages are still `honoured: false`.
 
 ## CV9–CV11 — contained items
 
