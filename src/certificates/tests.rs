@@ -759,6 +759,7 @@ async fn the_policy_comes_from_the_device_model_and_a_csms_write_changes_it() {
             write("CertSigningWaitMinimum", "45"),
             write("CertSigningRepeatTimes", "6"),
         ],
+        &crate::hardware::NoKeyStore,
     )
     .await;
 
@@ -849,6 +850,7 @@ async fn a_chain_larger_than_max_certificate_chain_size_is_refused() {
             attribute_type: VariableAttributeType::Actual,
             value: "64".into(),
         }],
+        &crate::hardware::NoKeyStore,
     )
     .await;
 

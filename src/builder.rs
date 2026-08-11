@@ -1884,15 +1884,44 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     /// Exists because 1.6J has no `GetBaseReport`/`GetReport` at all: its flat `GetConfiguration`
     /// already returns everything a report would, so bundling the four handlers together would
     /// make a 1.6J connection unable to register any of them.
+    ///
+    /// `SetVariables` is registered with [`crate::hardware::NoKeyStore`], so a
+    /// `NetworkConfiguration.BasicAuthPassword` rotation (CV10) is refused here exactly as it was
+    /// before that gap closed - call [`Self::basic_auth_password_rotation`] afterwards to make it
+    /// real.
     pub async fn configuration<N>(self, csms: &N) -> Self
     where
         N: GetVariablesHandler + SetVariablesHandler + Send + Sync + 'static,
     {
         csms.register_get_variables_handler(self.runtime.actor())
             .await;
-        csms.register_set_variables_handler(self.runtime.actor())
+        csms.register_set_variables_handler(self.runtime.actor(), crate::hardware::NoKeyStore)
             .await;
 
+        self
+    }
+
+    /// Makes a `NetworkConfiguration.BasicAuthPassword` rotation real (A01.FR.02, CV10):
+    /// re-registers `SetVariables`/`ChangeConfiguration` with `key_store`, which
+    /// [`crate::device_model::handle_set_variables`] then persists a validated rotation through
+    /// (`crate::basic_auth_credential`), with the previous password kept as a fallback. Call
+    /// *after* [`Self::configuration`]/[`Self::device_model`]: registration is
+    /// last-registration-wins, and this call's only job is to replace the `NoKeyStore` handler
+    /// those install with one that can actually act on the one variable they cannot.
+    ///
+    /// Builder-only, like [`Self::certificates`] (only present with the certificate-management
+    /// feature): it needs a [`crate::hardware::KeyStore`], which `setup()`'s generic signature
+    /// cannot receive. Carrying a rotated password onto a *live* connection, and rolling back
+    /// after repeated authentication failure, is a separate, transport-level opt-in - see
+    /// [`crate::network_switch::ConnectionTarget::attach_basic_auth_credential`], which reads
+    /// through the same `key_store`/slot pairing this method persists into.
+    pub async fn basic_auth_password_rotation<N, K>(self, csms: &N, key_store: K) -> Self
+    where
+        N: SetVariablesHandler + Send + Sync + 'static,
+        K: crate::hardware::KeyStore + Send + Sync + 'static,
+    {
+        csms.register_set_variables_handler(self.runtime.actor(), key_store)
+            .await;
         self
     }
 

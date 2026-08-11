@@ -6,10 +6,12 @@
 //! flat-key naming convention; see that submodule's docs for the convention and its limits.
 
 use crate::actor::ChargePointActor;
-use crate::hardware::{CAPABILITY_GATES, Capabilities};
+use crate::hardware::{CAPABILITY_GATES, Capabilities, KeyStore};
+use crate::security_profile::BasicAuthPassword;
 use crate::state::{
-    ChargePointEvent, Component, DeviceModel, DeviceModelEvent, Variable, VariableAttribute,
-    VariableAttributeType, VariableCharacteristics, VariableDataType, VariableMutability,
+    ChargePointEvent, Component, DeviceModel, DeviceModelEvent, SecurityEvent, SecurityEventType,
+    Variable, VariableAttribute, VariableAttributeType, VariableCharacteristics, VariableDataType,
+    VariableMutability,
 };
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -925,33 +927,26 @@ pub trait GetVariablesHandler {
     async fn register_get_variables_handler(&self, actor: ChargePointActor);
 }
 
-/// The `WriteOnly` variables a `SetVariables` is refused on, because this build cannot act on the
-/// value it would be handed (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV10).
+/// The `WriteOnly` variables a `SetVariables` is refused on outright, because this build cannot
+/// act on the value it would be handed at all (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV10).
 ///
 /// `DefaultVariable::honoured` forces an unhonoured variable to
 /// `ReadOnly`, which is how CV2.1 makes `SetVariables` refuse it (B05.FR.09). That lever does not
-/// reach these two: OCPP requires `NetworkConfiguration.BasicAuthPassword` to be reported
-/// `WriteOnly` (B09.FR.10), and this crate registers `WebPaymentsCtrlr.SharedSecret` the same way,
-/// for the reason both exist - a secret `GetVariables` can read is not a secret. So the refusal is
-/// spelled here instead of in the mutability.
+/// reach `WriteOnly` variables: OCPP requires `NetworkConfiguration.BasicAuthPassword` to be
+/// reported `WriteOnly` (B09.FR.10), and this crate registers `WebPaymentsCtrlr.SharedSecret` the
+/// same way, for the reason both exist - a secret `GetVariables` can read is not a secret. So a
+/// blanket refusal for a `WriteOnly` variable this build genuinely cannot honour is spelled here
+/// instead of in the mutability.
 ///
-/// **Accepting one of these would be worse than the usual silent lie, in two separate ways.** The
-/// value is a credential, so storing it would put it in `ChargePointState`, which `trace!` prints
-/// whole - and A01.FR.12 says the charge point SHALL NOT disclose a `BasicAuthPassword` in its
-/// logging, precisely so a diagnostics file cannot carry one. And a CSMS that sees `Accepted` for
-/// a password rotation stops accepting the old password immediately (A01.FR.03), so a station that
-/// accepted a rotation it cannot actually apply would lock itself out of the only peer able to
-/// correct it. `Rejected` keeps the old credentials in force (A01.FR.04), which is the failure mode
-/// an operator can recover from.
-///
-/// Making the write *real* - carrying a rotated password onto the connection - is CV10's remaining
-/// half and is deliberately not done here: it needs decisions about where a credential is persisted
-/// and how it reaches the transport that belong to an integrator's `Storage` and `ConnectOptions`,
-/// not to this table.
-const REFUSED_WRITE_ONLY_VARIABLES: &[(&str, &str)] = &[
-    ("NetworkConfiguration", "BasicAuthPassword"),
-    ("WebPaymentsCtrlr", "SharedSecret"),
-];
+/// **`BasicAuthPassword` is no longer in this table.** CV10's write is real now -
+/// [`resolve_and_apply_set`] special-cases it before ever reaching this list, validating with
+/// [`BasicAuthPassword::new`] and persisting through `hardware::KeyStore` (see
+/// `crate::basic_auth_credential`) rather than refusing outright. `WebPaymentsCtrlr.SharedSecret`
+/// stays refused: it is a different item (Web Payments TOTP, not HTTP Basic) with no consumer at
+/// all yet, so the same two reasons the old `BasicAuthPassword` entry gave still apply to it -
+/// accepting it would put a credential in `ChargePointState` (which `trace!` prints whole), and a
+/// CSMS that saw `Accepted` for a rotation it could not actually carry would have no way back in.
+const REFUSED_WRITE_ONLY_VARIABLES: &[(&str, &str)] = &[("WebPaymentsCtrlr", "SharedSecret")];
 
 /// One requested attribute write in a `SetVariables` request (OCPP `SetVariableData`, minus
 /// wire-only bookkeeping fields).
@@ -992,14 +987,21 @@ pub enum SetVariableOutcome {
 /// [`crate::state::DeviceModelEvent::AttributeValueSet`]) before moving on to the next, so a
 /// later item in the same batch already observes an earlier one's effect (e.g. writing the same
 /// attribute twice in one request applies both, in order).
+///
+/// `key_store` is where a `NetworkConfiguration.BasicAuthPassword` rotation is persisted (CV10) -
+/// see [`resolve_and_apply_set`]. Every other variable ignores it entirely; a caller with no real
+/// `hardware::KeyStore` to offer (or that deliberately doesn't want rotation applied) passes
+/// [`crate::hardware::NoKeyStore`], which makes that one write fail exactly as it did before CV10
+/// closed this gap - `Rejected`, not a silent no-op.
 #[tracing::instrument(skip_all)]
-pub async fn handle_set_variables(
+pub async fn handle_set_variables<K: KeyStore>(
     actor: &ChargePointActor,
     requests: Vec<SetVariableRequest>,
+    key_store: &K,
 ) -> Vec<SetVariableOutcome> {
     let mut outcomes = Vec::with_capacity(requests.len());
     for request in requests {
-        outcomes.push(resolve_and_apply_set(actor, &request).await);
+        outcomes.push(resolve_and_apply_set(actor, &request, key_store).await);
     }
     outcomes
 }
@@ -1009,9 +1011,10 @@ pub async fn handle_set_variables(
 /// -attribute-type priority, additionally rejecting a `ReadOnly` or `constant` attribute (neither
 /// of which `SetVariables` may ever write), and reports `RebootRequired` instead of `Accepted`
 /// when the attribute is marked as needing one.
-async fn resolve_and_apply_set(
+async fn resolve_and_apply_set<K: KeyStore>(
     actor: &ChargePointActor,
     request: &SetVariableRequest,
+    key_store: &K,
 ) -> SetVariableOutcome {
     let state = actor.state();
     let Some(definition) = state
@@ -1029,6 +1032,22 @@ async fn resolve_and_apply_set(
     };
     if attribute.mutability == VariableMutability::ReadOnly || attribute.constant {
         return SetVariableOutcome::Rejected;
+    }
+    // CV10: `NetworkConfiguration.BasicAuthPassword` never reaches `DeviceModelEvent::
+    // AttributeValueSet` below - doing so would put the credential in `ChargePointState`, which
+    // `trace!` prints whole (A01.FR.12) - so it is resolved and returned here, before the generic
+    // path (`REFUSED_WRITE_ONLY_VARIABLES`, `validate_value`, the `AttributeValueSet` send) ever
+    // sees it.
+    if request.component.name == "NetworkConfiguration"
+        && request.variable.name == "BasicAuthPassword"
+    {
+        return handle_basic_auth_password_write(
+            actor,
+            request.component.instance.as_deref(),
+            &request.value,
+            key_store,
+        )
+        .await;
     }
     // CV10: a credential this build could store but not use - see `REFUSED_WRITE_ONLY_VARIABLES`.
     // The log line names the variable and nothing else: not the value, and not its length either,
@@ -1076,6 +1095,67 @@ async fn resolve_and_apply_set(
     } else {
         SetVariableOutcome::Accepted
     }
+}
+
+/// Resolves a `NetworkConfiguration[slot].BasicAuthPassword` write (CV10, A01.FR.02/.04/.11/.12).
+///
+/// `instance` is the slot the write addressed (`Component::instance`, present because
+/// [`resolve_and_apply_set`] only reaches here once `state.device_model.get` has already found a
+/// `NetworkConfiguration[slot]` component - which is only ever registered for an *occupied* slot,
+/// so a slot number this crate has no stored profile for cannot reach this function at all).
+///
+/// 1. **Validate** with [`BasicAuthPassword::new`] (A00.FR.205) - this is the one check this
+///    function owns; everything OCPP says about the value's shape lives there, not here.
+/// 2. **Persist** through `key_store` (`crate::basic_auth_credential::rotate`), keeping the
+///    password this station was using before as a fallback - never through
+///    [`crate::hardware::Storage`]/`ChargePointState`, which `crate::persistence` writes as a plain
+///    JSON blob and `trace!` prints whole.
+/// 3. **Log** that the password changed, for which slot, and when - never the value, which never
+///    reaches this function's log lines, the security log, or (per `WriteOnly`) `GetVariables`.
+///
+/// Applying the new password to a *live* connection, and rolling back after repeated
+/// authentication failure (A01.FR.04), is [`crate::network_switch::ConnectionTarget`]'s job - it
+/// reads whatever `crate::basic_auth_credential::current` returns on every redial, so persisting
+/// here is sufficient for "apply on next connect" without this function reaching into the
+/// transport at all.
+async fn handle_basic_auth_password_write<K: KeyStore>(
+    actor: &ChargePointActor,
+    instance: Option<&str>,
+    value: &str,
+    key_store: &K,
+) -> SetVariableOutcome {
+    let Some(slot) = instance.and_then(|instance| instance.parse::<i32>().ok()) else {
+        tracing::warn!("refusing a BasicAuthPassword write with no readable configuration slot");
+        return SetVariableOutcome::Rejected;
+    };
+    let password = match BasicAuthPassword::new(value) {
+        Ok(password) => password,
+        Err(error) => {
+            // A01.FR.12: the reason is a shape (too short/too long), never the value or its
+            // length - length alone would still narrow a guess at the string this refused.
+            tracing::warn!(
+                slot,
+                ?error,
+                "refusing a BasicAuthPassword that fails A00.FR.205"
+            );
+            return SetVariableOutcome::Rejected;
+        }
+    };
+    if let Err(error) = crate::basic_auth_credential::rotate(key_store, slot, &password).await {
+        tracing::warn!(slot, %error, "could not persist a rotated BasicAuthPassword");
+        return SetVariableOutcome::Rejected;
+    }
+    crate::security::report_security_event(
+        actor,
+        SecurityEvent {
+            event_type: SecurityEventType::ReconfigurationOfSecurityParameters,
+            tech_info: Some(alloc::format!(
+                "BasicAuthPassword rotated for NetworkConfiguration slot {slot}"
+            )),
+        },
+    )
+    .await;
+    SetVariableOutcome::Accepted
 }
 
 /// Why [`validate_value`] refused a `SetVariables` value. Both map to OCPP's `Rejected`
@@ -1202,8 +1282,17 @@ fn validate_value(
 #[async_trait::async_trait]
 pub trait SetVariablesHandler {
     /// Registers a `SetVariables` handler with the CSMS connection that dispatches incoming
-    /// requests to [`handle_set_variables`] against `actor`.
-    async fn register_set_variables_handler(&self, actor: ChargePointActor);
+    /// requests to [`handle_set_variables`] against `actor`, threading `key_store` through for a
+    /// `NetworkConfiguration.BasicAuthPassword` rotation (CV10).
+    ///
+    /// `crate::builder::ChargePointBuilder::configuration`/`device_model` pass
+    /// [`crate::hardware::NoKeyStore`] here for a caller who hasn't opted into rotation - see
+    /// `crate::builder::ChargePointBuilder::basic_auth_password_rotation` for the one that does.
+    async fn register_set_variables_handler<K: crate::hardware::KeyStore + Send + Sync + 'static>(
+        &self,
+        actor: ChargePointActor,
+        key_store: K,
+    );
 }
 
 #[cfg(test)]
@@ -1214,10 +1303,46 @@ mod tests {
     };
     use crate::actor::ChargePointActor;
     use crate::executor::TokioExecutor;
+    use crate::hardware::{InMemoryStorage, NoKeyStore, SoftKeyStore, SoftwareCrypto};
     use crate::state::{
         ChargePointEvent, Component, DeviceModelEvent, Variable, VariableAttribute,
         VariableAttributeType, VariableCharacteristics, VariableDataType, VariableMutability,
     };
+    use alloc::sync::Arc;
+
+    /// A [`SoftwareCrypto`] that panics if ever asked to touch key material - none of this
+    /// module's tests exercise `KeyStore::generate_key_pair`/`sign`, only
+    /// `store_credential`/`load_credential`, so a call reaching this would mean a test wired the
+    /// wrong path.
+    #[derive(Debug, Default)]
+    struct UnusedCrypto;
+    impl SoftwareCrypto for UnusedCrypto {
+        type Error = core::convert::Infallible;
+        fn generate_key_pair(
+            &self,
+            _algorithm: crate::hardware::SignatureAlgorithm,
+        ) -> Result<(alloc::vec::Vec<u8>, crate::hardware::PublicKey), Self::Error> {
+            unreachable!("this test module never generates a key pair")
+        }
+        fn sign(
+            &self,
+            _algorithm: crate::hardware::SignatureAlgorithm,
+            _private_key: &[u8],
+            _digest: &[u8],
+        ) -> Result<alloc::vec::Vec<u8>, Self::Error> {
+            unreachable!("this test module never signs")
+        }
+        fn supported_algorithms(&self) -> &[crate::hardware::SignatureAlgorithm] {
+            &[]
+        }
+    }
+
+    /// A real (in-memory) `KeyStore`, for the tests proving CV10's write actually persists a
+    /// rotation - as opposed to `NoKeyStore`, which every other test in this module passes to
+    /// prove the ordinary paths are unaffected.
+    fn key_store() -> SoftKeyStore<Arc<InMemoryStorage>, UnusedCrypto> {
+        SoftKeyStore::new(Arc::new(InMemoryStorage::new()), UnusedCrypto)
+    }
 
     /// B1.7's rule, as a test rather than a claim: a capability that is *on* brings every required
     /// variable its component owes, and one that is *off* brings none of them.
@@ -1656,6 +1781,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "120".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -1695,6 +1821,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "changed".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -1722,6 +1849,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "new".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -1757,6 +1885,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "banana".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -1787,11 +1916,11 @@ mod tests {
         };
 
         assert_eq!(
-            handle_set_variables(&actor, alloc::vec![set("-1")]).await,
+            handle_set_variables(&actor, alloc::vec![set("-1")], &NoKeyStore).await,
             alloc::vec![SetVariableOutcome::Rejected]
         );
         assert_eq!(
-            handle_set_variables(&actor, alloc::vec![set("0")]).await,
+            handle_set_variables(&actor, alloc::vec![set("0")], &NoKeyStore).await,
             alloc::vec![SetVariableOutcome::Accepted],
             "zero is a real setting, not an out-of-range one"
         );
@@ -1810,12 +1939,12 @@ mod tests {
         };
 
         assert_eq!(
-            handle_set_variables(&actor, alloc::vec![set("false")]).await,
+            handle_set_variables(&actor, alloc::vec![set("false")], &NoKeyStore).await,
             alloc::vec![SetVariableOutcome::Accepted]
         );
         for bad in ["1", "True", "yes", ""] {
             assert_eq!(
-                handle_set_variables(&actor, alloc::vec![set(bad)]).await,
+                handle_set_variables(&actor, alloc::vec![set(bad)], &NoKeyStore).await,
                 alloc::vec![SetVariableOutcome::Rejected],
                 "{bad:?} is not a boolean"
             );
@@ -1870,6 +1999,7 @@ mod tests {
                 // not for what it says.
                 value: "true".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -1890,6 +2020,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "false".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -1911,6 +2042,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "0,1,2".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -1929,6 +2061,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "1".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -1965,15 +2098,17 @@ mod tests {
         actor
     }
 
-    /// A01.FR.02's rotation is refused rather than accepted, because this build cannot carry the
-    /// new password onto the connection.
+    /// Before CV10's second half, `NoKeyStore` is the honest stand-in for "this build has nothing
+    /// to persist a rotation through", and the outcome must still be `Rejected` rather than an
+    /// `Accepted` this crate cannot actually carry.
     ///
     /// The status matters more than it looks: A01.FR.03 has a CSMS that sees `Accepted` stop
     /// accepting the old password at once, so a station that accepted a rotation it then discarded
     /// would lock itself out of the only peer that could put it right. `Rejected` keeps the old
     /// credentials in force (A01.FR.04).
     #[tokio::test]
-    async fn rotating_the_basic_auth_password_is_refused_rather_than_silently_discarded() {
+    async fn rotating_the_basic_auth_password_with_no_key_store_is_refused_rather_than_silently_accepted()
+     {
         let actor = actor_with_a_network_profile().await;
 
         let outcomes = handle_set_variables(
@@ -1984,20 +2119,109 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "a-perfectly-valid-rotation".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
         assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Rejected]);
     }
 
-    /// A01.FR.12: the value must not be disclosed. `WriteOnly` already stops `GetVariables`
-    /// reading it; this covers the other door - a refused write must not have parked the plaintext
-    /// anywhere in `ChargePointState`, whose `Debug` is what `trace!` prints whole.
+    /// CV10's write is real now: a well-formed rotation against a real `KeyStore` is `Accepted`,
+    /// and the value it persisted is exactly what a later dial would read back through
+    /// `crate::basic_auth_credential::current`.
     #[tokio::test]
-    async fn a_refused_password_never_reaches_the_state_a_trace_log_would_print() {
+    async fn rotating_the_basic_auth_password_with_a_key_store_persists_it_and_is_accepted() {
         let actor = actor_with_a_network_profile().await;
+        let key_store = key_store();
 
-        handle_set_variables(
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: slot_component("NetworkConfiguration", "1"),
+                variable: variable("BasicAuthPassword"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "a-perfectly-valid-rotation".into(),
+            }],
+            &key_store,
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Accepted]);
+        assert_eq!(
+            crate::basic_auth_credential::current(&key_store, 1)
+                .await
+                .as_deref(),
+            Some("a-perfectly-valid-rotation")
+        );
+    }
+
+    /// A00.FR.205 is enforced through `BasicAuthPassword::new` before anything is persisted -
+    /// even with a real `KeyStore` behind it, a too-short value is refused and leaves no record.
+    #[tokio::test]
+    async fn a_password_below_ocpps_floor_is_rejected_even_with_a_key_store() {
+        let actor = actor_with_a_network_profile().await;
+        let key_store = key_store();
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: slot_component("NetworkConfiguration", "1"),
+                variable: variable("BasicAuthPassword"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "too-short".into(),
+            }],
+            &key_store,
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Rejected]);
+        assert_eq!(
+            crate::basic_auth_credential::current(&key_store, 1).await,
+            None
+        );
+    }
+
+    /// A01.FR.04: rotating a slot's password twice must not lose the *original* password - a
+    /// station that only remembered the last two values would still brick itself if the CSMS
+    /// wrote a bad rotation right after a good one.
+    #[tokio::test]
+    async fn a_second_rotation_still_leaves_the_first_password_recoverable() {
+        let actor = actor_with_a_network_profile().await;
+        let key_store = key_store();
+
+        for value in ["first-password-16", "second-password-16"] {
+            let outcomes = handle_set_variables(
+                &actor,
+                alloc::vec![SetVariableRequest {
+                    component: slot_component("NetworkConfiguration", "1"),
+                    variable: variable("BasicAuthPassword"),
+                    attribute_type: VariableAttributeType::Actual,
+                    value: value.into(),
+                }],
+                &key_store,
+            )
+            .await;
+            assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Accepted]);
+        }
+
+        assert!(crate::basic_auth_credential::rollback(&key_store, 1).await);
+        assert_eq!(
+            crate::basic_auth_credential::current(&key_store, 1)
+                .await
+                .as_deref(),
+            Some("first-password-16")
+        );
+    }
+
+    /// A01.FR.11/.12: a successful rotation is logged - that the password changed, for which
+    /// slot, and nothing else. The security log is where an operator (or an auditor) finds out a
+    /// credential rotated at all; the value must never be one of the fields it carries.
+    #[tokio::test]
+    async fn a_successful_rotation_is_logged_without_the_value() {
+        let actor = actor_with_a_network_profile().await;
+        let mut events = actor.subscribe_security_events();
+
+        let outcomes = handle_set_variables(
             &actor,
             alloc::vec![SetVariableRequest {
                 component: slot_component("NetworkConfiguration", "1"),
@@ -2005,15 +2229,56 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "correct-horse-battery-staple".into(),
             }],
+            &key_store(),
         )
         .await;
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Accepted]);
+
+        let received = events.recv().await.unwrap();
+        assert_eq!(
+            received.event_type,
+            crate::state::SecurityEventType::ReconfigurationOfSecurityParameters
+        );
+        let tech_info = received.tech_info.expect("a slot should be named");
+        assert!(
+            tech_info.contains('1'),
+            "the slot should be named: {tech_info}"
+        );
+        assert!(
+            !tech_info.contains("correct-horse-battery-staple"),
+            "the password reached the security log: {tech_info}"
+        );
+    }
+
+    /// A rotated password is never parked in `ChargePointState` - it goes to `key_store`, not
+    /// `DeviceModelEvent::AttributeValueSet`. This covers the door `WriteOnly` alone does not:
+    /// `GetVariables` already refuses to read it, but an `Accepted` write must not have left the
+    /// plaintext somewhere `ChargePointState`'s `Debug` (what `trace!` prints whole) would show
+    /// it (A01.FR.12).
+    #[tokio::test]
+    async fn a_rotated_password_never_reaches_the_state_a_trace_log_would_print() {
+        let actor = actor_with_a_network_profile().await;
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: slot_component("NetworkConfiguration", "1"),
+                variable: variable("BasicAuthPassword"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "correct-horse-battery-staple".into(),
+            }],
+            &key_store(),
+        )
+        .await;
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Accepted]);
 
         let printed = alloc::format!("{:?}", actor.state());
         assert!(
             !printed.contains("correct-horse-battery-staple"),
             "a credential reached the state a trace log prints"
         );
-        // ...and it is still unreadable through the front door.
+        // ...and it is still unreadable through the front door - `WriteOnly` blocks reads
+        // regardless of whether the write behind it succeeded.
         assert_eq!(
             handle_get_variables(
                 &actor,
@@ -2027,10 +2292,39 @@ mod tests {
         );
     }
 
+    /// A slot the CSMS never wrote a profile into has no `NetworkConfiguration[slot]` component
+    /// at all, so the write cannot reach `handle_basic_auth_password_write` in the first place -
+    /// it fails the same `UnknownComponent` every other variable on an unoccupied slot would.
+    #[tokio::test]
+    async fn a_password_for_an_unoccupied_slot_is_unknown_component_not_a_persisted_rotation() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let key_store = key_store();
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: slot_component("NetworkConfiguration", "9"),
+                variable: variable("BasicAuthPassword"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "a-perfectly-valid-rotation".into(),
+            }],
+            &key_store,
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::UnknownComponent]);
+        assert_eq!(
+            crate::basic_auth_credential::current(&key_store, 9).await,
+            None
+        );
+    }
+
     /// The same hole, the same shape: `WebPaymentsCtrlr.SharedSecret` is `WriteOnly` for the same
     /// reason and is equally unacted-on, so it takes the same refusal. Unlike the password's
     /// component this one is *not* re-derived per event, so an accepted write would have kept the
-    /// secret in `ChargePointState` indefinitely.
+    /// secret in `ChargePointState` indefinitely. Unlike `BasicAuthPassword`, a real `KeyStore`
+    /// changes nothing here - this variable has no consumer at all yet (see
+    /// `REFUSED_WRITE_ONLY_VARIABLES`'s docs).
     #[tokio::test]
     async fn the_web_payments_shared_secret_is_refused_on_the_same_grounds() {
         use crate::hardware::Capabilities;
@@ -2054,6 +2348,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "a-shared-secret-value".into(),
             }],
+            &key_store(),
         )
         .await;
 
@@ -2061,8 +2356,9 @@ mod tests {
         assert!(!alloc::format!("{:?}", actor.state()).contains("a-shared-secret-value"));
     }
 
-    /// The refusal is aimed at two named credentials, not at every `NetworkConfiguration` write -
-    /// a future build that honours one of the others must not be blocked by this table.
+    /// The refusal is aimed at one named credential now, not at every `NetworkConfiguration`
+    /// write - a variable name not in the table (or, since CV10, `BasicAuthPassword` itself) must
+    /// not be blocked by it.
     #[tokio::test]
     async fn the_refusal_does_not_spill_onto_other_variables_of_the_same_component() {
         let actor = actor_with_a_network_profile().await;
@@ -2078,6 +2374,7 @@ mod tests {
                 attribute_type: VariableAttributeType::Actual,
                 value: "x".into(),
             }],
+            &NoKeyStore,
         )
         .await;
 
@@ -2092,6 +2389,7 @@ mod ocpp_2_1 {
         SetVariableRequest, SetVariablesHandler, handle_get_variables, handle_set_variables,
     };
     use crate::actor::ChargePointActor;
+    use crate::hardware::KeyStore;
     use crate::state::{Component, Variable, VariableAttributeType};
     use crate::wire::v21::common::{
         AttributeEnum, GetVariableData, GetVariableResult, GetVariableStatusEnum, SetVariableData,
@@ -2285,9 +2583,15 @@ mod ocpp_2_1 {
 
     #[async_trait::async_trait]
     impl SetVariablesHandler for OCPP2_1Client {
-        async fn register_set_variables_handler(&self, actor: ChargePointActor) {
+        async fn register_set_variables_handler<K: KeyStore + Send + Sync + 'static>(
+            &self,
+            actor: ChargePointActor,
+            key_store: K,
+        ) {
+            let key_store = alloc::sync::Arc::new(key_store);
             self.on_set_variables(move |request, _client| {
                 let actor = actor.clone();
+                let key_store = key_store.clone();
                 async move {
                     // B05.FR.11 + B06.FR.16/.17 (CV2.8), same ceiling under a different instance.
                     if let Err(violation) = crate::message_limits::check_message_size(
@@ -2307,7 +2611,7 @@ mod ocpp_2_1 {
                         .iter()
                         .map(parse_set_variable_data)
                         .collect();
-                    let outcomes = handle_set_variables(&actor, parsed).await;
+                    let outcomes = handle_set_variables(&actor, parsed, &key_store).await;
                     let set_variable_result = request
                         .set_variable_data
                         .iter()
@@ -2456,6 +2760,7 @@ mod ocpp_2_0_1 {
         SetVariableRequest, SetVariablesHandler, handle_get_variables, handle_set_variables,
     };
     use crate::actor::ChargePointActor;
+    use crate::hardware::KeyStore;
     use crate::state::{Component, Variable, VariableAttributeType};
     use crate::wire::v201::common::{
         AttributeEnum, GetVariableData, GetVariableResult, GetVariableStatusEnum, SetVariableData,
@@ -2639,9 +2944,15 @@ mod ocpp_2_0_1 {
 
     #[async_trait::async_trait]
     impl SetVariablesHandler for OCPP2_0_1Client {
-        async fn register_set_variables_handler(&self, actor: ChargePointActor) {
+        async fn register_set_variables_handler<K: KeyStore + Send + Sync + 'static>(
+            &self,
+            actor: ChargePointActor,
+            key_store: K,
+        ) {
+            let key_store = alloc::sync::Arc::new(key_store);
             self.on_set_variables(move |request, _client| {
                 let actor = actor.clone();
+                let key_store = key_store.clone();
                 async move {
                     // B05.FR.11 + B06.FR.16/.17 (CV2.8), same ceiling under a different instance.
                     if let Err(violation) = crate::message_limits::check_message_size(
@@ -2661,7 +2972,7 @@ mod ocpp_2_0_1 {
                         .iter()
                         .map(parse_set_variable_data)
                         .collect();
-                    let outcomes = handle_set_variables(&actor, parsed).await;
+                    let outcomes = handle_set_variables(&actor, parsed, &key_store).await;
                     let set_variable_result = request
                         .set_variable_data
                         .iter()
@@ -2794,7 +3105,7 @@ mod ocpp_1_6 {
         handle_set_variables,
     };
     use crate::actor::ChargePointActor;
-    use crate::hardware::Capabilities;
+    use crate::hardware::{Capabilities, KeyStore};
     use crate::state::{
         Component, DeviceModel, Variable, VariableAttributeType, VariableDefinition,
         VariableMutability,
@@ -3373,9 +3684,15 @@ mod ocpp_1_6 {
 
     #[async_trait::async_trait]
     impl SetVariablesHandler for OCPP1_6Client {
-        async fn register_set_variables_handler(&self, actor: ChargePointActor) {
+        async fn register_set_variables_handler<K: KeyStore + Send + Sync + 'static>(
+            &self,
+            actor: ChargePointActor,
+            key_store: K,
+        ) {
+            let key_store = alloc::sync::Arc::new(key_store);
             self.on_change_configuration(move |request, _client| {
                 let actor = actor.clone();
+                let key_store = key_store.clone();
                 async move {
                     // A key this charge point answers from live state exists but cannot be
                     // written - `Rejected` says exactly that, where `NotSupported` would claim it
@@ -3394,6 +3711,7 @@ mod ocpp_1_6 {
                                 attribute_type: VariableAttributeType::Actual,
                                 value: request.value.to_string(),
                             }],
+                            &key_store,
                         )
                         .await
                         .remove(0),
@@ -3752,6 +4070,7 @@ mod ocpp_1_6 {
         async fn changing_configuration_by_a_standard_alias_key_updates_the_device_model() {
             use crate::actor::ChargePointActor;
             use crate::executor::TokioExecutor;
+            use crate::hardware::NoKeyStore;
 
             let actor = ChargePointActor::spawn([1], &TokioExecutor);
 
@@ -3764,6 +4083,7 @@ mod ocpp_1_6 {
                         attribute_type: VariableAttributeType::Actual,
                         value: "120".into(),
                     }],
+                    &NoKeyStore,
                 )
                 .await
                 .remove(0),

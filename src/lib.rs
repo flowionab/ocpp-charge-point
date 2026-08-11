@@ -26,6 +26,11 @@ extern crate alloc;
 pub mod actor;
 pub mod authorization;
 pub mod availability;
+/// `NetworkConfiguration.BasicAuthPassword` rotation: validation, `hardware::KeyStore`-backed
+/// persistence with rollback to the previous password, and the security-log entry a rotation
+/// writes (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV10). Not `pub` - [`device_model`] and
+/// [`network_switch`] are the only two consumers, on the write and the redial side respectively.
+mod basic_auth_credential;
 /// Battery Swap functional block (OCPP 2.1 only, `docs/PRODUCTION-ROADMAP.md` B8.3):
 /// `RequestBatterySwap`/`BatterySwap`, for battery-swap station hardware. Behind the
 /// `battery-swap` Cargo feature - see [`battery_swap`]'s own docs for why.

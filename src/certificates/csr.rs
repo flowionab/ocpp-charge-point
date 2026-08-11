@@ -667,6 +667,18 @@ mod tests {
         async fn backing(&self) -> Result<crate::hardware::KeyStoreBacking, Self::Error> {
             Ok(crate::hardware::KeyStoreBacking::Software)
         }
+
+        async fn store_credential(&self, _label: &str, _value: &str) -> Result<(), Self::Error> {
+            Err(FakeError)
+        }
+
+        async fn load_credential(&self, _label: &str) -> Result<Option<String>, Self::Error> {
+            Err(FakeError)
+        }
+
+        async fn delete_credential(&self, _label: &str) -> Result<(), Self::Error> {
+            Err(FakeError)
+        }
     }
 
     fn fake_spki() -> Vec<u8> {

@@ -79,8 +79,29 @@
 //! unconditionally reports [`KeyStoreBacking::Software`], regardless of what its
 //! [`SoftwareCrypto`] backend can do, so a software fallback can never be mistaken for a secure
 //! element that happens to be implemented over `Storage`.
+//!
+//! # Credentials are not key material (CV10)
+//!
+//! [`KeyStore::store_credential`]/[`KeyStore::load_credential`]/[`KeyStore::delete_credential`]
+//! are a second, deliberately narrower kind of secret this trait holds: an opaque, *retrievable*
+//! value such as OCPP's `NetworkConfiguration.BasicAuthPassword` (A01.FR.02). This looks like it
+//! should conflict with the no-export invariant above - it does not, because it is a different
+//! promise about a different kind of secret. A [`KeyHandle`]'s private key exists to *sign*
+//! things without ever leaving the element that holds it; a stored credential exists to be sent
+//! to a peer verbatim (HTTP Basic authentication has no other way to work), so
+//! [`Self::load_credential`] returning it in cleartext is the method doing its job, not a breach
+//! of it. What the two share is the reason this lives here rather than in
+//! [`Storage`](crate::hardware::Storage) directly: hardware with a secure element usually offers
+//! protected storage for both a key slot *and* a plain data/OTP zone (an ATECC608's data slots are
+//! the common example), so a credential gets the same "as good as this station's hardware allows"
+//! treatment a signing key does, rather than landing in the same plain-flash blob
+//! [`crate::persistence`] writes (which is deliberately readable with `cat` - see that module's
+//! docs - and exactly wrong for a password). [`SoftKeyStore`] falls back to
+//! [`Storage`](crate::hardware::Storage) for credentials exactly as it does for keys, and still
+//! honestly reports [`KeyStoreBacking::Software`].
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// An asymmetric key algorithm a [`KeyStore`] can be asked to generate a keypair for, or that a
@@ -214,6 +235,20 @@ pub trait KeyStore {
     /// see [`KeyStoreBacking`] and the module docs. An implementation must answer this honestly
     /// even when it would prefer to look more secure than it is.
     async fn backing(&self) -> Result<KeyStoreBacking, Self::Error>;
+
+    /// Stores `value` under `label`, overwriting whatever credential was stored under that label
+    /// before. See the module docs ("Credentials are not key material") for why this is not the
+    /// asymmetric key material [`Self::generate_key_pair`]/[`Self::sign`] guard, and is expected
+    /// to come back out of [`Self::load_credential`] unchanged.
+    async fn store_credential(&self, label: &str, value: &str) -> Result<(), Self::Error>;
+
+    /// Reads back the credential [`Self::store_credential`] stored under `label`, or `None` if
+    /// nothing is stored there.
+    async fn load_credential(&self, label: &str) -> Result<Option<String>, Self::Error>;
+
+    /// Deletes the credential stored under `label`. Removing a label with nothing stored under it
+    /// is not an error - the caller wanted it gone and it is gone.
+    async fn delete_credential(&self, label: &str) -> Result<(), Self::Error>;
 }
 
 #[async_trait::async_trait]
@@ -241,6 +276,18 @@ impl<T: KeyStore + Send + Sync + ?Sized> KeyStore for alloc::sync::Arc<T> {
 
     async fn backing(&self) -> Result<KeyStoreBacking, Self::Error> {
         (**self).backing().await
+    }
+
+    async fn store_credential(&self, label: &str, value: &str) -> Result<(), Self::Error> {
+        (**self).store_credential(label, value).await
+    }
+
+    async fn load_credential(&self, label: &str) -> Result<Option<String>, Self::Error> {
+        (**self).load_credential(label).await
+    }
+
+    async fn delete_credential(&self, label: &str) -> Result<(), Self::Error> {
+        (**self).delete_credential(label).await
     }
 }
 
@@ -294,6 +341,18 @@ impl KeyStore for NoKeyStore {
     async fn backing(&self) -> Result<KeyStoreBacking, Self::Error> {
         Ok(KeyStoreBacking::Software)
     }
+
+    async fn store_credential(&self, _label: &str, _value: &str) -> Result<(), Self::Error> {
+        Err(NoKeyStoreError)
+    }
+
+    async fn load_credential(&self, _label: &str) -> Result<Option<String>, Self::Error> {
+        Err(NoKeyStoreError)
+    }
+
+    async fn delete_credential(&self, _label: &str) -> Result<(), Self::Error> {
+        Err(NoKeyStoreError)
+    }
 }
 
 /// The actual asymmetric-key math a [`SoftKeyStore`] needs and this crate does not implement
@@ -338,11 +397,30 @@ pub trait SoftwareCrypto {
 /// chain's worth.
 pub const DEFAULT_MAX_KEYS: usize = 4;
 
+/// How many labelled credentials [`SoftKeyStore`] holds via
+/// [`KeyStore::store_credential`]/[`KeyStore::load_credential`]/[`KeyStore::delete_credential`].
+///
+/// Matches [`DEFAULT_MAX_NETWORK_PROFILE_SLOTS`](crate::state::DEFAULT_MAX_NETWORK_PROFILE_SLOTS):
+/// today's one consumer (CV10's `NetworkConfiguration.BasicAuthPassword` rotation) stores at most
+/// one credential per configuration slot, and a store a remote CSMS could grow without limit is
+/// not a bound (G2.2).
+const DEFAULT_MAX_CREDENTIALS: usize = 4;
+
 const KEYS_KEY: &str = "keys";
+const CREDENTIALS_KEY: &str = "credentials";
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct PersistedKeys {
     entries: Vec<PersistedKey>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedCredentials {
+    /// `(label, value)` pairs rather than a map: this crate's `no_std` JSON path
+    /// ([`crate::hardware::key_storage`]) prefers the types every target already carries, and a
+    /// handful of labelled credentials never needs map-shaped lookup performance to justify
+    /// pulling one in.
+    entries: Vec<(String, String)>,
 }
 
 /// Derives a [`SoftKeyStore`] handle from the key it names, rather than from a per-store counter.
@@ -422,6 +500,9 @@ pub enum SoftKeyStoreError<E> {
     /// that was generated but not durably recorded would be unrecoverable, so the caller must be
     /// told rather than left believing a key exists that a restart will lose.
     PersistenceFailed,
+    /// [`KeyStore::store_credential`] would exceed [`DEFAULT_MAX_CREDENTIALS`] on a label this
+    /// store does not already hold.
+    CredentialStoreFull,
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for SoftKeyStoreError<E> {
@@ -431,6 +512,7 @@ impl<E: core::fmt::Display> core::fmt::Display for SoftKeyStoreError<E> {
             Self::StoreFull => f.write_str("the software key store is full"),
             Self::KeyNotFound => f.write_str("no key exists for that handle"),
             Self::PersistenceFailed => f.write_str("could not persist the software key store"),
+            Self::CredentialStoreFull => f.write_str("the software credential store is full"),
         }
     }
 }
@@ -498,6 +580,39 @@ impl<S: crate::hardware::Storage, C: SoftwareCrypto> SoftKeyStore<S, C> {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(%error, "could not write the software key store");
+                false
+            }
+        }
+    }
+
+    /// Reads the credential index, treating an unreadable or corrupt one as empty - the same
+    /// "come up empty rather than refuse to come up" rule [`Self::load`] follows for keys. Unlike
+    /// a lost key, a lost credential is exactly what CV10's rollback exists for: a station that
+    /// cannot read its own rotated password falls back to behaving as though none was ever
+    /// stored, which is safe (it simply keeps whatever credential the transport was already
+    /// configured with) rather than a boot failure.
+    async fn load_credentials(&self) -> PersistedCredentials {
+        match self.storage.get(CREDENTIALS_KEY).await {
+            Ok(Some(encoded)) => serde_json::from_slice(&encoded).unwrap_or_else(|error| {
+                tracing::warn!(%error, "discarding a corrupt software credential store");
+                PersistedCredentials::default()
+            }),
+            Ok(None) => PersistedCredentials::default(),
+            Err(error) => {
+                tracing::warn!(%error, "could not read the software credential store");
+                PersistedCredentials::default()
+            }
+        }
+    }
+
+    async fn save_credentials(&self, credentials: &PersistedCredentials) -> bool {
+        let Ok(encoded) = serde_json::to_vec(credentials) else {
+            return false;
+        };
+        match self.storage.set(CREDENTIALS_KEY, &encoded).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "could not write the software credential store");
                 false
             }
         }
@@ -577,6 +692,51 @@ where
         // construction (its keys live in `Storage`), no matter how good the math behind it is.
         Ok(KeyStoreBacking::Software)
     }
+
+    async fn store_credential(&self, label: &str, value: &str) -> Result<(), Self::Error> {
+        let mut credentials = self.load_credentials().await;
+        let already_present = credentials
+            .entries
+            .iter()
+            .any(|(existing, _)| existing == label);
+        if !already_present && credentials.entries.len() >= DEFAULT_MAX_CREDENTIALS {
+            return Err(SoftKeyStoreError::CredentialStoreFull);
+        }
+        credentials
+            .entries
+            .retain(|(existing, _)| existing != label);
+        credentials.entries.push((label.into(), value.into()));
+        if self.save_credentials(&credentials).await {
+            Ok(())
+        } else {
+            Err(SoftKeyStoreError::PersistenceFailed)
+        }
+    }
+
+    async fn load_credential(&self, label: &str) -> Result<Option<String>, Self::Error> {
+        let credentials = self.load_credentials().await;
+        Ok(credentials
+            .entries
+            .into_iter()
+            .find(|(existing, _)| existing == label)
+            .map(|(_, value)| value))
+    }
+
+    async fn delete_credential(&self, label: &str) -> Result<(), Self::Error> {
+        let mut credentials = self.load_credentials().await;
+        let before = credentials.entries.len();
+        credentials
+            .entries
+            .retain(|(existing, _)| existing != label);
+        if credentials.entries.len() == before {
+            return Ok(());
+        }
+        if self.save_credentials(&credentials).await {
+            Ok(())
+        } else {
+            Err(SoftKeyStoreError::PersistenceFailed)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -606,6 +766,14 @@ mod tests {
         assert_eq!(store.supported_algorithms().await, Ok(Vec::new()));
         // Reports `Software`, never overclaiming hardware it doesn't have.
         assert_eq!(store.backing().await, Ok(KeyStoreBacking::Software));
+        // A credential is a secret too (CV10) - a charge point with no key storage at all cannot
+        // hold one durably, so it must refuse rather than silently drop it.
+        assert_eq!(
+            store.store_credential("label", "value").await,
+            Err(NoKeyStoreError)
+        );
+        assert_eq!(store.load_credential("label").await, Err(NoKeyStoreError));
+        assert_eq!(store.delete_credential("label").await, Err(NoKeyStoreError));
     }
 
     /// A fake [`SoftwareCrypto`] backend: "signing" is deterministic and reversible so tests can
@@ -816,5 +984,137 @@ mod tests {
         let store = SoftKeyStore::new(storage, FakeCrypto::default());
         let result = store.sign(&KeyHandle::new(*b"anything"), b"digest").await;
         assert!(matches!(result, Err(SoftKeyStoreError::KeyNotFound)));
+    }
+
+    /// CV10: a stored credential must come back out unchanged - unlike a key behind a
+    /// `KeyHandle`, this is the whole point of `store_credential`/`load_credential` (see the
+    /// module docs, "Credentials are not key material").
+    #[tokio::test]
+    async fn a_stored_credential_round_trips() {
+        let store = store();
+        assert_eq!(store.load_credential("basic-auth/1").await, Ok(None));
+
+        store
+            .store_credential("basic-auth/1", "s3cret-but-long-enough")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.load_credential("basic-auth/1").await,
+            Ok(Some("s3cret-but-long-enough".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn storing_under_the_same_label_again_overwrites_rather_than_duplicating() {
+        let store = store();
+        store
+            .store_credential("basic-auth/1", "first")
+            .await
+            .unwrap();
+        store
+            .store_credential("basic-auth/1", "second")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.load_credential("basic-auth/1").await,
+            Ok(Some("second".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_credential_makes_it_unreadable() {
+        let store = store();
+        store
+            .store_credential("basic-auth/1", "value")
+            .await
+            .unwrap();
+
+        store.delete_credential("basic-auth/1").await.unwrap();
+
+        assert_eq!(store.load_credential("basic-auth/1").await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_label_that_is_not_there_is_not_an_error() {
+        let store = store();
+        store.delete_credential("never-stored").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_credential_store_is_bounded_but_overwriting_an_existing_label_is_not_blocked() {
+        let store = store();
+        for slot in 0..DEFAULT_MAX_CREDENTIALS {
+            store
+                .store_credential(&alloc::format!("slot-{slot}"), "value")
+                .await
+                .unwrap();
+        }
+
+        // G2.2: a store a remote CSMS can grow without limit is not a bound.
+        let result = store.store_credential("one-too-many", "value").await;
+        assert!(matches!(
+            result,
+            Err(SoftKeyStoreError::CredentialStoreFull)
+        ));
+
+        // Rotating an already-occupied label must still work at the limit - CV10's rollback
+        // depends on being able to keep rewriting the one label a slot's password lives under.
+        store.store_credential("slot-0", "rotated").await.unwrap();
+        assert_eq!(
+            store.load_credential("slot-0").await,
+            Ok(Some("rotated".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_survive_a_reboot() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let before = SoftKeyStore::new(storage.clone(), FakeCrypto::default());
+        before
+            .store_credential("basic-auth/1", "value")
+            .await
+            .unwrap();
+
+        // --- the cut: only `storage` survives.
+        let after = SoftKeyStore::new(storage, FakeCrypto::default());
+
+        assert_eq!(
+            after.load_credential("basic-auth/1").await,
+            Ok(Some("value".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_credential_store_comes_up_empty_rather_than_refusing_to_come_up() {
+        let storage = Arc::new(InMemoryStorage::new());
+        crate::hardware::Storage::set(&*storage, "credentials", b"{not json")
+            .await
+            .unwrap();
+
+        let store = SoftKeyStore::new(storage, FakeCrypto::default());
+        assert_eq!(store.load_credential("anything").await, Ok(None));
+    }
+
+    /// The keys index and the credentials index are stored under different `Storage` keys, so
+    /// generating a key does not disturb a stored credential and vice versa.
+    #[tokio::test]
+    async fn keys_and_credentials_do_not_collide() {
+        let store = store();
+        store
+            .store_credential("basic-auth/1", "value")
+            .await
+            .unwrap();
+        let generated = store
+            .generate_key_pair(SignatureAlgorithm::EcdsaP256Sha256)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.load_credential("basic-auth/1").await,
+            Ok(Some("value".into()))
+        );
+        assert!(store.sign(&generated.handle, b"digest").await.is_ok());
     }
 }

@@ -1017,6 +1017,18 @@ mod tests {
         async fn backing(&self) -> Result<KeyStoreBacking, Self::Error> {
             Ok(KeyStoreBacking::Software)
         }
+
+        async fn store_credential(&self, _label: &str, _value: &str) -> Result<(), Self::Error> {
+            Err(FakeKeyStoreError)
+        }
+
+        async fn load_credential(&self, _label: &str) -> Result<Option<String>, Self::Error> {
+            Err(FakeKeyStoreError)
+        }
+
+        async fn delete_credential(&self, _label: &str) -> Result<(), Self::Error> {
+            Err(FakeKeyStoreError)
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

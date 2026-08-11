@@ -202,9 +202,12 @@ impl GetVariablesHandler for AlwaysAcceptBootNotifier {
 
 #[async_trait::async_trait]
 impl SetVariablesHandler for AlwaysAcceptBootNotifier {
-    async fn register_set_variables_handler(
+    async fn register_set_variables_handler<
+        K: ocpp_charge_point::hardware::KeyStore + Send + Sync + 'static,
+    >(
         &self,
         _actor: ocpp_charge_point::actor::ChargePointActor,
+        _key_store: K,
     ) {
     }
 }

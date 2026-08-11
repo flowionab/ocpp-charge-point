@@ -56,20 +56,43 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
 - A `SetVariables` for a variable this build does not act on is now `Rejected` rather than
   accepted and ignored (CV2.1, B05.FR.09). A CSMS that relied on the previous silent acceptance
   will start seeing refusals — which is the point.
-- A `SetVariables` writing `NetworkConfiguration.BasicAuthPassword` or
-  `WebPaymentsCtrlr.SharedSecret` is now `Rejected` (CV10). Both are registered `WriteOnly`, which
-  keeps `GetVariables` from disclosing them (A01.FR.12) but — unlike `ReadOnly` — did **not** stop
-  the write: the password was `Accepted` and then silently discarded on the next event, and the
-  shared secret was `Accepted` and kept in `ChargePointState`, which `trace!` prints whole. Two
-  requirements make the refusal the right answer rather than merely the safe one: A01.FR.12 forbids
-  a `BasicAuthPassword` reaching the log at all, and A01.FR.03 has a CSMS stop accepting the old
-  password the moment it sees `Accepted` — so a station that accepted a rotation it could not apply
-  locked itself out of the only peer able to correct it. `Rejected` keeps the old credentials
-  working (A01.FR.04). **Carrying a rotated password onto the connection is still not
-  implemented**; see `docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV10.
+- A `SetVariables` writing `WebPaymentsCtrlr.SharedSecret` is `Rejected` (CV10): it is
+  `WriteOnly`, which keeps `GetVariables` from disclosing it (A01.FR.12) but — unlike `ReadOnly` —
+  does not by itself stop the write, and this crate has no consumer for it yet. An `Accepted`
+  write would have kept the secret in `ChargePointState`, which `trace!` prints whole.
+- `hardware::KeyStore` gained three methods — `store_credential`/`load_credential`/
+  `delete_credential` — for an opaque, *retrievable* secret (CV10), as opposed to the asymmetric
+  key material the rest of the trait deliberately never gives back. Every implementation must add
+  them; `NoKeyStore` refuses all three and `SoftKeyStore` persists them through `Storage` the same
+  way it does keys. See the trait's module docs, "Credentials are not key material", for why this
+  does not undermine the no-export invariant the rest of the trait exists to protect.
+- `device_model::SetVariablesHandler::register_set_variables_handler` and
+  `device_model::handle_set_variables` take a `hardware::KeyStore` (CV10) — see "Added" below for
+  what it is now used for. `ChargePointBuilder::configuration`/`device_model` pass
+  `hardware::NoKeyStore`, so a caller that does not opt into
+  `ChargePointBuilder::basic_auth_password_rotation` sees no behavioural change.
 
 ### Added
 
+- `NetworkConfiguration.BasicAuthPassword` writes are real (CV10, A01.FR.02): a `SetVariables`
+  carrying a well-formed password (`security_profile::BasicAuthPassword`, A00.FR.205) is now
+  `Accepted` rather than refused. The value is validated and persisted through
+  `hardware::KeyStore::store_credential` — never through `Storage`/`ChargePointState`, which
+  `crate::persistence` writes as a plain, `cat`-readable JSON blob and `trace!` prints whole — and
+  the previous password is kept alongside it. A successful rotation is logged to the security log
+  (`SecurityEventType::ReconfigurationOfSecurityParameters`) naming the slot and nothing else
+  (A01.FR.11/.12); the value never reaches a log line, `GetVariables` (still blocked by
+  `WriteOnly`), or `ChargePointState`. Opt in with the new
+  `ChargePointBuilder::basic_auth_password_rotation`. Applying the rotation to the transport, and
+  rolling back to the previous password after repeated authentication failure (A01.FR.04), is a
+  separate opt-in on the redial side — the new
+  `network_switch::ConnectionTarget::attach_basic_auth_credential` — which reads the current
+  password fresh from the same `KeyStore` on every redial to the origin address (so "apply on next
+  connect" needs no extra plumbing) and reverts to the previous one after
+  `OCPPCommCtrlr`/`NetworkProfileConnectionAttempts` consecutive failures, the same threshold and
+  shape `ConnectionTarget::stage_tls_config` already uses for a staged TLS trust configuration.
+  Scoped to the origin address only, mirroring this module's existing "credentials are not carried
+  across" rule for a switched profile.
 - All 122 device-model variables OCPP 2.1 marks required are now registered (CV1), including the
   per-EVSE and per-connector components and a per-slot `NetworkConfiguration` mirror.
 - `SetVariables` validates values against their declared type, range and value list (CV3).

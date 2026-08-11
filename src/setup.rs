@@ -638,7 +638,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::device_model::SetVariablesHandler for RecordingCsms {
-        async fn register_set_variables_handler(&self, _actor: crate::actor::ChargePointActor) {}
+        async fn register_set_variables_handler<
+            K: crate::hardware::KeyStore + Send + Sync + 'static,
+        >(
+            &self,
+            _actor: crate::actor::ChargePointActor,
+            _key_store: K,
+        ) {
+        }
     }
 
     #[async_trait::async_trait]
