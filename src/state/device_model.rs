@@ -697,6 +697,37 @@ pub(crate) const VARIABLE_BOUNDS: &[VariableBounds] = &[
         max: None,
         values: None,
     },
+    // CV9. Both are counts of seconds/repetitions, so the same "never negative" floor the
+    // intervals above take; `0` on either switches the resend discipline off, which is a value
+    // this crate honours rather than one it merely tolerates (see
+    // `crate::certificates::SignCertificateRetryPolicy`).
+    VariableBounds {
+        component: "SecurityCtrlr",
+        variable: "CertSigningWaitMinimum",
+        instance: None,
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    VariableBounds {
+        component: "SecurityCtrlr",
+        variable: "CertSigningRepeatTimes",
+        instance: None,
+        min: Some(0.0),
+        max: None,
+        values: None,
+    },
+    // A02.FR.16's ceiling is a ceiling on `CertificateSignedRequest.certificateChain`, which OCPP
+    // declares as `string[0..10000]` - so both ends of this range are the spec's own, not an
+    // invention: a limit above 10000 could never bind on a message the wire format permits.
+    VariableBounds {
+        component: "SecurityCtrlr",
+        variable: "MaxCertificateChainSize",
+        instance: None,
+        min: Some(0.0),
+        max: Some(10_000.0),
+        values: None,
+    },
     VariableBounds {
         component: "ChargingStation",
         variable: "MinimumStatusDuration",
@@ -1524,6 +1555,60 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         mutability: VariableMutability::ReadOnly,
         honoured: false,
         persistent: false,
+    },
+    // CV9 (A02.FR.17/A03.FR.17): the first back-off before a `SignCertificate` the CSMS accepted
+    // but never answered is resent. 30 seconds because the two failure modes it sits between are
+    // asymmetric: a CSMS that signs in three seconds costs nothing by being asked again at thirty,
+    // while a CSR is a public-key signature an MCU may spend hundreds of milliseconds on, so a
+    // back-off short enough to retry during a routine CSMS hiccup would burn the station's own
+    // budget. Doubling from here reaches roughly four minutes by the third resend, which is longer
+    // than any signing round trip that is going to complete at all.
+    DefaultVariable {
+        component: "SecurityCtrlr",
+        variable: "CertSigningWaitMinimum",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: Some("s"),
+        value: "30",
+        mutability: VariableMutability::ReadWrite,
+        // CV9: read by `crate::certificates::sign_certificate_retry_policy` on every pass of
+        // `crate::certificate_renewal::run_sign_certificate_retries`.
+        honoured: true,
+        persistent: true,
+    },
+    // CV9 (A02.FR.18/.19, A03.FR.18/.19): how many times the back-off above may expire - and so
+    // double - before this charge point stops resending, until a `TriggerMessage` restarts it.
+    // Three gives waits of 30 s, 60 s and 120 s: enough to ride out a CSMS restart, and bounded
+    // rather than open-ended because A02.FR.19 makes stopping the *required* end state, not a
+    // fallback.
+    DefaultVariable {
+        component: "SecurityCtrlr",
+        variable: "CertSigningRepeatTimes",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "3",
+        mutability: VariableMutability::ReadWrite,
+        // CV9: read alongside `CertSigningWaitMinimum`, same call site.
+        honoured: true,
+        persistent: true,
+    },
+    // CV9 (A02.FR.16/A03.FR.16): the largest `CertificateSignedRequest.certificateChain` this
+    // charge point will accept. 10000 is the field's own wire maximum (`string[0..10000]`), which
+    // is the only figure that is a fact rather than a guess - a station wanting a tighter ceiling
+    // writes one, and the `SetVariables` bound below refuses anything above what the wire could
+    // carry anyway.
+    DefaultVariable {
+        component: "SecurityCtrlr",
+        variable: "MaxCertificateChainSize",
+        instance: None,
+        data_type: VariableDataType::Integer,
+        unit: None,
+        value: "10000",
+        mutability: VariableMutability::ReadWrite,
+        // CV9: read by `crate::certificates::handle_certificate_signed` before installing a chain.
+        honoured: true,
+        persistent: true,
     },
     DefaultVariable {
         component: "DeviceDataCtrlr",

@@ -53,6 +53,17 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
 - A `SetVariables` for a variable this build does not act on is now `Rejected` rather than
   accepted and ignored (CV2.1, B05.FR.09). A CSMS that relied on the previous silent acceptance
   will start seeing refusals — which is the point.
+- A `SetVariables` writing `NetworkConfiguration.BasicAuthPassword` or
+  `WebPaymentsCtrlr.SharedSecret` is now `Rejected` (CV10). Both are registered `WriteOnly`, which
+  keeps `GetVariables` from disclosing them (A01.FR.12) but — unlike `ReadOnly` — did **not** stop
+  the write: the password was `Accepted` and then silently discarded on the next event, and the
+  shared secret was `Accepted` and kept in `ChargePointState`, which `trace!` prints whole. Two
+  requirements make the refusal the right answer rather than merely the safe one: A01.FR.12 forbids
+  a `BasicAuthPassword` reaching the log at all, and A01.FR.03 has a CSMS stop accepting the old
+  password the moment it sees `Accepted` — so a station that accepted a rotation it could not apply
+  locked itself out of the only peer able to correct it. `Rejected` keeps the old credentials
+  working (A01.FR.04). **Carrying a rotated password onto the connection is still not
+  implemented**; see `docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV10.
 
 ### Added
 
@@ -87,6 +98,25 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   `meterValue` — and no standalone message at all — rather than a reading-free reading.
   `connect_and_setup` wires the actor-aware notifiers on both 2.1 and 2.0.1, so this is live on the
   default path: a CSMS `SetVariables` narrowing a list takes effect on the very next event.
+- A `SignCertificate` the CSMS accepted but never answered is resent on OCPP's own doubling
+  back-off (CV9, A02.FR.17–.19 / A03.FR.17–.19). New
+  `certificate_renewal::run_sign_certificate_retries` is the loop: it waits
+  `SecurityCtrlr.CertSigningWaitMinimum` seconds, resends the same CSR (signed with the key already
+  recorded for that purpose), doubles the back-off on every expiry, and stops at
+  `CertSigningRepeatTimes` until `certificates::PendingSignRequests::restart` is called for a
+  `TriggerMessage` (`SignChargingStationCertificate`, `SignV2GCertificate`, `SignV2G20Certificate`
+  or `SignCombinedCertificate`). A `SignCertificate` the CSMS *rejected* arms nothing (A02.FR.20).
+  It consults no clock, so a station waiting on its first certificate — the one least likely to
+  know the date — is still covered. Drive it with the same `PendingSignRequests` the
+  `CertificateSigned` handler was registered against.
+- Three new `SecurityCtrlr` variables, all honoured rather than decorative:
+  `CertSigningWaitMinimum` (default `30` s), `CertSigningRepeatTimes` (default `3`) — read per pass
+  by the loop above, so a CSMS write changes the back-off in force rather than the next boot's —
+  and `MaxCertificateChainSize` (default `10000`, the `certificateChain` field's own wire maximum).
+  A `CertificateSigned` whose chain exceeds it is now `Rejected` before the certificate store is
+  touched, and the CSR stays outstanding so a resend can still get a chain that fits (A02.FR.16 /
+  A03.FR.16, a `MAY` this build takes). Setting either of the first two to `0` switches resending
+  off.
 - New `setup_with_meter_data_notifiers`, which is `setup` with the `TransactionEvent` and
   `MeterValues` blocks driven by notifiers the caller supplies. They arrive as factories taking the
   `ChargePointActor`, because a notifier that honours measurand configuration must hold the actor

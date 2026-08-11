@@ -59,6 +59,16 @@
 //! the [`crate::certificate_renewal::RenewalStore`]'s stashed backup and reporting
 //! [`crate::state::SecurityEventType::DiscardedRenewedClientCertificate`], the security event
 //! OCPP models for exactly this.
+//!
+//! # A CSR the CSMS accepted and then lost (CV9)
+//!
+//! The paragraph above is about a `CertificateSigned` that arrived and did not work. The other
+//! half is one that never arrives at all, and OCPP specifies the answer rather than leaving it to
+//! implementations: resend the `SignCertificate` after `SecurityCtrlr.CertSigningWaitMinimum`
+//! seconds, double the back-off on every expiry, and stop at `CertSigningRepeatTimes` until a
+//! `TriggerMessage` asks again (A02.FR.17-.19, A03.FR.17-.19).
+//! [`crate::certificate_renewal::run_sign_certificate_retries`] is that loop; the state it runs on lives in
+//! [`crate::certificates::PendingSignRequests`], next to the correlation it already tracks.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -66,8 +76,8 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::actor::ChargePointActor;
 use crate::certificates::{
-    CertificateSigningPurpose, CertificateSigningRequester, CsrSubject, SignCertificateError,
-    SignCertificateOutcome,
+    CertificateSigningPurpose, CertificateSigningRequester, CsrSubject, PendingSignRequests,
+    SignCertificateError, SignCertificateOutcome,
 };
 use crate::clock::Clock;
 use crate::hardware::{
@@ -510,6 +520,108 @@ pub async fn run_certificate_renewal<Cl, S, K, St, R, ClientErr, B>(
     }
 }
 
+// --- CV9: resending a SignCertificate the CSMS never answered ----------------------------------
+
+/// Resends `SignCertificate` for any CSR the CSMS accepted but never answered, on OCPP's own
+/// doubling back-off (A02.FR.17-.19, A03.FR.17-.19; `docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV9).
+///
+/// # The failure this closes
+///
+/// [`crate::certificates::record_sign_certificate_sent`] records an accepted `SignCertificate` as
+/// pending and then waits - indefinitely. A `CertificateSigned` is not a response but a separate
+/// CSMS-initiated message, so a CSMS that accepted the request and then lost it (a restart mid-
+/// signing, a queue that dropped it, a signing service that was down) leaves the station holding
+/// a CSR that will never be answered and a certificate that will expire anyway. Nothing in the
+/// protocol tells it so, which is why OCPP specifies the resend rather than leaving it to
+/// implementations.
+///
+/// # The discipline
+///
+/// Every `tick_secs`, [`PendingSignRequests::due_for_resend`] is advanced by that many seconds.
+/// A purpose whose back-off has expired is resent through [`renew_certificate`] - the *same* CSR,
+/// signed with the key already recorded for that purpose, which is what A02.FR.17's "a new
+/// SignCertificateRequest for the CSR" means (it permits a fresh key pair; reusing is this
+/// module's documented default, see [`RenewalStore::key_pair_for`]). The back-off then doubles
+/// (A02.FR.18) and, at `CertSigningRepeatTimes`, stops (A02.FR.19) until
+/// [`PendingSignRequests::restart`] is called for a `TriggerMessage`.
+///
+/// `pending` **must be the same instance** the [`CertificateSigningRequester`] and the
+/// `CertificateSigned` handler were registered against - see
+/// [`crate::certificates::CertificateHandler`]'s docs for why, and each version adapter's
+/// `pending()` accessor for how to get at it.
+///
+/// `tick_secs` is the resolution of the back-off, not its length: it is clamped to at least one
+/// second, and a tick coarser than `CertSigningWaitMinimum` simply rounds the first resend up to
+/// the next tick. Runs until the task holding it is dropped.
+///
+/// **No clock.** Unlike [`run_certificate_renewal`], this does not consult one and is not skipped
+/// while time is unsynchronized: a station that has never held a certificate is exactly the
+/// station whose clock is least likely to be set, and it is the one that most needs its CSR
+/// answered.
+// Eight parameters, for the same reason `run_certificate_renewal` takes ten - see its own note.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sign_certificate_retries<K, St, R, ClientErr, B>(
+    actor: &ChargePointActor,
+    key_store: &K,
+    renewals: &RenewalStore<St>,
+    requester: &R,
+    pending: &PendingSignRequests,
+    subject_for: impl Fn(CertificateSigningPurpose) -> CsrSubject,
+    default_algorithm: SignatureAlgorithm,
+    backoff: &B,
+    tick_secs: u32,
+) where
+    K: KeyStore + Send + Sync,
+    St: Storage,
+    R: CertificateSigningRequester<ClientErr>,
+    ClientErr: core::fmt::Display,
+    B: crate::provisioning::Backoff,
+{
+    let tick_secs = tick_secs.max(1);
+    loop {
+        backoff.wait(tick_secs).await;
+        // Read per pass rather than captured: both variables are CSMS-writable, and the value
+        // that matters is the one in force when a back-off actually expires.
+        let policy = crate::certificates::sign_certificate_retry_policy(&actor.state());
+
+        for purpose in pending.due_for_resend(tick_secs, policy) {
+            match renew_certificate(
+                key_store,
+                renewals,
+                requester,
+                &subject_for(purpose),
+                purpose,
+                default_algorithm,
+            )
+            .await
+            {
+                Ok(SignCertificateOutcome::Accepted) => {
+                    tracing::debug!(
+                        ?purpose,
+                        "resent a SignCertificate the CSMS had not answered"
+                    );
+                }
+                Ok(SignCertificateOutcome::Rejected) => {
+                    tracing::warn!(?purpose, "the CSMS rejected a resent SignCertificate");
+                }
+                Err(error) => {
+                    tracing::warn!(?purpose, %error, "failed to resend a SignCertificate");
+                }
+            }
+
+            // A02.FR.19 as an operator-visible fact: the station has stopped asking, and only a
+            // `TriggerMessage` will make it ask again. Station-wide and rare, so `info!`.
+            if pending.has_stopped(purpose, policy) {
+                tracing::info!(
+                    ?purpose,
+                    repeat_times = policy.repeat_times,
+                    "stopped resending SignCertificate; only a TriggerMessage restarts it"
+                );
+            }
+        }
+    }
+}
+
 // --- Confirming or discarding an installed renewal --------------------------------------------
 
 /// Confirms that the certificate just renewed for `purpose` is working (e.g. this charge point
@@ -921,6 +1033,10 @@ mod tests {
     struct FakeRequester {
         outcome: SignCertificateOutcome,
         seen_handles: std::sync::Mutex<Vec<KeyHandle>>,
+        /// CV9: when set, every call records its outcome here exactly as a real adapter does
+        /// (via [`crate::certificates::record_sign_certificate_sent`]), so the resend back-off
+        /// sees the same pending state a live session would.
+        pending: Option<Arc<PendingSignRequests>>,
     }
 
     impl FakeRequester {
@@ -928,6 +1044,7 @@ mod tests {
             Self {
                 outcome: SignCertificateOutcome::Accepted,
                 seen_handles: std::sync::Mutex::new(Vec::new()),
+                pending: None,
             }
         }
 
@@ -935,6 +1052,14 @@ mod tests {
             Self {
                 outcome: SignCertificateOutcome::Rejected,
                 seen_handles: std::sync::Mutex::new(Vec::new()),
+                pending: None,
+            }
+        }
+
+        fn recording_into(pending: Arc<PendingSignRequests>) -> Self {
+            Self {
+                pending: Some(pending),
+                ..Self::accepting()
             }
         }
     }
@@ -946,12 +1071,20 @@ mod tests {
             _key_store: &K,
             key: &GeneratedKeyPair,
             _subject: &CsrSubject,
-            _purpose: CertificateSigningPurpose,
+            purpose: CertificateSigningPurpose,
         ) -> Result<SignCertificateOutcome, SignCertificateError<K::Error, FakeClientError>>
         where
             K: KeyStore + Send + Sync,
         {
             self.seen_handles.lock().unwrap().push(key.handle.clone());
+            if let Some(pending) = &self.pending {
+                crate::certificates::record_sign_certificate_sent(
+                    pending,
+                    purpose,
+                    Some(pending.next_request_id()),
+                    self.outcome,
+                );
+            }
             Ok(self.outcome)
         }
     }
@@ -1315,6 +1448,122 @@ mod tests {
                 .await,
             Some("current-pem".into())
         );
+    }
+
+    // --- CV9: run_sign_certificate_retries ---------------------------------------------------
+
+    /// A02.FR.17-.19 end to end: a CSR the CSMS accepted and never answered is resent on a
+    /// doubling back-off, exactly `CertSigningRepeatTimes` times, and then stops.
+    ///
+    /// `tick_secs` is the *virtual* second count each pass advances the back-off by, so the whole
+    /// schedule plays out in milliseconds of real time: at the registered 30 s minimum, a 30 s
+    /// tick fires on passes 1 (30 s), 3 (+60 s) and 7 (+120 s).
+    #[tokio::test]
+    async fn an_unanswered_sign_certificate_is_resent_on_a_doubling_back_off_and_then_stops() {
+        let actor = actor_for_tests().await;
+        let key_store = FakeKeyStore::default();
+        let renewals = store();
+        let pending = Arc::new(PendingSignRequests::new());
+        let requester = Arc::new(FakeRequester::recording_into(pending.clone()));
+
+        // The CSMS accepted a `SignCertificate`, and from here on says nothing.
+        renewals
+            .record_key_pair(
+                CertificateSigningPurpose::ChargingStationCertificate,
+                &key(b"existing"),
+            )
+            .await;
+        crate::certificates::record_sign_certificate_sent(
+            &pending,
+            CertificateSigningPurpose::ChargingStationCertificate,
+            Some(1),
+            SignCertificateOutcome::Accepted,
+        );
+
+        let retrying = {
+            let actor = actor.clone();
+            let renewals = renewals.clone();
+            let requester = requester.clone();
+            let pending = pending.clone();
+            tokio::spawn(async move {
+                run_sign_certificate_retries(
+                    &actor,
+                    &key_store,
+                    &renewals,
+                    &*requester,
+                    &pending,
+                    |_purpose| CsrSubject::new("CP-0001"),
+                    SignatureAlgorithm::EcdsaP256Sha256,
+                    &NoBackoff,
+                    30,
+                )
+                .await;
+            })
+        };
+
+        for _ in 0..200 {
+            if requester.seen_handles.lock().unwrap().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
+        // Long enough for many more passes to have fired had the count not stopped it.
+        tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+        retrying.abort();
+
+        assert_eq!(
+            requester.seen_handles.lock().unwrap().len(),
+            3,
+            "CertSigningRepeatTimes is a stop, not a slowdown"
+        );
+        // The same key as the certificate being replaced - A02.FR.17 permits a fresh key pair, and
+        // this module's documented default is to reuse.
+        assert!(
+            requester
+                .seen_handles
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|handle| *handle == key(b"existing").handle)
+        );
+        assert!(pending.has_stopped(
+            CertificateSigningPurpose::ChargingStationCertificate,
+            crate::certificates::sign_certificate_retry_policy(&actor.state()),
+        ));
+    }
+
+    /// Nothing outstanding, nothing resent: a station that never sent a CSR - or whose CSR the
+    /// CSMS answered - must not start sending them on a timer (A02.FR.20).
+    #[tokio::test]
+    async fn nothing_is_resent_when_no_csr_is_outstanding() {
+        let actor = actor_for_tests().await;
+        let key_store = FakeKeyStore::default();
+        let renewals = store();
+        let pending = Arc::new(PendingSignRequests::new());
+        let requester = Arc::new(FakeRequester::recording_into(pending.clone()));
+
+        let retrying = {
+            let actor = actor.clone();
+            let requester = requester.clone();
+            tokio::spawn(async move {
+                run_sign_certificate_retries(
+                    &actor,
+                    &key_store,
+                    &renewals,
+                    &*requester,
+                    &pending,
+                    |_purpose| CsrSubject::new("CP-0001"),
+                    SignatureAlgorithm::EcdsaP256Sha256,
+                    &NoBackoff,
+                    3600,
+                )
+                .await;
+            })
+        };
+        tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+        retrying.abort();
+
+        assert!(requester.seen_handles.lock().unwrap().is_empty());
     }
 
     // --- confirm/discard ---------------------------------------------------------------------

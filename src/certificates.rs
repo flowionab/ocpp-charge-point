@@ -112,6 +112,115 @@ struct PendingSignRequest {
     /// 2.1's `requestId`, when the connection negotiated 2.1. `None` on 2.0.1 (which has no such
     /// field) or when a 2.1 CSMS omits it.
     request_id: Option<i64>,
+    /// CV9 (A02.FR.17): seconds elapsed since this CSR was last sent, as accumulated by
+    /// [`PendingSignRequests::due_for_resend`]. Reset to zero on every resend.
+    waited_secs: u32,
+    /// CV9 (A02.FR.18/.19): how many times this CSR's back-off has expired without a
+    /// `CertificateSigned` arriving. Doubles as the exponent of the doubling - the *n*th wait is
+    /// `CertSigningWaitMinimum << n` - and as the count A02.FR.19 measures against
+    /// `CertSigningRepeatTimes`.
+    resends: u32,
+}
+
+/// How a `SignCertificate` the CSMS accepted but never answered is resent (A02.FR.17-.19 and
+/// A03.FR.17-.19, `docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV9).
+///
+/// Both fields come from `SecurityCtrlr` and are CSMS-writable, so this is read fresh on every
+/// pass of [`crate::certificate_renewal::run_sign_certificate_retries`] rather than captured once:
+/// a CSMS lengthening the back-off mid-outage is asking the station to stop hammering it *now*,
+/// not from the next reboot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignCertificateRetryPolicy {
+    /// `SecurityCtrlr.CertSigningWaitMinimum`: how long to wait before the first resend, in
+    /// seconds. Every later wait doubles from here (A02.FR.18).
+    ///
+    /// **Zero switches the discipline off entirely.** OCPP states no floor, and a zero back-off
+    /// has no reading that is not "resend as fast as the sweep can run" - a station flooding the
+    /// CSMS it is trying to be signed by. Treating it as off is the only interpretation that is
+    /// both honourable and safe, and it gives an operator a way to disable resending without
+    /// having to know that `CertSigningRepeatTimes = 0` also does it.
+    pub wait_minimum_secs: u32,
+    /// `SecurityCtrlr.CertSigningRepeatTimes`: how many times the back-off may expire - and so
+    /// double - before this charge point stops resending (A02.FR.19). Once reached, only a
+    /// `TriggerMessage` for `SignChargingStationCertificate`, `SignV2GCertificate`,
+    /// `SignV2G20Certificate` or `SignCombinedCertificate` restarts it - see
+    /// [`PendingSignRequests::restart`].
+    pub repeat_times: u32,
+}
+
+impl SignCertificateRetryPolicy {
+    /// The back-off, in seconds, that applies after `resends` previous expiries: OCPP's
+    /// "double the previous back-off time, starting with `CertSigningWaitMinimum`" (A02.FR.18),
+    /// which is `CertSigningWaitMinimum << resends`.
+    ///
+    /// Saturates rather than wrapping, in both directions a `u32` can lose: an over-wide shift
+    /// (which `<<` leaves undefined) and a product that no longer fits. A CSMS may write any
+    /// non-negative integer into `CertSigningRepeatTimes`, and the failure being avoided is a
+    /// back-off that comes back *round* to a short one - a station that resends fastest exactly
+    /// when it has been told to back off hardest. `checked_shl` alone is not enough: it validates
+    /// the shift amount, not the value, so `30 << 28` silently drops its high bits.
+    fn back_off_secs(self, resends: u32) -> u32 {
+        match 1u32.checked_shl(resends) {
+            Some(multiplier) => self.wait_minimum_secs.saturating_mul(multiplier),
+            None => self.wait_minimum_secs.saturating_mul(u32::MAX),
+        }
+    }
+}
+
+impl Default for SignCertificateRetryPolicy {
+    /// The values `DEFAULT_VARIABLES` registers for the two variables, so a caller with no device
+    /// model to read (a unit test, an integrator driving the round trip by hand) gets the same
+    /// discipline a live station runs.
+    fn default() -> Self {
+        Self {
+            wait_minimum_secs: 30,
+            repeat_times: 3,
+        }
+    }
+}
+
+/// Reads `SecurityCtrlr.CertSigningWaitMinimum`/`CertSigningRepeatTimes` out of the live device
+/// model (CV9).
+///
+/// A variable that is absent, unparseable or negative falls back to that field's registered
+/// default rather than to zero: a malformed value should degrade to this crate's own discipline,
+/// not silently switch resending off, which would leave a CSR outstanding for ever with nothing
+/// in the log to say why.
+pub fn sign_certificate_retry_policy(
+    state: &crate::state::ChargePointState,
+) -> SignCertificateRetryPolicy {
+    let default = SignCertificateRetryPolicy::default();
+    SignCertificateRetryPolicy {
+        wait_minimum_secs: security_ctrlr_u32(state, "CertSigningWaitMinimum")
+            .unwrap_or(default.wait_minimum_secs),
+        repeat_times: security_ctrlr_u32(state, "CertSigningRepeatTimes")
+            .unwrap_or(default.repeat_times),
+    }
+}
+
+/// `SecurityCtrlr.MaxCertificateChainSize` (A02.FR.16/A03.FR.16), or `None` when the variable is
+/// absent or unparseable - which is OCPP's "not implemented" case, and imposes no limit.
+fn max_certificate_chain_size(state: &crate::state::ChargePointState) -> Option<u32> {
+    security_ctrlr_u32(state, "MaxCertificateChainSize")
+}
+
+/// Reads a non-negative integer `SecurityCtrlr` variable out of the live device model.
+fn security_ctrlr_u32(state: &crate::state::ChargePointState, variable: &str) -> Option<u32> {
+    state
+        .device_model
+        .get(
+            &crate::state::Component {
+                name: "SecurityCtrlr".into(),
+                instance: None,
+                evse: None,
+            },
+            &crate::state::Variable {
+                name: variable.into(),
+                instance: None,
+            },
+        )
+        .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
+        .and_then(|attribute| attribute.value.trim().parse().ok())
 }
 
 /// Tracks outstanding `SignCertificate` requests, so [`handle_certificate_signed`] can tell a
@@ -160,9 +269,105 @@ impl PendingSignRequests {
     /// Superseding: a second call for the same `purpose` (e.g. a renewal fired before the first
     /// CSR was answered) replaces the first pending entry rather than stacking - only the most
     /// recent CSR for a given purpose can plausibly still be answered by the CSMS.
+    ///
+    /// **CV9: the back-off carries across a supersede.** The resend count
+    /// ([`Self::due_for_resend`]) is preserved when a request for `purpose` is already
+    /// outstanding, and only reset when this is the first CSR for it. That is what makes a
+    /// *resend* continue A02.FR.18's doubling instead of restarting it at
+    /// `CertSigningWaitMinimum` - a resend goes out through the same
+    /// [`CertificateSigningRequester::sign_certificate`] path as the original, so without this the
+    /// station would resend on a flat interval for ever and never reach A02.FR.19's stop. A
+    /// renewal that fires over a still-outstanding CSR inherits the same count, which errs
+    /// towards fewer messages rather than more.
     pub fn record_sent(&self, purpose: CertificateSigningPurpose, request_id: Option<i64>) {
         self.slots.lock(|slots| {
-            slots.borrow_mut()[purpose.slot_index()] = Some(PendingSignRequest { request_id });
+            let mut slots = slots.borrow_mut();
+            let resends = slots[purpose.slot_index()].map_or(0, |pending| pending.resends);
+            slots[purpose.slot_index()] = Some(PendingSignRequest {
+                request_id,
+                waited_secs: 0,
+                resends,
+            });
+        });
+    }
+
+    /// CV9 (A02.FR.17/.18): advances every outstanding CSR's back-off by `elapsed_secs` and
+    /// returns the purposes whose back-off has just expired, so the caller resends
+    /// `SignCertificate` for each.
+    ///
+    /// Called on a fixed tick by [`crate::certificate_renewal::run_sign_certificate_retries`],
+    /// with `elapsed_secs` the tick length - elapsed time is accumulated here rather than read
+    /// from a clock so the discipline needs neither a synchronized wall clock (which a station
+    /// waiting on its *first* certificate very well may not have) nor a monotonic one.
+    ///
+    /// **Stops at `CertSigningRepeatTimes` (A02.FR.19).** A purpose that has reached it is left
+    /// untouched - not even its elapsed time accumulates - and is never returned again until
+    /// [`Self::restart`] is called. The pending entry itself is deliberately *kept*: the CSMS may
+    /// still answer a CSR the station has given up resending, and that answer is solicited.
+    pub fn due_for_resend(
+        &self,
+        elapsed_secs: u32,
+        policy: SignCertificateRetryPolicy,
+    ) -> Vec<CertificateSigningPurpose> {
+        let mut due = Vec::new();
+        // Either variable at zero switches resending off - see `SignCertificateRetryPolicy`.
+        if policy.wait_minimum_secs == 0 || policy.repeat_times == 0 {
+            return due;
+        }
+        self.slots.lock(|slots| {
+            let mut slots = slots.borrow_mut();
+            for purpose in [
+                CertificateSigningPurpose::ChargingStationCertificate,
+                CertificateSigningPurpose::V2GCertificate,
+            ] {
+                let Some(pending) = slots[purpose.slot_index()].as_mut() else {
+                    continue;
+                };
+                if pending.resends >= policy.repeat_times {
+                    continue;
+                }
+                pending.waited_secs = pending.waited_secs.saturating_add(elapsed_secs);
+                if pending.waited_secs < policy.back_off_secs(pending.resends) {
+                    continue;
+                }
+                // Counted on *expiry*, not on a successful send: A02.FR.18 measures "every time
+                // the back-off time expires without having received the CertificateSignedRequest",
+                // so a resend the transport then drops has still used up an attempt.
+                pending.waited_secs = 0;
+                pending.resends = pending.resends.saturating_add(1);
+                due.push(purpose);
+            }
+        });
+        due
+    }
+
+    /// CV9 (A02.FR.19): whether the CSR outstanding for `purpose` has stopped resending because
+    /// `CertSigningRepeatTimes` was reached. `false` when nothing is outstanding at all.
+    pub fn has_stopped(
+        &self,
+        purpose: CertificateSigningPurpose,
+        policy: SignCertificateRetryPolicy,
+    ) -> bool {
+        self.slots.lock(|slots| {
+            slots.borrow()[purpose.slot_index()]
+                .is_some_and(|pending| pending.resends >= policy.repeat_times)
+        })
+    }
+
+    /// CV9 (A02.FR.19/.20): restarts `purpose`'s back-off from `CertSigningWaitMinimum`, which
+    /// OCPP permits only in answer to a `TriggerMessage` for `SignChargingStationCertificate`,
+    /// `SignV2GCertificate`, `SignV2G20Certificate` or `SignCombinedCertificate`.
+    ///
+    /// A no-op when nothing is outstanding for `purpose` - including the A02.FR.20 case, where the
+    /// CSMS *rejected* the original `SignCertificate` and the back-off was therefore never armed.
+    /// In both, the trigger's job is to send a fresh `SignCertificate`, and
+    /// [`Self::record_sent`] arms the discipline from zero when it does.
+    pub fn restart(&self, purpose: CertificateSigningPurpose) {
+        self.slots.lock(|slots| {
+            if let Some(pending) = slots.borrow_mut()[purpose.slot_index()].as_mut() {
+                pending.waited_secs = 0;
+                pending.resends = 0;
+            }
         });
     }
 
@@ -224,6 +429,16 @@ pub fn record_sign_certificate_sent(
 /// "our own certificate, and it's unusable" (OCPP's security-events list has no
 /// V2G-certificate-specific variant, so both purposes report through this one; see
 /// `state::security_event`).
+///
+/// # A02.FR.16: an oversized chain
+///
+/// A chain longer than `SecurityCtrlr.MaxCertificateChainSize` characters is `Rejected` before the
+/// store is touched (CV9). OCPP makes this a `MAY`, and the reason to take it is that the field is
+/// `string[0..10000]` on the wire while the thing that has to hold it is a flash sector on a
+/// microcontroller - refusing at the boundary is how a station with a smaller ceiling says so,
+/// rather than discovering it half-way through an install. The pending request is deliberately
+/// **not** cleared: the CSR is still outstanding, so the resend discipline above may yet ask
+/// again and get a chain that fits.
 #[tracing::instrument(skip_all)]
 pub async fn handle_certificate_signed<S: CertificateStore>(
     actor: &ChargePointActor,
@@ -253,6 +468,22 @@ pub async fn handle_certificate_signed<S: CertificateStore>(
         .await;
         return CertificateSignedOutcome::Rejected;
     }
+
+    // A02.FR.16/A03.FR.16 - see this function's docs. Counted in characters rather than bytes,
+    // like every other OCPP string bound this crate enforces: the wire limit is on a `string`.
+    if let Some(maximum) = max_certificate_chain_size(&actor.state()) {
+        let length = certificate_chain.chars().count();
+        if length > maximum as usize {
+            tracing::warn!(
+                ?purpose,
+                length,
+                maximum,
+                "refusing a signed certificate chain larger than MaxCertificateChainSize"
+            );
+            return CertificateSignedOutcome::Rejected;
+        }
+    }
+
     pending.clear(purpose);
 
     match store

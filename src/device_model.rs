@@ -899,6 +899,34 @@ pub trait GetVariablesHandler {
     async fn register_get_variables_handler(&self, actor: ChargePointActor);
 }
 
+/// The `WriteOnly` variables a `SetVariables` is refused on, because this build cannot act on the
+/// value it would be handed (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV10).
+///
+/// `DefaultVariable::honoured` forces an unhonoured variable to
+/// `ReadOnly`, which is how CV2.1 makes `SetVariables` refuse it (B05.FR.09). That lever does not
+/// reach these two: OCPP requires `NetworkConfiguration.BasicAuthPassword` to be reported
+/// `WriteOnly` (B09.FR.10), and this crate registers `WebPaymentsCtrlr.SharedSecret` the same way,
+/// for the reason both exist - a secret `GetVariables` can read is not a secret. So the refusal is
+/// spelled here instead of in the mutability.
+///
+/// **Accepting one of these would be worse than the usual silent lie, in two separate ways.** The
+/// value is a credential, so storing it would put it in `ChargePointState`, which `trace!` prints
+/// whole - and A01.FR.12 says the charge point SHALL NOT disclose a `BasicAuthPassword` in its
+/// logging, precisely so a diagnostics file cannot carry one. And a CSMS that sees `Accepted` for
+/// a password rotation stops accepting the old password immediately (A01.FR.03), so a station that
+/// accepted a rotation it cannot actually apply would lock itself out of the only peer able to
+/// correct it. `Rejected` keeps the old credentials in force (A01.FR.04), which is the failure mode
+/// an operator can recover from.
+///
+/// Making the write *real* - carrying a rotated password onto the connection - is CV10's remaining
+/// half and is deliberately not done here: it needs decisions about where a credential is persisted
+/// and how it reaches the transport that belong to an integrator's `Storage` and `ConnectOptions`,
+/// not to this table.
+const REFUSED_WRITE_ONLY_VARIABLES: &[(&str, &str)] = &[
+    ("NetworkConfiguration", "BasicAuthPassword"),
+    ("WebPaymentsCtrlr", "SharedSecret"),
+];
+
 /// One requested attribute write in a `SetVariables` request (OCPP `SetVariableData`, minus
 /// wire-only bookkeeping fields).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -974,6 +1002,22 @@ async fn resolve_and_apply_set(
         return SetVariableOutcome::NotSupportedAttributeType;
     };
     if attribute.mutability == VariableMutability::ReadOnly || attribute.constant {
+        return SetVariableOutcome::Rejected;
+    }
+    // CV10: a credential this build could store but not use - see `REFUSED_WRITE_ONLY_VARIABLES`.
+    // The log line names the variable and nothing else: not the value, and not its length either,
+    // which would narrow a guess (A01.FR.12).
+    if REFUSED_WRITE_ONLY_VARIABLES
+        .iter()
+        .any(|(component, variable)| {
+            *component == request.component.name && *variable == request.variable.name
+        })
+    {
+        tracing::warn!(
+            component = %request.component.name,
+            variable = %request.variable.name,
+            "refusing a credential write this build cannot carry onto the connection"
+        );
         return SetVariableOutcome::Rejected;
     }
     // B05.FR.07 (badly formatted) and B05.FR.08 (out of range) - CV3. Both answer `Rejected`;
@@ -1863,6 +1907,155 @@ mod tests {
         .await;
 
         assert_eq!(outcomes, alloc::vec![SetVariableOutcome::UnknownComponent]);
+    }
+
+    // --- CV10: the credential writes this build refuses (A01.FR.02/.03/.12) ---
+
+    fn slot_component(name: &str, instance: &str) -> Component {
+        Component {
+            name: name.into(),
+            instance: Some(instance.into()),
+            evse: None,
+        }
+    }
+
+    async fn actor_with_a_network_profile() -> ChargePointActor {
+        use crate::state::{NetworkConnectionProfile, NetworkInterface, NetworkTransport};
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let _ = actor
+            .send(ChargePointEvent::NetworkProfileSet {
+                slot: 1,
+                profile: alloc::boxed::Box::new(NetworkConnectionProfile {
+                    csms_url: "wss://csms.example/ocpp".into(),
+                    interface: NetworkInterface::Any,
+                    transport: NetworkTransport::Json,
+                    security_profile: 1,
+                    message_timeout_secs: 30,
+                    identity: None,
+                }),
+            })
+            .await;
+        actor
+    }
+
+    /// A01.FR.02's rotation is refused rather than accepted, because this build cannot carry the
+    /// new password onto the connection.
+    ///
+    /// The status matters more than it looks: A01.FR.03 has a CSMS that sees `Accepted` stop
+    /// accepting the old password at once, so a station that accepted a rotation it then discarded
+    /// would lock itself out of the only peer that could put it right. `Rejected` keeps the old
+    /// credentials in force (A01.FR.04).
+    #[tokio::test]
+    async fn rotating_the_basic_auth_password_is_refused_rather_than_silently_discarded() {
+        let actor = actor_with_a_network_profile().await;
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: slot_component("NetworkConfiguration", "1"),
+                variable: variable("BasicAuthPassword"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "a-perfectly-valid-rotation".into(),
+            }],
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Rejected]);
+    }
+
+    /// A01.FR.12: the value must not be disclosed. `WriteOnly` already stops `GetVariables`
+    /// reading it; this covers the other door - a refused write must not have parked the plaintext
+    /// anywhere in `ChargePointState`, whose `Debug` is what `trace!` prints whole.
+    #[tokio::test]
+    async fn a_refused_password_never_reaches_the_state_a_trace_log_would_print() {
+        let actor = actor_with_a_network_profile().await;
+
+        handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: slot_component("NetworkConfiguration", "1"),
+                variable: variable("BasicAuthPassword"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "correct-horse-battery-staple".into(),
+            }],
+        )
+        .await;
+
+        let printed = alloc::format!("{:?}", actor.state());
+        assert!(
+            !printed.contains("correct-horse-battery-staple"),
+            "a credential reached the state a trace log prints"
+        );
+        // ...and it is still unreadable through the front door.
+        assert_eq!(
+            handle_get_variables(
+                &actor,
+                alloc::vec![GetVariableRequest {
+                    component: slot_component("NetworkConfiguration", "1"),
+                    variable: variable("BasicAuthPassword"),
+                    attribute_type: VariableAttributeType::Actual,
+                }]
+            ),
+            alloc::vec![GetVariableOutcome::Rejected]
+        );
+    }
+
+    /// The same hole, the same shape: `WebPaymentsCtrlr.SharedSecret` is `WriteOnly` for the same
+    /// reason and is equally unacted-on, so it takes the same refusal. Unlike the password's
+    /// component this one is *not* re-derived per event, so an accepted write would have kept the
+    /// secret in `ChargePointState` indefinitely.
+    #[tokio::test]
+    async fn the_web_payments_shared_secret_is_refused_on_the_same_grounds() {
+        use crate::hardware::Capabilities;
+
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let _ = actor
+            .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
+                payment: true,
+                ..Capabilities::default()
+            }))
+            .await;
+        for event in super::capability_gate_events(&actor.state().capabilities) {
+            let _ = actor.send(event).await;
+        }
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: component("WebPaymentsCtrlr"),
+                variable: variable("SharedSecret"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "a-shared-secret-value".into(),
+            }],
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Rejected]);
+        assert!(!alloc::format!("{:?}", actor.state()).contains("a-shared-secret-value"));
+    }
+
+    /// The refusal is aimed at two named credentials, not at every `NetworkConfiguration` write -
+    /// a future build that honours one of the others must not be blocked by this table.
+    #[tokio::test]
+    async fn the_refusal_does_not_spill_onto_other_variables_of_the_same_component() {
+        let actor = actor_with_a_network_profile().await;
+
+        // `OcppCsmsUrl` is `ReadOnly` (CV1.3), so it is refused for its own reason - and reports
+        // the same `Rejected`. What this pins is that a *variable name* not in the table takes
+        // the ordinary path: an unknown one still answers `UnknownVariable`.
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: slot_component("NetworkConfiguration", "1"),
+                variable: variable("NotAVariable"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "x".into(),
+            }],
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::UnknownVariable]);
     }
 }
 

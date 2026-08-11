@@ -166,6 +166,14 @@ impl NetworkConnectionProfileSnapshot {
         // exact variable, and a required key answering `UnknownVariable` is itself a failure. The
         // write is refused today - applying a new password needs the reconnect plumbing that is
         // CV10's - and refusing is what B05.FR.09 asks of a variable that cannot be honoured.
+        //
+        // **The refusal is not expressible here.** `WriteOnly` is not `ReadOnly`, so the
+        // mutability that blocks the *read* does not block the write, and this registration is
+        // re-derived from the profile on every applied event - so a `SetVariables` used to be
+        // `Accepted` and then silently discarded on the next event, which is the worst of both.
+        // `crate::device_model::REFUSED_WRITE_ONLY_VARIABLES` is where the write is actually
+        // refused; see its docs for why an accepted-but-unapplied rotation would lock the station
+        // out (A01.FR.03).
         register(
             "BasicAuthPassword",
             VariableDataType::String,
