@@ -496,7 +496,8 @@ CSMS something untrue about its own behaviour. It is now closed.
 | **CV19** | **Three station-owned counters registered at 0 and never updated** — `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]`, `DisplayMessageCtrlr.DisplayMessages`. A CSMS reads each to know how full the station is; all three answer 0 however much is installed. Found by CV14's sweep. | D01, K01, B6 | open |
 | **CV15** | **Transaction limits (E16).** `TransactionLimit` exists only as a type alias; `triggerReason = LimitSet` occurs nowhere. Unblocks C17 (prepaid) outright and gives CV8's local cost a ceiling to act on. Audit §2.14. | E16 (20 FRs), C17 | open |
 | **CV16** | **A renegotiation surface in `crate::hardware`.** K16.FR.02 is a `SHALL` on the station whenever the composite schedule changes, and `Iso15118Controller` has one method — a certificate hook. No integrator can satisfy K16–K20 through this crate today. Audit §2.18. | K16, K17 (33 FRs) | open |
-| **CV17** | **`LocalGeneration` needs its own internal purpose.** It is currently mapped onto `ExternalConstraints` through a `_` catch-all and cannot round-trip through `GetChargingProfiles`; `isLocalGeneration` is hardcoded `None`. Audit §2.16. | K27.FR.02/.03/.05 | open |
+| **CV17** | **`LocalGeneration` has its own internal purpose, and it *adds* rather than caps.** The `_` catch-all made it an `ExternalConstraints` cap, so 2 kW of sun under a 5 kW `TxDefaultProfile` charged at 2 kW instead of K27's own 7 kW — a behaviour bug, not the reporting one this row was filed as. `ExternalChargingLimit` carries `is_local_generation`, held in its own slot per scope so a constraint and capacity can both be in force (K27.FR.05), and `isLocalGeneration` is now stated on the wire in both directions. Audit §2.16. | K27.FR.01/.02/.03/.05, §K.3.6 | **done** |
+| **CV20** | **Two K27/K10 remainders CV17 did not take.** (a) K27.FR.02 wants an EMS-pushed `LocalGeneration` schedule reported by `GetChargingProfiles`, but external limits are deliberately not stored as profiles and their synthetic ids are negative — reporting them needs a positive reserved id range first. (b) K10.FR.04/.08/.09 have `ClearChargingProfile` disregard `ExternalConstraints` **and** `LocalGeneration`; `ChargingProfileCriteria::matches` excludes neither, so a CSMS that installs one (K01.FR.06 says it shall not, but the station receives what it receives) can clear it. | K27.FR.02, K10.FR.04/.08/.09 | open |
 | **CV18** | **`triggerReason = ChargingRateChanged`.** A `SHALL` only for externally caused rate changes (K11.FR.04, K13.FR.03) — K01.FR.61 makes the CSMS-caused case a `MAY`, so this is narrower than it looks. Reachable now that CV13 has landed. Audit §2.17. | K11.FR.04, K13.FR.03 | open |
 
 **Sequencing:** CV13 before CV18 (nothing changes a rate externally until the limit is enforced) —
@@ -505,6 +506,39 @@ and CV13 left `LocalGeneration` composing as an external constraint exactly as i
 was independent and cheap and is done**, CV15
 independent and largest, CV16 a `crate::hardware` addition that should be taken together with the
 DER actuation trait `docs/CERTIFICATION.md` §3 names — one considered break rather than two.
+
+### CV17 — the row that was filed as reporting fidelity and turned out to be behaviour
+
+The audit read `map_purpose`'s `_` arm as a round-trip problem: `LocalGeneration` arrives as
+`ExternalConstraints`, so `GetChargingProfiles` cannot report it as itself and `NotifyChargingLimit`
+cannot flag it. Both true. What neither the audit nor this row said is what that arm did to the
+*limit the connector runs at*, because it takes the spec text to see it:
+
+> If a charging profile of chargingProfilePurpose = LocalGeneration is active for the EVSE, then
+> this capacity is **added on top of** the calculated composite schedule. — 2.1 Part 2 §K.3.6
+
+`ExternalConstraints` caps. So a station handed K27's own example — 2 kW of local generation under a
+5 kW `TxDefaultProfile` — charged at **2 kW instead of 7 kW**. It is the CV13 pattern (the station
+does something other than what it tells the CSMS) with the sign flipped: it under-delivers rather
+than over-draws, so it is safe, merely wrong, and invisible to anyone not reading §K.3.6.
+
+Three decisions worth recording:
+
+- **Composition gained a third rule.** A purpose now caps the result, competes for it by stack
+  level, or adds to it, and `adds_to_the_result` names the third the way `caps_the_result` named
+  the first. A test asserts every purpose is exactly one of the three, so a purpose added later
+  cannot quietly become two.
+- **Local generation is added *after* the caps.** §K.3.6 adds it to the composite, and K27's own
+  diagram has a 7 kW grid connection precisely because the 2 kW never crosses it. Adding before
+  the cap would have the installation limit clip away capacity that does not come through it.
+- **`ExternalChargingLimit` got a second slot rather than a flag.** K27.FR.05 describes a station
+  holding a constraint and local generation at once, from the same source — one slot would have had
+  the second evict the first, and `ExternalChargingLimitCleared` would have had no way to say which
+  of the two went away. Hence `is_local_generation` on the clear event as well, even though OCPP's
+  own `ClearedChargingLimit` has no such field.
+
+**Two K27/K10 remainders are deliberately not in CV17** — see CV20. Neither is a regression: both
+were true before this row and are true after it.
 
 ### CV14 — what the sweep found, and the two rows it did not expect
 
@@ -544,7 +578,7 @@ and four of the six rows its first sweep opened, plus the one CV14 added on its 
 
 ```
 CV12.1 (K, done) ──┬─> CV13 (done) ──> CV18
-                   ├─> CV17
+                   ├─> CV17 (done) ──> CV20   the K27/K10 remainders it did not take
                    ├─> CV14 (done) ──> CV19   the stale counters the sweep turned up
                    ├─> CV15        independent, largest
                    └─> CV16        a crate::hardware break — take with the DER trait
@@ -566,9 +600,11 @@ actuation surface, and the payment terminal work CV2.11 half-answers. CV16 makes
 
 None of CV13–CV18 blocks Core, Reservation or Local Authorization List Management. **CV13, CV17 and
 CV18 do touch Smart Charging**, which `docs/CERTIFICATION.md` §4 puts in the first group of claims
-to pursue. With CV13 closed, what is left against that claim is CV17 (a `LocalGeneration` round-trip)
-and CV18 (a trigger reason) — both reporting fidelity rather than behaviour the station gets wrong,
-so the claim is defensible in a way it was not before.
+to pursue. CV13 and CV17 are both closed, and CV17 turned out to matter more than this paragraph
+used to say: it was filed as reporting fidelity and was in fact the composite limit being computed
+wrongly whenever local generation was in play (see its section above). What is left against that
+claim is CV18 (a trigger reason) and CV20's two remainders — reporting fidelity in the way CV17 was
+only believed to be.
 
 One caveat on the four `*Interval` variables under CV2.6: they remain refused, so a station is
 conformant in *what* it samples but not yet configurable in *how often*. That is a known, declared

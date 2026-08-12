@@ -242,6 +242,7 @@ mod tests {
             .send(ChargePointEvent::ExternalChargingLimitSet {
                 evse_id: Some(0),
                 limit: ExternalChargingLimit {
+                    is_local_generation: false,
                     source: ChargingLimitSource::Ems,
                     is_grid_critical: None,
                     schedule: None,
@@ -251,6 +252,7 @@ mod tests {
             .unwrap();
         actor
             .send(ChargePointEvent::ExternalChargingLimitCleared {
+                is_local_generation: false,
                 evse_id: Some(0),
                 source: ChargingLimitSource::Ems,
             })
@@ -326,12 +328,21 @@ mod ocpp_2_1 {
         heapless::String::try_from(text).unwrap_or_default()
     }
 
+    /// K27.FR.03/.05: the CSMS is told which of the two a schedule is, because - in the spec's own
+    /// words - it "cannot deduce from the charging schedule that a schedule represents local
+    /// generation or a limit". Sent explicitly in both directions rather than omitted for the
+    /// constraint case, which FR.05 permits ("false or absent") but which would leave a CSMS
+    /// unable to tell an old station from a station reporting a constraint.
+    ///
+    /// The grouping FR.05 also asks for needs nothing here: each limit is notified on its own
+    /// call, so local generation schedules and constraint schedules are already in separate
+    /// messages, each carrying the flag its own limit set.
     fn wire_charging_limit(limit: &ExternalChargingLimit) -> ChargingLimit {
         ChargingLimit {
             charging_limit_source: wire_source(limit.source),
             custom_data: None,
             is_grid_critical: limit.is_grid_critical,
-            is_local_generation: None,
+            is_local_generation: Some(limit.is_local_generation),
         }
     }
 
@@ -536,6 +547,7 @@ mod ocpp_2_1 {
         #[test]
         fn the_evse_id_offsets_by_one_or_reports_the_whole_station() {
             let limit = ExternalChargingLimit {
+                is_local_generation: false,
                 source: ChargingLimitSource::Ems,
                 is_grid_critical: Some(true),
                 schedule: None,
@@ -555,6 +567,32 @@ mod ocpp_2_1 {
                 evse_id: None::<usize>.map(|id| id as i64 + 1),
             };
             assert_eq!(station_wide.evse_id, None);
+        }
+
+        /// K27.FR.03/.05: the CSMS is told which kind of schedule it is being handed, because it
+        /// cannot work that out from the numbers. Both directions are stated explicitly rather
+        /// than leaving the constraint case absent.
+        #[test]
+        fn the_charging_limit_says_whether_it_is_locally_generated_capacity() {
+            let constraint = ExternalChargingLimit {
+                is_local_generation: false,
+                source: ChargingLimitSource::Ems,
+                is_grid_critical: Some(true),
+                schedule: None,
+            };
+            let generation = ExternalChargingLimit {
+                is_local_generation: true,
+                ..constraint.clone()
+            };
+
+            assert_eq!(
+                wire_charging_limit(&constraint).is_local_generation,
+                Some(false)
+            );
+            assert_eq!(
+                wire_charging_limit(&generation).is_local_generation,
+                Some(true)
+            );
         }
     }
 }
@@ -593,6 +631,10 @@ mod ocpp_2_0_1 {
         }
     }
 
+    /// 2.0.1's `ChargingLimit` has no `isLocalGeneration` - the field is a 2.1 addition - so the
+    /// distinction K27.FR.05 exists to communicate cannot be communicated on this connection at
+    /// all. The station still *behaves* differently (composition reads the real purpose either
+    /// way); a 2.0.1 CSMS simply sees a limit whose source it knows and whose sign it does not.
     fn wire_charging_limit(limit: &ExternalChargingLimit) -> ChargingLimit {
         ChargingLimit {
             charging_limit_source: wire_source(limit.source),

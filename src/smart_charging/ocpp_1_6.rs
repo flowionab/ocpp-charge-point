@@ -61,16 +61,25 @@ fn map_purpose(purpose: &WirePurpose) -> ChargingProfilePurpose {
 
 /// This crate's purpose enum back onto 1.6J's - lossy, and the loss is stated rather than hidden.
 ///
-/// 1.6J has neither an external-constraints purpose nor 2.1's priority charging. An external
-/// constraint reports as `ChargePointMaxProfile`: both are station-level caps that the driver and
-/// the CSMS should read the same way, and the alternative (omitting it) would understate the limit
-/// actually in force. Priority charging reports as `TxProfile`, being a transaction-scoped limit.
+/// 1.6J has neither an external-constraints purpose nor 2.1's priority charging or local
+/// generation. An external constraint reports as `ChargePointMaxProfile`: both are station-level
+/// caps that the driver and the CSMS should read the same way, and the alternative (omitting it)
+/// would understate the limit actually in force. Priority charging reports as `TxProfile`, being a
+/// transaction-scoped limit.
+///
+/// Local generation reports as `ChargePointMaxProfile` too, and this is the *worst* of the three
+/// losses because it inverts the sign: locally generated capacity widens what the station may
+/// draw, and a 1.6J CSMS reading a `ChargePointMaxProfile` will take it as a ceiling. Reporting it
+/// is still better than dropping it - the profile exists, the composite schedule it feeds is
+/// reported honestly through `GetCompositeSchedule`, and a 1.6J CSMS has no vocabulary in which
+/// the truth could be told. This is exactly the "downgrade the 2.1 model, never upgrade the older
+/// one" rule in `CLAUDE.md` producing a lossy answer rather than a wrong internal state.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn wire_purpose(purpose: ChargingProfilePurpose) -> WirePurpose {
     match purpose {
-        ChargingProfilePurpose::ChargePointMax | ChargingProfilePurpose::ExternalConstraints => {
-            WirePurpose::ChargePointMaxProfile
-        }
+        ChargingProfilePurpose::ChargePointMax
+        | ChargingProfilePurpose::ExternalConstraints
+        | ChargingProfilePurpose::LocalGeneration => WirePurpose::ChargePointMaxProfile,
         ChargingProfilePurpose::TxDefault => WirePurpose::TxDefaultProfile,
         ChargingProfilePurpose::Tx | ChargingProfilePurpose::PriorityCharging => {
             WirePurpose::TxProfile

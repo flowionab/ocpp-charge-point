@@ -905,6 +905,7 @@ mod tests {
             .send(ChargePointEvent::ExternalChargingLimitSet {
                 evse_id: Some(0),
                 limit: crate::state::ExternalChargingLimit {
+                    is_local_generation: false,
                     source: ChargingLimitSource::Ems,
                     is_grid_critical: Some(true),
                     schedule: Some(ChargingSchedule {

@@ -59,10 +59,7 @@ fn map_purpose(purpose: &ChargingProfilePurposeEnum) -> ChargingProfilePurpose {
         ChargingProfilePurposeEnum::TxDefaultProfile => ChargingProfilePurpose::TxDefault,
         ChargingProfilePurposeEnum::TxProfile => ChargingProfilePurpose::Tx,
         ChargingProfilePurposeEnum::PriorityCharging => ChargingProfilePurpose::PriorityCharging,
-        // 2.1 adds `LocalGeneration` (on-site generation feeding the station). Nothing in this
-        // crate distinguishes where a cap came from, and it behaves like an external constraint
-        // from the charge point's point of view, so it maps there rather than being refused.
-        _ => ChargingProfilePurpose::ExternalConstraints,
+        ChargingProfilePurposeEnum::LocalGeneration => ChargingProfilePurpose::LocalGeneration,
     }
 }
 
@@ -78,6 +75,7 @@ pub(super) fn wire_purpose(purpose: ChargingProfilePurpose) -> ChargingProfilePu
             ChargingProfilePurposeEnum::ChargingStationExternalConstraints
         }
         ChargingProfilePurpose::PriorityCharging => ChargingProfilePurposeEnum::PriorityCharging,
+        ChargingProfilePurpose::LocalGeneration => ChargingProfilePurposeEnum::LocalGeneration,
     }
 }
 
@@ -1068,6 +1066,10 @@ mod tests {
             ChargingProfilePurpose::Tx,
             ChargingProfilePurpose::ExternalConstraints,
             ChargingProfilePurpose::PriorityCharging,
+            // K27.FR.02, and what CV17 was about: `LocalGeneration` used to arrive through a `_`
+            // arm as `ExternalConstraints` and could never be reported back as itself, so a CSMS
+            // asking `GetChargingProfiles` was told the station held a constraint it did not hold.
+            ChargingProfilePurpose::LocalGeneration,
         ] {
             assert_eq!(map_purpose(&wire_purpose(purpose)), purpose);
         }

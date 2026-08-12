@@ -1,6 +1,7 @@
 # OCPP 2.1 compliance audit — spec vs. this crate
 
-**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13 and §2.15 closed 2026-08-12 ·
+**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13, §2.15 and §2.16 closed
+2026-08-12 ·
 **Baseline:** `main` @ `4c6abe3`, sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
 part 2 appendices v2.1 CSVs + errata 2026-06).
 
@@ -391,7 +392,28 @@ honouring.
 Two rows also caught CV2.1's original blind spot exactly: `LimitChangeSignificance` and `Language`
 each appear outside their registration site only inside a test asserting they are registered.
 
-### 2.16 Medium · `LocalGeneration` is collapsed into `ExternalConstraints` and cannot round-trip (K27.FR.02/.03/.05) [READ]
+### 2.16 ~~Medium~~ **Closed by CV17 — and it was a behaviour finding, not a reporting one** · `LocalGeneration` is collapsed into `ExternalConstraints` and cannot round-trip (K27.FR.02/.03/.05) [READ]
+
+**Fixed, and the finding below understates what was wrong.** This was filed as a round-trip
+problem. It was also the composite limit: `ExternalConstraints` *caps* the result, while §K.3.6 has
+local generation **added on top of** it, so a station handed K27's own example — 2 kW of local
+generation under a 5 kW `TxDefaultProfile` — computed 2 kW where the spec computes 7 kW. Safe (it
+under-draws) but wrong, and invisible without the spec text in hand.
+
+`ChargingProfilePurpose::LocalGeneration` now exists internally; composition gained a third rule
+(`adds_to_the_result`) applied after the caps; `map_purpose`'s `_` arm is gone in favour of
+exhaustive arms, so the next purpose 2.1 adds is a compile error rather than a silent collapse; and
+2.0.1/1.6J project it onto their external-constraints equivalent with the sign-inversion stated in
+each adapter's docs. `ExternalChargingLimit` carries `is_local_generation`, held in a slot of its
+own per scope so a constraint and locally generated capacity can be in force together (K27.FR.05),
+and `isLocalGeneration` is stated on the 2.1 wire in both directions (K27.FR.03).
+
+Two remainders are **not** closed and are filed as CV20: K27.FR.02 wants an EMS-pushed
+`LocalGeneration` schedule reported by `GetChargingProfiles`, which needs external limits to have
+positive, CSMS-addressable ids first; and K10.FR.04/.08/.09 want `ClearChargingProfile` to disregard
+both `ExternalConstraints` and `LocalGeneration`, which `ChargingProfileCriteria::matches` does not.
+The second predates this finding and applies to `ExternalConstraints` already. Original finding
+follows.
 
 `smart_charging::ocpp_2_1::map_purpose` maps 2.1's `LocalGeneration` purpose onto this crate's
 `ChargingProfilePurpose::ExternalConstraints` through a `_` catch-all arm, and `wire_purpose` maps
@@ -518,6 +540,8 @@ the sweep, by certification impact rather than by size:
     counters registered at 0 that nothing ever updates.
 11. **§2.14 (E16 transaction limits)** — 20 FRs, unblocks C17 outright, and gives CV8's locally
     computed cost something to act on. The largest of the three.
-12. **§2.16 / §2.17** — contained, and both are consequences of work above.
+12. ~~**§2.16**~~ — **closed by CV17**, which turned out to be a behaviour fix: local generation
+    adds capacity, and collapsing it onto `ExternalConstraints` had it capping instead. **§2.17**
+    remains, contained, and is a consequence of §2.13 above.
 13. **§2.18** — a `crate::hardware` addition, so it belongs with the DER actuation trait in a single
     considered break rather than on its own.

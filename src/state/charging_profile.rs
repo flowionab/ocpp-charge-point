@@ -43,6 +43,17 @@ pub enum ChargingProfilePurpose {
     /// result like [`Self::ChargePointMax`] does; 1.6J has no equivalent and its adapter never
     /// produces one.
     ExternalConstraints,
+    /// 2.1's locally generated capacity (`LocalGeneration`) - power available on site, from solar
+    /// or a local battery, that the grid connection never carries. **Adds to the composite result
+    /// rather than capping it**: 2 kW of local generation under a 5 kW `TxDefaultProfile` is 7 kW,
+    /// not 2 kW (2.1 Part 2 §K.3.6, use case K27).
+    ///
+    /// The distinction is the whole point of the purpose existing. An external limit *narrows*
+    /// what the station may draw; local generation *widens* it, and the CSMS cannot tell which a
+    /// schedule is from its numbers alone - which is why K27.FR.05 has the charge point say so
+    /// explicitly. Neither 2.0.1 nor 1.6J has the purpose, so both adapters project it onto their
+    /// external-constraints equivalent and say so in their module docs.
+    LocalGeneration,
     /// 2.1's priority-charging profile, applied while a transaction has been granted priority
     /// (`UsePriorityCharging`). Not applicable to 1.6J or 2.0.1.
     PriorityCharging,
@@ -54,6 +65,16 @@ impl ChargingProfilePurpose {
     /// asked for; a non-capping one is chosen between by stack level.
     pub fn caps_the_result(&self) -> bool {
         matches!(self, Self::ChargePointMax | Self::ExternalConstraints)
+    }
+
+    /// Whether this purpose *adds* its limit to the composite result - true only for
+    /// [`Self::LocalGeneration`], and the reason composition has three rules rather than two.
+    ///
+    /// Exclusive with [`Self::caps_the_result`]: a purpose either bounds the result from above,
+    /// competes for it by stack level, or widens it. A test in this module asserts every variant
+    /// falls into exactly one of the three, so a purpose added later cannot quietly become both.
+    pub fn adds_to_the_result(&self) -> bool {
+        matches!(self, Self::LocalGeneration)
     }
 }
 
@@ -1139,6 +1160,35 @@ mod tests {
         assert!(!ChargingProfilePurpose::TxDefault.caps_the_result());
         assert!(!ChargingProfilePurpose::Tx.caps_the_result());
         assert!(!ChargingProfilePurpose::PriorityCharging.caps_the_result());
+        assert!(!ChargingProfilePurpose::LocalGeneration.caps_the_result());
+    }
+
+    /// The claim `adds_to_the_result`'s docs make, as a test: every purpose is capping, competing
+    /// or adding, and never two of those. A purpose that was both would make composition's answer
+    /// depend on the order the two rules happened to be written in.
+    #[test]
+    fn every_purpose_caps_competes_or_adds_and_never_two_of_them() {
+        for purpose in [
+            ChargingProfilePurpose::ChargePointMax,
+            ChargingProfilePurpose::TxDefault,
+            ChargingProfilePurpose::Tx,
+            ChargingProfilePurpose::ExternalConstraints,
+            ChargingProfilePurpose::LocalGeneration,
+            ChargingProfilePurpose::PriorityCharging,
+        ] {
+            assert!(
+                !(purpose.caps_the_result() && purpose.adds_to_the_result()),
+                "{purpose:?} both caps and adds"
+            );
+        }
+
+        // And adding is exactly one purpose - the one whose whole point is that it is not a limit.
+        assert!(ChargingProfilePurpose::LocalGeneration.adds_to_the_result());
+        assert!(!ChargingProfilePurpose::ChargePointMax.adds_to_the_result());
+        assert!(!ChargingProfilePurpose::ExternalConstraints.adds_to_the_result());
+        assert!(!ChargingProfilePurpose::TxDefault.adds_to_the_result());
+        assert!(!ChargingProfilePurpose::Tx.adds_to_the_result());
+        assert!(!ChargingProfilePurpose::PriorityCharging.adds_to_the_result());
     }
 
     #[test]

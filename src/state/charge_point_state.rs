@@ -310,6 +310,10 @@ pub struct ChargePointState {
     /// `evseId` absent/zero case) - mirrors [`EvseState::external_charging_limit`] at
     /// station scope. See `docs/PRODUCTION-ROADMAP.md` B2.8.
     pub station_external_charging_limit: Option<ExternalChargingLimit>,
+    /// Locally generated capacity available to the whole station - mirrors
+    /// [`EvseState::local_generation_limit`] at station scope, and separate from the slot above
+    /// for the reason given there (K27.FR.05).
+    pub station_local_generation_limit: Option<ExternalChargingLimit>,
 }
 
 /// The charge point's own lifecycle state, independent of any individual EVSE/connector's state.
@@ -384,6 +388,7 @@ impl ChargePointState {
             der_controls: DERControlStore::with_limit(limits.max_der_controls),
             afrr_signal: None,
             station_external_charging_limit: None,
+            station_local_generation_limit: None,
         }
     }
 
@@ -984,9 +989,16 @@ impl ChargePointState {
             ChargePointEvent::ExternalChargingLimitSet { evse_id, limit } => {
                 self.set_external_charging_limit(evse_id, limit, &mut effects)
             }
-            ChargePointEvent::ExternalChargingLimitCleared { evse_id, source } => {
-                self.clear_external_charging_limit(evse_id, source, &mut effects)
-            }
+            ChargePointEvent::ExternalChargingLimitCleared {
+                evse_id,
+                source,
+                is_local_generation,
+            } => self.clear_external_charging_limit(
+                evse_id,
+                source,
+                is_local_generation,
+                &mut effects,
+            ),
             ChargePointEvent::VariableMonitoring(event) => match event {
                 VariableMonitoringEvent::MonitorSet {
                     id,
@@ -2290,9 +2302,12 @@ impl ChargePointState {
                  cannot be enforced - there is no limit value to apply"
             );
         }
-        match evse_id {
-            None => self.station_external_charging_limit = Some(limit.clone()),
-            Some(id) => {
+        // Which slot depends on what the limit *is*: capacity and constraints are held separately
+        // so a station can be under both at once, which is exactly the case K27.FR.05 describes.
+        match (evse_id, limit.is_local_generation) {
+            (None, false) => self.station_external_charging_limit = Some(limit.clone()),
+            (None, true) => self.station_local_generation_limit = Some(limit.clone()),
+            (Some(id), is_local_generation) => {
                 let Some(evse) = self.evses.get_mut(id) else {
                     tracing::warn!(
                         evse_id = id,
@@ -2300,7 +2315,11 @@ impl ChargePointState {
                     );
                     return false;
                 };
-                evse.external_charging_limit = Some(limit.clone());
+                if is_local_generation {
+                    evse.local_generation_limit = Some(limit.clone());
+                } else {
+                    evse.external_charging_limit = Some(limit.clone());
+                }
             }
         }
         effects.push(ChargePointEffect::SmartChargingNotification(
@@ -2318,15 +2337,21 @@ impl ChargePointState {
         &mut self,
         evse_id: Option<usize>,
         source: crate::state::ChargingLimitSource,
+        is_local_generation: bool,
         effects: &mut Vec<ChargePointEffect>,
     ) -> bool {
-        let slot = match evse_id {
-            None => &mut self.station_external_charging_limit,
-            Some(id) => {
+        let slot = match (evse_id, is_local_generation) {
+            (None, false) => &mut self.station_external_charging_limit,
+            (None, true) => &mut self.station_local_generation_limit,
+            (Some(id), is_local_generation) => {
                 let Some(evse) = self.evses.get_mut(id) else {
                     return false;
                 };
-                &mut evse.external_charging_limit
+                if is_local_generation {
+                    &mut evse.local_generation_limit
+                } else {
+                    &mut evse.external_charging_limit
+                }
             }
         };
         if slot.as_ref().is_some_and(|limit| limit.source == source) {
@@ -5771,6 +5796,7 @@ mod tests {
 
     fn ems_limit() -> crate::state::ExternalChargingLimit {
         crate::state::ExternalChargingLimit {
+            is_local_generation: false,
             source: crate::state::ChargingLimitSource::Ems,
             is_grid_critical: Some(true),
             schedule: None,
@@ -5833,6 +5859,7 @@ mod tests {
         });
 
         let effects = state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            is_local_generation: false,
             evse_id: Some(0),
             source: crate::state::ChargingLimitSource::Ems,
         });
@@ -5857,6 +5884,7 @@ mod tests {
         });
 
         let effects = state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            is_local_generation: false,
             evse_id: Some(0),
             source: crate::state::ChargingLimitSource::Other,
         });
@@ -5870,6 +5898,7 @@ mod tests {
         let mut state = ChargePointState::new([1]);
 
         let effects = state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            is_local_generation: false,
             evse_id: Some(0),
             source: crate::state::ChargingLimitSource::Ems,
         });

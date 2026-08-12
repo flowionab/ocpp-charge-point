@@ -51,6 +51,23 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   I07/I08/I11/I12); exhaustive matches over `ConnectorEvent` must handle it.
 - `TriggeredMonitor::monitor_id` is now `Option` — `None` marks a hard-wired notification, which
   OCPP requires for a lock failure (CV11).
+- **Local generation now widens the composite limit instead of capping it** (CV17, K27, 2.1 Part 2
+  §K.3.6). New `ChargingProfilePurpose::LocalGeneration` variant, which *adds* its capacity on top
+  of the composed result rather than bounding it — exhaustive matches over the purpose must handle
+  it, and a station whose CSMS sends `LocalGeneration` profiles will now charge *higher* than
+  before. That is the fix: the purpose previously arrived through a `_` arm as
+  `ExternalConstraints`, so 2 kW of local generation under a 5 kW `TxDefaultProfile` composed to
+  2 kW where the spec composes 7 kW. New `ChargingProfilePurpose::adds_to_the_result` alongside
+  `caps_the_result`.
+- `state::ExternalChargingLimit` gained `is_local_generation`, and
+  `ChargePointEvent::ExternalChargingLimitCleared` gained the same field: struct literals of either
+  must add it (`false` preserves today's behaviour exactly). An integrator's energy-management
+  binding that pushes locally generated capacity sets it `true`, which changes what the limit
+  *does* — it adds rather than caps — and sets `isLocalGeneration` on the 2.1 wire (K27.FR.03).
+- `EvseState` gained `local_generation_limit` and `ChargePointState` gained
+  `station_local_generation_limit`, each a second slot beside the existing external-limit one, so a
+  constraint and locally generated capacity can be in force on the same scope at once (K27.FR.05)
+  instead of evicting each other.
 - Offline queues built through `ChargePointBuilder` no longer drain before the CSMS has accepted
   the charge point (CV4, B01.FR.08). Nothing is dropped; delivery is deferred until acceptance.
 - A `SetVariables` for a variable this build does not act on is now `Rejected` rather than

@@ -200,6 +200,111 @@ fn a_cap_with_nothing_to_cap_is_itself_the_limit() {
     assert_eq!(limits(&composed), vec![(0, 20.0)]);
 }
 
+/// K27's own worked example, and the reason CV17 is a behaviour fix rather than a reporting one:
+/// 2 kW of local generation on top of a 5 kW `TxDefaultProfile` is 7 kW, not 2 kW. "If a charging
+/// profile of chargingProfilePurpose = LocalGeneration is active for the EVSE, then this capacity
+/// is added on top of the calculated composite schedule" (2.1 Part 2 §K.3.6).
+#[test]
+fn local_generation_adds_its_capacity_on_top_rather_than_capping_the_result() {
+    let profiles = [
+        profile(
+            1,
+            ChargingProfilePurpose::TxDefault,
+            0,
+            schedule(&[(0, 5_000.0)]),
+        ),
+        profile(
+            2,
+            ChargingProfilePurpose::LocalGeneration,
+            0,
+            schedule(&[(0, 2_000.0)]),
+        ),
+    ];
+
+    let composed = compose(&profiles.iter().collect::<Vec<_>>(), &context()).unwrap();
+
+    assert_eq!(limits(&composed), vec![(0, 7_000.0)]);
+}
+
+/// The other half of "adds on top": it is added *after* the minimum across purposes, so an
+/// installation limit does not clip the locally generated capacity away. K27's grid connection is
+/// 7 kW precisely because the 2 kW never crosses it.
+#[test]
+fn local_generation_is_added_after_the_caps_not_before_them() {
+    let profiles = [
+        profile(
+            1,
+            ChargingProfilePurpose::TxDefault,
+            0,
+            schedule(&[(0, 8_000.0)]),
+        ),
+        profile(
+            2,
+            ChargingProfilePurpose::ChargePointMax,
+            0,
+            schedule(&[(0, 5_000.0)]),
+        ),
+        profile(
+            3,
+            ChargingProfilePurpose::LocalGeneration,
+            0,
+            schedule(&[(0, 2_000.0)]),
+        ),
+    ];
+
+    let composed = compose(&profiles.iter().collect::<Vec<_>>(), &context()).unwrap();
+
+    assert_eq!(limits(&composed), vec![(0, 7_000.0)]);
+}
+
+/// Local generation with nothing to add to leaves the connector unlimited rather than becoming
+/// the limit itself - the mirror image of `a_cap_with_nothing_to_cap_is_itself_the_limit`, and the
+/// opposite answer, because "2 kW of headroom" says nothing about the ceiling.
+#[test]
+fn local_generation_with_nothing_to_add_to_does_not_become_the_limit() {
+    let profiles = [profile(
+        1,
+        ChargingProfilePurpose::LocalGeneration,
+        0,
+        schedule(&[(0, 2_000.0)]),
+    )];
+
+    assert!(compose(&profiles.iter().collect::<Vec<_>>(), &context()).is_none());
+}
+
+/// Stack level disambiguates local generation exactly as it does every other purpose: §K.3.6's
+/// "leading charging schedule for that purpose is the one ... with the highest stack level" is not
+/// qualified by purpose, so two local generation profiles are two candidates and the higher stack
+/// level leads. Summing them would be a rule invented here - and would double-count an EMS that
+/// re-sent a revised figure at a new stack level.
+#[test]
+fn the_highest_stacked_local_generation_profile_leads_rather_than_summing() {
+    let profiles = [
+        profile(
+            1,
+            ChargingProfilePurpose::TxDefault,
+            0,
+            schedule(&[(0, 5_000.0)]),
+        ),
+        profile(
+            2,
+            ChargingProfilePurpose::LocalGeneration,
+            0,
+            schedule(&[(0, 2_000.0)]),
+        ),
+        profile(
+            3,
+            ChargingProfilePurpose::LocalGeneration,
+            1,
+            schedule(&[(0, 1_000.0)]),
+        ),
+    ];
+
+    let composed = compose(&profiles.iter().collect::<Vec<_>>(), &context()).unwrap();
+
+    assert_eq!(limits(&composed), vec![(0, 6_000.0)]);
+}
+
 #[test]
 fn external_constraints_cap_the_result_the_same_way_an_installation_limit_does() {
     let profiles = [
@@ -739,19 +844,32 @@ fn a_dynamic_profile_whose_csms_went_quiet_falls_through_to_the_next_profile() {
     assert_eq!(limits(&composed), vec![(0, 8.0)]);
 }
 
-/// CV13's own cases: an external charging limit is not a stored profile, so it reaches composition
-/// through [`external_charging_limits`]/[`composing_profiles`] rather than through the store. What
-/// it does once it gets there is the [`ChargingProfilePurpose::ExternalConstraints`] capping rule,
-/// already covered above - these check the joining, and the two ways a limit can fail to reach it.
-mod external_charging_limits_compose_as_caps {
+/// CV13's and CV17's cases: an external charging limit is not a stored profile, so it reaches
+/// composition through [`external_charging_limits`]/[`composing_profiles`] rather than through the
+/// store. What it does once it gets there is one of the two rules already covered above - the
+/// [`ChargingProfilePurpose::ExternalConstraints`] cap for a constraint, the
+/// [`ChargingProfilePurpose::LocalGeneration`] addition for capacity - so these check the joining,
+/// the two ways a limit can fail to reach it, and that the two kinds stay apart.
+mod external_charging_limits_reach_composition {
     use super::*;
     use crate::state::{ChargePointEvent, ChargePointState, ChargingLimitSource};
 
     fn ems_limit(schedule: Option<ChargingSchedule>) -> crate::state::ExternalChargingLimit {
         crate::state::ExternalChargingLimit {
+            is_local_generation: false,
             source: ChargingLimitSource::Ems,
             is_grid_critical: None,
             schedule,
+        }
+    }
+
+    /// The same EMS reporting locally generated capacity rather than a constraint (CV17) - same
+    /// source, opposite meaning, which is exactly why the flag has to be carried and why the two
+    /// cannot share a slot.
+    fn local_generation(schedule: Option<ChargingSchedule>) -> crate::state::ExternalChargingLimit {
+        crate::state::ExternalChargingLimit {
+            is_local_generation: true,
+            ..ems_limit(schedule)
         }
     }
 
@@ -843,11 +961,96 @@ mod external_charging_limits_compose_as_caps {
             limit: ems_limit(Some(schedule(&[(0, 6.0)]))),
         });
         state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            is_local_generation: false,
             evse_id: Some(0),
             source: ChargingLimitSource::Ems,
         });
 
         assert_eq!(composed_limit_ma(&state), Some(32_000));
+    }
+
+    /// CV17, through the same path CV13 built: an external schedule flagged as locally generated
+    /// capacity is treated internally as a `LocalGeneration` profile (K27.FR.01), so it *widens*
+    /// the connector's limit instead of narrowing it. 32 A installed plus 6 A of sun is 38 A.
+    #[test]
+    fn a_local_generation_limit_widens_the_profile_the_csms_installed() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: local_generation(Some(schedule(&[(0, 6.0)]))),
+        });
+
+        assert_eq!(composed_limit_ma(&state), Some(38_000));
+    }
+
+    /// K27.FR.05's premise, which is what forced the second slot: a station can be under an EMS
+    /// constraint *and* have local generation at the same time, and the two do opposite things.
+    /// 32 A installed, capped to 10 A by the EMS, plus 6 A generated on site, is 16 A.
+    #[test]
+    fn a_constraint_and_local_generation_are_both_in_force_at_once() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(Some(schedule(&[(0, 10.0)]))),
+        });
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: local_generation(Some(schedule(&[(0, 6.0)]))),
+        });
+
+        // Neither evicted the other - the bug a single slot would have had.
+        assert!(state.evses[0].external_charging_limit.is_some());
+        assert!(state.evses[0].local_generation_limit.is_some());
+        assert_eq!(composed_limit_ma(&state), Some(16_000));
+    }
+
+    /// The two slots clear independently, which is why the event says which one it means: both
+    /// limits here are from `Ems`, so the source alone could not have chosen between them.
+    #[test]
+    fn clearing_the_generation_leaves_the_constraint_standing() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(Some(schedule(&[(0, 10.0)]))),
+        });
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: local_generation(Some(schedule(&[(0, 6.0)]))),
+        });
+        state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            evse_id: Some(0),
+            source: ChargingLimitSource::Ems,
+            is_local_generation: true,
+        });
+
+        assert!(state.evses[0].external_charging_limit.is_some());
+        assert!(state.evses[0].local_generation_limit.is_none());
+        assert_eq!(composed_limit_ma(&state), Some(10_000));
+    }
+
+    /// Station-wide generation reaches an EVSE the same way a station-wide constraint does, and
+    /// the four slots (two scopes × two kinds) all compose together rather than shadowing one
+    /// another: 32 A installed, capped to 20 A station-wide, plus 2 A of station generation and
+    /// 3 A of this EVSE's own.
+    #[test]
+    fn all_four_slots_compose_together() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: None,
+            limit: ems_limit(Some(schedule(&[(0, 20.0)]))),
+        });
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: None,
+            limit: local_generation(Some(schedule(&[(0, 2.0)]))),
+        });
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: local_generation(Some(schedule(&[(0, 3.0)]))),
+        });
+
+        // The two generation slots are two candidates at the same stack level, not two sources to
+        // add up - the EVSE's own is written last and leads.
+        assert_eq!(composed_limit_ma(&state), Some(23_000));
     }
 
     /// A limit on one EVSE is not a limit on another - only the station-wide slot crosses.

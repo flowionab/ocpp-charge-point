@@ -65,11 +65,23 @@ fn map_purpose(purpose: &ChargingProfilePurposeEnum) -> ChargingProfilePurpose {
 
 /// This crate's purpose enum back onto 2.0.1's - the one genuinely lossy mapping in this module.
 ///
-/// 2.0.1 has no `PriorityCharging`, so a priority-charging profile (2.1-only, and only reachable
-/// on a 2.1 connection in the first place) is reported as a plain `TxProfile`: it *is* a
-/// transaction-scoped limit, and reporting it as one is closer to the truth than dropping it from
-/// a `ReportChargingProfiles` the CSMS asked for. Not yet wired (see B2.5's remaining rows), but
-/// kept beside its inverse so the two cannot drift apart.
+/// 2.0.1 has neither `PriorityCharging` nor `LocalGeneration`, both being 2.1 additions, and both
+/// are reachable here only because the internal model is version-independent by design.
+///
+/// A priority-charging profile is reported as a plain `TxProfile`: it *is* a transaction-scoped
+/// limit, and reporting it as one is closer to the truth than dropping it from a
+/// `ReportChargingProfiles` the CSMS asked for. A local generation profile is reported as
+/// `ChargingStationExternalConstraints` - the nearest thing 2.0.1 has to "a limit the station was
+/// handed rather than chose", and the same collapse 2.1's own `_` arm used to perform internally
+/// (CV17 undid that; this is where the loss legitimately belongs, at the version boundary).
+///
+/// The loss is not symmetric and should not be read as one: local generation *adds* capacity,
+/// while external constraints *subtract* it, so a 2.0.1 CSMS reading this will understand the
+/// wrong sign. There is no value in 2.0.1's enum that carries the right one, and the composite
+/// schedule the station reports through `GetCompositeSchedule` is computed from the real purpose
+/// regardless - so what the CSMS is told the station will *do* stays true even where the *why*
+/// cannot be expressed. Not yet wired (see B2.5's remaining rows), but kept beside its inverse so
+/// the two cannot drift apart.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn wire_purpose(purpose: ChargingProfilePurpose) -> ChargingProfilePurposeEnum {
     match purpose {
@@ -80,7 +92,7 @@ pub(super) fn wire_purpose(purpose: ChargingProfilePurpose) -> ChargingProfilePu
         ChargingProfilePurpose::Tx | ChargingProfilePurpose::PriorityCharging => {
             ChargingProfilePurposeEnum::TxProfile
         }
-        ChargingProfilePurpose::ExternalConstraints => {
+        ChargingProfilePurpose::ExternalConstraints | ChargingProfilePurpose::LocalGeneration => {
             ChargingProfilePurposeEnum::ChargingStationExternalConstraints
         }
     }

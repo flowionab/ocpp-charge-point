@@ -401,6 +401,16 @@ pub enum ChargePointEvent {
         evse_id: Option<usize>,
         /// The source of the limit that ended.
         source: ChargingLimitSource,
+        /// Which of the two limits this scope can hold ended - the locally generated capacity, or
+        /// the constraint. Needed because both may be in force at once and both may name the same
+        /// [`ChargingLimitSource`] (K27 has local generation arrive from `EMS` or `Other`, exactly
+        /// as a constraint does), so the source alone cannot say which one went away.
+        ///
+        /// OCPP's own `ClearedChargingLimit` carries no equivalent field, so the message the CSMS
+        /// receives is the same either way. This distinction is what keeps the *station's* two
+        /// slots straight; the CSMS learns that the EMS's limit on that EVSE is gone, which is
+        /// true of whichever one it was.
+        is_local_generation: bool,
     },
     /// An event addressed to one EVSE (or, via [`EvseEvent::Connector`], one of its connectors).
     Evse {

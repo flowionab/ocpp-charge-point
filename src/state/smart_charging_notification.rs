@@ -23,11 +23,12 @@ use crate::state::{ChargingLimitSource, ChargingSchedule};
 /// **Enforced as well as reported** (OCPP K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01). Being kept
 /// out of the profile store does not mean being kept out of composition:
 /// [`crate::smart_charging::external_charging_limits`] turns whichever limits are in force into
-/// [`ChargingProfilePurpose::ExternalConstraints`](crate::state::ChargingProfilePurpose::ExternalConstraints)
-/// capping profiles at composition time, so the limit lowers whatever the CSMS's own profiles asked
-/// for and never raises it. A station that reported a limit it did not apply would hand the CSMS's
-/// load calculation a reduction that never happened, which is worse than not supporting external
-/// limits at all.
+/// composing profiles at composition time - [`ChargingProfilePurpose::ExternalConstraints`](crate::state::ChargingProfilePurpose::ExternalConstraints)
+/// for a constraint, so it lowers whatever the CSMS's own profiles asked for and never raises it,
+/// and [`LocalGeneration`](crate::state::ChargingProfilePurpose::LocalGeneration) for capacity, so
+/// it does the opposite (see [`Self::is_local_generation`]). A station that reported a limit it did
+/// not apply would hand the CSMS's load calculation a reduction that never happened, which is worse
+/// than not supporting external limits at all.
 ///
 /// Two cases where a limit is reported but cannot bind, both by construction rather than by
 /// oversight:
@@ -57,6 +58,21 @@ pub struct ExternalChargingLimit {
     /// limit is in force without saying what it is - OCPP's own `chargingSchedule` is optional for
     /// exactly this reason.
     pub schedule: Option<ChargingSchedule>,
+    /// Whether this describes locally generated capacity - power from solar or a site battery -
+    /// rather than a constraint on what the station may draw (2.1's `isLocalGeneration`, K27).
+    ///
+    /// **It inverts what the schedule means.** A constraint's schedule is a ceiling and composes
+    /// as [`ChargingProfilePurpose::ExternalConstraints`](crate::state::ChargingProfilePurpose::ExternalConstraints);
+    /// local generation's is headroom and composes as
+    /// [`LocalGeneration`](crate::state::ChargingProfilePurpose::LocalGeneration), which *adds* to
+    /// the composite rather than capping it (K27.FR.01). An integrator that sets this wrongly does
+    /// not merely mislabel a report - it moves the limit the connector runs at.
+    ///
+    /// The CSMS is told explicitly for the same reason: K27.FR.05 notes that it "cannot deduce
+    /// from the charging schedule that a schedule represents local generation or a limit". 1.6J
+    /// and 2.0.1 have no field for it, so on those connections the distinction survives in what
+    /// the station *does* and is lost in what it *says* - see each adapter's `wire_purpose`.
+    pub is_local_generation: bool,
 }
 
 /// How the EV wants to receive energy - ISO 15118-2's `EnergyTransferModeEnum`, forwarded as part

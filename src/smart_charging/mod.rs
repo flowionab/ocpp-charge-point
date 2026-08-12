@@ -338,22 +338,36 @@ pub fn current_limit_ma(
 /// ever colliding with one. Nothing reports these ids: an external limit is not an installed
 /// charging profile, and `GetChargingProfiles` must go on saying so - see
 /// [`crate::state::ChargingLimitSource`].
-fn external_limit_profile_id(scope: ChargingProfileScope) -> ChargingProfileId {
+fn external_limit_profile_id(
+    scope: ChargingProfileScope,
+    is_local_generation: bool,
+) -> ChargingProfileId {
+    // Two limits can be in force on one scope at once - a constraint and locally generated
+    // capacity (K27.FR.05) - so the id has to separate them too, or the pair would look like one
+    // profile installed twice. Local generation takes the even half of the negative range and
+    // constraints the odd half, which keeps both unbounded in the number of EVSEs they cover.
+    let offset = i32::from(is_local_generation);
     match scope {
-        ChargingProfileScope::ChargePoint => ChargingProfileId(-1),
+        ChargingProfileScope::ChargePoint => ChargingProfileId(-1 - offset),
         ChargingProfileScope::Evse(evse_id) => {
-            ChargingProfileId((-2i32).saturating_sub(i32::try_from(evse_id).unwrap_or(i32::MAX)))
+            let evse_id = i32::try_from(evse_id).unwrap_or(i32::MAX / 2);
+            ChargingProfileId((-3i32).saturating_sub(evse_id.saturating_mul(2) + offset))
         }
     }
 }
 
-/// The capping profile an external limit composes as, or `None` when the limit carries no schedule
-/// and so says nothing that *could* be enforced.
+/// The profile an external limit composes as, or `None` when the limit carries no schedule and so
+/// says nothing that *could* be enforced.
 ///
-/// [`ChargingProfilePurpose::ExternalConstraints`] because that is exactly what this is - a
-/// constraint the station is subject to rather than one it chose - and because that purpose already
-/// [caps the composed result](ChargingProfilePurpose::caps_the_result) rather than competing for
-/// it: an external limit lowers whatever the CSMS asked for and never raises it.
+/// The purpose follows [`ExternalChargingLimit::is_local_generation`], and the two compose in
+/// opposite directions. A constraint becomes [`ChargingProfilePurpose::ExternalConstraints`] -
+/// exactly what it is, a constraint the station is subject to rather than one it chose - and that
+/// purpose already [caps the composed result](ChargingProfilePurpose::caps_the_result), so the
+/// limit lowers whatever the CSMS asked for and never raises it. Locally generated capacity
+/// becomes [`ChargingProfilePurpose::LocalGeneration`], which
+/// [adds to it](ChargingProfilePurpose::adds_to_the_result) instead: K27.FR.01 has the station
+/// treat an external schedule that represents local generation as exactly that profile, and
+/// §K.3.6 has that capacity added on top of the composite rather than bounding it.
 ///
 /// [`ChargingProfileKind::Absolute`], so a limit whose schedule carries a `start_schedule` is
 /// honoured to the second. A schedule *without* one anchors at "now" on every evaluation, which is
@@ -361,7 +375,7 @@ fn external_limit_profile_id(scope: ChargingProfileScope) -> ChargingProfileId {
 /// external schedule, which would restart rather than advance. An external system that wants a
 /// time-bounded limit must therefore stamp `start_schedule` itself - unlike the wire adapters,
 /// which stamp it on the CSMS's behalf, the state machine here is deliberately clock-free.
-fn as_capping_profile(
+fn as_composing_profile(
     limit: &ExternalChargingLimit,
     scope: ChargingProfileScope,
 ) -> Option<InstalledChargingProfile> {
@@ -369,9 +383,13 @@ fn as_capping_profile(
     Some(InstalledChargingProfile {
         scope,
         profile: ChargingProfile {
-            id: external_limit_profile_id(scope),
+            id: external_limit_profile_id(scope, limit.is_local_generation),
             stack_level: 0,
-            purpose: ChargingProfilePurpose::ExternalConstraints,
+            purpose: if limit.is_local_generation {
+                ChargingProfilePurpose::LocalGeneration
+            } else {
+                ChargingProfilePurpose::ExternalConstraints
+            },
             kind: ChargingProfileKind::Absolute,
             recurrency: None,
             valid_from: None,
@@ -400,16 +418,29 @@ pub fn external_charging_limits(
     state: &ChargePointState,
     evse_id: usize,
 ) -> Vec<InstalledChargingProfile> {
-    let station = state
-        .station_external_charging_limit
-        .as_ref()
-        .and_then(|limit| as_capping_profile(limit, ChargingProfileScope::ChargePoint));
-    let evse = state
-        .evses
-        .get(evse_id)
-        .and_then(|evse| evse.external_charging_limit.as_ref())
-        .and_then(|limit| as_capping_profile(limit, ChargingProfileScope::Evse(evse_id)));
-    station.into_iter().chain(evse).collect()
+    let station_scope = ChargingProfileScope::ChargePoint;
+    let evse_scope = ChargingProfileScope::Evse(evse_id);
+    let evse = state.evses.get(evse_id);
+    // All four slots this EVSE composes under: the station's constraint and capacity, and its
+    // own. Each is independent of the others - a site under an EMS cap can still have sun on the
+    // roof - so this is a chain rather than a choice.
+    [
+        state
+            .station_external_charging_limit
+            .as_ref()
+            .and_then(|limit| as_composing_profile(limit, station_scope)),
+        state
+            .station_local_generation_limit
+            .as_ref()
+            .and_then(|limit| as_composing_profile(limit, station_scope)),
+        evse.and_then(|evse| evse.external_charging_limit.as_ref())
+            .and_then(|limit| as_composing_profile(limit, evse_scope)),
+        evse.and_then(|evse| evse.local_generation_limit.as_ref())
+            .and_then(|limit| as_composing_profile(limit, evse_scope)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Everything that limits `evse_id`: the profiles the CSMS installed, plus the capping profiles
@@ -578,9 +609,12 @@ fn applies_to_transaction(
     context: &CompositionContext,
 ) -> bool {
     match profile.purpose {
-        ChargingProfilePurpose::ChargePointMax | ChargingProfilePurpose::ExternalConstraints => {
-            true
-        }
+        // Local generation is a fact about the site, not about the session: the capacity is there
+        // whether or not a car is plugged in, so it qualifies the connector's limit the same way
+        // an installation limit does (K27 - the EMS pushes it, and no transaction is mentioned).
+        ChargingProfilePurpose::ChargePointMax
+        | ChargingProfilePurpose::ExternalConstraints
+        | ChargingProfilePurpose::LocalGeneration => true,
         ChargingProfilePurpose::Tx => match (profile.transaction_id, context.transaction_id) {
             (Some(profile_transaction), Some(running)) => profile_transaction == running,
             // A `TxProfile` with no transaction id applies to whatever is running on the
@@ -605,6 +639,10 @@ fn limit_at(
 ) -> Option<Contribution> {
     let mut selected: Option<(ChargingProfilePurpose, u32, Contribution)> = None;
     let mut cap: Option<f64> = None;
+    // Locally generated capacity: the leading `LocalGeneration` profile's limit, by stack level,
+    // kept apart from `selected` because it does not compete with the transaction profiles - it
+    // widens whatever they and the caps settle on (K27, §K.3.6).
+    let mut headroom: Option<(u32, f64)> = None;
 
     for installed in profiles {
         let profile = &installed.profile;
@@ -630,6 +668,15 @@ fn limit_at(
             cap = Some(cap.map_or(limit, |current: f64| current.min(limit)));
             continue;
         }
+        if profile.purpose.adds_to_the_result() {
+            // Stack level picks the leading one, the same rule every other purpose gets - two
+            // local generation profiles are two answers to "how much is available", not two
+            // sources to be added together.
+            if headroom.is_none_or(|(stack_level, _)| profile.stack_level >= stack_level) {
+                headroom = Some((profile.stack_level, limit));
+            }
+            continue;
+        }
         let contribution = Contribution {
             limit,
             number_phases: period.number_phases,
@@ -643,7 +690,7 @@ fn limit_at(
         }
     }
 
-    match (selected, cap) {
+    let composed = match (selected, cap) {
         (Some((_, _, contribution)), Some(cap)) => Some(Contribution {
             limit: contribution.limit.min(cap),
             ..contribution
@@ -657,5 +704,21 @@ fn limit_at(
             min_charging_rate: None,
         }),
         (None, None) => None,
+    };
+
+    // "If a charging profile of chargingProfilePurpose = LocalGeneration is active for the EVSE,
+    // then this capacity is added on top of the calculated composite schedule" (§K.3.6) - *on top
+    // of*, so after the caps rather than alongside them. An installation limit describes the grid
+    // connection, and locally generated power does not arrive through it.
+    //
+    // Headroom with nothing to add to is not a limit, which is where this parts company with the
+    // capping rule directly above: "20 A is the ceiling" still bounds an otherwise unlimited
+    // connector, while "2 kW is available on site" says nothing about a ceiling at all.
+    match (composed, headroom) {
+        (Some(contribution), Some((_, headroom))) => Some(Contribution {
+            limit: contribution.limit + headroom,
+            ..contribution
+        }),
+        (composed, _) => composed,
     }
 }

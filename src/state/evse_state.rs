@@ -15,8 +15,18 @@ pub struct EvseState {
     /// CSMS charging profile - typically a local energy-management system), reported via
     /// `NotifyChargingLimit`/`ClearedChargingLimit`. `None` when nothing external is currently
     /// limiting this EVSE. See [`ExternalChargingLimit`]'s docs for why this is not a
-    /// [`crate::state::ChargingProfile`] and does not feed the composite-schedule projection.
+    /// [`crate::state::ChargingProfile`].
     pub external_charging_limit: Option<ExternalChargingLimit>,
+    /// Locally generated capacity currently available to this EVSE - solar, a site battery -
+    /// pushed by the same integrator path as [`Self::external_charging_limit`] and reported the
+    /// same way, but with `isLocalGeneration = true` (K27.FR.03).
+    ///
+    /// **A separate slot rather than a flag on the one above**, because K27.FR.05 has the station
+    /// hold and report both at once: an EMS that caps the site at 6 kW *and* 2 kW of sun are two
+    /// facts, and a single slot would have the second evict the first. They also compose
+    /// oppositely - the limit caps, the generation adds - so collapsing them would be exactly the
+    /// conflation CV17 exists to undo.
+    pub local_generation_limit: Option<ExternalChargingLimit>,
     /// This EVSE's connectors, indexed by `connector_id` as used throughout this crate and OCPP.
     pub connectors: Vec<ConnectorState>,
     /// The active transaction for each connector, indexed the same as `connectors`. `None`
@@ -132,6 +142,7 @@ impl EvseState {
         Self {
             status: EvseStatus::Available,
             external_charging_limit: None,
+            local_generation_limit: None,
             connectors: vec![ConnectorState::Available; connector_count],
             transactions: vec![None; connector_count],
             reservations: vec![None; connector_count],

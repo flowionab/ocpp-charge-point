@@ -1659,6 +1659,7 @@ enum PersistedChargingProfilePurpose {
     Tx,
     ExternalConstraints,
     PriorityCharging,
+    LocalGeneration,
 }
 
 impl From<ChargingProfilePurpose> for PersistedChargingProfilePurpose {
@@ -1669,6 +1670,7 @@ impl From<ChargingProfilePurpose> for PersistedChargingProfilePurpose {
             ChargingProfilePurpose::Tx => Self::Tx,
             ChargingProfilePurpose::ExternalConstraints => Self::ExternalConstraints,
             ChargingProfilePurpose::PriorityCharging => Self::PriorityCharging,
+            ChargingProfilePurpose::LocalGeneration => Self::LocalGeneration,
         }
     }
 }
@@ -1681,6 +1683,7 @@ impl From<PersistedChargingProfilePurpose> for ChargingProfilePurpose {
             PersistedChargingProfilePurpose::Tx => Self::Tx,
             PersistedChargingProfilePurpose::ExternalConstraints => Self::ExternalConstraints,
             PersistedChargingProfilePurpose::PriorityCharging => Self::PriorityCharging,
+            PersistedChargingProfilePurpose::LocalGeneration => Self::LocalGeneration,
         }
     }
 }

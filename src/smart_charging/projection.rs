@@ -618,6 +618,7 @@ mod tests {
     /// An EMS limit of `amps`, expressed the way an integrator's energy-management binding would.
     fn ems_limit(amps: f64) -> crate::state::ExternalChargingLimit {
         crate::state::ExternalChargingLimit {
+            is_local_generation: false,
             source: crate::state::ChargingLimitSource::Ems,
             is_grid_critical: Some(false),
             schedule: Some(ChargingSchedule {
@@ -672,6 +673,7 @@ mod tests {
         // CSMS reinstalling anything.
         let _ = actor
             .send(ChargePointEvent::ExternalChargingLimitCleared {
+                is_local_generation: false,
                 evse_id: Some(0),
                 source: crate::state::ChargingLimitSource::Ems,
             })
