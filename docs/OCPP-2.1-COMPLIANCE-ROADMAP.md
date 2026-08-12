@@ -492,7 +492,8 @@ CSMS something untrue about its own behaviour. It is now closed.
 | ID | Item | Requirements | Status |
 |---|---|---|---|
 | **CV13** | **Enforce an external charging limit, don't just report it.** `external_charging_limits` turns the recorded limits — the station-wide one and the EVSE's own — into `ExternalConstraints` capping profiles, and `composing_profiles` joins them onto `charging_profiles.applying_to()` at both composition sites: the projection that drives hardware, and `GetCompositeSchedule`, so the CSMS is shown the curve the station will apply. Audit §2.13. | K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01 | **done** |
-| **CV14** | **Sweep `CAPABILITY_GATED_VARIABLES` the way CV2.1 swept `DEFAULT_VARIABLES`.** `CapabilityGatedVariable` has no `honoured` field, so 19 of its 26 writable rows accept a `SetVariables` and discard it. Audit §2.15. | B05.FR.09 | open |
+| **CV14** | **Sweep `CAPABILITY_GATED_VARIABLES` the way CV2.1 swept `DEFAULT_VARIABLES`.** `CapabilityGatedVariable::honoured` now records, per row, whether this build makes the value mean anything, and `false` forces the registration to `ReadOnly` — the same lever `register_defaults` pulls. 24 of the 26 writable rows refuse the write; the two `ISO15118Ctrlr` rows stay writable. Audit §2.15. | B05.FR.09 | **done** |
+| **CV19** | **Three station-owned counters registered at 0 and never updated** — `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]`, `DisplayMessageCtrlr.DisplayMessages`. A CSMS reads each to know how full the station is; all three answer 0 however much is installed. Found by CV14's sweep. | D01, K01, B6 | open |
 | **CV15** | **Transaction limits (E16).** `TransactionLimit` exists only as a type alias; `triggerReason = LimitSet` occurs nowhere. Unblocks C17 (prepaid) outright and gives CV8's local cost a ceiling to act on. Audit §2.14. | E16 (20 FRs), C17 | open |
 | **CV16** | **A renegotiation surface in `crate::hardware`.** K16.FR.02 is a `SHALL` on the station whenever the composite schedule changes, and `Iso15118Controller` has one method — a certificate hook. No integrator can satisfy K16–K20 through this crate today. Audit §2.18. | K16, K17 (33 FRs) | open |
 | **CV17** | **`LocalGeneration` needs its own internal purpose.** It is currently mapped onto `ExternalConstraints` through a `_` catch-all and cannot round-trip through `GetChargingProfiles`; `isLocalGeneration` is hardcoded `None`. Audit §2.16. | K27.FR.02/.03/.05 | open |
@@ -500,10 +501,28 @@ CSMS something untrue about its own behaviour. It is now closed.
 
 **Sequencing:** CV13 before CV18 (nothing changes a rate externally until the limit is enforced) —
 **CV13 is done, so CV18 is now reachable**; CV17 next to it (both touch the same purpose mapping,
-and CV13 left `LocalGeneration` composing as an external constraint exactly as it found it), CV14
-independent and cheap, CV15
+and CV13 left `LocalGeneration` composing as an external constraint exactly as it found it), **CV14
+was independent and cheap and is done**, CV15
 independent and largest, CV16 a `crate::hardware` addition that should be taken together with the
 DER actuation trait `docs/CERTIFICATION.md` §3 names — one considered break rather than two.
+
+### CV14 — what the sweep found, and the two rows it did not expect
+
+The audit's arithmetic held: 26 writable rows, 19 decorative, 5 station-written, 2 honoured. The
+five station-written rows are `PaymentCtrlr.Merchant[Id|TaxId|Name|Address|City]`, and they are
+refused for a different reason than the other 19 — not "nothing reads it" but "the terminal owns
+it": `apply_payment_terminal_status` fills all five when the terminal registers and again on every
+`payment_status_updates` sweep, so an accepted CSMS write would be silently replaced minutes later.
+That is `ClockCtrlr.DateTime`'s situation, and CV1.2's answer applies unchanged.
+
+The field is set on all 71 rows rather than only the writable ones, matching what
+`DefaultVariable::honoured` already records for its own read-only rows: `true` where the build
+enforces the value or keeps it in step with the fact it reports, `false` where it is a placeholder
+that makes the component complete. Filling it in is what turned up **CV19** — and one of those
+three counters was worse than stale, because `LocalAuthListCtrlr.Entries` carried a comment
+claiming `ChargePointState::apply`'s `LocalListUpdated` arm kept it current. Nothing in that arm
+touches the device model. The comment is now the truth, which is the least this can do until CV19
+makes the value one.
 
 ---
 
@@ -521,12 +540,12 @@ CV12                           continuous, in parallel
 ```
 
 Everything above the line is done. **CV1–CV11 are closed.** What is open is CV12's remaining sweeps
-and the six rows its first sweep opened:
+and four of the six rows its first sweep opened, plus the one CV14 added on its way past:
 
 ```
 CV12.1 (K, done) ──┬─> CV13 (done) ──> CV18
                    ├─> CV17
-                   ├─> CV14        independent, cheap
+                   ├─> CV14 (done) ──> CV19   the stale counters the sweep turned up
                    ├─> CV15        independent, largest
                    └─> CV16        a crate::hardware break — take with the DER trait
 CV12.2 … CV12.7                    the rest of the sweeps, continuous
@@ -540,7 +559,7 @@ a future one — and the K sweep sharpened what it should take first. **CV13 was
 should not wait for it** — a station that reports an external charging limit it never applies gives
 the CSMS's load calculation a reduction that did not happen, which is worse than not supporting
 external limits at all — and it is now done, which removes the one blocker in front of that run.
-The rest of the sweep's findings are either cheap (CV14), bounded and
+The rest of the sweep's findings are either done (CV14), bounded and
 well-understood (CV15, CV17, CV18), or a hardware-surface decision (CV16) that belongs with the two
 `crate::hardware` additions `docs/CERTIFICATION.md` §3 already names as outright blockers — a DER
 actuation surface, and the payment terminal work CV2.11 half-answers. CV16 makes that list three.

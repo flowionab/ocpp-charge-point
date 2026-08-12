@@ -56,6 +56,14 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
 - A `SetVariables` for a variable this build does not act on is now `Rejected` rather than
   accepted and ignored (CV2.1, B05.FR.09). A CSMS that relied on the previous silent acceptance
   will start seeing refusals — which is the point.
+- The same refusal now covers the capability-gated variables CV2.1 never reached (CV14,
+  B05.FR.09): 24 of the 26 rows OCPP marks writable — every `TariffCostCtrlr`, `PaymentCtrlr`,
+  `WebPaymentsCtrlr` and `V2XChargingCtrlr` setting, plus `SmartChargingCtrlr.
+  LimitChangeSignificance` and `DisplayMessageCtrlr.Language` — are registered `ReadOnly` and
+  `Rejected` on write. `ISO15118Ctrlr.ContractValidationOffline` and `.CentralContractValidation
+  Allowed` stay writable, being the two this crate reads. The five `PaymentCtrlr.Merchant`
+  instances are refused for a second reason: a payment terminal's status sweep owns them, so an
+  accepted write would have been overwritten within the interval.
 - A `SetVariables` writing `WebPaymentsCtrlr.SharedSecret` is `Rejected` (CV10): it is
   `WriteOnly`, which keeps `GetVariables` from disclosing it (A01.FR.12) but — unlike `ReadOnly` —
   does not by itself stop the write, and this crate has no consumer for it yet. An `Accepted`

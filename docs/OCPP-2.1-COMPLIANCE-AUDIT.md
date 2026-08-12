@@ -1,6 +1,6 @@
 # OCPP 2.1 compliance audit — spec vs. this crate
 
-**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13 closed 2026-08-12 ·
+**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13 and §2.15 closed 2026-08-12 ·
 **Baseline:** `main` @ `4c6abe3`, sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
 part 2 appendices v2.1 CSVs + errata 2026-06).
 
@@ -343,7 +343,26 @@ whose whole mechanism is a CSMS-set `maxCost` — and it is the one gap that dir
 value, since the crate now computes a running cost locally (`EvseState::running_cost`) and still has
 no way to act on a cost ceiling.
 
-### 2.15 Medium · `CAPABILITY_GATED_VARIABLES` was never swept by CV2.1 — 19 of 26 writable rows accept a write and discard it (B05.FR.09) [MECHANICAL]
+### 2.15 ~~Medium~~ **Closed by CV14** · `CAPABILITY_GATED_VARIABLES` was never swept by CV2.1 — 19 of 26 writable rows accept a write and discard it (B05.FR.09) [MECHANICAL]
+
+**Fixed.** `CapabilityGatedVariable::honoured` now records per row whether this build makes the
+value mean anything, and `capability_gate_events` narrows an unhonoured row to `ReadOnly` before it
+reaches the device model — the same lever `DeviceModel::register_defaults` pulls on the other table,
+so both tables now answer B05.FR.09 the same way. 24 of the 26 writable rows refuse the write; the
+two `ISO15118Ctrlr` rows, which `crate::authorization` genuinely reads, stay writable.
+
+The count below held exactly, and the split between its two "not honoured" reasons is preserved in
+the field's docs rather than flattened: the 19 are refused because nothing reads them, the five
+`Merchant` instances because the terminal owns them and a poll would overwrite a CSMS write within
+one sweep (CV1.2's `ClockCtrlr.DateTime` rule).
+
+The field is filled in on all 71 rows, not just the 26 writable ones, matching what
+`DefaultVariable::honoured` already records for its read-only rows. Doing that turned up a separate
+finding, now **CV19**: `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]`
+and `DisplayMessageCtrlr.DisplayMessages` are registered at 0 and never updated, so a CSMS asking
+how full the station is gets 0 whatever is installed. `LocalAuthListCtrlr.Entries` additionally
+carried a comment claiming `ChargePointState::apply`'s `LocalListUpdated` arm kept it in step;
+that arm does not touch the device model. Original finding follows.
 
 CV2.1 added `DefaultVariable::honoured` and swept `DEFAULT_VARIABLES` (`src/state/device_model.rs`).
 `CapabilityGatedVariable` (`src/device_model.rs:36`) has no such field, so the same question was
@@ -494,8 +513,9 @@ the sweep, by certification impact rather than by size:
 9. ~~**§2.13 (external limits are not enforced)**~~ — **closed by CV13.** It was the only finding
    here where the station told the CSMS something untrue about its own behaviour, and it was the
    prerequisite for §2.17, which is now reachable.
-10. **§2.15 (the second variable table)** — the same one-word-per-row change CV2.1 was, on a table
-    CV2.1 never reached, and the same B05.FR.09 argument.
+10. ~~**§2.15 (the second variable table)**~~ — **closed by CV14.** It was the same one-word-per-row
+    change CV2.1 was, on the table CV2.1 never reached, and it turned up **CV19**: three station-owned
+    counters registered at 0 that nothing ever updates.
 11. **§2.14 (E16 transaction limits)** — 20 FRs, unblocks C17 outright, and gives CV8's locally
     computed cost something to act on. The largest of the three.
 12. **§2.16 / §2.17** — contained, and both are consequences of work above.

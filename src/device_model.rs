@@ -44,8 +44,32 @@ struct CapabilityGatedVariable {
     data_type: VariableDataType,
     /// The value to register.
     value: &'static str,
-    /// Whether a CSMS may write it.
+    /// What OCPP says about writing it - **not** necessarily what a CSMS gets. See
+    /// [`Self::honoured`], which can narrow it.
     mutability: VariableMutability,
+    /// Whether this build makes the value mean anything
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV14) - the same question
+    /// [`DefaultVariable::honoured`](crate::state::DefaultVariable) asks of the other table, asked
+    /// here too because it was never asked when this one was written.
+    ///
+    /// **`false` forces the registration to `ReadOnly`, whatever [`Self::mutability`] says**, so a
+    /// `SetVariables` is `Rejected` rather than accepted and discarded (B05.FR.09). Two different
+    /// facts make a writable row unhonoured, and both get the same refusal:
+    ///
+    /// - **Decorative** - nothing reads the value. A CSMS setting
+    ///   `SmartChargingCtrlr.LimitChangeSignificance` to 20% was told the threshold took, and the
+    ///   station went on reporting every composed change however small.
+    /// - **Station-written** - the value is a fact about the hardware that this crate keeps in
+    ///   step itself, so a CSMS write survives only until the next sweep overwrites it. The five
+    ///   `PaymentCtrlr.Merchant` instances are `crate::payment`'s to fill in, exactly as
+    ///   `ClockCtrlr.DateTime` is the clock's (CV1.2 settled that one the same way).
+    ///
+    /// On a row OCPP already makes `ReadOnly` the field changes nothing and records the same
+    /// distinction the other table's read-only rows record: `true` where this build enforces the
+    /// value or keeps it in step with the fact it reports, `false` where it is a placeholder
+    /// registered so the component is complete. `WriteOnly` is not reachable by this lever at all
+    /// - see [`REFUSED_WRITE_ONLY_VARIABLES`].
+    honoured: bool,
 }
 
 /// The OCPP 2.x variables the vendored 2.1 appendix marks **Required** for components this crate
@@ -65,16 +89,39 @@ struct CapabilityGatedVariable {
 /// `V2XChargingCtrlr`, `NetworkConfiguration` - own the remaining 34 of the appendix's 122
 /// required rows between them and appear nowhere here. That is the same rule applied
 /// consistently, not an omission: their capabilities are `false`, so nothing is owed.
+///
+/// # Which of these this build acts on
+///
+/// [`CapabilityGatedVariable::honoured`] records it per row, and CV14 swept the table the way
+/// CV2.1 swept `DEFAULT_VARIABLES`. Of the 26 rows OCPP makes `ReadWrite`, two are honoured -
+/// `ISO15118Ctrlr`'s pair, read by `crate::authorization` before it decides how a contract
+/// certificate gets validated. The other 24 are registered `ReadOnly` so the write is refused:
+/// five `PaymentCtrlr.Merchant` instances the terminal owns, and 19 that nothing reads at all.
+///
+/// The 19 are not one problem but three, and the refusal is the honest answer to each:
+///
+/// - **`SmartChargingCtrlr.LimitChangeSignificance`** and **`DisplayMessageCtrlr.Language`** -
+///   blocks that exist and work, with one configuration knob apiece that isn't wired up.
+/// - **`TariffCostCtrlr.{Currency,TariffFallbackMessage,TotalCostFallbackMessage}`** and the seven
+///   `PaymentCtrlr` settings - the parts of two blocks CV8 and CV2.11 left for later. CV8 recorded
+///   them as unhonoured already; CV14 is about *refusing* them, not about honouring them.
+/// - **`V2XChargingCtrlr.Enabled`** and the four `WebPaymentsCtrlr` settings - configuration for
+///   blocks with no implementation behind them (Q02-Q08 and C25 respectively). A CSMS cannot
+///   switch on what isn't there, and telling it otherwise is the worst available answer.
 const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
     CapabilityGatedVariable {
         component: "LocalAuthListCtrlr",
         variable: "Entries",
         instance: None,
         data_type: VariableDataType::Integer,
-        // How many entries the list currently holds. Registered at 0 and updated by the list
-        // itself; see `crate::state::ChargePointState::apply`'s `LocalListUpdated` arm.
+        // How many entries the list currently holds - or would, if anything kept it in step.
+        // `replace_local_authorization_list` does not touch this variable, so it reads 0 however
+        // many entries a `SendLocalList` installed. CV14's sweep found the claim that it did
+        // (this comment used to name `ChargePointState::apply`'s `LocalListUpdated` arm) and
+        // recorded the truth instead; see that roadmap row for the follow-up.
         value: "0",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     // D01.FR.11: one ceiling for the whole block rather than one per message, hence no instance.
     // Enforced by `crate::message_limits` on every `SendLocalList` (CV2.8).
@@ -85,6 +132,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Integer,
         value: "50",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "LocalAuthListCtrlr",
@@ -93,14 +141,18 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Integer,
         value: "8192",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "SmartChargingCtrlr",
         variable: "Entries",
         instance: Some("ChargingProfiles"),
         data_type: VariableDataType::Integer,
+        // The same stale counter as `LocalAuthListCtrlr.Entries` above: nothing updates it as
+        // profiles are installed or cleared, so it reads 0 for a station holding a full stack.
         value: "0",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "SmartChargingCtrlr",
@@ -112,14 +164,20 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // bound this crate enforces.
         value: "8",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "SmartChargingCtrlr",
         variable: "PeriodsPerSchedule",
         instance: None,
         data_type: VariableDataType::Integer,
+        // Advisory in the same way `ProfileStackLevel` is: nothing checks a schedule's period
+        // count against it (the only period-count rule in `charging_profile` is K28.FR.01's
+        // "a Dynamic profile carries exactly one"), so it is a figure a CSMS can read rather
+        // than one this crate enforces.
         value: "24",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "SmartChargingCtrlr",
@@ -130,6 +188,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // expressed in.
         value: "A,W",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "SmartChargingCtrlr",
@@ -138,9 +197,13 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         // 0: this crate reports every composed limit change to hardware, however small, rather
         // than filtering insignificant ones. Claiming a threshold it does not apply would be
-        // worse than admitting there isn't one.
+        // worse than admitting there isn't one - which is also why the write is refused (CV14).
+        // The appendix marks this one `Required? = yes` and OCPP makes it writable; a CSMS that
+        // set it to 20% and saw `Accepted` would believe the station had stopped reporting small
+        // changes, and would be reading the resulting traffic as significant.
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DisplayMessageCtrlr",
@@ -153,6 +216,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // known gap; see `docs/PRODUCTION-ROADMAP.md`.
         value: "0",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DisplayMessageCtrlr",
@@ -166,6 +230,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // empty too, and `handle_set_display_message` refuses every format against it.
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "DisplayMessageCtrlr",
@@ -178,6 +243,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // test in this module.
         value: "AlwaysFront,InFront,NormalCycle",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "DisplayMessageCtrlr",
@@ -194,6 +260,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // `MessageState::ALL` by a test in this module.
         value: "Charging,Faulted,Idle,Unavailable",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "DisplayMessageCtrlr",
@@ -205,6 +272,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // set to. `ReadWrite` per the spec, so a CSMS can configure the default.
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "TariffCostCtrlr",
@@ -216,6 +284,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // *tariff* carries its own currency and never consults this.
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     // The two bounds `SetDefaultTariff`/`ChangeTransactionTariff` refuse against (I07.FR.02/.03,
     // I11.FR.02/.03). Both are `ReadOnly` in the appendix and both are read on the path that
@@ -230,6 +299,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // which is where the reasoning for the number itself lives.
         value: "16",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "TariffCostCtrlr",
@@ -241,6 +311,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // observe as unmet rather than ignoring it.
         value: "true",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "TariffCostCtrlr",
@@ -249,6 +320,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "TariffCostCtrlr",
@@ -257,6 +329,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     // `PaymentCtrlr`'s 22 required variables (B7.2), gated by `Capabilities::payment` - see
     // `docs/PRODUCTION-ROADMAP.md` B7.2's task notes for where the source CSV rows this mirrors
@@ -272,6 +345,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Boolean,
         value: "true",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -280,6 +354,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Boolean,
         value: "false",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -291,6 +366,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // `AuthorizeRequest` round trip unless configured to.
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -299,6 +375,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -310,6 +387,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // `TariffCostCtrlr.Currency` above.
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -320,6 +398,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // otherwise.
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -328,6 +407,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -336,7 +416,14 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Boolean,
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
+    // The five `Merchant` instances are the station-written case of `honoured: false` (CV14): OCPP
+    // makes them writable, but `crate::payment::apply_payment_terminal_status` fills all five from
+    // the terminal - once when it is registered, and again on every sweep a
+    // `ChargePointBuilder::payment_status_updates` configures. A CSMS write would be accepted and
+    // then silently replaced by whatever the terminal last said, so it is refused instead, exactly
+    // as CV1.2 settled `ClockCtrlr.DateTime`.
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
         variable: "Merchant",
@@ -344,6 +431,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -352,6 +440,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -360,6 +449,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -368,6 +458,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -376,6 +467,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -384,6 +476,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -392,6 +485,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -400,6 +494,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -408,6 +503,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -416,6 +512,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -424,6 +521,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -432,6 +530,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -440,6 +539,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "PaymentCtrlr",
@@ -448,6 +548,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Boolean,
         value: "false",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     // `ISO15118Ctrlr`'s required variable (B4.5) and the one optional one this crate can act on
     // (B4.6), both gated by `Capabilities::iso15118_support`. The appendix lists fifteen further
@@ -469,6 +570,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // refused the write would misreport a stack limitation as a spec deviation.
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "ISO15118Ctrlr",
@@ -487,6 +589,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         // so the misconfiguration is visible rather than silent.
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: true,
     },
     // --- CV1.6: the last of OCPP's required capability-gated variables ---
     //
@@ -512,6 +615,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "TariffCostCtrlr",
@@ -520,6 +624,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "V2XChargingCtrlr",
@@ -528,6 +633,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Boolean,
         value: "false",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "V2XChargingCtrlr",
@@ -536,6 +642,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::MemberList,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "V2XChargingCtrlr",
@@ -544,6 +651,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::MemberList,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "ACDERCtrlr",
@@ -552,6 +660,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::MemberList,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -560,6 +669,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -568,6 +678,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -576,6 +687,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -584,6 +696,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -592,6 +705,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::MemberList,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -600,6 +714,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -608,6 +723,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -616,6 +732,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -624,6 +741,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -632,6 +750,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -640,6 +759,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -648,6 +768,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -656,6 +777,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -664,6 +786,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -672,6 +795,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "DCDERCtrlr",
@@ -680,6 +804,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Decimal,
         value: "",
         mutability: VariableMutability::ReadOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "WebPaymentsCtrlr",
@@ -688,6 +813,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "WebPaymentsCtrlr",
@@ -696,6 +822,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::WriteOnly,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "WebPaymentsCtrlr",
@@ -704,6 +831,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::String,
         value: "",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "WebPaymentsCtrlr",
@@ -712,6 +840,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Integer,
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     CapabilityGatedVariable {
         component: "WebPaymentsCtrlr",
@@ -720,6 +849,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Integer,
         value: "0",
         mutability: VariableMutability::ReadWrite,
+        honoured: false,
     },
     // --- CV1.4: MonitoringCtrlr's required message-size variables ---
     //
@@ -738,6 +868,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Integer,
         value: "50",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "MonitoringCtrlr",
@@ -746,6 +877,7 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         data_type: VariableDataType::Integer,
         value: "8192",
         mutability: VariableMutability::ReadOnly,
+        honoured: true,
     },
 ];
 
@@ -794,7 +926,16 @@ pub fn capability_gate_events(capabilities: &Capabilities) -> Vec<ChargePointEve
                     attributes: vec![VariableAttribute {
                         attribute_type: VariableAttributeType::Actual,
                         value: variable.value.to_string(),
-                        mutability: variable.mutability,
+                        // CV14, the same narrowing `DeviceModel::register_defaults` applies to
+                        // `DEFAULT_VARIABLES`: a variable this build does not act on is
+                        // registered read-only, so a `SetVariables` on it is `Rejected`
+                        // (B05.FR.09) rather than accepted and ignored. See
+                        // `CapabilityGatedVariable::honoured`.
+                        mutability: if variable.honoured {
+                            variable.mutability
+                        } else {
+                            VariableMutability::ReadOnly
+                        },
                         persistent: false,
                         constant: false,
                         requires_reboot: false,
@@ -930,8 +1071,9 @@ pub trait GetVariablesHandler {
 /// The `WriteOnly` variables a `SetVariables` is refused on outright, because this build cannot
 /// act on the value it would be handed at all (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV10).
 ///
-/// `DefaultVariable::honoured` forces an unhonoured variable to
-/// `ReadOnly`, which is how CV2.1 makes `SetVariables` refuse it (B05.FR.09). That lever does not
+/// `DefaultVariable::honoured` (CV2.1) and [`CapabilityGatedVariable::honoured`] (CV14) each force
+/// an unhonoured variable in their own table to
+/// `ReadOnly`, which is how `SetVariables` comes to refuse it (B05.FR.09). That lever does not
 /// reach `WriteOnly` variables: OCPP requires `NetworkConfiguration.BasicAuthPassword` to be
 /// reported `WriteOnly` (B09.FR.10), and this crate registers `WebPaymentsCtrlr.SharedSecret` the
 /// same way, for the reason both exist - a secret `GetVariables` can read is not a secret. So a
@@ -1576,6 +1718,193 @@ mod tests {
         assert_eq!(
             registered(Iso15118SupportLevel::None),
             alloc::vec![("ISO15118Ctrlr".to_string(), "Available".to_string())],
+        );
+    }
+
+    /// Every capability this crate gates a variable behind, all on at once - so a sweep over the
+    /// gated table registers every row rather than silently skipping the ones behind a capability
+    /// the test forgot. A row this misses fails
+    /// `an_unhonoured_gated_variable_reaches_the_device_model_read_only` as "never registered"
+    /// rather than passing vacuously.
+    fn all_capabilities() -> crate::hardware::Capabilities {
+        crate::hardware::Capabilities {
+            has_display: true,
+            local_auth_list: true,
+            smart_charging: true,
+            variable_monitoring: true,
+            tariff_and_cost: true,
+            payment: true,
+            der_control: true,
+            supports_bidirectional_power: true,
+            iso15118_support: crate::hardware::Iso15118SupportLevel::Iso15118_20,
+            ..Default::default()
+        }
+    }
+
+    /// An actor with every gated component registered, so a `SetVariables` against one resolves
+    /// against a real registration rather than `UnknownComponent`.
+    async fn actor_with_every_capability() -> ChargePointActor {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        let capabilities = all_capabilities();
+        actor
+            .send(crate::state::ChargePointEvent::CapabilitiesDeclared(
+                capabilities,
+            ))
+            .await
+            .unwrap();
+        for event in super::capability_gate_events(&capabilities) {
+            actor.send(event).await.unwrap();
+        }
+        actor
+    }
+
+    /// CV14, the structural half: a gated variable this build does not act on must reach the
+    /// device model `ReadOnly`, whatever OCPP says about writing it - the same lever CV2.1 pulls
+    /// on `DEFAULT_VARIABLES`, applied to the second table. Asserted over the events rather than
+    /// the table alone, because the registration is where the narrowing either happens or doesn't.
+    #[test]
+    fn an_unhonoured_gated_variable_reaches_the_device_model_read_only() {
+        use super::{CAPABILITY_GATED_VARIABLES, capability_gate_events};
+        use crate::state::{ChargePointEvent, DeviceModelEvent};
+
+        let registered: alloc::vec::Vec<_> = capability_gate_events(&all_capabilities())
+            .into_iter()
+            .filter_map(|event| match event {
+                ChargePointEvent::DeviceModel(DeviceModelEvent::VariableRegistered {
+                    component,
+                    variable,
+                    attributes,
+                    ..
+                }) => Some((component.name, variable.name, variable.instance, attributes)),
+                _ => None,
+            })
+            .collect();
+
+        // Driven from the table rather than from the events, so a row behind a capability
+        // `all_capabilities` forgot fails here as "never registered" instead of being skipped -
+        // the failure mode a loop over the events would have hidden.
+        for row in CAPABILITY_GATED_VARIABLES
+            .iter()
+            .filter(|row| !row.honoured && row.mutability != VariableMutability::ReadOnly)
+        {
+            let mut found = false;
+            for (component, variable, instance, attributes) in &registered {
+                if component != row.component
+                    || variable != row.variable
+                    || instance.as_deref() != row.instance
+                {
+                    continue;
+                }
+                found = true;
+                for attribute in attributes {
+                    assert_eq!(
+                        attribute.mutability,
+                        VariableMutability::ReadOnly,
+                        "{}.{} is not honoured, so a CSMS must not be told it can write it",
+                        row.component,
+                        row.variable,
+                    );
+                }
+            }
+            assert!(
+                found,
+                "{}.{} never registered - `all_capabilities` is missing the capability that gates \
+                 it, so this test proves nothing about it",
+                row.component, row.variable,
+            );
+        }
+    }
+
+    /// CV14, the behavioural half: `SmartChargingCtrlr.LimitChangeSignificance` is the row with a
+    /// consequence beyond the false `Accepted` - a CSMS setting it to 20% was told the threshold
+    /// took, and the station went on reporting every composed change however small.
+    #[tokio::test]
+    async fn setting_a_decorative_gated_variable_is_refused_rather_than_silently_accepted() {
+        let actor = actor_with_every_capability().await;
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: component("SmartChargingCtrlr"),
+                variable: variable("LimitChangeSignificance"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "20".into(),
+            }],
+            &NoKeyStore,
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Rejected]);
+    }
+
+    /// The station-written half of the same rule, and the reason it is a separate test: OCPP makes
+    /// `PaymentCtrlr.Merchant[Name]` writable, but `crate::payment`'s status poll overwrites it
+    /// from the terminal on every sweep. Accepting the write and clobbering it minutes later is
+    /// the `ClockCtrlr.DateTime` situation CV1.2 already settled (B05.FR.09).
+    #[tokio::test]
+    async fn setting_a_station_written_gated_variable_is_refused() {
+        let actor = actor_with_every_capability().await;
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: component("PaymentCtrlr"),
+                variable: Variable {
+                    name: "Merchant".into(),
+                    instance: Some("Name".into()),
+                },
+                attribute_type: VariableAttributeType::Actual,
+                value: "A Charging Company".into(),
+            }],
+            &NoKeyStore,
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Rejected]);
+    }
+
+    /// The other side of the contract, exactly as CV2.1 has it for the defaults: CV14 must not be
+    /// satisfiable by freezing the whole gated table. `ISO15118Ctrlr.ContractValidationOffline` is
+    /// read by `crate::authorization` before it validates a contract certificate offline, so it
+    /// stays writable.
+    #[tokio::test]
+    async fn a_gated_variable_this_build_acts_on_is_still_writable() {
+        let actor = actor_with_every_capability().await;
+
+        let outcomes = handle_set_variables(
+            &actor,
+            alloc::vec![SetVariableRequest {
+                component: component("ISO15118Ctrlr"),
+                variable: variable("ContractValidationOffline"),
+                attribute_type: VariableAttributeType::Actual,
+                value: "true".into(),
+            }],
+            &NoKeyStore,
+        )
+        .await;
+
+        assert_eq!(outcomes, alloc::vec![SetVariableOutcome::Accepted]);
+    }
+
+    /// Pins the sweep's own arithmetic, the way CV2.1's "30 of 49" pins the defaults': a new
+    /// writable row cannot be added without someone answering whether this build acts on it,
+    /// because the count moves and this test fails.
+    #[test]
+    fn the_gated_table_records_which_writable_rows_this_build_acts_on() {
+        let writable = super::CAPABILITY_GATED_VARIABLES
+            .iter()
+            .filter(|row| row.mutability == VariableMutability::ReadWrite);
+
+        assert_eq!(writable.clone().count(), 26);
+        assert_eq!(
+            writable
+                .filter(|row| row.honoured)
+                .map(|row| row.variable)
+                .collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![
+                "ContractValidationOffline",
+                "CentralContractValidationAllowed"
+            ],
         );
     }
 
