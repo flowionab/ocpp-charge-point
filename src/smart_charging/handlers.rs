@@ -14,7 +14,7 @@ use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::smart_charging::{
     ChargingLimitProjection, CompositeSchedule, compose, composing_profiles,
-    connector_composition_context, external_charging_limits,
+    connector_composition_context, external_charging_limits, reportable_external_limits,
 };
 use crate::state::{
     ChargePointEvent, ChargingLimitSource, ChargingProfile, ChargingProfileCriteria,
@@ -241,6 +241,15 @@ pub fn handle_get_charging_profiles(
         .selected_by(query)
         .into_iter()
         .cloned()
+        // K27.FR.02 (CV20): the limits an external system imposed are profiles too - the station
+        // holds them, composes against them, and OCPP has it report them. Filtered by the same
+        // query as the installed ones, so a CSMS asking for one EVSE, one purpose or one limit
+        // source gets a consistent answer across both halves.
+        .chain(
+            reportable_external_limits(&state)
+                .into_iter()
+                .filter(|limit| query.matches(limit)),
+        )
         .collect()
 }
 
@@ -575,7 +584,7 @@ pub fn chunk_charging_profile_report(
 ) -> Vec<ChargingProfileReportChunk> {
     let mut groups: Vec<(ChargingProfileScope, ChargingLimitSource, Vec<_>)> = Vec::new();
     for profile in profiles {
-        let key = (profile.scope, profile.source());
+        let key = (profile.scope, profile.source);
         // Linear rather than a map: this runs over at most `max_charging_profiles` items, and
         // preserving first-seen group order keeps the report deterministic (and its tests
         // readable) where a hash map would not.
@@ -710,7 +719,11 @@ mod tests {
     }
 
     async fn actor_with_smart_charging() -> ChargePointActor {
-        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        actor_with_smart_charging_on([1]).await
+    }
+
+    async fn actor_with_smart_charging_on<const N: usize>(evses: [usize; N]) -> ChargePointActor {
+        let actor = ChargePointActor::spawn(evses, &TokioExecutor);
         let _ = actor
             .send(ChargePointEvent::CapabilitiesDeclared(Capabilities {
                 smart_charging: true,
@@ -826,6 +839,38 @@ mod tests {
             ClearChargingProfileOutcome::Accepted
         );
         assert!(actor.state().charging_profiles.is_empty());
+    }
+
+    /// K10.FR.08/.09 (CV20): a request that matches only the purposes the CSMS may not clear
+    /// answers `Unknown`, and leaves them installed. Both halves in one test, because "Unknown"
+    /// alone would also be satisfied by a build that answered `Unknown` *and then cleared them*.
+    #[tokio::test]
+    async fn clearing_a_limit_the_csms_may_not_clear_reports_unknown_and_changes_nothing() {
+        let actor = actor_with_smart_charging().await;
+        let mut external = profile(1);
+        external.purpose = ChargingProfilePurpose::ExternalConstraints;
+        handle_set_charging_profile(&actor, ChargingProfileScope::ChargePoint, external, now())
+            .await;
+        assert_eq!(actor.state().charging_profiles.len(), 1);
+
+        // By id (K10.FR.09)...
+        assert_eq!(
+            handle_clear_charging_profile(
+                &actor,
+                ChargingProfileCriteria {
+                    id: Some(ChargingProfileId(1)),
+                    ..Default::default()
+                }
+            )
+            .await,
+            ClearChargingProfileOutcome::Unknown
+        );
+        // ...and by criteria that would otherwise sweep everything (K10.FR.08).
+        assert_eq!(
+            handle_clear_charging_profile(&actor, ChargingProfileCriteria::default()).await,
+            ClearChargingProfileOutcome::Unknown
+        );
+        assert_eq!(actor.state().charging_profiles.len(), 1);
     }
 
     #[tokio::test]
@@ -996,8 +1041,10 @@ mod tests {
         let actor = actor_with_smart_charging().await;
         handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), profile(1), now()).await;
 
-        // Everything here arrived by SetChargingProfile, so it is CSO-installed. A CSMS asking
-        // for EMS-installed profiles must be told there are none, not handed these.
+        // Everything here arrived by SetChargingProfile, so it is CSO-installed, and no external
+        // system has imposed anything. A CSMS asking for EMS-installed profiles must be told
+        // there are none, not handed these - the answer is "none *right now*" since CV20, not
+        // "none ever": see `getting_charging_profiles_reports_the_external_limits_too`.
         assert!(
             handle_get_charging_profiles(
                 &actor,
@@ -1021,8 +1068,152 @@ mod tests {
         );
     }
 
+    /// An external limit of `amps`, as an integrator's energy-management binding would push it.
+    fn external_limit(
+        source: ChargingLimitSource,
+        is_local_generation: bool,
+        amps: f64,
+    ) -> crate::state::ExternalChargingLimit {
+        crate::state::ExternalChargingLimit {
+            is_local_generation,
+            source,
+            is_grid_critical: None,
+            schedule: Some(ChargingSchedule {
+                id: 1,
+                start_schedule: None,
+                duration_secs: None,
+                rate_unit: ChargingRateUnit::Amps,
+                min_charging_rate: None,
+                periods: alloc::vec![ChargingSchedulePeriod {
+                    start_period_secs: 0,
+                    limit: amps,
+                    number_phases: None,
+                }],
+            }),
+        }
+    }
+
+    /// K27.FR.02 (CV20): the CSMS asked what charging profiles this station holds, and an EMS's
+    /// locally generated capacity is one of them - K27.FR.01 has the station treat it as exactly
+    /// that. Reporting only the installed ones would describe a different charge point from the
+    /// one composing against it.
+    #[tokio::test]
+    async fn getting_charging_profiles_reports_the_external_limits_too() {
+        let actor = actor_with_smart_charging().await;
+        handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), profile(1), now()).await;
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitSet {
+                evse_id: Some(0),
+                limit: external_limit(ChargingLimitSource::Ems, true, 2.0),
+            })
+            .await;
+
+        let reported = handle_get_charging_profiles(&actor, &ChargingProfileQuery::default());
+
+        assert_eq!(reported.len(), 2);
+        let generation = reported
+            .iter()
+            .find(|installed| installed.profile.purpose == ChargingProfilePurpose::LocalGeneration)
+            .expect("the local generation limit is reported as a profile");
+        assert_eq!(generation.source, ChargingLimitSource::Ems);
+        // OCPP: "Id can have a negative value. This is useful to distinguish charging profiles
+        // from an external actor ... from charging profiles received from CSMS."
+        assert!(generation.profile.id.0 < 0);
+    }
+
+    /// ...and the query filters both halves the same way, so a CSMS asking for one purpose or one
+    /// source gets a consistent answer rather than one rule for installed profiles and another
+    /// for external limits.
+    #[tokio::test]
+    async fn a_query_filters_external_limits_the_same_way_as_installed_profiles() {
+        let actor = actor_with_smart_charging().await;
+        handle_set_charging_profile(&actor, ChargingProfileScope::Evse(0), profile(1), now()).await;
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitSet {
+                evse_id: None,
+                limit: external_limit(ChargingLimitSource::Ems, false, 10.0),
+            })
+            .await;
+
+        // By source: the EMS's limit, and only it.
+        let by_source = handle_get_charging_profiles(
+            &actor,
+            &ChargingProfileQuery {
+                sources: alloc::vec![ChargingLimitSource::Ems],
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_source.len(), 1);
+        assert_eq!(
+            by_source[0].profile.purpose,
+            ChargingProfilePurpose::ExternalConstraints
+        );
+
+        // By scope: it was pushed station-wide, so an EVSE-scoped query does not see it (K09.FR.04)
+        // even though composition applies it to that EVSE.
+        assert!(
+            handle_get_charging_profiles(
+                &actor,
+                &ChargingProfileQuery {
+                    scope: Some(ChargingProfileScope::ChargePoint),
+                    sources: alloc::vec![ChargingLimitSource::Ems],
+                    ..Default::default()
+                }
+            )
+            .len()
+                == 1
+        );
+        assert!(
+            handle_get_charging_profiles(
+                &actor,
+                &ChargingProfileQuery {
+                    scope: Some(ChargingProfileScope::Evse(0)),
+                    sources: alloc::vec![ChargingLimitSource::Ems],
+                    ..Default::default()
+                }
+            )
+            .is_empty()
+        );
+    }
+
+    /// A station-wide limit is one profile, not one per EVSE - the difference between "what
+    /// limits this EVSE" (composition's question, which counts it for every EVSE) and "what does
+    /// this charge point hold" (reporting's).
+    #[tokio::test]
+    async fn a_station_wide_limit_is_reported_once_however_many_evses_it_covers() {
+        let actor = actor_with_smart_charging_on([1, 1, 1]).await;
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitSet {
+                evse_id: None,
+                limit: external_limit(ChargingLimitSource::Ems, false, 10.0),
+            })
+            .await;
+
+        assert_eq!(
+            handle_get_charging_profiles(&actor, &ChargingProfileQuery::default()).len(),
+            1
+        );
+    }
+
+    /// The report groups by source as well as scope, so an EMS limit does not arrive in a message
+    /// claiming the CSO installed it.
+    #[test]
+    fn the_report_puts_each_source_in_its_own_message() {
+        let mut ems = installed(ChargingProfileScope::ChargePoint, -1);
+        ems.source = ChargingLimitSource::Ems;
+
+        let chunks =
+            chunk_charging_profile_report(&[installed(ChargingProfileScope::ChargePoint, 1), ems]);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].source, ChargingLimitSource::Cso);
+        assert_eq!(chunks[1].source, ChargingLimitSource::Ems);
+        assert!(!chunks[1].tbc);
+    }
+
     fn installed(scope: ChargingProfileScope, id: i32) -> InstalledChargingProfile {
         InstalledChargingProfile {
+            source: crate::state::ChargingLimitSource::Cso,
             scope,
             profile: profile(id),
         }

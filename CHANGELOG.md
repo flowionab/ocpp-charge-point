@@ -64,6 +64,11 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   must add it (`false` preserves today's behaviour exactly). An integrator's energy-management
   binding that pushes locally generated capacity sets it `true`, which changes what the limit
   *does* — it adds rather than caps — and sets `isLocalGeneration` on the 2.1 wire (K27.FR.03).
+- `state::InstalledChargingProfile` gained a `source` field and lost its `source()` method (CV20).
+  It returned `ChargingLimitSource::Cso` unconditionally, which stopped being true once the limits
+  an external system imposed became reportable: those carry the external system's own source.
+  Struct literals must add the field — `ChargingLimitSource::Cso` is what everything reaching the
+  profile store is.
 - **Transaction limits are enforced** (CV15, E16). New `state::TransactionLimit` and
   `state::TransactionLimitKind`; `state::Transaction` gained `limit`, `csms_limit`,
   `limit_reached` and `energy_start_wh`, so struct literals of it must add all four (`None`
@@ -238,6 +243,17 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
 
 ### Fixed
 
+- **`GetChargingProfiles` reported nothing about the limits an external system had imposed**
+  (CV20, K27.FR.02). A station composing against a 6 kW EMS limit answered "no profiles from an
+  EMS", which was truthful about its profile store and misleading about the charge point. Those
+  limits are now reported as the profiles OCPP says they are, carrying the external system's own
+  `chargingLimitSource` — so they group into their own `ReportChargingProfiles` message, and a
+  query filtered on `EMS` returns them. Their ids stay negative, which is OCPP's own recommended
+  way of marking a profile that came from an external actor.
+- **`ClearChargingProfile` could clear a limit the CSMS is not allowed to touch** (CV20,
+  K10.FR.04/.08/.09). A profile with purpose `ChargingStationExternalConstraints` or
+  `LocalGeneration` is now invisible to it: the profiles survive, and a request that matched only
+  those answers `Unknown`.
 - **Three device-model counters reported 0 however full the station was** (CV19).
   `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]` and
   `DisplayMessageCtrlr.DisplayMessages` were registered at 0 and never updated, so a CSMS reading

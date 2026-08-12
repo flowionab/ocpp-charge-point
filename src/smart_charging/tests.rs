@@ -42,6 +42,7 @@ fn profile(
     schedule: ChargingSchedule,
 ) -> InstalledChargingProfile {
     InstalledChargingProfile {
+        source: crate::state::ChargingLimitSource::Cso,
         scope: ChargingProfileScope::Evse(0),
         profile: ChargingProfile {
             id: ChargingProfileId(id),

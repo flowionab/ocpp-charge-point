@@ -331,13 +331,14 @@ pub fn current_limit_ma(
     Some((milliamps + 0.5) as u32)
 }
 
-/// The profile id a limit from an external system composes under.
+/// The profile id a limit from an external system composes - and is reported - under.
 ///
-/// Negative, and therefore outside the range a CSMS uses (OCPP profile ids are non-negative), so
-/// that a synthetic profile can share a list with real installed ones inside [`compose`] without
-/// ever colliding with one. Nothing reports these ids: an external limit is not an installed
-/// charging profile, and `GetChargingProfiles` must go on saying so - see
-/// [`crate::state::ChargingLimitSource`].
+/// **Negative on purpose, and OCPP says so**: `ChargingProfileType.id` is documented as "Id can
+/// have a negative value. This is useful to distinguish charging profiles from an external actor
+/// (external constraints) from charging profiles received from CSMS." So the range that keeps a
+/// synthetic profile from colliding with a CSMS-installed one inside [`compose`] is the same
+/// range the spec recommends for exactly this, and these ids are reported to the CSMS as they are
+/// (CV20, K27.FR.02) rather than hidden.
 fn external_limit_profile_id(
     scope: ChargingProfileScope,
     is_local_generation: bool,
@@ -382,6 +383,10 @@ fn as_composing_profile(
     let schedule = limit.schedule.clone()?;
     Some(InstalledChargingProfile {
         scope,
+        // The external system's own source, not `Cso` - which is what lets a
+        // `GetChargingProfiles` filtered on `chargingLimitSource = EMS` answer truthfully
+        // (CV20), and what groups these into their own `ReportChargingProfiles` message.
+        source: limit.source,
         profile: ChargingProfile {
             id: external_limit_profile_id(scope, limit.is_local_generation),
             stack_level: 0,
@@ -441,6 +446,44 @@ pub fn external_charging_limits(
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// Every external limit in force anywhere on the charge point, as the profiles OCPP says they
+/// are - what `GetChargingProfiles` reports alongside the installed ones (**K27.FR.02**, CV20).
+///
+/// [`external_charging_limits`] answers "what limits *this EVSE*", which is composition's
+/// question and deliberately includes the station-wide limits for every EVSE it is asked about.
+/// Reporting asks a different one - "what does this charge point hold" - so a station-wide limit
+/// must appear once rather than once per EVSE, which is why this is its own pass rather than a
+/// loop over that one.
+///
+/// K27.FR.01 and K11.FR.01 both have the station treat an external limit *as a charging profile*
+/// internally, and K09.FR.05's note has `ChargingStationExternalConstraints` among the purposes
+/// EVSE #0 can hold - so a CSMS asking what profiles exist is entitled to see these, and a
+/// station that answered "none from an EMS" while composing against one would be describing a
+/// different charge point from the one it is.
+pub fn reportable_external_limits(state: &ChargePointState) -> Vec<InstalledChargingProfile> {
+    let station = ChargingProfileScope::ChargePoint;
+    let station_limits = [
+        state.station_external_charging_limit.as_ref(),
+        state.station_local_generation_limit.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(move |limit| as_composing_profile(limit, station));
+
+    let evse_limits = state.evses.iter().enumerate().flat_map(|(evse_id, evse)| {
+        let scope = ChargingProfileScope::Evse(evse_id);
+        [
+            evse.external_charging_limit.as_ref(),
+            evse.local_generation_limit.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(move |limit| as_composing_profile(limit, scope))
+    });
+
+    station_limits.chain(evse_limits).collect()
 }
 
 /// Everything that limits `evse_id`: the profiles the CSMS installed, plus the capping profiles

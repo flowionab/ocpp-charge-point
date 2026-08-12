@@ -320,13 +320,23 @@ pub enum ChargingProfileScope {
     Evse(usize),
 }
 
-/// A profile together with the scope it was installed at.
+/// A profile together with the scope it was installed at and who put it there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstalledChargingProfile {
     /// Where it was installed - see [`ChargingProfileScope`].
     pub scope: ChargingProfileScope,
     /// The profile itself.
     pub profile: ChargingProfile,
+    /// Who imposed it - [`ChargingLimitSource::Cso`] for everything the CSMS installed through
+    /// `SetChargingProfile`, and the external system's own source for the synthetic profiles an
+    /// [`ExternalChargingLimit`](crate::state::ExternalChargingLimit) composes and reports as
+    /// (CV20).
+    ///
+    /// A field rather than the constant it used to be, because it stopped being one: an EMS's
+    /// limit reaches `GetChargingProfiles` as an `EMS`-sourced profile, which is what makes a
+    /// CSMS query filtered on `chargingLimitSource` answerable truthfully rather than always
+    /// "none".
+    pub source: ChargingLimitSource,
 }
 
 /// Which profiles a `ClearChargingProfile` request selects. Every field that is `Some` must match;
@@ -345,8 +355,30 @@ pub struct ChargingProfileCriteria {
 
 impl ChargingProfileCriteria {
     /// Whether `installed` is selected by these criteria.
+    ///
+    /// **Two purposes are never selected, whatever the criteria say** - `ChargingStation`
+    /// `ExternalConstraints` and `LocalGeneration` (**K10.FR.04/.08/.09**). Both describe a limit
+    /// the station was handed by something that is not the CSMS: a grid or energy-management
+    /// constraint, or capacity from local generation. OCPP tells the CSMS not to name them in a
+    /// `ClearChargingProfile` (K10.FR.06), and tells the station to disregard them if it does -
+    /// clearing an energy manager's limit because the CSMS asked would leave the station drawing
+    /// more than the site allows, and the CSMS could not put it back.
+    ///
+    /// Excluding them here rather than in the handler makes the two halves of the requirement one
+    /// fact: [`ChargingProfileStore::clear`] leaves them installed, and
+    /// [`ChargingProfileStore::matching`] does not see them - so a request that matched nothing
+    /// else answers `Unknown` (K10.FR.08/.09) through the same "nothing matched" path any other
+    /// unmatched request takes.
+    ///
+    /// This crate does not put such profiles in the store itself - an external limit is an
+    /// [`ExternalChargingLimit`](crate::state::ExternalChargingLimit) and composes as a synthetic
+    /// profile that never enters it - so the case this guards is a CSMS that installed one anyway,
+    /// which K01.FR.06 forbids but nothing prevents.
     pub fn matches(&self, installed: &InstalledChargingProfile) -> bool {
-        self.id.is_none_or(|id| installed.profile.id == id)
+        !matches!(
+            installed.profile.purpose,
+            ChargingProfilePurpose::ExternalConstraints | ChargingProfilePurpose::LocalGeneration
+        ) && self.id.is_none_or(|id| installed.profile.id == id)
             && self.scope.is_none_or(|scope| installed.scope == scope)
             && self
                 .purpose
@@ -359,18 +391,20 @@ impl ChargingProfileCriteria {
 
 /// Who installed a charging profile, OCPP's `ChargingLimitSourceEnum`.
 ///
-/// Every profile this crate holds is [`ChargingLimitSource::Cso`]: the only way one gets installed
-/// is `SetChargingProfile`, which is the CSMS (the charge point operator) talking. The other
-/// variants exist because a CSMS may *filter* on them in `GetChargingProfiles` - asking for only
-/// EMS-installed profiles is a question this charge point must be able to answer truthfully, and
-/// the answer is "none" rather than "all of them".
+/// Every profile in [`ChargingProfileStore`] is [`ChargingLimitSource::Cso`]: the only way one
+/// gets in there is `SetChargingProfile`, which is the CSMS (the charge point operator) talking.
 ///
-/// Limits arriving from somewhere other than the CSMS - a local energy manager, a DSO signal - are
-/// not profiles and are not stored here. They arrive as
-/// [`ExternalChargingLimit`](crate::state::ExternalChargingLimit), are reported with
-/// `NotifyChargingLimit`/`ClearedChargingLimit`, and are enforced by
-/// [`crate::smart_charging::composing_profiles`], which joins them onto the installed profiles as
-/// capping profiles at composition time.
+/// Limits arriving from somewhere else - a local energy manager, a DSO signal - are **not** stored
+/// there. They arrive as [`ExternalChargingLimit`](crate::state::ExternalChargingLimit), are
+/// reported with `NotifyChargingLimit`/`ClearedChargingLimit`, and are enforced by
+/// [`crate::smart_charging::composing_profiles`], which joins them onto the installed profiles at
+/// composition time.
+///
+/// They are also *reported* as profiles carrying this source (CV20, K27.FR.02): K27.FR.01 and
+/// K11.FR.01 both have the station treat an external limit as a charging profile internally, so a
+/// `GetChargingProfiles` filtered on `EMS` answers with the EMS's limits rather than with "none".
+/// That is what makes the filter worth having - before CV20 the answer was always "none", which
+/// was truthful about the store and misleading about the charge point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChargingLimitSource {
     /// An energy management system on site.
@@ -394,14 +428,6 @@ impl ChargingLimitSource {
             Self::So => "SO",
             Self::Other => "Other",
         }
-    }
-}
-
-impl InstalledChargingProfile {
-    /// Who installed this profile - always [`ChargingLimitSource::Cso`]; see that type for why
-    /// this is a fact about how profiles get here rather than a stub.
-    pub fn source(&self) -> ChargingLimitSource {
-        ChargingLimitSource::Cso
     }
 }
 
@@ -439,7 +465,7 @@ impl ChargingProfileQuery {
             && self
                 .stack_level
                 .is_none_or(|level| installed.profile.stack_level == level)
-            && (self.sources.is_empty() || self.sources.contains(&installed.source()))
+            && (self.sources.is_empty() || self.sources.contains(&installed.source))
     }
 }
 
@@ -549,8 +575,14 @@ impl ChargingProfileStore {
             return Err(ChargingProfileRejection::TooManyProfiles);
         }
         self.profiles.retain(|installed| !superseded(installed));
-        self.profiles
-            .push(InstalledChargingProfile { scope, profile });
+        // Everything reaching the store came through `SetChargingProfile`, which is the CSMS
+        // talking - an external system's limit is an `ExternalChargingLimit` and never enters
+        // here (see `ChargingLimitSource`).
+        self.profiles.push(InstalledChargingProfile {
+            scope,
+            profile,
+            source: ChargingLimitSource::Cso,
+        });
         Ok(())
     }
 
@@ -1052,6 +1084,66 @@ mod tests {
             ),
             Err(ChargingProfileRejection::ScopeNotAllowedForPurpose(_))
         ));
+    }
+
+    /// K10.FR.04/.08/.09 (CV20): a `ClearChargingProfile` never touches the two purposes that
+    /// describe a limit the station was *handed* - an external constraint or locally generated
+    /// capacity. The CSMS is told not to ask (K10.FR.06), but a station receives what it receives,
+    /// and clearing an EMS's limit on a CSMS's say-so would leave the station drawing more than
+    /// the site allows.
+    #[test]
+    fn clearing_everything_leaves_the_limits_the_csms_may_not_clear() {
+        let mut store = ChargingProfileStore::with_limit(10);
+        store
+            .install(
+                ChargingProfileScope::Evse(0),
+                profile(1, ChargingProfilePurpose::TxDefault, 1),
+            )
+            .unwrap();
+        store
+            .install(
+                ChargingProfileScope::ChargePoint,
+                profile(2, ChargingProfilePurpose::ExternalConstraints, 1),
+            )
+            .unwrap();
+        store
+            .install(
+                ChargingProfileScope::ChargePoint,
+                profile(3, ChargingProfilePurpose::LocalGeneration, 1),
+            )
+            .unwrap();
+
+        assert_eq!(store.clear(&ChargingProfileCriteria::default()), 1);
+        assert_eq!(store.len(), 2);
+        assert!(
+            store
+                .installed()
+                .iter()
+                .all(|installed| installed.profile.purpose != ChargingProfilePurpose::TxDefault)
+        );
+    }
+
+    /// K10.FR.09: naming one of them by id does not clear it either - and because nothing
+    /// matched, the request answers `Unknown` rather than `Accepted` (that half is
+    /// `handle_clear_charging_profile`'s, which asks `matching` first).
+    #[test]
+    fn a_limit_the_csms_may_not_clear_is_invisible_to_a_clear_by_id() {
+        let mut store = ChargingProfileStore::with_limit(10);
+        store
+            .install(
+                ChargingProfileScope::ChargePoint,
+                profile(7, ChargingProfilePurpose::ExternalConstraints, 0),
+            )
+            .unwrap();
+
+        let by_id = ChargingProfileCriteria {
+            id: Some(ChargingProfileId(7)),
+            ..Default::default()
+        };
+
+        assert!(store.matching(&by_id).is_empty());
+        assert_eq!(store.clear(&by_id), 0);
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

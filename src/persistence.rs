@@ -1911,6 +1911,8 @@ impl From<PersistedChargingProfile> for InstalledChargingProfile {
     fn from(persisted: PersistedChargingProfile) -> Self {
         Self {
             scope: persisted.scope.into(),
+            // Only a CSMS-installed profile is ever persisted - the store holds nothing else.
+            source: crate::state::ChargingLimitSource::Cso,
             profile: ChargingProfile {
                 id: ChargingProfileId(persisted.id),
                 stack_level: persisted.stack_level,
@@ -4455,6 +4457,7 @@ mod tests {
 
     fn test_charging_profile(id: i32) -> InstalledChargingProfile {
         InstalledChargingProfile {
+            source: crate::state::ChargingLimitSource::Cso,
             scope: ChargingProfileScope::Evse(0),
             profile: ChargingProfile {
                 id: ChargingProfileId(id),

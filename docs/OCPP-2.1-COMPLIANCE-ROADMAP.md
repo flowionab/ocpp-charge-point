@@ -498,14 +498,47 @@ CSMS something untrue about its own behaviour. It is now closed.
 | **CV21** | **`maxTime` transaction limits.** The one E16 ceiling CV15 left out, and the only one that cannot be decided from a meter reading: E16.FR.09 measures it from the transaction's start, and the state machine is clock-free by design. Needs a clock-driven sweep of the kind `run_pending_remote_start_timeouts` already is, plus the transaction start times such a sweep would have to keep (as `ChargingLimitProjection` already does for `Relative` profiles). `TxCtrlr.SupportedLimits` omits `maxTime` until then, so a CSMS is told not to send one and a station handed one anyway neither records nor confirms it (E16.FR.12/.13). | E16.FR.09, `maxTime` | open |
 | **CV16** | **A renegotiation surface in `crate::hardware`.** K16.FR.02 is a `SHALL` on the station whenever the composite schedule changes, and `Iso15118Controller` has one method — a certificate hook. No integrator can satisfy K16–K20 through this crate today. Audit §2.18. | K16, K17 (33 FRs) | open |
 | **CV17** | **`LocalGeneration` has its own internal purpose, and it *adds* rather than caps.** The `_` catch-all made it an `ExternalConstraints` cap, so 2 kW of sun under a 5 kW `TxDefaultProfile` charged at 2 kW instead of K27's own 7 kW — a behaviour bug, not the reporting one this row was filed as. `ExternalChargingLimit` carries `is_local_generation`, held in its own slot per scope so a constraint and capacity can both be in force (K27.FR.05), and `isLocalGeneration` is now stated on the wire in both directions. Audit §2.16. | K27.FR.01/.02/.03/.05, §K.3.6 | **done** |
-| **CV20** | **Two K27/K10 remainders CV17 did not take.** (a) K27.FR.02 wants an EMS-pushed `LocalGeneration` schedule reported by `GetChargingProfiles`, but external limits are deliberately not stored as profiles and their synthetic ids are negative — reporting them needs a positive reserved id range first. (b) K10.FR.04/.08/.09 have `ClearChargingProfile` disregard `ExternalConstraints` **and** `LocalGeneration`; `ChargingProfileCriteria::matches` excludes neither, so a CSMS that installs one (K01.FR.06 says it shall not, but the station receives what it receives) can clear it. | K27.FR.02, K10.FR.04/.08/.09 | open |
+| **CV20** | **The two K27/K10 remainders CV17 did not take.** (a) K27.FR.02 — `GetChargingProfiles` now reports the external limits in force as the profiles OCPP says they are, carrying the external system's own `chargingLimitSource` and filtered by the same query as the installed ones. (b) K10.FR.04/.08/.09 — `ChargingProfileCriteria::matches` excludes `ExternalConstraints` and `LocalGeneration`, so a `ClearChargingProfile` naming them clears nothing and answers `Unknown`. | K27.FR.02, K10.FR.04/.08/.09, K09.FR.04/.05/.06 | **done** |
 | **CV18** | **`triggerReason = ChargingRateChanged`.** Sent when an external limit is set or released, the composed rate actually moves, and a transaction is running — all three preconditions the two requirements state. The CSMS-caused case stays unsent: K01.FR.61 makes it a `MAY`, and the CSMS installed the schedule whose boundaries it would be told about. `ConnectorEvent::CurrentLimitComputed` carries `externally_caused`, set by the projection, which is the only place that can see the difference. Audit §2.17. | K11.FR.04, K13.FR.03 | **done** |
 
 **Sequencing:** CV13 before CV18 (nothing changes a rate externally until the limit is enforced),
 and both are now done, as are CV14, CV15 and CV17. **What is left of this group is CV16 (a
 `crate::hardware` addition that should be taken together with the DER actuation trait
 `docs/CERTIFICATION.md` §3 names — one considered break rather than two), and the three rows the
-finished work opened: CV20 and CV21** (CV19 is closed).
+finished work opened: CV21** (CV19 and CV20 are closed).
+
+### CV20 — the blocker that wasn't
+
+This row was filed with a prerequisite attached: reporting an external limit through
+`GetChargingProfiles` "needs a positive reserved id range first", because the synthetic profiles
+CV13 built carry negative ids and OCPP profile ids were assumed to be non-negative. **The spec says
+the opposite**, in `ChargingProfileType.id`'s own description:
+
+> Id can have a negative value. This is useful to distinguish charging profiles from an external
+> actor (external constraints) from charging profiles received from CSMS.
+
+So the range CV13 chose to keep synthetic profiles from colliding inside `compose` is the range
+OCPP recommends for exactly this purpose, and the ids go out as they are. The work that remained
+was smaller than the row claimed: report the limits, and give them a source.
+
+**`InstalledChargingProfile::source()` became a field.** It returned `Cso` unconditionally, which
+was true of everything in the store and false of everything CV20 added — an EMS's limit reaches
+`GetChargingProfiles` as an `EMS`-sourced profile, which is what makes a query filtered on
+`chargingLimitSource` answerable truthfully rather than always "none". The report chunking already
+grouped by `(scope, source)`, so an external limit lands in its own `ReportChargingProfiles`
+message rather than one claiming the CSO installed it.
+
+**Reporting asks a different question from composing.** `external_charging_limits` answers "what
+limits *this EVSE*" and deliberately counts the station-wide limits for every EVSE it is asked
+about; a report needs each held limit once. Hence `reportable_external_limits` as its own pass
+rather than a loop over the other.
+
+**The K10 half is four lines and one comment.** `ChargingProfileCriteria::matches` now refuses the
+two purposes outright, which makes `clear` leave them installed (K10.FR.04) *and* `matching` not
+see them, so a request that matched nothing else answers `Unknown` (K10.FR.08/.09) through the
+same path any other unmatched request takes. This crate never puts such a profile in the store
+itself, so what this guards is a CSMS that installed one anyway — which K01.FR.06 forbids and
+nothing prevents.
 
 ### CV15 — the three decisions, and the one limit it does not support
 
@@ -566,8 +599,8 @@ Three decisions worth recording:
   of the two went away. Hence `is_local_generation` on the clear event as well, even though OCPP's
   own `ClearedChargingLimit` has no such field.
 
-**Two K27/K10 remainders are deliberately not in CV17** — see CV20. Neither is a regression: both
-were true before this row and are true after it.
+**Two K27/K10 remainders were deliberately not in CV17** — CV20, since closed. Neither was a
+regression: both were true before that row and after it.
 
 ### CV14 — what the sweep found, and the two rows it did not expect
 
@@ -607,7 +640,7 @@ and four of the six rows its first sweep opened, plus the one CV14 added on its 
 
 ```
 CV12.1 (K, done) ──┬─> CV13 (done) ──> CV18 (done)
-                   ├─> CV17 (done) ──> CV20   the K27/K10 remainders it did not take
+                   ├─> CV17 (done) ──> CV20 (done)
                    ├─> CV14 (done) ──> CV19 (done)
                    ├─> CV15 (done) ──> CV21   the maxTime ceiling it declined to half-do
                    └─> CV16        a crate::hardware break — take with the DER trait

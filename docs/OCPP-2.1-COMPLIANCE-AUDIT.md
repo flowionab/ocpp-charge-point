@@ -430,11 +430,13 @@ each adapter's docs. `ExternalChargingLimit` carries `is_local_generation`, held
 own per scope so a constraint and locally generated capacity can be in force together (K27.FR.05),
 and `isLocalGeneration` is stated on the 2.1 wire in both directions (K27.FR.03).
 
-Two remainders are **not** closed and are filed as CV20: K27.FR.02 wants an EMS-pushed
-`LocalGeneration` schedule reported by `GetChargingProfiles`, which needs external limits to have
-positive, CSMS-addressable ids first; and K10.FR.04/.08/.09 want `ClearChargingProfile` to disregard
-both `ExternalConstraints` and `LocalGeneration`, which `ChargingProfileCriteria::matches` does not.
-The second predates this finding and applies to `ExternalConstraints` already. Original finding
+Two remainders were filed as CV20 and are **now closed too**. K27.FR.02's report needed no
+"positive, CSMS-addressable ids" after all — `ChargingProfileType.id` is documented as "Id can have
+a negative value. This is useful to distinguish charging profiles from an external actor (external
+constraints) from charging profiles received from CSMS", so the negative range CV13 already chose
+is the spec's own convention and the ids go out unchanged. `GetChargingProfiles` now reports the
+external limits in force, carrying the external system's `chargingLimitSource`. K10.FR.04/.08/.09
+are closed by excluding both purposes from `ChargingProfileCriteria::matches`. Original finding
 follows.
 
 `smart_charging::ocpp_2_1::map_purpose` maps 2.1's `LocalGeneration` purpose onto this crate's
