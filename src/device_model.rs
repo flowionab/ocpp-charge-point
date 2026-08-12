@@ -114,14 +114,14 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         variable: "Entries",
         instance: None,
         data_type: VariableDataType::Integer,
-        // How many entries the list currently holds - or would, if anything kept it in step.
-        // `replace_local_authorization_list` does not touch this variable, so it reads 0 however
-        // many entries a `SendLocalList` installed. CV14's sweep found the claim that it did
-        // (this comment used to name `ChargePointState::apply`'s `LocalListUpdated` arm) and
-        // recorded the truth instead; see that roadmap row for the follow-up.
+        // How many IdTokens the local authorization list currently holds (D01). Registered at 0
+        // and kept in step by `ChargePointState::sync_inventory_counters`, which re-derives it
+        // per applied event - CV14 found this comment claiming a liveness that did not exist,
+        // and CV19 made the claim true. A CSMS reads it before choosing between a differential
+        // and a full list update, so a permanently-zero count changes what it does next.
         value: "0",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
     },
     // D01.FR.11: one ceiling for the whole block rather than one per message, hence no instance.
     // Enforced by `crate::message_limits` on every `SendLocalList` (CV2.8).
@@ -148,11 +148,13 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         variable: "Entries",
         instance: Some("ChargingProfiles"),
         data_type: VariableDataType::Integer,
-        // The same stale counter as `LocalAuthListCtrlr.Entries` above: nothing updates it as
-        // profiles are installed or cleared, so it reads 0 for a station holding a full stack.
+        // How many charging profiles are installed (K01). Kept in step by
+        // `ChargePointState::sync_inventory_counters` alongside the other two counters (CV19) -
+        // it counts *slots*, so a `SetChargingProfile` replacing an existing scope/purpose/stack
+        // level leaves it where it was, which is what "currently installed" means.
         value: "0",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "SmartChargingCtrlr",
@@ -211,12 +213,12 @@ const CAPABILITY_GATED_VARIABLES: &[CapabilityGatedVariable] = &[
         instance: None,
         data_type: VariableDataType::Integer,
         // How many messages are currently installed (OCPP: "Amount of different messages that
-        // are currently configured ... via SetDisplayMessageRequest"). Registered at 0 and, like
-        // `LocalAuthListCtrlr.Entries`, not yet kept live as messages are set/cleared - B6's
-        // known gap; see `docs/PRODUCTION-ROADMAP.md`.
+        // are currently configured ... via SetDisplayMessageRequest"). Registered at 0 and kept
+        // in step by `ChargePointState::sync_inventory_counters` as messages are set and cleared
+        // (CV19, closing what B6 recorded as a known gap).
         value: "0",
         mutability: VariableMutability::ReadOnly,
-        honoured: false,
+        honoured: true,
     },
     CapabilityGatedVariable {
         component: "DisplayMessageCtrlr",

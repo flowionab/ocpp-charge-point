@@ -493,7 +493,7 @@ CSMS something untrue about its own behaviour. It is now closed.
 |---|---|---|---|
 | **CV13** | **Enforce an external charging limit, don't just report it.** `external_charging_limits` turns the recorded limits — the station-wide one and the EVSE's own — into `ExternalConstraints` capping profiles, and `composing_profiles` joins them onto `charging_profiles.applying_to()` at both composition sites: the projection that drives hardware, and `GetCompositeSchedule`, so the CSMS is shown the curve the station will apply. Audit §2.13. | K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01 | **done** |
 | **CV14** | **Sweep `CAPABILITY_GATED_VARIABLES` the way CV2.1 swept `DEFAULT_VARIABLES`.** `CapabilityGatedVariable::honoured` now records, per row, whether this build makes the value mean anything, and `false` forces the registration to `ReadOnly` — the same lever `register_defaults` pulls. 24 of the 26 writable rows refuse the write; the two `ISO15118Ctrlr` rows stay writable. Audit §2.15. | B05.FR.09 | **done** |
-| **CV19** | **Three station-owned counters registered at 0 and never updated** — `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]`, `DisplayMessageCtrlr.DisplayMessages`. A CSMS reads each to know how full the station is; all three answer 0 however much is installed. Found by CV14's sweep. | D01, K01, B6 | open |
+| **CV19** | **Three station-owned counters registered at 0 and never updated** — `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]`, `DisplayMessageCtrlr.DisplayMessages`. `ChargePointState::sync_inventory_counters` now re-derives all three per applied event, the way the availability and network-configuration variables already were. Found by CV14's sweep. | D01, K01, B6 | **done** |
 | **CV15** | **Transaction limits (E16).** `state::TransactionLimit` is a real internal type on `Transaction`, set by the CSMS off a `TransactionEventResponse` or locally on the driver's behalf, confirmed once with `triggerReason = LimitSet`, and enforced: reaching a ceiling commands 0 A, moves the connector to `SuspendedEVSE` and reports the trigger reason naming *which* ceiling. Cost, energy and state of charge are enforced; `maxTime` is declared unsupported rather than half-done (see CV21). Audit §2.14. | E16.FR.01/.02/.03/.04/.05/.10/.13/.14/.15/.16/.17, C17 | **done** |
 | **CV21** | **`maxTime` transaction limits.** The one E16 ceiling CV15 left out, and the only one that cannot be decided from a meter reading: E16.FR.09 measures it from the transaction's start, and the state machine is clock-free by design. Needs a clock-driven sweep of the kind `run_pending_remote_start_timeouts` already is, plus the transaction start times such a sweep would have to keep (as `ChargingLimitProjection` already does for `Relative` profiles). `TxCtrlr.SupportedLimits` omits `maxTime` until then, so a CSMS is told not to send one and a station handed one anyway neither records nor confirms it (E16.FR.12/.13). | E16.FR.09, `maxTime` | open |
 | **CV16** | **A renegotiation surface in `crate::hardware`.** K16.FR.02 is a `SHALL` on the station whenever the composite schedule changes, and `Iso15118Controller` has one method — a certificate hook. No integrator can satisfy K16–K20 through this crate today. Audit §2.18. | K16, K17 (33 FRs) | open |
@@ -505,7 +505,7 @@ CSMS something untrue about its own behaviour. It is now closed.
 and both are now done, as are CV14, CV15 and CV17. **What is left of this group is CV16 (a
 `crate::hardware` addition that should be taken together with the DER actuation trait
 `docs/CERTIFICATION.md` §3 names — one considered break rather than two), and the three rows the
-finished work opened: CV19, CV20 and CV21.**
+finished work opened: CV20 and CV21** (CV19 is closed).
 
 ### CV15 — the three decisions, and the one limit it does not support
 
@@ -584,8 +584,8 @@ enforces the value or keeps it in step with the fact it reports, `false` where i
 that makes the component complete. Filling it in is what turned up **CV19** — and one of those
 three counters was worse than stale, because `LocalAuthListCtrlr.Entries` carried a comment
 claiming `ChargePointState::apply`'s `LocalListUpdated` arm kept it current. Nothing in that arm
-touches the device model. The comment is now the truth, which is the least this can do until CV19
-makes the value one.
+touches the device model. The comment is now the truth, and **CV19 has since made the value one**:
+all three counters are re-derived per applied event by `sync_inventory_counters`.
 
 ---
 
@@ -608,7 +608,7 @@ and four of the six rows its first sweep opened, plus the one CV14 added on its 
 ```
 CV12.1 (K, done) ──┬─> CV13 (done) ──> CV18 (done)
                    ├─> CV17 (done) ──> CV20   the K27/K10 remainders it did not take
-                   ├─> CV14 (done) ──> CV19   the stale counters the sweep turned up
+                   ├─> CV14 (done) ──> CV19 (done)
                    ├─> CV15 (done) ──> CV21   the maxTime ceiling it declined to half-do
                    └─> CV16        a crate::hardware break — take with the DER trait
 CV12.2 … CV12.7                    the rest of the sweeps, continuous

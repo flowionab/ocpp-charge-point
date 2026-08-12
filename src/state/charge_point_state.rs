@@ -1030,6 +1030,7 @@ impl ChargePointState {
         // point has single digits of them.
         self.sync_availability_variables();
         self.sync_network_configuration_variables();
+        self.sync_inventory_counters();
         if changed {
             effects.insert(0, ChargePointEffect::StateChanged);
         }
@@ -1330,6 +1331,98 @@ impl ChargePointState {
     /// Writes one component's `AvailabilityState`, if it moved. A component that isn't registered
     /// (a binding that removed it, or a model bounded too low to hold it) is a no-op, matching
     /// [`DeviceModel::set_attribute_value`]'s own tolerance.
+    /// Keeps the three "how full is this station" counters in step with the stores they describe
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV19).
+    ///
+    /// | Variable | Answers |
+    /// |---|---|
+    /// | `LocalAuthListCtrlr.Entries` | IdTokens in the local authorization list (D01) |
+    /// | `SmartChargingCtrlr.Entries[ChargingProfiles]` | charging profiles installed (K01) |
+    /// | `DisplayMessageCtrlr.DisplayMessages` | messages configured via `SetDisplayMessage` (B6) |
+    ///
+    /// All three were registered at 0 and never updated, so a CSMS asking how full the station
+    /// was got 0 whatever was installed - and `LocalAuthListCtrlr.Entries` carried a comment
+    /// claiming an arm of this very function kept it current, which no code did. A CSMS reads
+    /// these before deciding whether to send a differential list update or a full one, so a
+    /// permanently-zero count is a wrong answer to a question that changes what it does next.
+    ///
+    /// Re-derived per applied event, for the reason [`Self::sync_availability_variables`] gives:
+    /// each of the three stores is mutated from several places (a CSMS update, a restore from
+    /// durable storage, an expiry sweep), and one sync point cannot drift where several mutation
+    /// sites would.
+    ///
+    /// Writing to a variable that was never registered is a no-op, so a station whose capabilities
+    /// leave a component gated off simply has nothing to update - which is the same rule that
+    /// decides whether the variable exists in the first place, applied for free.
+    fn sync_inventory_counters(&mut self) {
+        for (component, variable, instance, count) in [
+            (
+                "LocalAuthListCtrlr",
+                "Entries",
+                None,
+                self.local_authorization_list.entries.len(),
+            ),
+            (
+                "SmartChargingCtrlr",
+                "Entries",
+                Some("ChargingProfiles"),
+                self.charging_profiles.len(),
+            ),
+            (
+                "DisplayMessageCtrlr",
+                "DisplayMessages",
+                None,
+                self.display_messages.len(),
+            ),
+        ] {
+            self.set_counter_variable(component, variable, instance, count);
+        }
+    }
+
+    /// Writes one [`Self::sync_inventory_counters`] count, if it differs from what is already
+    /// recorded - the same "only when it changed" rule [`Self::set_availability_state`] follows,
+    /// and for the same reason: this runs on *every* applied event, so the common case is a
+    /// station whose counts have not moved since the last meter sample, and formatting a `usize`
+    /// into a fresh `String` three times per event to store what is already there is work an
+    /// MCU should not do.
+    ///
+    /// Like the availability sync, this writes through [`DeviceModel::set_attribute_value`]
+    /// rather than raising a `DeviceModelEvent::AttributeValueSet`, so no variable monitor is
+    /// evaluated against these changes. That costs nothing today: all three are registered with
+    /// `supports_monitoring: false`, and `SetVariableMonitoring` refuses a variable that says so.
+    fn set_counter_variable(
+        &mut self,
+        component_name: &str,
+        variable_name: &str,
+        instance: Option<&str>,
+        count: usize,
+    ) {
+        let component = Component {
+            name: component_name.into(),
+            instance: None,
+            evse: None,
+        };
+        let variable = Variable {
+            name: variable_name.into(),
+            instance: instance.map(Into::into),
+        };
+        let value = alloc::format!("{count}");
+        let unchanged = self
+            .device_model
+            .get(&component, &variable)
+            .and_then(|definition| definition.attribute(VariableAttributeType::Actual))
+            .is_some_and(|attribute| attribute.value == value);
+        if unchanged {
+            return;
+        }
+        self.device_model.set_attribute_value(
+            &component,
+            &variable,
+            VariableAttributeType::Actual,
+            value,
+        );
+    }
+
     fn set_availability_state(
         &mut self,
         component_name: &str,
@@ -5370,6 +5463,226 @@ mod tests {
         assert_eq!(state.local_authorization_list.version, 1);
         assert_eq!(state.local_authorization_list.entries, alloc::vec![entry]);
         assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    // --- CV19: the counters a CSMS reads to know how full the station is ---
+
+    /// Reads one of the three counters, or `None` where the variable is not registered (its
+    /// capability is off).
+    fn counter(
+        state: &ChargePointState,
+        component: &str,
+        variable: &str,
+        instance: Option<&str>,
+    ) -> Option<String> {
+        state
+            .device_model
+            .get(
+                &Component {
+                    name: component.into(),
+                    instance: None,
+                    evse: None,
+                },
+                &crate::state::Variable {
+                    name: variable.into(),
+                    instance: instance.map(Into::into),
+                },
+            )
+            .and_then(|definition| {
+                definition.attribute(crate::state::VariableAttributeType::Actual)
+            })
+            .map(|attribute| attribute.value.clone())
+    }
+
+    fn test_display_message(id: i64) -> crate::state::DisplayedMessage {
+        use crate::state::{MessageContent, MessageFormat, MessagePriority};
+        crate::state::DisplayedMessage {
+            id: crate::state::DisplayMessageId(id),
+            priority: MessagePriority::NormalCycle,
+            state: None,
+            message: MessageContent {
+                content: "hello".into(),
+                format: MessageFormat::Ascii,
+                language: None,
+            },
+            transaction_id: None,
+        }
+    }
+
+    /// A state with every capability whose component owns one of the three counters, so the
+    /// variables are registered at all - a bare `ChargePointState` gates all three off.
+    fn state_with_counters() -> ChargePointState {
+        let mut state = ChargePointState::new([1]);
+        let capabilities = crate::hardware::Capabilities {
+            local_auth_list: true,
+            smart_charging: true,
+            has_display: true,
+            ..Default::default()
+        };
+        state.apply(ChargePointEvent::CapabilitiesDeclared(capabilities));
+        for event in crate::device_model::capability_gate_events(&capabilities) {
+            state.apply(event);
+        }
+        state
+    }
+
+    /// D01: `LocalAuthListCtrlr.Entries` is "amount of IdTokens currently in the Local
+    /// Authorization List". It read 0 however many were installed, and carried a comment claiming
+    /// otherwise (CV19).
+    #[test]
+    fn the_local_list_entry_count_follows_the_list() {
+        let mut state = state_with_counters();
+        assert_eq!(
+            counter(&state, "LocalAuthListCtrlr", "Entries", None).as_deref(),
+            Some("0")
+        );
+
+        state.apply(ChargePointEvent::LocalListUpdated {
+            version: 1,
+            entries: alloc::vec![
+                crate::state::LocalListEntry {
+                    id_token: test_id_token(),
+                    status: crate::state::AuthorizationStatus::Accepted,
+                },
+                crate::state::LocalListEntry {
+                    id_token: IdToken {
+                        value: "second".into(),
+                        kind: IdTokenKind::ISO14443,
+                    },
+                    status: crate::state::AuthorizationStatus::Accepted,
+                },
+            ],
+        });
+
+        assert_eq!(
+            counter(&state, "LocalAuthListCtrlr", "Entries", None).as_deref(),
+            Some("2")
+        );
+
+        // And back down: a full update to an empty list empties the count too.
+        state.apply(ChargePointEvent::LocalListUpdated {
+            version: 2,
+            entries: alloc::vec![],
+        });
+
+        assert_eq!(
+            counter(&state, "LocalAuthListCtrlr", "Entries", None).as_deref(),
+            Some("0")
+        );
+    }
+
+    /// K01: `SmartChargingCtrlr.Entries[ChargingProfiles]` is "the amount of Charging profiles
+    /// currently installed on the Charging Station" (CV19).
+    #[test]
+    fn the_charging_profile_count_follows_the_store() {
+        let mut state = state_with_counters();
+
+        state.apply(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::Evse(0),
+            profile: alloc::boxed::Box::new(test_charging_profile(1)),
+        });
+        assert_eq!(
+            counter(
+                &state,
+                "SmartChargingCtrlr",
+                "Entries",
+                Some("ChargingProfiles")
+            )
+            .as_deref(),
+            Some("1")
+        );
+
+        // A second *slot* - same scope and purpose at a different stack level. Installing the
+        // same slot again would replace rather than add, which is the store's own rule and not
+        // something this counter should paper over.
+        state.apply(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::Evse(0),
+            profile: alloc::boxed::Box::new(crate::state::ChargingProfile {
+                stack_level: 1,
+                ..test_charging_profile(2)
+            }),
+        });
+        assert_eq!(
+            counter(
+                &state,
+                "SmartChargingCtrlr",
+                "Entries",
+                Some("ChargingProfiles")
+            )
+            .as_deref(),
+            Some("2")
+        );
+
+        // Replacing a slot leaves the count where it was.
+        state.apply(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::Evse(0),
+            profile: alloc::boxed::Box::new(test_charging_profile(3)),
+        });
+        assert_eq!(
+            counter(
+                &state,
+                "SmartChargingCtrlr",
+                "Entries",
+                Some("ChargingProfiles")
+            )
+            .as_deref(),
+            Some("2")
+        );
+
+        state.apply(ChargePointEvent::ChargingProfilesCleared {
+            criteria: crate::state::ChargingProfileCriteria::default(),
+        });
+        assert_eq!(
+            counter(
+                &state,
+                "SmartChargingCtrlr",
+                "Entries",
+                Some("ChargingProfiles")
+            )
+            .as_deref(),
+            Some("0")
+        );
+    }
+
+    /// B6: `DisplayMessageCtrlr.DisplayMessages` is "amount of different messages that are
+    /// currently configured ... via SetDisplayMessageRequest" (CV19).
+    #[test]
+    fn the_display_message_count_follows_the_store() {
+        let mut state = state_with_counters();
+
+        state.apply(ChargePointEvent::DisplayMessageSet(alloc::boxed::Box::new(
+            test_display_message(1),
+        )));
+        assert_eq!(
+            counter(&state, "DisplayMessageCtrlr", "DisplayMessages", None).as_deref(),
+            Some("1")
+        );
+
+        state.apply(ChargePointEvent::DisplayMessageCleared(
+            crate::state::DisplayMessageId(1),
+        ));
+        assert_eq!(
+            counter(&state, "DisplayMessageCtrlr", "DisplayMessages", None).as_deref(),
+            Some("0")
+        );
+    }
+
+    /// A station whose capabilities leave these components unregistered must not gain them by the
+    /// back door: writing an attribute onto a variable that was never registered is a no-op, and
+    /// this is what says the sync relies on that rather than on registering as it goes.
+    #[test]
+    fn the_counters_stay_absent_on_a_station_that_owes_none_of_them() {
+        let mut state = ChargePointState::new([1]);
+
+        state.apply(ChargePointEvent::LocalListUpdated {
+            version: 1,
+            entries: alloc::vec![crate::state::LocalListEntry {
+                id_token: test_id_token(),
+                status: crate::state::AuthorizationStatus::Accepted,
+            }],
+        });
+
+        assert_eq!(counter(&state, "LocalAuthListCtrlr", "Entries", None), None);
     }
 
     /// G2.2 (docs/PRODUCTION-ROADMAP.md §9.2): the state machine is the last line of defence for

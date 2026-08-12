@@ -238,6 +238,12 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
 
 ### Fixed
 
+- **Three device-model counters reported 0 however full the station was** (CV19).
+  `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]` and
+  `DisplayMessageCtrlr.DisplayMessages` were registered at 0 and never updated, so a CSMS reading
+  them — before choosing between a differential and a full local-list update, say — was answered
+  with a number that had nothing to do with what was installed. All three are now re-derived per
+  applied event, the way the availability and network-configuration variables already were.
 - **A reservation was erased by the next event that touched its connector.** The reservation
   record was reassigned on every event that left the connector `Reserved`, and only
   `ConnectorEvent::Reserved` carries one — so the first meter sample an idle connector's hardware

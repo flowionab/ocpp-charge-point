@@ -379,11 +379,13 @@ one sweep (CV1.2's `ClockCtrlr.DateTime` rule).
 
 The field is filled in on all 71 rows, not just the 26 writable ones, matching what
 `DefaultVariable::honoured` already records for its read-only rows. Doing that turned up a separate
-finding, now **CV19**: `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]`
-and `DisplayMessageCtrlr.DisplayMessages` are registered at 0 and never updated, so a CSMS asking
-how full the station is gets 0 whatever is installed. `LocalAuthListCtrlr.Entries` additionally
-carried a comment claiming `ChargePointState::apply`'s `LocalListUpdated` arm kept it in step;
-that arm does not touch the device model. Original finding follows.
+finding, **CV19 — since closed**: `LocalAuthListCtrlr.Entries`,
+`SmartChargingCtrlr.Entries[ChargingProfiles]` and `DisplayMessageCtrlr.DisplayMessages` were
+registered at 0 and never updated, so a CSMS asking how full the station is got 0 whatever was
+installed. `LocalAuthListCtrlr.Entries` additionally carried a comment claiming
+`ChargePointState::apply`'s `LocalListUpdated` arm kept it in step; that arm does not touch the
+device model. `sync_inventory_counters` now re-derives all three per applied event, and all three
+rows are `honoured: true`. Original finding follows.
 
 CV2.1 added `DefaultVariable::honoured` and swept `DEFAULT_VARIABLES` (`src/state/device_model.rs`).
 `CapabilityGatedVariable` (`src/device_model.rs:36`) has no such field, so the same question was
@@ -573,8 +575,8 @@ the sweep, by certification impact rather than by size:
    here where the station told the CSMS something untrue about its own behaviour, and it was the
    prerequisite for §2.17, which is now reachable.
 10. ~~**§2.15 (the second variable table)**~~ — **closed by CV14.** It was the same one-word-per-row
-    change CV2.1 was, on the table CV2.1 never reached, and it turned up **CV19**: three station-owned
-    counters registered at 0 that nothing ever updates.
+    change CV2.1 was, on the table CV2.1 never reached, and it turned up **CV19** (three station-owned
+    counters registered at 0 that nothing ever updated), since closed.
 11. ~~**§2.14 (E16 transaction limits)**~~ — **closed by CV15**, which unblocked C17 and gave CV8's
     locally computed cost a ceiling to act on. `maxTime` is declared unsupported rather than
     half-enforced; see CV21.
