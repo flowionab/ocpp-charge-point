@@ -1545,7 +1545,10 @@ impl ChargePointState {
             _ => None,
         };
         let computed_limit = match &event {
-            ConnectorEvent::CurrentLimitComputed(limit_ma) => Some(*limit_ma),
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma,
+                externally_caused,
+            } => Some((*limit_ma, *externally_caused)),
             _ => None,
         };
         let confirmed_limit = match &event {
@@ -1895,7 +1898,7 @@ impl ChargePointState {
         // already requested for this connector: the projection re-evaluates on every state
         // change, and re-issuing an unchanged limit would put a hardware call on the path of
         // every meter sample.
-        let limit_changed = computed_limit.is_some_and(|limit_ma| {
+        let limit_changed = computed_limit.is_some_and(|(limit_ma, _)| {
             let Some(slot) = evse.charging_limits.get_mut(connector_id) else {
                 return false;
             };
@@ -1912,6 +1915,27 @@ impl ChargePointState {
             ));
             true
         });
+        // K11.FR.04/K13.FR.03 (CV18). All three of the requirements' preconditions, in the one
+        // place that can see all three: an external system caused it, the rate genuinely moved
+        // (`limit_changed` is "by more than `LimitChangeSignificance`", which this build registers
+        // as 0), and a transaction is ongoing to report it against.
+        if limit_changed
+            && computed_limit.is_some_and(|(_, externally_caused)| externally_caused)
+            && let Some(Some(transaction)) = evse.transactions.get_mut(connector_id)
+        {
+            transaction.seq_no += 1;
+            effects.push(ChargePointEffect::TransactionEvent(
+                TransactionEventOccurred {
+                    evse_id,
+                    connector_id,
+                    kind: TransactionEventKind::Updated(
+                        TransactionUpdateReason::ChargingRateChanged,
+                    ),
+                    transaction: transaction.clone(),
+                    offline: false,
+                },
+            ));
+        }
         let limit_confirmed = confirmed_limit.is_some_and(|limit_ma| {
             let Some(slot) = evse.applied_charging_limits.get_mut(connector_id) else {
                 return false;
@@ -5411,7 +5435,10 @@ mod tests {
 
         let effects = apply_connector_event(
             &mut state,
-            ConnectorEvent::CurrentLimitComputed(Some(16_000)),
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: Some(16_000),
+                externally_caused: false,
+            },
         );
         assert!(effects.contains(&ChargePointEffect::HardwareCommand(
             HardwareCommand::SetCurrentLimit {
@@ -5425,13 +5452,22 @@ mod tests {
         // The same limit again is not re-issued to hardware.
         let effects = apply_connector_event(
             &mut state,
-            ConnectorEvent::CurrentLimitComputed(Some(16_000)),
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: Some(16_000),
+                externally_caused: false,
+            },
         );
         assert!(effects.is_empty());
 
         // Dropping the limit entirely is a real change, and is dispatched as such - hardware
         // has to be told to stop limiting, not left holding the last value forever.
-        let effects = apply_connector_event(&mut state, ConnectorEvent::CurrentLimitComputed(None));
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: None,
+                externally_caused: false,
+            },
+        );
         assert!(effects.contains(&ChargePointEffect::HardwareCommand(
             HardwareCommand::SetCurrentLimit {
                 evse_id: 0,
@@ -5442,13 +5478,138 @@ mod tests {
         assert_eq!(state.evses[0].charging_limits[0], None);
     }
 
+    /// K11.FR.04/K13.FR.03 (CV18): a rate change an *external* control system caused, on a
+    /// connector with a transaction running, is a `SHALL`-report to the CSMS. Reachable only since
+    /// CV13 made an external limit change the rate at all.
+    #[test]
+    fn an_externally_caused_rate_change_reports_a_transaction_event() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: Some(6_000),
+                externally_caused: true,
+            },
+        );
+
+        let reported = effects.iter().find_map(|effect| match effect {
+            ChargePointEffect::TransactionEvent(occurred) => Some(occurred),
+            _ => None,
+        });
+        let reported = reported.expect("an externally caused rate change is reported");
+        assert_eq!(
+            reported.kind,
+            TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged)
+        );
+        // The sequence number moves with every event about a transaction, as OCPP requires.
+        assert_eq!(reported.transaction.seq_no, 2);
+    }
+
+    /// K01.FR.61 makes the CSMS-caused case a `MAY`, and this crate does not: a schedule period
+    /// boundary in a profile the CSMS installed changes the rate on a cadence the CSMS already
+    /// knows, and reporting each one would be traffic it can derive.
+    #[test]
+    fn a_rate_change_the_csms_caused_reports_nothing() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: Some(6_000),
+                externally_caused: false,
+            },
+        );
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
+    }
+
+    /// The other precondition both requirements state: *a transaction is ongoing*. An external
+    /// limit arriving at an idle connector still changes the limit and still reaches hardware -
+    /// there is simply no transaction to report it against.
+    #[test]
+    fn an_externally_caused_rate_change_with_no_transaction_reports_nothing() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: Some(6_000),
+                externally_caused: true,
+            },
+        );
+
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::SetCurrentLimit {
+                evse_id: 0,
+                connector_id: 0,
+                limit_ma: Some(6_000),
+            }
+        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::TransactionEvent(_)))
+        );
+    }
+
+    /// "Changed by more than `LimitChangeSignificance`" - which this build registers as 0 and does
+    /// not honour a write to (CV14), so *any* change qualifies and no change qualifies for
+    /// nothing. Re-issuing the same limit is not a rate change, whatever caused it.
+    #[test]
+    fn an_unchanged_limit_reports_nothing_even_when_externally_caused() {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: Some(6_000),
+                externally_caused: true,
+            },
+        );
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: Some(6_000),
+                externally_caused: true,
+            },
+        );
+
+        assert!(effects.is_empty());
+    }
+
     #[test]
     fn a_confirmed_current_limit_is_recorded_separately_from_the_requested_one() {
         let mut state = ChargePointState::new([1]);
 
         apply_connector_event(
             &mut state,
-            ConnectorEvent::CurrentLimitComputed(Some(16_000)),
+            ConnectorEvent::CurrentLimitComputed {
+                limit_ma: Some(16_000),
+                externally_caused: false,
+            },
         );
         assert_eq!(state.evses[0].applied_charging_limits[0], None);
 

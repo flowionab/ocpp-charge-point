@@ -1,7 +1,7 @@
 # OCPP 2.1 compliance audit — spec vs. this crate
 
-**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13, §2.15 and §2.16 closed
-2026-08-12 ·
+**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13, §2.15, §2.16 and §2.17
+closed 2026-08-12 ·
 **Baseline:** `main` @ `4c6abe3`, sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
 part 2 appendices v2.1 CSVs + errata 2026-06).
 
@@ -430,7 +430,24 @@ so:
 The `_` catch-all is also the mechanism: it silently absorbs any purpose 2.1 adds later, which is the
 failure mode `CLAUDE.md`'s "exhaustive matches with no wildcard arm" rule exists to prevent.
 
-### 2.17 Medium · no `triggerReason = ChargingRateChanged` (K11.FR.04, K13.FR.03) [MECHANICAL]
+### 2.17 ~~Medium~~ **Closed by CV18** · no `triggerReason = ChargingRateChanged` (K11.FR.04, K13.FR.03) [MECHANICAL]
+
+**Fixed.** `TransactionUpdateReason::ChargingRateChanged` exists and maps to `TriggerReasonEnum::
+ChargingRateChanged` on both 2.x wires. It is emitted on all three of the requirements'
+preconditions together: an external control system caused the change, the composed rate actually
+moved, and a transaction is ongoing.
+
+The narrowness the finding below predicted held. `ConnectorEvent::CurrentLimitComputed` gained an
+`externally_caused` flag, set by the projection — which is the only place that can tell the two
+apart, since by the time a limit reaches the state machine it is a number and nothing about the
+number says where it came from. The projection compares the external limits in force on an EVSE
+against the ones the previous evaluation saw, which is exactly K11.FR.01 (set) and K13.FR.01
+(released), the two events the requirements hang off. A schedule period boundary inside a CSMS
+profile moves the rate without moving those, and stays unreported per K01.FR.61's `MAY`.
+
+Not persisted: a rate change moves `seq_no` and nothing else recoverable, and an energy manager may
+move a limit every few minutes, so writing one would be flash wear for a fresher sequence number.
+Original finding follows.
 
 `ChargingRateChanged` occurs nowhere in `src/`, and `TransactionUpdateReason` has only
 `ChargingStateChanged` and `MeterValuePeriodic`.
@@ -542,6 +559,7 @@ the sweep, by certification impact rather than by size:
     computed cost something to act on. The largest of the three.
 12. ~~**§2.16**~~ — **closed by CV17**, which turned out to be a behaviour fix: local generation
     adds capacity, and collapsing it onto `ExternalConstraints` had it capping instead. **§2.17**
-    remains, contained, and is a consequence of §2.13 above.
+    ~~**§2.17**~~ — **closed by CV18**, reachable only once §2.13 made an external limit change the
+    rate at all.
 13. **§2.18** — a `crate::hardware` addition, so it belongs with the DER actuation trait in a single
     considered break rather than on its own.

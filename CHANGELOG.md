@@ -64,6 +64,14 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   must add it (`false` preserves today's behaviour exactly). An integrator's energy-management
   binding that pushes locally generated capacity sets it `true`, which changes what the limit
   *does* — it adds rather than caps — and sets `isLocalGeneration` on the 2.1 wire (K27.FR.03).
+- `ConnectorEvent::CurrentLimitComputed` is now a struct variant, `{ limit_ma, externally_caused }`
+  (CV18): the projection sets the second field so the state machine can tell a rate change an
+  energy manager caused from one the CSMS's own profiles caused. New
+  `TransactionUpdateReason::ChargingRateChanged`, sent as `triggerReason = ChargingRateChanged`
+  when an external limit is set or released, the composed rate actually moves, and a transaction is
+  running (K11.FR.04, K13.FR.03). The CSMS-caused case stays unsent — K01.FR.61 makes it a `MAY`,
+  and the CSMS installed the schedule whose boundaries it would be told about. Exhaustive matches
+  over either enum must handle the new cases.
 - `EvseState` gained `local_generation_limit` and `ChargePointState` gained
   `station_local_generation_limit`, each a second slot beside the existing external-limit one, so a
   constraint and locally generated capacity can be in force on the same scope at once (K27.FR.05)

@@ -498,14 +498,13 @@ CSMS something untrue about its own behaviour. It is now closed.
 | **CV16** | **A renegotiation surface in `crate::hardware`.** K16.FR.02 is a `SHALL` on the station whenever the composite schedule changes, and `Iso15118Controller` has one method — a certificate hook. No integrator can satisfy K16–K20 through this crate today. Audit §2.18. | K16, K17 (33 FRs) | open |
 | **CV17** | **`LocalGeneration` has its own internal purpose, and it *adds* rather than caps.** The `_` catch-all made it an `ExternalConstraints` cap, so 2 kW of sun under a 5 kW `TxDefaultProfile` charged at 2 kW instead of K27's own 7 kW — a behaviour bug, not the reporting one this row was filed as. `ExternalChargingLimit` carries `is_local_generation`, held in its own slot per scope so a constraint and capacity can both be in force (K27.FR.05), and `isLocalGeneration` is now stated on the wire in both directions. Audit §2.16. | K27.FR.01/.02/.03/.05, §K.3.6 | **done** |
 | **CV20** | **Two K27/K10 remainders CV17 did not take.** (a) K27.FR.02 wants an EMS-pushed `LocalGeneration` schedule reported by `GetChargingProfiles`, but external limits are deliberately not stored as profiles and their synthetic ids are negative — reporting them needs a positive reserved id range first. (b) K10.FR.04/.08/.09 have `ClearChargingProfile` disregard `ExternalConstraints` **and** `LocalGeneration`; `ChargingProfileCriteria::matches` excludes neither, so a CSMS that installs one (K01.FR.06 says it shall not, but the station receives what it receives) can clear it. | K27.FR.02, K10.FR.04/.08/.09 | open |
-| **CV18** | **`triggerReason = ChargingRateChanged`.** A `SHALL` only for externally caused rate changes (K11.FR.04, K13.FR.03) — K01.FR.61 makes the CSMS-caused case a `MAY`, so this is narrower than it looks. Reachable now that CV13 has landed. Audit §2.17. | K11.FR.04, K13.FR.03 | open |
+| **CV18** | **`triggerReason = ChargingRateChanged`.** Sent when an external limit is set or released, the composed rate actually moves, and a transaction is running — all three preconditions the two requirements state. The CSMS-caused case stays unsent: K01.FR.61 makes it a `MAY`, and the CSMS installed the schedule whose boundaries it would be told about. `ConnectorEvent::CurrentLimitComputed` carries `externally_caused`, set by the projection, which is the only place that can see the difference. Audit §2.17. | K11.FR.04, K13.FR.03 | **done** |
 
-**Sequencing:** CV13 before CV18 (nothing changes a rate externally until the limit is enforced) —
-**CV13 is done, so CV18 is now reachable**; CV17 next to it (both touch the same purpose mapping,
-and CV13 left `LocalGeneration` composing as an external constraint exactly as it found it), **CV14
-was independent and cheap and is done**, CV15
-independent and largest, CV16 a `crate::hardware` addition that should be taken together with the
-DER actuation trait `docs/CERTIFICATION.md` §3 names — one considered break rather than two.
+**Sequencing:** CV13 before CV18 (nothing changes a rate externally until the limit is enforced),
+and both are now done, as are CV14 and CV17. **What is left of this group is CV15 (independent and
+largest), CV16 (a `crate::hardware` addition that should be taken together with the DER actuation
+trait `docs/CERTIFICATION.md` §3 names — one considered break rather than two), and the two rows
+the finished work opened: CV19 and CV20.**
 
 ### CV17 — the row that was filed as reporting fidelity and turned out to be behaviour
 
@@ -577,7 +576,7 @@ Everything above the line is done. **CV1–CV11 are closed.** What is open is CV
 and four of the six rows its first sweep opened, plus the one CV14 added on its way past:
 
 ```
-CV12.1 (K, done) ──┬─> CV13 (done) ──> CV18
+CV12.1 (K, done) ──┬─> CV13 (done) ──> CV18 (done)
                    ├─> CV17 (done) ──> CV20   the K27/K10 remainders it did not take
                    ├─> CV14 (done) ──> CV19   the stale counters the sweep turned up
                    ├─> CV15        independent, largest

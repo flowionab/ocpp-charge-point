@@ -137,6 +137,13 @@ pub fn persistence_decision(
         | TransactionEventKind::Updated(TransactionUpdateReason::ChargingStateChanged) => {
             PersistenceDecision::Write
         }
+        // A rate change (CV18) moves `seq_no` and nothing else recoverable: no new energy, no new
+        // charging state. An energy manager may move the limit every few minutes - a dynamic
+        // profile every `dynUpdateInterval` - so writing here would put flash wear on a path that
+        // buys a recovered transaction nothing but a fresher sequence number.
+        TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged) => {
+            PersistenceDecision::Skip
+        }
         TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic) => {
             let Some(sample) = occurred.transaction.last_meter_sample else {
                 return PersistenceDecision::Skip;
@@ -915,6 +922,7 @@ enum PersistedTransactionEventKind {
     UpdatedChargingStateChanged,
     UpdatedMeterValuePeriodic,
     Ended,
+    UpdatedChargingRateChanged,
 }
 
 impl From<TransactionEventKind> for PersistedTransactionEventKind {
@@ -926,6 +934,12 @@ impl From<TransactionEventKind> for PersistedTransactionEventKind {
             }
             TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic) => {
                 Self::UpdatedMeterValuePeriodic
+            }
+            // Never actually written - `persistence_decision` skips a rate change - but the
+            // mapping stays total so that a decision to start writing them is a one-line change
+            // there rather than a new variant here too.
+            TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged) => {
+                Self::UpdatedChargingRateChanged
             }
             TransactionEventKind::Ended => Self::Ended,
         }
@@ -941,6 +955,9 @@ impl From<PersistedTransactionEventKind> for TransactionEventKind {
             }
             PersistedTransactionEventKind::UpdatedMeterValuePeriodic => {
                 Self::Updated(TransactionUpdateReason::MeterValuePeriodic)
+            }
+            PersistedTransactionEventKind::UpdatedChargingRateChanged => {
+                Self::Updated(TransactionUpdateReason::ChargingRateChanged)
             }
             PersistedTransactionEventKind::Ended => Self::Ended,
         }

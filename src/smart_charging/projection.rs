@@ -24,7 +24,8 @@ use crate::smart_charging::{
     external_charging_limits,
 };
 use crate::state::{
-    ChargePointEvent, ChargePointState, ChargingRateUnit, ConnectorEvent, EvseEvent, TransactionId,
+    ChargePointEvent, ChargePointState, ChargingRateUnit, ConnectorEvent, EvseEvent,
+    InstalledChargingProfile, TransactionId,
 };
 
 /// How far ahead the projection composes when it is looking for the next period boundary.
@@ -60,6 +61,15 @@ pub struct ChargingLimitProjection {
         CriticalSectionRawMutex,
         RefCell<Vec<(usize, usize, TransactionId, DateTime<Utc>)>>,
     >,
+    /// The external limits each EVSE was composing under at the previous evaluation, so a change
+    /// in them can be told apart from a change in the CSMS's own profiles - see
+    /// [`Self::external_limits_changed`] and CV18. One entry per EVSE that has ever been
+    /// evaluated; the `Vec` inside is empty for the usual case of no external limit at all.
+    #[allow(clippy::type_complexity)]
+    external_limits: BlockingMutex<
+        CriticalSectionRawMutex,
+        RefCell<Vec<(usize, Vec<InstalledChargingProfile>)>>,
+    >,
 }
 
 impl ChargingLimitProjection {
@@ -69,6 +79,7 @@ impl ChargingLimitProjection {
         Self {
             supply: None,
             transaction_starts: BlockingMutex::new(RefCell::new(Vec::new())),
+            external_limits: BlockingMutex::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -116,6 +127,42 @@ impl ChargingLimitProjection {
                 .borrow_mut()
                 .retain(|(evse, connector, _, _)| (*evse, *connector) != (evse_id, connector_id));
         });
+    }
+
+    /// Whether the external limits in force on `evse_id` differ from the ones the previous
+    /// evaluation saw, recording them for the next comparison (CV18).
+    ///
+    /// This is what "caused by an external control system" reduces to in a loop that re-evaluates
+    /// on every state change: K11.FR.01 (a limit was set) and K13.FR.01 (one was released) are the
+    /// two events K11.FR.04 and K13.FR.03 hang off, and both show up here as the composing
+    /// profiles derived from those limits changing. A schedule period boundary inside a *CSMS*
+    /// profile moves the rate without moving these, which is exactly the case K01.FR.61 leaves
+    /// optional and this crate declines to report.
+    ///
+    /// The first evaluation for an EVSE is not a change: a charge point that boots with a limit
+    /// already recorded has not just been handed one, and reporting a rate change against a
+    /// transaction that has only just been restored would date the report to the wrong cause.
+    fn external_limits_changed(
+        &self,
+        evse_id: usize,
+        external: &[InstalledChargingProfile],
+    ) -> bool {
+        self.external_limits.lock(|limits| {
+            let mut limits = limits.borrow_mut();
+            match limits.iter_mut().find(|(evse, _)| *evse == evse_id) {
+                Some(entry) => {
+                    if entry.1 == external {
+                        return false;
+                    }
+                    entry.1 = external.to_vec();
+                    true
+                }
+                None => {
+                    limits.push((evse_id, external.to_vec()));
+                    false
+                }
+            }
+        })
     }
 }
 
@@ -173,6 +220,11 @@ async fn evaluate_all<C: Clock>(
     let mut next_change: Option<DateTime<Utc>> = None;
 
     for evse_id in 0..state.evses.len() {
+        // Once per EVSE, not once per connector: the limits are a property of the EVSE, and
+        // `external_limits_changed` records what it saw, so asking it twice for the same
+        // evaluation would have the second connector told nothing changed (CV18).
+        let external = external_charging_limits(&state, evse_id);
+        let externally_caused = projection.external_limits_changed(evse_id, &external);
         for connector_id in 0..state.evses[evse_id].connectors.len() {
             let context = connector_composition_context(
                 projection,
@@ -182,7 +234,6 @@ async fn evaluate_all<C: Clock>(
                 now,
                 LOOKAHEAD_SECS,
             );
-            let external = external_charging_limits(&state, evse_id);
             let profiles = composing_profiles(&state, evse_id, &external);
             let limit_ma = current_limit_ma(&profiles, &context);
             if let Some(composed) = compose(&profiles, &context)
@@ -197,7 +248,10 @@ async fn evaluate_all<C: Clock>(
                     evse_id,
                     event: EvseEvent::Connector {
                         connector_id,
-                        event: ConnectorEvent::CurrentLimitComputed(limit_ma),
+                        event: ConnectorEvent::CurrentLimitComputed {
+                            limit_ma,
+                            externally_caused,
+                        },
                     },
                 })
                 .await;
@@ -680,6 +734,94 @@ mod tests {
             .await;
         settle().await;
         assert_eq!(actor.state().evses[0].charging_limits[0], Some(32_000));
+    }
+
+    /// CV18 (K11.FR.04, K13.FR.03) end to end: the projection is the only place that can tell an
+    /// externally-caused rate change from a CSMS-caused one, and this is the path that carries
+    /// that judgement into the `TransactionEvent` the CSMS is owed. Both halves in one test,
+    /// because the interesting assertion is the *contrast*: the CSMS's own profile moves the rate
+    /// and reports nothing, the EMS's limit moves it and reports.
+    #[tokio::test]
+    async fn only_an_externally_caused_rate_change_reports_a_transaction_event() {
+        let actor = Arc::new(ChargePointActor::spawn([1], &TokioExecutor));
+        let projection = Arc::new(ChargingLimitProjection::new());
+        let mut events = actor.subscribe_transaction_events();
+
+        let task_actor = actor.clone();
+        let task_projection = projection.clone();
+        tokio::spawn(async move {
+            run_charging_limit_projection(&task_actor, &task_projection, &fixed_clock()).await;
+        });
+
+        start_charging(&actor).await;
+        // The CSMS installs a profile, which moves the rate from unlimited to 32 A. K01.FR.61
+        // makes reporting that a `MAY`, and this crate does not.
+        let _ = actor
+            .send(ChargePointEvent::ChargingProfileSet {
+                scope: ChargingProfileScope::Evse(0),
+                profile: alloc::boxed::Box::new(amp_profile(1, 32.0)),
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(32_000));
+
+        // Read past whatever the transaction's own lifecycle produced (Started,
+        // ChargingStateChanged) until nothing more arrives, so what is read after this point is
+        // caused by the limits alone - and assert that none of it was a rate change.
+        while let Ok(Ok(occurred)) =
+            tokio::time::timeout(core::time::Duration::from_millis(20), events.recv()).await
+        {
+            assert_ne!(
+                occurred.kind,
+                crate::state::TransactionEventKind::Updated(
+                    crate::state::TransactionUpdateReason::ChargingRateChanged
+                ),
+                "K01.FR.61 leaves a CSMS-caused rate change optional and this crate declines it"
+            );
+        }
+
+        // The EMS now limits the same connector to 6 A - K11.FR.01, and so K11.FR.04.
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitSet {
+                evse_id: Some(0),
+                limit: ems_limit(6.0),
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(6_000));
+
+        let reported = tokio::time::timeout(core::time::Duration::from_millis(20), events.recv())
+            .await
+            .expect("K11.FR.04 reports the rate change")
+            .expect("the transaction event channel stays open");
+        assert_eq!(
+            reported.kind,
+            crate::state::TransactionEventKind::Updated(
+                crate::state::TransactionUpdateReason::ChargingRateChanged
+            )
+        );
+
+        // K13.FR.03: releasing it is a rate change too, and reported the same way.
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitCleared {
+                evse_id: Some(0),
+                source: crate::state::ChargingLimitSource::Ems,
+                is_local_generation: false,
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(32_000));
+
+        let reported = tokio::time::timeout(core::time::Duration::from_millis(20), events.recv())
+            .await
+            .expect("K13.FR.03 reports the release")
+            .expect("the transaction event channel stays open");
+        assert_eq!(
+            reported.kind,
+            crate::state::TransactionEventKind::Updated(
+                crate::state::TransactionUpdateReason::ChargingRateChanged
+            )
+        );
     }
 
     /// A station-wide limit (`evseId` absent) binds every connector, including one with no profile

@@ -830,7 +830,27 @@ pub enum ConnectorEvent {
     /// [`HardwareCommand::SetCurrentLimit`] - but only when it actually differs from the limit
     /// already requested for this connector, so a projection that re-evaluates on every state
     /// change doesn't re-issue the same limit to hardware over and over.
-    CurrentLimitComputed(Option<u32>),
+    CurrentLimitComputed {
+        /// The limit, in milliamps, or `None` when nothing limits this connector any more.
+        limit_ma: Option<u32>,
+        /// Whether an external control system is what moved it - an
+        /// [`ExternalChargingLimit`](crate::state::ExternalChargingLimit) set or released since
+        /// the previous evaluation, rather than a profile the CSMS installed or a schedule period
+        /// boundary within one (**K11.FR.04**, **K13.FR.03**).
+        ///
+        /// The distinction decides whether the CSMS is *told*. OCPP asks for a
+        /// `TransactionEvent(Updated, triggerReason = ChargingRateChanged)` when an external
+        /// system changed the rate under a running transaction, and both those requirements are
+        /// `SHALL`s - while **K01.FR.61** makes the same report a `MAY` when the CSMS's own
+        /// profiles caused the change, which this crate does not send: the CSMS installed the
+        /// schedule and can derive its boundaries, so reporting each one back is traffic that
+        /// tells it nothing it did not already know.
+        ///
+        /// Set by [`crate::smart_charging`]'s projection, which is the only place that can see
+        /// it: by the time a limit reaches this event it is a number, and nothing about the number
+        /// says where it came from.
+        externally_caused: bool,
+    },
 }
 
 /// A side effect of applying a [`ChargePointEvent`], to be carried out by the actor's caller
@@ -998,6 +1018,13 @@ pub enum TransactionUpdateReason {
     ChargingStateChanged,
     /// A periodic meter reading was reported while charging.
     MeterValuePeriodic,
+    /// An external control system changed the rate this transaction is charging at - an energy
+    /// manager's limit arriving or being released (**K11.FR.04**, **K13.FR.03**).
+    ///
+    /// Only the externally-caused case. A rate change the CSMS's own charging profiles produced is
+    /// a `MAY` under K01.FR.61 and is not reported - see
+    /// [`ConnectorEvent::CurrentLimitComputed::externally_caused`].
+    ChargingRateChanged,
 }
 
 /// One in-flight transaction read back from durable storage at boot, carried by

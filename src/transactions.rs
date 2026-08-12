@@ -481,6 +481,10 @@ pub(crate) mod ocpp_2_1 {
             TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic) => {
                 TriggerReasonEnum::MeterValuePeriodic
             }
+            // K11.FR.04/K13.FR.03 (CV18): an external control system moved the rate.
+            TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged) => {
+                TriggerReasonEnum::ChargingRateChanged
+            }
             TransactionEventKind::Ended => match transaction.stop_reason {
                 Some(StopReason::EmergencyStop) => TriggerReasonEnum::AbnormalCondition,
                 Some(StopReason::Remote) => TriggerReasonEnum::RemoteStop,
@@ -1537,6 +1541,10 @@ pub(crate) mod ocpp_2_0_1 {
             }
             TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic) => {
                 TriggerReasonEnum::MeterValuePeriodic
+            }
+            // K11.FR.04/K13.FR.03 (CV18): an external control system moved the rate.
+            TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged) => {
+                TriggerReasonEnum::ChargingRateChanged
             }
             TransactionEventKind::Ended => match transaction.stop_reason {
                 Some(StopReason::EmergencyStop) => TriggerReasonEnum::AbnormalCondition,
