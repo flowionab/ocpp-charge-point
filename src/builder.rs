@@ -4864,6 +4864,7 @@ mod tests {
                         value: "04A224B2".into(),
                         kind: IdTokenKind::ISO14443,
                     },
+                    group_id_token: None,
                     expires_at: None,
                 },
             }])

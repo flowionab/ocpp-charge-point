@@ -72,6 +72,11 @@ pub enum ReserveNowOutcome {
 /// counterpart) - unlike `RequestStartTransaction`/`ChangeAvailability`, there is no way for the
 /// CSMS to target one specific connector directly.
 ///
+/// `group_id_token` becomes [`Reservation::group_id_token`]: the group this bay is being held
+/// for, from `ReserveNowRequest.groupIdToken` (2.x) or `parentIdTag` (1.6J). It is what lets a
+/// fleet reservation be honoured by whichever of its vehicles turns up - see **F01.FR.22** and
+/// [`crate::remote_control::handle_request_start_transaction`].
+///
 /// `expires_at` becomes [`Reservation::expires_at`] directly - callers (the `ocpp_1_6`/
 /// `ocpp_2_0_1`/`ocpp_2_1` adapters below) convert it from the wire request via
 /// `parse_expiry_date_time` (private to this module). `None` means a reservation that never expires, per
@@ -83,6 +88,7 @@ pub async fn handle_reserve_now(
     evse_id: Option<usize>,
     reservation_id: ReservationId,
     id_token: IdToken,
+    group_id_token: Option<IdToken>,
     expires_at: Option<DateTime<Utc>>,
 ) -> ReserveNowOutcome {
     let state = actor.state();
@@ -116,6 +122,7 @@ pub async fn handle_reserve_now(
                 event: ConnectorEvent::Reserved(Reservation {
                     id: reservation_id,
                     id_token,
+                    group_id_token,
                     expires_at,
                 }),
             },
@@ -460,6 +467,7 @@ mod tests {
             Some(0),
             ReservationId(id),
             test_id_token(),
+            None,
             expires_at.map(at),
         )
         .await;
@@ -623,8 +631,15 @@ mod tests {
     async fn reserving_an_available_connector_on_a_given_evse_succeeds() {
         let actor = spawn_with_reservation([1]).await;
 
-        let outcome =
-            handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
+        let outcome = handle_reserve_now(
+            &actor,
+            Some(0),
+            ReservationId(1),
+            test_id_token(),
+            None,
+            None,
+        )
+        .await;
 
         assert_eq!(outcome, ReserveNowOutcome::Accepted);
         assert_eq!(
@@ -652,6 +667,7 @@ mod tests {
             Some(0),
             ReservationId(1),
             test_id_token(),
+            None,
             Some(expires_at),
         )
         .await;
@@ -680,7 +696,7 @@ mod tests {
             .unwrap();
 
         let outcome =
-            handle_reserve_now(&actor, None, ReservationId(1), test_id_token(), None).await;
+            handle_reserve_now(&actor, None, ReservationId(1), test_id_token(), None, None).await;
 
         assert_eq!(outcome, ReserveNowOutcome::Accepted);
         assert_eq!(
@@ -693,8 +709,15 @@ mod tests {
     async fn an_unknown_evse_is_rejected() {
         let actor = spawn_with_reservation([1]).await;
 
-        let outcome =
-            handle_reserve_now(&actor, Some(5), ReservationId(1), test_id_token(), None).await;
+        let outcome = handle_reserve_now(
+            &actor,
+            Some(5),
+            ReservationId(1),
+            test_id_token(),
+            None,
+            None,
+        )
+        .await;
 
         assert_eq!(outcome, ReserveNowOutcome::Rejected);
     }
@@ -713,8 +736,15 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
+        let outcome = handle_reserve_now(
+            &actor,
+            Some(0),
+            ReservationId(1),
+            test_id_token(),
+            None,
+            None,
+        )
+        .await;
 
         assert_eq!(outcome, ReserveNowOutcome::Occupied);
     }
@@ -733,8 +763,15 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
+        let outcome = handle_reserve_now(
+            &actor,
+            Some(0),
+            ReservationId(1),
+            test_id_token(),
+            None,
+            None,
+        )
+        .await;
 
         assert_eq!(outcome, ReserveNowOutcome::Unavailable);
     }
@@ -742,7 +779,15 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_known_reservation_frees_the_connector() {
         let actor = spawn_with_reservation([1]).await;
-        handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
+        handle_reserve_now(
+            &actor,
+            Some(0),
+            ReservationId(1),
+            test_id_token(),
+            None,
+            None,
+        )
+        .await;
 
         let outcome = handle_cancel_reservation(&actor, ReservationId(1)).await;
 
@@ -771,8 +816,15 @@ mod tests {
     async fn reserve_now_is_rejected_when_the_reservation_capability_is_absent() {
         let actor = ChargePointActor::spawn([1], &TokioExecutor);
 
-        let outcome =
-            handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
+        let outcome = handle_reserve_now(
+            &actor,
+            Some(0),
+            ReservationId(1),
+            test_id_token(),
+            None,
+            None,
+        )
+        .await;
 
         assert_eq!(outcome, ReserveNowOutcome::Rejected);
         assert_eq!(
@@ -785,7 +837,15 @@ mod tests {
     #[tokio::test]
     async fn cancel_reservation_is_rejected_when_the_reservation_capability_is_absent() {
         let actor = spawn_with_reservation([1]).await;
-        handle_reserve_now(&actor, Some(0), ReservationId(1), test_id_token(), None).await;
+        handle_reserve_now(
+            &actor,
+            Some(0),
+            ReservationId(1),
+            test_id_token(),
+            None,
+            None,
+        )
+        .await;
         // Turn the capability back off - the reservation already made must not become
         // cancellable just because it exists.
         actor
@@ -891,6 +951,7 @@ mod ocpp_2_1 {
                                 evse_id,
                                 ReservationId(request.id),
                                 map_id_token(&request.id_token),
+                                request.group_id_token.as_ref().map(map_id_token),
                                 Some(super::parse_expiry_date_time(&request.expiry_date_time)),
                             )
                             .await
@@ -1117,6 +1178,7 @@ mod ocpp_2_0_1 {
                                 evse_id,
                                 ReservationId(request.id),
                                 map_id_token(&request.id_token),
+                                request.group_id_token.as_ref().map(map_id_token),
                                 Some(super::parse_expiry_date_time(&request.expiry_date_time)),
                             )
                             .await
@@ -1375,6 +1437,15 @@ mod ocpp_1_6 {
                                     evse_id,
                                     ReservationId(request.reservation_id),
                                     map_id_token(&request.id_tag),
+                                    // 1.6J's `parentIdTag` is the group id under another name -
+                                    // it is exactly the field a fleet reservation is booked
+                                    // under, so it maps onto `groupIdToken` (F01.FR.22).
+                                    request.parent_id_tag.as_ref().map(|parent| {
+                                        crate::state::IdToken {
+                                            value: parent.as_str().into(),
+                                            kind: crate::state::IdTokenKind::Central,
+                                        }
+                                    }),
                                     Some(super::parse_expiry_date_time(&request.expiry_date)),
                                 )
                                 .await

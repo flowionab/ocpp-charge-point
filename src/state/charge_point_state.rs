@@ -1429,6 +1429,11 @@ impl ChargePointState {
                 .string_variable("TxCtrlr", "MaxEnergyOnInvalidId")
                 .parse::<i64>()
                 .ok(),
+            authorize_remote_start: self.boolean_variable(
+                "AuthCtrlr",
+                "AuthorizeRemoteStart",
+                ConnectorPolicy::default().authorize_remote_start,
+            ),
         };
         let Some(evse) = self.evses.get_mut(evse_id) else {
             return false;
@@ -1494,6 +1499,19 @@ impl ChargePointState {
             ConnectorEvent::RemoteStartPendingCleared => Some(None),
             _ => None,
         };
+        // CV7/F01.FR.01: the request as it would be held, if the policy routes it through
+        // authorization rather than starting it outright. Which of the two happened is only
+        // knowable after `apply`, so this is captured now and consumed below.
+        let remote_start_request = match &event {
+            ConnectorEvent::RemoteStartRequested {
+                id_token,
+                remote_start_id,
+            } => Some(crate::state::PendingRemoteStart {
+                id_token: id_token.clone(),
+                remote_start_id: *remote_start_id,
+            }),
+            _ => None,
+        };
         let meter_sample = match &event {
             ConnectorEvent::MeterValueSampled(sample) => Some(*sample),
             _ => None,
@@ -1531,8 +1549,16 @@ impl ChargePointState {
         let mut reservation_ended = None;
         let mut honoured = None;
         if let Some(slot) = evse.reservations.get_mut(connector_id) {
+            // Only an event that actually *carries* a reservation records one. Assigning
+            // `reservation_made` unconditionally here would clear the record on every other event
+            // that finds the connector still `Reserved` - a meter sample from idle hardware, a
+            // held remote start (CV7) - leaving the connector reserved with nothing saying for
+            // whom, which reads downstream as an unreserved bay. Entering `Reserved` at all is
+            // only possible via `ConnectorEvent::Reserved`, so nothing needs the clearing case.
             if new_state == ConnectorState::Reserved {
-                *slot = reservation_made;
+                if let Some(reservation) = reservation_made {
+                    *slot = Some(reservation);
+                }
             } else if previous_state == ConnectorState::Reserved {
                 // Why it ended decides whether the CSMS hears about it. A cancellation it sent
                 // needs no report, and a cable arriving is the reservation being *honoured* -
@@ -1627,8 +1653,29 @@ impl ChargePointState {
             // rather than `RemoteStart` (see `trigger_reason_for`).
             remote_start_id: None,
         });
+        // F01.FR.01 (CV7): a remote start routed through authorization instead of started
+        // outright. The `remoteStartId` has to outlive the event that carried it, because the
+        // transaction is not created until the decision comes back - the same gap
+        // `honoured_reservations` bridges for a reservation id, and the same slot E03 already
+        // holds a pre-cable authorization in.
+        let authorizing_hold = match new_state {
+            ConnectorState::Authorizing => remote_start_request,
+            _ => None,
+        };
+        // At most one of the two can be set: `local_hold` needs a `ChargingAuthorized`, and
+        // `authorizing_hold` a `RemoteStartRequested`.
+        let hold = local_hold.or(authorizing_hold);
+        // Read *before* the block below, because the `Starting` arm consumes the very hold this
+        // has to survive: the transaction the authorization starts is created further down, and
+        // F01.FR.25 says it quotes the `remoteStartId` the request carried. F02's and E03's holds
+        // are taken by the dispatch arm instead, and E03's carries no id anyway.
+        let held_remote_start_id = evse
+            .pending_remote_starts
+            .get(connector_id)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|pending| pending.remote_start_id);
         if let Some(slot) = evse.pending_remote_starts.get_mut(connector_id) {
-            match (&pending_remote_start_change, &local_hold, new_state) {
+            match (&pending_remote_start_change, &hold, new_state) {
                 (Some(Some(pending)), _, _) => {
                     pending_changed = slot.as_ref() != Some(pending);
                     *slot = Some(pending.clone());
@@ -1640,7 +1687,34 @@ impl ChargePointState {
                     pending_changed = slot.as_ref() != Some(hold);
                     *slot = Some(hold.clone());
                 }
-                (None, None, ConnectorState::Locked) => dispatch_pending = slot.take(),
+                // F02/E03: the cable latched, so whatever was held is dispatched. Narrowed to
+                // arrivals *from `Connected`*, which is the only way a cable can latch - the other
+                // ways to reach `Locked` are a refused authorization (F01.FR.01, below) and the
+                // end of a retained-cable session (E09.FR.03), and dispatching a start into either
+                // would begin a transaction nobody asked for.
+                (None, None, ConnectorState::Locked)
+                    if previous_state == ConnectorState::Connected =>
+                {
+                    dispatch_pending = slot.take()
+                }
+                // F01.FR.01: back at `Locked` without a transaction means the authorization was
+                // refused. The held `remoteStartId` dies with it - otherwise it would attach
+                // itself to whatever the next driver starts on this connector.
+                (None, None, ConnectorState::Locked)
+                    if previous_state != ConnectorState::Locked =>
+                {
+                    pending_changed = slot.take().is_some();
+                }
+                // F01.FR.01: the authorization came back positive and the session is starting, so
+                // the hold has done its job - `held_remote_start_id` above already carries the id
+                // into the transaction. Leaving it would make the connector look, to
+                // `remote_control::run_pending_remote_start_timeouts`, like a bay still waiting for
+                // a driver who is in fact charging on it.
+                (None, None, ConnectorState::Starting)
+                    if previous_state == ConnectorState::Authorizing =>
+                {
+                    pending_changed = slot.take().is_some();
+                }
                 // Only when the connector *arrives* at idle, not on every event that finds it
                 // there. A held start is recorded while the connector is already `Available` and
                 // sits there until the cable comes - so clearing on the state alone would let the
@@ -1711,6 +1785,25 @@ impl ChargePointState {
                 },
             ));
         }
+        // F01.FR.01 (CV7): the same request a presented card raises, for a remote start the
+        // operator asked to have authorized. Never carries certificate material - a
+        // `RequestStartTransaction` conveys an identifier, not a contract; Plug & Charge arrives
+        // through `ContractCertificatePresented` instead.
+        if let Some(hold) = evse
+            .pending_remote_starts
+            .get(connector_id)
+            .and_then(|slot| slot.as_ref())
+            .filter(|_| new_state == ConnectorState::Authorizing)
+        {
+            effects.push(ChargePointEffect::AuthorizationRequested(
+                AuthorizationRequested {
+                    evse_id,
+                    connector_id,
+                    id_token: hold.id_token.clone(),
+                    contract: None,
+                },
+            ));
+        }
         if let Some(slot) = evse.transactions.get_mut(connector_id) {
             if let Some((kind, transaction)) = advance_transaction(
                 slot,
@@ -1720,7 +1813,10 @@ impl ChargePointState {
                 stop_reason,
                 TransactionOrigin {
                     id_token: authorized_id_token,
-                    remote_start_id: event_remote_start_id,
+                    // F01.FR.25: the event's own id when the start was immediate (F01.FR.02), and
+                    // the one held across the authorization round trip when it was not
+                    // (F01.FR.01) - either way the transaction quotes the request that caused it.
+                    remote_start_id: event_remote_start_id.or(held_remote_start_id),
                     reservation_id: active_reservation_id,
                 },
                 TransactionPoints {
@@ -2728,6 +2824,173 @@ mod tests {
         )));
     }
 
+    /// **F01.FR.01** (CV7): with `AuthCtrlr.AuthorizeRemoteStart` on, a `RequestStartTransaction`
+    /// is authorized exactly as a card presented at the reader would be - the CSMS's own request
+    /// is no longer taken as the decision. Energy transfer waits for that decision, so nothing is
+    /// asked of the contactor yet.
+    #[test]
+    fn a_remote_start_is_authorized_first_when_the_operator_asks_for_it() {
+        let mut state = ChargePointState::new([1]);
+        set_boolean(&mut state, "AuthCtrlr", "AuthorizeRemoteStart", "true");
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: Some(7),
+            },
+        );
+
+        assert_eq!(
+            state.evses[0].connectors[0],
+            ConnectorState::Authorizing,
+            "F01.FR.01 is exactly the requirement to authorize before allowing energy transfer"
+        );
+        assert!(effects.contains(&ChargePointEffect::AuthorizationRequested(
+            AuthorizationRequested {
+                evse_id: 0,
+                connector_id: 0,
+                id_token: test_id_token(),
+                contract: None,
+            }
+        )));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                ChargePointEffect::HardwareCommand(HardwareCommand::CloseContactor { .. })
+            )),
+            "the contactor must not close on an authorization nobody has given yet"
+        );
+        assert!(state.evses[0].transactions[0].is_none());
+    }
+
+    /// The `remoteStartId` has to survive the authorization round trip, or F01.FR.25 breaks for
+    /// exactly the stations that turned F01.FR.01 on: the CSMS would get a transaction it cannot
+    /// correlate with the request that caused it, reported as a local start.
+    #[test]
+    fn an_authorized_remote_start_still_reports_the_remote_start_id() {
+        let mut state = ChargePointState::new([1]);
+        set_boolean(&mut state, "AuthCtrlr", "AuthorizeRemoteStart", "true");
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: Some(7),
+            },
+        );
+
+        assert_eq!(
+            state.evses[0].connectors[0],
+            ConnectorState::Authorizing,
+            "otherwise this test says nothing the immediate-start path would not also satisfy"
+        );
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
+        let transaction = state.evses[0].transactions[0]
+            .as_ref()
+            .expect("the authorization starts the transaction");
+        assert_eq!(transaction.remote_start_id, Some(7));
+        assert_eq!(transaction.id_token, Some(test_id_token()));
+        assert!(
+            state.evses[0].pending_remote_starts[0].is_none(),
+            "the hold has done its job; leaving it would look like a bay still waiting for a \
+             driver who is charging on it"
+        );
+    }
+
+    /// A refusal must leave nothing behind - the same rule a refused card follows. Without it the
+    /// held `remoteStartId` would outlive the request that carried it and attach itself to
+    /// whatever the next driver starts on this connector.
+    #[test]
+    fn a_refused_remote_start_leaves_no_remote_start_id_for_the_next_driver() {
+        let mut state = ChargePointState::new([1]);
+        set_boolean(&mut state, "AuthCtrlr", "AuthorizeRemoteStart", "true");
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: Some(7),
+            },
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::AuthorizationDenied);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Locked);
+        assert!(state.evses[0].pending_remote_starts[0].is_none());
+
+        // The driver then presents their own card on the same connector, and that transaction is
+        // theirs - not a continuation of the remote start the CSMS was refused.
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::IdTokenPresented(test_id_token()),
+        );
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .expect("the card starts a transaction")
+                .remote_start_id,
+            None
+        );
+    }
+
+    /// **F01.FR.02's second clause**: `Central` and `NoAuthorization` identifiers bypass the check
+    /// however `AuthorizeRemoteStart` is set. A `Central` token *is* the CSMS's own decision -
+    /// asking it to confirm its own instruction is a round trip with one possible answer - and
+    /// `NoAuthorization` names a connector that authorizes nobody.
+    #[test]
+    fn a_centrally_assigned_token_starts_without_a_separate_authorization() {
+        for kind in [IdTokenKind::Central, IdTokenKind::NoAuthorization] {
+            let mut state = ChargePointState::new([1]);
+            set_boolean(&mut state, "AuthCtrlr", "AuthorizeRemoteStart", "true");
+            apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+            apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+
+            let effects = apply_connector_event(
+                &mut state,
+                ConnectorEvent::RemoteStartRequested {
+                    id_token: IdToken {
+                        value: "CSMS-1".into(),
+                        kind,
+                    },
+                    remote_start_id: Some(7),
+                },
+            );
+
+            assert_eq!(
+                state.evses[0].connectors[0],
+                ConnectorState::Starting,
+                "{kind:?} is exempt from F01.FR.01"
+            );
+            assert!(
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect, ChargePointEffect::AuthorizationRequested(_)))
+            );
+            assert_eq!(
+                state.evses[0].transactions[0]
+                    .as_ref()
+                    .expect("the transaction starts immediately")
+                    .remote_start_id,
+                Some(7)
+            );
+        }
+    }
+
     #[test]
     fn a_remote_start_request_is_ignored_outside_the_locked_state() {
         let mut state = ChargePointState::new([1]);
@@ -3410,10 +3673,37 @@ mod tests {
         )));
     }
 
+    /// A reservation has to survive the traffic a reserved connector actually sees. Idle hardware
+    /// keeps pushing meter samples, and CV7 can hold a remote start against a reserved bay - each
+    /// of those found the connector still `Reserved` and used to overwrite the record with the
+    /// nothing that event carried, leaving a bay reserved for no one.
+    #[test]
+    fn a_reservation_survives_events_that_leave_the_connector_reserved() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::Reserved(reservation(1)));
+        assert!(state.evses[0].reservations[0].is_some());
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::MeterValueSampled(crate::state::MeterSample {
+                energy_wh: 10,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Reserved);
+        assert_eq!(
+            state.evses[0].reservations[0].as_ref().map(|r| r.id),
+            Some(crate::state::ReservationId(1)),
+            "a meter sample says nothing about who the bay is held for"
+        );
+    }
+
     fn reservation(id: i64) -> crate::state::Reservation {
         crate::state::Reservation {
             id: crate::state::ReservationId(id),
             id_token: test_id_token(),
+            group_id_token: None,
             expires_at: None,
         }
     }

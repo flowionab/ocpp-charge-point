@@ -239,6 +239,9 @@ fn fill_connectors(state: &mut ChargePointState) {
             evse.reservations[connector_id] = Some(Reservation {
                 id: ReservationId(index as i64),
                 id_token: id_token(index),
+                // The budget measures the worst case, and a grouped reservation is bigger than
+                // an ungrouped one - so this is `Some`, not `None`.
+                group_id_token: Some(id_token(index)),
                 expires_at: None,
             });
             evse.running_costs[connector_id] = Some(12.75);

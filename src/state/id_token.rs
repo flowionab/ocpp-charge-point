@@ -101,6 +101,27 @@ pub enum IdTokenKind {
     Vin,
 }
 
+impl IdTokenKind {
+    /// Whether an identifier of this kind needs an authorization decision before energy may flow.
+    ///
+    /// `false` for exactly the two kinds **F01.FR.02** exempts, and for the reasons the kinds
+    /// themselves give:
+    ///
+    /// - [`Self::Central`] was assigned by the CSMS, so the CSMS asking this charge point to start
+    ///   a transaction under it *is* the decision. Re-asking is a round trip with one possible
+    ///   answer, and one more chance for a flapping link to refuse a start the CSMS commanded.
+    /// - [`Self::NoAuthorization`] names a connector that authorizes nobody - a free-charging bay.
+    ///   There is no decision to obtain.
+    ///
+    /// Consulted by `ConnectorState::apply` when `AuthCtrlr.AuthorizeRemoteStart` is on
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV7); every other kind takes the ordinary
+    /// authorization path.
+    #[must_use]
+    pub fn requires_authorization(&self) -> bool {
+        !matches!(self, Self::Central | Self::NoAuthorization)
+    }
+}
+
 #[cfg(test)]
 mod redaction_tests {
     use super::*;

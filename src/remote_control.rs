@@ -145,6 +145,14 @@ pub enum RequestStartTransactionOutcome {
     /// Maps to OCPP's `Accepted` on the wire, same as [`Self::Accepted`] - the distinction is for
     /// this crate's callers, since there is no `transactionId` to quote yet.
     AcceptedPendingCable,
+    /// The request was accepted, and the identifier it carried is being authorized before energy
+    /// may flow - **F01.FR.01** (CV7), the path `AuthCtrlr.AuthorizeRemoteStart` selects.
+    ///
+    /// The cable is already in; what is outstanding is the authorization decision, which is why
+    /// this is distinct from [`Self::AcceptedPendingCable`]. Maps to OCPP's `Accepted` on the
+    /// wire like both its siblings - the requirement's own note says the charge point responds
+    /// first and authorizes afterwards - and carries no `transactionId`, because none exists yet.
+    AcceptedPendingAuthorization,
     /// No connector could take the request - see [`find_start_target`] for the conditions
     /// F01.FR.21-.24 name.
     Rejected,
@@ -156,14 +164,23 @@ pub enum RequestStartTransactionOutcome {
 /// transaction immediately - if the cable is already latched, F01 - or **holds the request until
 /// the driver plugs in**, which is F02 and did not work at all before CV7. Starts a transaction
 /// without a separate Authorize round-trip (the CSMS's own request is itself the authorization
-/// decision; see `ConnectorEvent::RemoteStartRequested`). `id_token` is the identifier the CSMS
-/// supplied, recorded on the started `Transaction`. Rejects if `evse_id` is out of range, or no
-/// matching connector is currently `Locked`.
+/// decision; see `ConnectorEvent::RemoteStartRequested`) - unless
+/// `AuthCtrlr.AuthorizeRemoteStart` says to authorize it first, which is **F01.FR.01** and
+/// answers [`RequestStartTransactionOutcome::AcceptedPendingAuthorization`].
+///
+/// `id_token` is the identifier the CSMS supplied, recorded on the started `Transaction`.
+/// `group_id_token` is the request's `groupIdToken`, used only to decide whether a reservation
+/// held for a group admits this driver (**F01.FR.22**, see [`find_start_target`]); it is never
+/// recorded on the transaction. 1.6J's `RemoteStartTransaction` has no such field, so its adapter
+/// passes `None`.
+///
+/// Rejects if `evse_id` is out of range, or no connector passes F01.FR.21-.24.
 #[tracing::instrument(skip_all, fields(evse_id))]
 pub async fn handle_request_start_transaction(
     actor: &ChargePointActor,
     evse_id: Option<usize>,
     id_token: IdToken,
+    group_id_token: Option<IdToken>,
     remote_start_id: Option<i64>,
 ) -> RequestStartTransactionOutcome {
     // B02.FR.05: while the CSMS has answered `Pending` (or has not answered at all), a remote
@@ -185,7 +202,8 @@ pub async fn handle_request_start_transaction(
         tracing::warn!(evse_id, "refusing RequestStartTransaction: no such EVSE");
         return RequestStartTransactionOutcome::Rejected;
     }
-    let Some((evse_id, connector_id, latched)) = find_start_target(&state, evse_id, &id_token)
+    let Some((evse_id, connector_id, latched)) =
+        find_start_target(&state, evse_id, &id_token, group_id_token.as_ref())
     else {
         tracing::warn!("refusing RequestStartTransaction: no connector can take it");
         return RequestStartTransactionOutcome::Rejected;
@@ -235,10 +253,22 @@ pub async fn handle_request_start_transaction(
         })
         .await;
 
-    match &actor.state().evses[evse_id].transactions[connector_id] {
+    let state = actor.state();
+    match &state.evses[evse_id].transactions[connector_id] {
         Some(transaction) => RequestStartTransactionOutcome::Accepted {
             transaction_id: transaction.id,
         },
+        // F01.FR.01 (CV7): the operator asked for this to be authorized first, so the connector
+        // is waiting on the CSMS rather than on the contactor.
+        None if state.evses[evse_id].connectors[connector_id] == ConnectorState::Authorizing => {
+            tracing::info!(
+                evse_id,
+                connector_id,
+                "accepted a remote start; authorizing the identifier before allowing energy \
+                 transfer"
+            );
+            RequestStartTransactionOutcome::AcceptedPendingAuthorization
+        }
         // The connector moved but no transaction exists yet - a `TxStartPoint` later than
         // `Authorized` (CV2.2). The request was still accepted; there is simply no id to quote.
         None => RequestStartTransactionOutcome::AcceptedPendingCable,
@@ -289,19 +319,7 @@ pub async fn run_pending_remote_start_timeouts<B, M>(
         let now = monotonic.now();
         let timeout = ev_connection_timeout_secs(actor);
 
-        let held: alloc::vec::Vec<(usize, usize)> = actor
-            .state()
-            .evses
-            .iter()
-            .enumerate()
-            .flat_map(|(evse_id, evse)| {
-                evse.pending_remote_starts
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, pending)| pending.is_some())
-                    .map(move |(connector_id, _)| (evse_id, connector_id))
-            })
-            .collect();
+        let held = held_starts_awaiting_a_cable(&actor.state());
 
         // Forget connectors that are no longer holding anything, so a later request on the same
         // connector is timed from when *it* arrived rather than from a previous one.
@@ -334,6 +352,38 @@ pub async fn run_pending_remote_start_timeouts<B, M>(
             first_seen.remove(&address);
         }
     }
+}
+
+/// Every `(evse_id, connector_id)` holding an authorization that is still **waiting for a cable**,
+/// and so is subject to `TxCtrlr.EVConnectionTimeOut`.
+///
+/// The name of the variable is the whole rule: it times how long to wait for the *EV to connect*.
+/// A connector whose cable is already in is waiting for something else, and releasing its hold
+/// would deauthorize a session for a reason that demonstrably did not happen.
+///
+/// Today that excludes exactly one state, [`ConnectorState::Authorizing`] - a remote start the
+/// operator asked to have authorized first (F01.FR.01, CV7), held across the round trip to the
+/// CSMS. Every other way a hold exists (F02's pre-cable request, E03's pre-cable card) sits on a
+/// connector that has no cable by construction.
+fn held_starts_awaiting_a_cable(
+    state: &crate::state::ChargePointState,
+) -> alloc::vec::Vec<(usize, usize)> {
+    state
+        .evses
+        .iter()
+        .enumerate()
+        .flat_map(|(evse_id, evse)| {
+            evse.pending_remote_starts
+                .iter()
+                .enumerate()
+                .filter(|(_, pending)| pending.is_some())
+                .filter(move |(connector_id, _)| {
+                    evse.connectors.get(*connector_id)
+                        != Some(&crate::state::ConnectorState::Authorizing)
+                })
+                .map(move |(connector_id, _)| (evse_id, connector_id))
+        })
+        .collect()
 }
 
 /// `TxCtrlr.EVConnectionTimeOut` in seconds, or `0` (meaning "no timeout") when it is absent or
@@ -372,34 +422,45 @@ pub fn ev_connection_timeout_secs(actor: &ChargePointActor) -> u32 {
 ///
 /// A latched connector is preferred over an idle one so the common case (driver already plugged
 /// in, CSMS starts remotely) still starts immediately rather than waiting for a cable that is
-/// already there.
+/// already there. Among connectors with no cable, one this driver *reserved* is preferred over a
+/// merely free one, so the reservation is consumed rather than stranded.
 fn find_start_target(
     state: &ChargePointState,
     evse_id: Option<usize>,
     id_token: &IdToken,
+    group_id_token: Option<&IdToken>,
 ) -> Option<(usize, usize, bool)> {
     let evses: alloc::vec::Vec<usize> = match evse_id {
         Some(evse_id) => alloc::vec![evse_id],
         None => (0..state.evses.len()).collect(),
     };
     let mut waiting = None;
+    let mut reserved_waiting = None;
     for evse_id in evses {
         let Some(evse) = state.evses.get(evse_id) else {
             continue;
         };
         for connector_id in 0..evse.connectors.len() {
-            if !can_start_here(state, evse_id, connector_id, id_token) {
+            if !can_start_here(state, evse_id, connector_id, id_token, group_id_token) {
                 continue;
             }
-            if evse.connectors[connector_id] == ConnectorState::Locked {
-                return Some((evse_id, connector_id, true));
-            }
-            if waiting.is_none() && evse.connectors[connector_id] == ConnectorState::Available {
-                waiting = Some((evse_id, connector_id, false));
+            match evse.connectors[connector_id] {
+                ConnectorState::Locked => return Some((evse_id, connector_id, true)),
+                // Reached only when the reservation admits this driver - `can_start_here` has
+                // already refused every other one.
+                ConnectorState::Reserved if reserved_waiting.is_none() => {
+                    reserved_waiting = Some((evse_id, connector_id, false));
+                }
+                ConnectorState::Available if waiting.is_none() => {
+                    waiting = Some((evse_id, connector_id, false));
+                }
+                _ => {}
             }
         }
     }
-    waiting
+    // A bay this driver reserved beats a merely free one: sending them elsewhere would leave the
+    // reservation to expire unused beside the connector they were told to use.
+    reserved_waiting.or(waiting)
 }
 
 /// Whether one connector passes F01.FR.21-.24 - see [`find_start_target`].
@@ -408,13 +469,18 @@ fn can_start_here(
     evse_id: usize,
     connector_id: usize,
     id_token: &IdToken,
+    group_id_token: Option<&IdToken>,
 ) -> bool {
     let evse = &state.evses[evse_id];
     if evse.status != crate::state::EvseStatus::Available {
         return false;
     }
     match evse.connectors[connector_id] {
-        ConnectorState::Available | ConnectorState::Locked => {}
+        // `Reserved` is here because FR.21/.22 are rules about *whose* reservation it is, and they
+        // say nothing unless a matching identifier can get as far as the comparison below.
+        // Excluding the state outright would refuse a remote start from the very driver the bay is
+        // being held for - which is the one thing a reservation exists to enable.
+        ConnectorState::Available | ConnectorState::Locked | ConnectorState::Reserved => {}
         // FR.23 and everything else mid-session: not a connector a new request can be matched to.
         _ => return false,
     }
@@ -422,15 +488,36 @@ fn can_start_here(
     if evse.transactions[connector_id].is_some() {
         return false;
     }
-    // FR.21/.22: a reservation for a different identifier. This crate models a reservation's
-    // `idToken` only (no group id), so the group-id half of FR.22 is not distinguishable here -
-    // an idToken mismatch already refuses, which is the conservative side of that rule.
+    // FR.21/.22: a reservation held for someone else. The rule refuses only when *neither* the
+    // identifier nor the group matches - a fleet books a bay under one token and whichever
+    // vehicle turns up starts on another, so requiring the identifier alone would make every
+    // group reservation unusable by the group it was made for.
     if let Some(reservation) = evse.reservations[connector_id].as_ref()
-        && reservation.id_token.value != id_token.value
+        && !reservation_admits(reservation, id_token, group_id_token)
     {
         return false;
     }
     true
+}
+
+/// Whether `reservation` may be honoured by this identifier - **F01.FR.22**/F02.FR.24.
+///
+/// The identifier matches, or the group does. An absent group on either side is not a wildcard:
+/// two reservations that name no group are not thereby in the same group, and a request naming a
+/// group does not thereby open a reservation that named none. Only a group present on *both*
+/// sides and equal counts, which is why this is not a plain `==` on two `Option`s.
+fn reservation_admits(
+    reservation: &crate::state::Reservation,
+    id_token: &IdToken,
+    group_id_token: Option<&IdToken>,
+) -> bool {
+    if reservation.id_token.value == id_token.value {
+        return true;
+    }
+    matches!(
+        (reservation.group_id_token.as_ref(), group_id_token),
+        (Some(reserved_for), Some(presented)) if reserved_for.value == presented.value
+    )
 }
 
 /// Registers this charge point's inbound `RequestStartTransaction` handling with the CSMS
@@ -885,7 +972,7 @@ mod tests {
         lock_connector(&actor, 0, 0).await;
 
         let outcome =
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await;
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await;
 
         assert_eq!(
             outcome,
@@ -904,7 +991,8 @@ mod tests {
         let actor = accepted_actor([1, 1]).await;
         lock_connector(&actor, 1, 0).await;
 
-        let outcome = handle_request_start_transaction(&actor, None, test_id_token(), None).await;
+        let outcome =
+            handle_request_start_transaction(&actor, None, test_id_token(), None, None).await;
 
         assert_eq!(
             outcome,
@@ -928,7 +1016,7 @@ mod tests {
         lock_connector(&actor, 0, 0).await;
 
         let outcome =
-            handle_request_start_transaction(&actor, Some(5), test_id_token(), None).await;
+            handle_request_start_transaction(&actor, Some(5), test_id_token(), None, None).await;
 
         assert_eq!(outcome, RequestStartTransactionOutcome::Rejected);
     }
@@ -943,7 +1031,8 @@ mod tests {
         lock_connector(&actor, 0, 0).await;
 
         let outcome =
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), Some(4242)).await;
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, Some(4242))
+                .await;
 
         assert!(matches!(
             outcome,
@@ -992,7 +1081,7 @@ mod tests {
 
         // Nothing answered yet.
         assert_eq!(
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await,
             RequestStartTransactionOutcome::Rejected
         );
         assert_eq!(
@@ -1008,7 +1097,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await,
             RequestStartTransactionOutcome::Rejected
         );
         assert_eq!(
@@ -1026,7 +1115,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await,
             RequestStartTransactionOutcome::Accepted {
                 transaction_id: TransactionId(0)
             }
@@ -1041,7 +1130,8 @@ mod tests {
         let actor = accepted_actor([1]).await;
 
         assert_eq!(
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), Some(77)).await,
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, Some(77))
+                .await,
             RequestStartTransactionOutcome::AcceptedPendingCable
         );
         assert!(
@@ -1061,6 +1151,55 @@ mod tests {
             actor.state().evses[0].pending_remote_starts[0],
             None,
             "the held request is consumed, not left to fire again"
+        );
+    }
+
+    /// `EVConnectionTimeOut` times how long to wait for the *EV to connect*. A remote start the
+    /// operator asked to have authorized (F01.FR.01, CV7) is held on a connector whose cable is
+    /// already latched, waiting on the CSMS rather than on a driver - so the sweep must leave it
+    /// alone. Releasing it would deauthorize a session for the one reason that demonstrably did
+    /// not happen, and would drop the `remoteStartId` with it.
+    #[tokio::test]
+    async fn a_remote_start_awaiting_authorization_is_not_swept_as_a_driver_who_never_arrived() {
+        use crate::state::{Component, DeviceModelEvent, Variable, VariableAttributeType};
+
+        let actor = accepted_actor([2]).await;
+        actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: Component {
+                        name: "AuthCtrlr".into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: Variable {
+                        name: "AuthorizeRemoteStart".into(),
+                        instance: None,
+                    },
+                    attribute_type: VariableAttributeType::Actual,
+                    value: "true".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Connector 0 has its cable in, so the remote start lands there and waits for the CSMS.
+        lock_connector(&actor, 0, 0).await;
+        handle_request_start_transaction(&actor, Some(0), test_id_token(), None, Some(1)).await;
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            crate::state::ConnectorState::Authorizing
+        );
+        assert!(actor.state().evses[0].pending_remote_starts[0].is_some());
+
+        // Connector 1 has no cable, so its request is held for a driver who may never arrive.
+        handle_request_start_transaction(&actor, Some(0), test_id_token(), None, Some(2)).await;
+        assert!(actor.state().evses[0].pending_remote_starts[1].is_some());
+
+        assert_eq!(
+            super::held_starts_awaiting_a_cable(&actor.state()),
+            alloc::vec![(0, 1)],
+            "only the connector still waiting for a cable is the sweep's business"
         );
     }
 
@@ -1092,7 +1231,7 @@ mod tests {
         assert_eq!(super::ev_connection_timeout_secs(&actor), 30);
 
         let outcome =
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), Some(1)).await;
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, Some(1)).await;
         assert_eq!(
             outcome,
             RequestStartTransactionOutcome::AcceptedPendingCable
@@ -1149,7 +1288,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await,
             RequestStartTransactionOutcome::Rejected
         );
     }
@@ -1171,6 +1310,7 @@ mod tests {
                             value: "SOMEONE-ELSE".into(),
                             kind: crate::state::IdTokenKind::ISO14443,
                         },
+                        group_id_token: None,
                         expires_at: None,
                     }),
                 },
@@ -1179,9 +1319,175 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await,
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await,
             RequestStartTransactionOutcome::Rejected
         );
+    }
+
+    /// **F01.FR.21** is a rule about *whose* reservation it is, and it only says anything if a
+    /// matching identifier gets through. Before CV7's group work this check was unreachable: a
+    /// `Reserved` connector was excluded by state before the identity comparison ran, so a
+    /// reservation blocked remote starts from the very driver it was made for - the one thing a
+    /// reservation exists to enable.
+    #[tokio::test]
+    async fn a_remote_start_is_accepted_on_a_connector_reserved_for_that_same_identifier() {
+        let actor = accepted_actor([1]).await;
+        reserve(&actor, &test_id_token().value, None).await;
+
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, Some(3)).await,
+            RequestStartTransactionOutcome::AcceptedPendingCable
+        );
+
+        lock_connector(&actor, 0, 0).await;
+        assert!(actor.state().evses[0].transactions[0].is_some());
+    }
+
+    /// A reservation for this driver is preferred over a free bay, so the reservation is actually
+    /// consumed rather than left to expire beside the connector they were sent to instead.
+    #[tokio::test]
+    async fn a_reserved_connector_is_preferred_over_a_merely_free_one() {
+        let actor = accepted_actor([2]).await;
+        // Connector 0 stays free; connector 1 is held for this driver.
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 1,
+                    event: ConnectorEvent::Reserved(crate::state::Reservation {
+                        id: crate::state::ReservationId(1),
+                        id_token: test_id_token(),
+                        group_id_token: None,
+                        expires_at: None,
+                    }),
+                },
+            })
+            .await
+            .unwrap();
+
+        handle_request_start_transaction(&actor, Some(0), test_id_token(), None, Some(3)).await;
+
+        assert!(
+            actor.state().evses[0].pending_remote_starts[1].is_some(),
+            "the held start belongs on the connector this driver reserved"
+        );
+        assert!(actor.state().evses[0].pending_remote_starts[0].is_none());
+    }
+
+    /// **F01.FR.22** (CV7): the reservation is held for a *group*, and the CSMS starts for a
+    /// different driver in that group. The rule rejects only when **neither** the idToken nor the
+    /// groupIdToken matches, so this must be accepted - a fleet reservation the fleet cannot use
+    /// is a reservation for nobody.
+    #[tokio::test]
+    async fn a_remote_start_is_accepted_for_another_member_of_the_reserved_group() {
+        let actor = accepted_actor([1]).await;
+        reserve(&actor, "SOMEONE-ELSE", Some("FLEET-7")).await;
+
+        // No cable yet - a reserved bay is by definition one nobody has plugged into - so this is
+        // F02's held form, and the reservation is honoured when the driver arrives.
+        assert_eq!(
+            handle_request_start_transaction(
+                &actor,
+                Some(0),
+                test_id_token(),
+                Some(group_token("FLEET-7")),
+                Some(3),
+            )
+            .await,
+            RequestStartTransactionOutcome::AcceptedPendingCable
+        );
+
+        lock_connector(&actor, 0, 0).await;
+        let transaction = actor.state().evses[0].transactions[0]
+            .clone()
+            .expect("the cable arriving dispatches the held start");
+        assert_eq!(transaction.remote_start_id, Some(3));
+        assert_eq!(
+            transaction.reservation_id,
+            Some(1),
+            "the transaction consumes the reservation it was admitted by"
+        );
+    }
+
+    /// The group has to actually match. A reservation held for one fleet is not a reservation the
+    /// next fleet may walk into.
+    #[tokio::test]
+    async fn a_remote_start_for_a_different_group_is_still_rejected() {
+        let actor = accepted_actor([1]).await;
+        reserve(&actor, "SOMEONE-ELSE", Some("FLEET-7")).await;
+
+        assert_eq!(
+            handle_request_start_transaction(
+                &actor,
+                Some(0),
+                test_id_token(),
+                Some(group_token("FLEET-9")),
+                None,
+            )
+            .await,
+            RequestStartTransactionOutcome::Rejected
+        );
+    }
+
+    /// A reservation with no group, and a request carrying one, must not match on "both absent"
+    /// or on some accidental equality - the idToken is the only thing left to compare.
+    #[tokio::test]
+    async fn a_group_on_the_request_does_not_open_a_reservation_that_has_none() {
+        let actor = accepted_actor([1]).await;
+        reserve(&actor, "SOMEONE-ELSE", None).await;
+
+        assert_eq!(
+            handle_request_start_transaction(
+                &actor,
+                Some(0),
+                test_id_token(),
+                Some(group_token("FLEET-7")),
+                None,
+            )
+            .await,
+            RequestStartTransactionOutcome::Rejected
+        );
+    }
+
+    /// And the reverse: a *grouped* reservation is not opened by a request that names no group.
+    #[tokio::test]
+    async fn a_request_with_no_group_does_not_open_a_grouped_reservation() {
+        let actor = accepted_actor([1]).await;
+        reserve(&actor, "SOMEONE-ELSE", Some("FLEET-7")).await;
+
+        assert_eq!(
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await,
+            RequestStartTransactionOutcome::Rejected
+        );
+    }
+
+    fn group_token(value: &str) -> crate::state::IdToken {
+        crate::state::IdToken {
+            value: value.into(),
+            kind: crate::state::IdTokenKind::Central,
+        }
+    }
+
+    /// Reserves connector 0 for `id_token`, optionally on behalf of a group.
+    async fn reserve(actor: &ChargePointActor, id_token: &str, group: Option<&str>) {
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::Reserved(crate::state::Reservation {
+                        id: crate::state::ReservationId(1),
+                        id_token: crate::state::IdToken {
+                            value: id_token.into(),
+                            kind: crate::state::IdTokenKind::ISO14443,
+                        },
+                        group_id_token: group.map(group_token),
+                        expires_at: None,
+                    }),
+                },
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1189,7 +1495,7 @@ mod tests {
         let actor = accepted_actor([1]).await;
 
         assert_eq!(
-            handle_request_start_transaction(&actor, Some(9), test_id_token(), None).await,
+            handle_request_start_transaction(&actor, Some(9), test_id_token(), None, None).await,
             RequestStartTransactionOutcome::Rejected
         );
     }
@@ -1198,7 +1504,7 @@ mod tests {
     async fn charging_actor() -> ChargePointActor {
         let actor = accepted_actor([1]).await;
         lock_connector(&actor, 0, 0).await;
-        handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await;
+        handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await;
         actor
             .send(ChargePointEvent::Evse {
                 evse_id: 0,
@@ -1238,7 +1544,7 @@ mod tests {
     async fn a_transaction_not_yet_charging_is_rejected() {
         let actor = accepted_actor([1]).await;
         lock_connector(&actor, 0, 0).await;
-        handle_request_start_transaction(&actor, Some(0), test_id_token(), None).await;
+        handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await;
         // Still `Starting` here - the contactor hasn't confirmed closed yet.
 
         let outcome = handle_request_stop_transaction(&actor, TransactionId(0)).await;
@@ -1721,8 +2027,10 @@ mod ocpp_2_1 {
                         .expect("u64 transaction id always fits in a 36-byte wire field"),
                 ),
             ),
-            // F02: accepted, with no transaction to name yet.
-            RequestStartTransactionOutcome::AcceptedPendingCable => {
+            // F02 (no cable yet) and F01.FR.01 (authorizing first): accepted, with no
+            // transaction to name yet. OCPP has one `Accepted` for all three.
+            RequestStartTransactionOutcome::AcceptedPendingCable
+            | RequestStartTransactionOutcome::AcceptedPendingAuthorization => {
                 (RequestStartStopStatusEnum::Accepted, None)
             }
             RequestStartTransactionOutcome::Rejected => {
@@ -1752,6 +2060,9 @@ mod ocpp_2_1 {
                                 &actor,
                                 evse_id,
                                 map_id_token(&request.id_token),
+                                // F01.FR.22: consulted only against a reservation held for a
+                                // group, never recorded on the transaction.
+                                request.group_id_token.as_ref().map(map_id_token),
                                 Some(request.remote_start_id),
                             )
                             .await
@@ -2236,8 +2547,10 @@ pub(crate) mod ocpp_2_0_1 {
                         .expect("u64 transaction id always fits in a 36-byte wire field"),
                 ),
             ),
-            // F02: accepted, with no transaction to name yet.
-            RequestStartTransactionOutcome::AcceptedPendingCable => {
+            // F02 (no cable yet) and F01.FR.01 (authorizing first): accepted, with no
+            // transaction to name yet. OCPP has one `Accepted` for all three.
+            RequestStartTransactionOutcome::AcceptedPendingCable
+            | RequestStartTransactionOutcome::AcceptedPendingAuthorization => {
                 (RequestStartStopStatusEnum::Accepted, None)
             }
             RequestStartTransactionOutcome::Rejected => {
@@ -2265,6 +2578,9 @@ pub(crate) mod ocpp_2_0_1 {
                                 &actor,
                                 evse_id,
                                 map_id_token(&request.id_token),
+                                // F01.FR.22: consulted only against a reservation held for a
+                                // group, never recorded on the transaction.
+                                request.group_id_token.as_ref().map(map_id_token),
                                 Some(request.remote_start_id),
                             )
                             .await
@@ -2885,7 +3201,8 @@ mod ocpp_1_6 {
             // accepted shapes project onto the same status - the distinction only exists in this
             // crate's own outcome type.
             RequestStartTransactionOutcome::Accepted { .. }
-            | RequestStartTransactionOutcome::AcceptedPendingCable => {
+            | RequestStartTransactionOutcome::AcceptedPendingCable
+            | RequestStartTransactionOutcome::AcceptedPendingAuthorization => {
                 RemoteStartTransactionResponseStatus::Accepted
             }
             RequestStartTransactionOutcome::Rejected => {
@@ -2987,6 +3304,10 @@ mod ocpp_1_6 {
                                     &actor,
                                     evse_id,
                                     map_id_token(&request.id_tag),
+                                    // 1.6J's `RemoteStartTransaction` carries an `idTag` alone -
+                                    // no `parentIdTag`, so F01.FR.22's group half cannot be
+                                    // matched on this version and an idToken mismatch refuses.
+                                    None,
                                     // 1.6J's `RemoteStartTransaction` has no `remoteStartId` -
                                     // the field arrived with 2.0. Nothing to correlate, and
                                     // nothing downstream reports one on a 1.6J connection.

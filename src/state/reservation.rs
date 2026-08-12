@@ -34,6 +34,20 @@ pub struct Reservation {
     pub id: ReservationId,
     /// The identifier this reservation is held for.
     pub id_token: IdToken,
+    /// The *group* this reservation is held for, if the CSMS named one - OCPP
+    /// `ReserveNowRequest.groupIdToken` (2.x), `parentIdTag` (1.6J).
+    ///
+    /// A reservation may be honoured by any driver in the group, which is what makes a fleet
+    /// reservation useful: the vehicle that turns up is rarely the one the booking named.
+    /// **F01.FR.22** is the rule - a start is refused only when *neither* the identifier nor the
+    /// group matches - and [`crate::remote_control::handle_request_start_transaction`] is where it
+    /// is applied.
+    ///
+    /// `None` means the reservation names no group, and a request naming one does not match it.
+    /// Absence is not a wildcard in either direction: two reservations with no group are not
+    /// thereby in the same group.
+    #[serde(default)]
+    pub group_id_token: Option<IdToken>,
     /// When this reservation expires, if known. See the struct docs.
     pub expires_at: Option<DateTime<Utc>>,
 }

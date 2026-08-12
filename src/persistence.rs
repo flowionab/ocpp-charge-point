@@ -5163,6 +5163,7 @@ mod tests {
             reservation: Reservation {
                 id: ReservationId(1),
                 id_token: test_id_token(),
+                group_id_token: None,
                 expires_at,
             },
         }
@@ -5306,6 +5307,7 @@ mod tests {
                     event: ConnectorEvent::Reserved(Reservation {
                         id: ReservationId(9),
                         id_token: test_id_token(),
+                        group_id_token: None,
                         expires_at: None,
                     }),
                 },

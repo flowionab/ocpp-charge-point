@@ -1063,7 +1063,25 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         unit: None,
         value: "false",
         mutability: VariableMutability::ReadWrite,
-        honoured: false,
+        // CV7: read into `ConnectorPolicy::authorize_remote_start` and honoured by
+        // `ConnectorState::apply` (F01.FR.01 vs F01.FR.02).
+        honoured: true,
+        persistent: true,
+    },
+    DefaultVariable {
+        component: "AuthCtrlr",
+        variable: "DisableRemoteAuthorization",
+        instance: None,
+        data_type: VariableDataType::Boolean,
+        unit: None,
+        // Off: an unconfigured station asks the CSMS, which is the only source that can refuse a
+        // card in real time. Turning it on is a deliberate decision to run on locally-held lists.
+        value: "false",
+        mutability: VariableMutability::ReadWrite,
+        // CV7: read by `crate::authorization::remote_authorization_disabled`.
+        honoured: true,
+        // An operator who has decided this station decides locally means it to survive a reboot -
+        // the reboot is exactly when a station would otherwise resume asking.
         persistent: true,
     },
     // --- recorded: readable and writable, but not yet consulted by this crate ---

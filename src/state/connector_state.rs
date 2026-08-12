@@ -213,6 +213,17 @@ pub(crate) struct ConnectorPolicy {
     /// `TxCtrlr.MaxEnergyOnInvalidId`, in Wh - the last allowance granted when
     /// `stop_tx_on_invalid_id` is off. `None`/`0` means no allowance, which stops immediately.
     pub max_energy_on_invalid_id_wh: Option<i64>,
+    /// `AuthCtrlr.AuthorizeRemoteStart` - **F01.FR.01 vs F01.FR.02** (CV7).
+    ///
+    /// `false` (this crate's default): a `RequestStartTransaction` starts the transaction
+    /// immediately, and the CSMS checks the identifier when it processes the resulting
+    /// `TransactionEvent` - F01.FR.02's path, and one fewer round trip.
+    /// `true`: the request is authorized first, exactly as a card presented at the reader is, and
+    /// energy transfer waits for that answer - F01.FR.01.
+    ///
+    /// Never consulted for an identifier whose kind is exempt; see
+    /// [`IdTokenKind::requires_authorization`](crate::state::IdTokenKind::requires_authorization).
+    pub authorize_remote_start: bool,
 }
 
 impl Default for ConnectorPolicy {
@@ -228,6 +239,10 @@ impl Default for ConnectorPolicy {
             // not keep drawing energy nobody will be billed for.
             stop_tx_on_invalid_id: true,
             max_energy_on_invalid_id_wh: None,
+            // F01.FR.02, and what this crate did before the variable was honoured at all: the
+            // CSMS's own request stands as the decision, and it re-checks the identifier when the
+            // `TransactionEvent` reaches it.
+            authorize_remote_start: false,
         }
     }
 }
@@ -317,6 +332,18 @@ impl ConnectorState {
             }
             (Self::Locked, ConnectorEvent::RemoteUnlockRequested) => {
                 (Self::Unlocking, Some(ConnectorCommand::Unlock))
+            }
+            // F01.FR.01 (CV7): the operator asked for a remote start to be authorized like a local
+            // one, so the connector waits for a decision instead of closing the contactor. The
+            // path from here is byte-for-byte the one a presented card takes - `Authorizing`, then
+            // `ChargingAuthorized`/`AuthorizationDenied` - which is what the requirement means by
+            // "behave as if in response to a local action".
+            //
+            // Checked before the immediate-start arm because it is the narrower rule.
+            (Self::Locked, ConnectorEvent::RemoteStartRequested { ref id_token, .. })
+                if policy.authorize_remote_start && id_token.kind.requires_authorization() =>
+            {
+                (Self::Authorizing, None)
             }
             (Self::Locked, ConnectorEvent::RemoteStartRequested { .. }) => {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))

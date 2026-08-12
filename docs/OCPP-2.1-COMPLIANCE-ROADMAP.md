@@ -85,16 +85,16 @@ cleared.
 | ID | Item | Requirements | Status |
 |---|---|---|---|
 | **CV2.1** | `DefaultVariable::honoured` — the table now records *both* what OCPP says about writing a variable and whether this build acts on it; `false` forces the registration to `ReadOnly`, so the write is `Rejected`. 30 of 49 defaults were decorative; all now refuse. | B05.FR.09 | **done** |
-| **CV2.2** | `TxCtrlr.TxStartPoint` — honoured via `ConnectorPolicy::tx_start_point`. **`TxStopPoint` is still refused** (see below). | E01, E02, E03 | **partial** |
-| **CV2.3** | `TxCtrlr.EVConnectionTimeOut` — a held remote start whose driver never plugs in is released by `run_pending_remote_start_timeouts`, wired into `setup()` on a 5s sweep. **E03.FR.15** (the same timeout applied to a *locally* presented card that is never followed by a cable) is **not** covered. | F02.FR.07/08 | **partial** |
-| **CV2.4** | `TxCtrlr.StopTxOnEVSideDisconnect` — the suspend-vs-stop branch on cable removal, via `ConnectorPolicy`. `UnlockOnEVSideDisconnect` (the unlock half) is **still open**. | **E09 vs E10** | **partial** |
-| **CV2.5** | `TxCtrlr.StopTxOnInvalidId`, `MaxEnergyOnInvalidId` — a new `ConnectorEvent::AuthorizationRevoked` either stops at once or grants the configured last allowance, ending with `stoppedReason = DeAuthorized`. **The event has no producer yet** — see below. | E05 | **partial** |
-| **CV2.6** | Measurand configuration — `SampledDataCtrlr.Tx{Started,Updated,Ended}Measurands` + intervals, `AlignedDataCtrlr.Measurands`/`TxEndedMeasurands`/`TxEndedInterval`. Largest row in CV2. **Design decided; groundwork landed, filter not yet applied — see below.** | J01, J02, J03, F01.FR.14/15 | **partial** |
-| **CV2.7** | `ChargingStation.MinimumStatusDuration` — status debouncing. | G01 | open |
-| **CV2.8** | `DeviceDataCtrlr` / `LocalAuthListCtrlr` `ItemsPerMessage`/`BytesPerMessage` — refuse oversized requests with `OccurrenceConstraintViolation`/`FormatViolation`. | B05, B06.FR.16/17, B07, B08, D01 | open |
+| **CV2.2** | `TxCtrlr.TxStartPoint` **and `TxStopPoint`** — both honoured via `ConnectorPolicy`; the stop point is read by `ends_transaction`. | E01, E02, E03 | **done** |
+| **CV2.3** | `TxCtrlr.EVConnectionTimeOut` — a held authorization whose driver never plugs in is released by `run_pending_remote_start_timeouts`, wired into `setup()` on a 5s sweep. Covers **both** F02's held remote start and **E03.FR.15**'s locally presented card, which share one slot. | E03.FR.15, F02.FR.07/08 | **done** |
+| **CV2.4** | `TxCtrlr.StopTxOnEVSideDisconnect` — the suspend-vs-stop branch on cable removal, via `ConnectorPolicy` — **and `OCPPCommCtrlr.UnlockOnEVSideDisconnect`**, the unlock half, via the `StoppingLocked` state. | **E09 vs E10**, E09.FR.02/.03 | **done** |
+| **CV2.5** | `TxCtrlr.StopTxOnInvalidId`, `MaxEnergyOnInvalidId` — `ConnectorEvent::AuthorizationRevoked` either stops at once or grants the configured last allowance, ending with `stoppedReason = DeAuthorized`. Raised by `deliver_transaction_event` from a rejected `idTokenInfo` on a live session. | E05 | **done** |
+| **CV2.6** | Measurand configuration — `SampledDataCtrlr.Tx{Started,Updated,Ended}Measurands`, `AlignedDataCtrlr.Measurands`. Largest row in CV2. The 2.x adapters filter sampled values by the configured list, re-read per message. The four `*Interval` variables stay refused (see below). | J01, J02, J03, F01.FR.14/15 | **done** |
+| **CV2.7** | `ChargingStation.MinimumStatusDuration` — status debouncing, via `MinimumStatusDurationNotifier` (`src/availability.rs`). A status the connector has already left is dropped without waiting, so a bouncing connector costs one window rather than one per bounce; `0` short-circuits the path entirely. | G01 | **done** |
+| **CV2.8** | `DeviceDataCtrlr` / `LocalAuthListCtrlr` `ItemsPerMessage`/`BytesPerMessage` — `GetVariables`, `SetVariables`, `GetReport`, `SendLocalList` and `SetVariableMonitoring` refuse an oversized request with `OccurrenceConstraintViolation` (items) or `FormatViolation` (bytes), naming the variable and both numbers (`src/message_limits.rs`). | B05, B06.FR.16/17, B07, B08, D01 | **done** |
 | **CV2.9** | `AuthCtrlr.OfflineTxForUnknownIdEnabled` — an identifier neither the list nor the cache knows is now accepted offline when the operator opted in, and refused otherwise. Does not override a known rejection. | C15 | **done** |
 | **CV2.10** | `SecurityCtrlr.OrganizationName` → the CSR's `O=` RDN, via `CsrSubject::with_organization_name_from_device_model`. A caller-supplied name always wins — the variable is CSMS-writable, so letting it override would let a remote peer redirect which organization the next certificate is issued under. | A02, A03, A00.FR.509 | **done** |
-| **CV2.11** | `PaymentCtrlr` live status variables — needs a terminal-status hardware surface. Tracked in `docs/CERTIFICATION.md` §3 as a product-level blocker. | C18–C24 | open |
+| **CV2.11** | `PaymentCtrlr` live status variables — a default-implemented `PaymentTerminal::status()` lets an integrator with a real terminal drive `Connected`/ICCID/IMSI/`Merchant`, and leaves a station without one reporting honestly. Mirrors how `ChargePoint::electrical()` landed in CV1.5. | C18–C24 | **done** |
 
 ### CV2.2 — what landed, and the one decision worth knowing
 
@@ -113,10 +113,17 @@ transactions at some *other* point — the silent lie B05.FR.09 forbids. Declari
 work makes CV3's validation reject the rest with a reason, and `values_list` is exactly where a
 charge point is supposed to say what it accepts.
 
-**`TxStopPoint` is still `honoured: false` and still refuses writes.** Stopping is not the mirror
-image of starting: a stop point is a condition that *ceases* to hold, and this crate's stop path is
-driven by an explicit `ChargingStopped` from the binding rather than by observing each condition
-lapse. Doing it properly is its own row.
+**`TxStopPoint` is honoured too, and it is not the mirror image of `TxStartPoint`.** A start point
+is a condition that *begins* to hold and OCPP starts once every configured one does — so a set
+resolves to its *latest* member. A stop point is a condition that *ceases* to hold, and a
+transaction cannot outlive the first of its conditions to lapse — so a set resolves to its
+**earliest**. `TxStopPoint::from_member_list` therefore takes the minimum where its start-point
+counterpart takes the maximum, and `ends_transaction` applies it.
+
+One combination OCPP itself warns about is reachable: `EVConnected` on a station with
+`UnlockOnEVSideDisconnect = false` leaves the transaction open forever, because the cable is
+deliberately never released. OCPP puts responsibility for sensible start/stop combinations on the
+CSMS, and this crate does not second-guess a configuration it was told to honour.
 
 ### CV2.3 — where the timing lives, and why not on the request
 
@@ -129,6 +136,15 @@ on it.
 
 The cost is stated rather than hidden: a request is released between `EVConnectionTimeOut` and that
 plus one sweep interval. `setup()` sweeps every 5s against a 120s default.
+
+**E03.FR.15 needed no second mechanism.** A card presented on a connector with no cable is held in
+the same `pending_remote_starts` slot a `RequestStartTransaction` is, so one sweep covers both: a
+driver who authorizes and walks away is deauthorized rather than leaving a live authorization for
+whoever plugs in next.
+
+What the sweep must *not* touch is a hold on a connector whose cable is already in — CV7's
+authorize-first remote start waits there on the CSMS, not on a driver. `held_starts_awaiting_a_cable`
+draws that line; the variable times how long to wait for the EV to connect, and the EV has.
 
 **A real bug fell out of testing this.** Recording a held request produced `changed: false` — it
 arrives on an idle connector and moves nothing — so the actor never published the new state and
@@ -145,11 +161,11 @@ A target the meter has to reach is the same answer however the samples arrive.
 `StopTxOnInvalidId: false` with no allowance configured stops immediately rather than charging
 forever — there is nothing to grant.
 
-**What is still missing is the trigger.** `ConnectorEvent::AuthorizationRevoked` is handled
-correctly but nothing raises it: the crate does not yet inspect a `TransactionEventResponse`'s
-`idTokenInfo` for a rejection on a session already underway. Until that lands, E05 works for an
-integrator who raises the event themselves and not from the CSMS's own refusal. That is the next
-row.
+**The trigger is `deliver_transaction_event`.** A CSMS blocklist update lands mid-session as a
+rejected `idTokenInfo` on the response to an ordinary `Updated` event, and that raises
+`ConnectorEvent::AuthorizationRevoked` — so E05 works from the CSMS's own refusal, not only from an
+integrator raising the event themselves. Raised at most once per session, because the state machine
+ignores a second revocation on a connector that has already left `Charging`.
 
 ### CV2.6 — the two decisions, settled
 
@@ -189,18 +205,21 @@ table is held to.
   firmware produces, so a `SetVariables` naming any other measurand is now `Rejected` with a reason
   rather than accepted and never sampled — that part of CV2.6 is live today.
 
-### Remaining work for CV2.6
+### CV2.6 — what closed it
 
 - `build_meter_values`/`sampled_values` take a `MeasurandSet` in both 2.x adapters (1.6J is out of
   scope — its `MeterValuesSampledData` is a different mechanism).
-- **The notifiers hold the actor.** This is the part that stalled and it is a *breaking* change, not
-  a threading exercise: `Ocpp2_1MeterValuesNotifier::with_clock` and its three siblings are public
-  constructors, so each gains a `ChargePointActor` parameter and every call site follows. Budget for
-  the API break and a CHANGELOG entry.
-- An empty set must produce **no `MeterValue` at all**, not a `MeterValue` carrying an empty list of
+- **The notifiers hold the actor**, so the config is re-read per message and a CSMS changing a
+  measurand list takes effect on the next event. This was the *breaking* part: `with_clock` and its
+  three siblings are public constructors and each gained a `ChargePointActor` parameter.
+  `connect_and_setup` builds them from the actor, so the default path filters; `setup()` called
+  directly with a bare client cannot (one object for 45 traits has no device model to consult), and
+  says so in its docs.
+- An empty set produces **no `MeterValue` at all**, not a `MeterValue` carrying an empty list of
   readings — the latter says nothing and still costs a wire round trip.
-- The four `*Interval` variables are a separate concern (how *often* to sample, not *what*) and stay
-  refused under CV2.1 until something drives them.
+- **The four `*Interval` variables stay refused**, and that is the one part of the row deliberately
+  left open: they are a different concern (how *often* to sample, not *what*), and nothing drives
+  them yet.
 
 ## CV3 — `SetVariables` value validation
 
@@ -292,7 +311,7 @@ never synced reads as `u64::MAX` and sweeps, same reasoning.
 Closes audit §2.6. Carry `remoteStartId`, `reservationId` and `offline` on `Transaction` and populate
 them on the wire; derive `triggerReason = RemoteStart` for a remotely started transaction instead of
 the hardcoded `Authorized`. Mechanical, and it unblocks E12 and the H03 reservation link.
-Requirements: F01.FR.19/.25, F02.FR.01/.06/.21. Status: **done**, except `offline`.
+Requirements: F01.FR.19/.25, F02.FR.01/.06/.21. Status: **done**.
 
 `remoteStartId` and `reservationId` are now carried on `Transaction` and quoted on every event it
 produces, and `triggerReason` derives `RemoteStart` from the presence of a `remoteStartId` — which
@@ -305,15 +324,17 @@ left to read. `EvseState::honoured_reservations` bridges that gap — the id out
 until the connector returns to `Available`, without keeping a spent reservation in the store where
 it would look reservable.
 
-**`offline` is not done and is now CV6.1.** OCPP's `offline` flag means the event was generated
-while the CSMS was unreachable, but the wire message is built at *send* time — inside the queue's
-flush — so the encoder cannot see whether the event it is encoding was queued. Wiring it needs the
-queue to tell the encoder, which is a change to the forwarding contract rather than a field to
-populate. E12 stays open on it.
+**`offline` (CV6.1) closed by changing the forwarding contract, not by populating a field.** OCPP's
+`offline` flag means the event was generated while the CSMS was unreachable, but the wire message is
+built at *send* time — inside the queue's flush — so the encoder could not see whether the event it
+was encoding had been queued. `OfflineQueue::marking_offline` is the answer: the queue stamps every
+message it has had to hold, `ChargePointBuilder` wires that stamp to
+`TransactionEventOccurred::offline`, and the encoder reads a field that is true by the time it gets
+there. E12 is unblocked.
 
 ## CV7 — `RequestStartTransaction` acceptance rules and F02
 
-Closes audit §2.7. Status: **mostly done** — F02 works; the timeout does not.
+Closes audit §2.7. Status: **done**.
 
 **F02 now works at all, which it did not before.** A `RequestStartTransaction` for a connector with
 no cable is accepted and held (`EvseState::pending_remote_starts`); when the driver plugs in and the
@@ -327,13 +348,55 @@ The rejection conditions F01.FR.21–.24 name are now checked explicitly rather 
 already-authorized transaction, or a reservation held for a different identifier. A latched
 connector is preferred over an idle one, so the common case still starts immediately.
 
-**Still open, and split out rather than glossed:**
+### CV7 — the authorize-or-not branch (F01.FR.01/.02)
 
-- **F01.FR.22's group-id half** — this crate's `Reservation` models an `idToken` only, so a
-  `groupIdToken` match cannot be distinguished. An idToken mismatch already refuses, which is the
-  conservative side of that rule.
-- **`AuthorizeRemoteStart` / `DisableRemoteAuthorization`** (F01.FR.01/.02) — the authorize-or-not
-  branch is untouched.
+`AuthCtrlr.AuthorizeRemoteStart` is now honoured through `ConnectorPolicy`. Off (the default) is
+F01.FR.02: the CSMS's own request stands as the decision and it re-checks the identifier when the
+`TransactionEvent` reaches it. On is F01.FR.01: the connector goes to `Authorizing` instead of
+`Starting`, takes byte-for-byte the path a presented card takes, and the contactor waits — which is
+what "behave as if in response to a local action" means.
+
+`Central` and `NoAuthorization` identifiers are exempt however the variable is set
+(`IdTokenKind::requires_authorization`), because a `Central` token *is* the CSMS's own decision and
+`NoAuthorization` names a bay that authorizes nobody.
+
+**The `remoteStartId` had to be made to survive the round trip.** The transaction does not exist
+until the decision comes back, so the id is held in the connector's pending slot and read at
+transaction start — the same gap `honoured_reservations` bridges for a reservation id. It is dropped
+on refusal, or it would attach itself to whatever the next driver starts on that connector. A new
+`AcceptedPendingAuthorization` outcome distinguishes this from `AcceptedPendingCable`; both project
+onto OCPP's `Accepted`.
+
+**`AuthCtrlr.DisableRemoteAuthorization` is a different question and gets its own path.** Despite
+the name it has nothing to do with remote *starts*: it forbids issuing `AuthorizeRequest`s at all,
+leaving the local authorization list and the authorization cache as the only sources. It is
+deliberately not implemented as "pretend to be offline" — two of `offline_decision`'s three switches
+describe outage behaviour and would be wrong here, so `local_only_decision` is separate.
+`LocalAuthorizeOffline` does not gate it (the link is not down); `AuthCacheCtrlr.Enabled` does (a
+disabled cache is not a source); `OfflineTxForUnknownIdEnabled` does not (there is no outage to
+strand anyone in). A Plug & Charge presentation is refused rather than answered locally, for the
+same reason the offline contract path refuses.
+
+### CV7 — F01.FR.22's group half, and the bug underneath it
+
+`Reservation` now carries `group_id_token`, from `ReserveNowRequest.groupIdToken` (2.x) or
+`parentIdTag` (1.6J — the same field under an older name). A start is refused only when *neither*
+the identifier nor the group matches. Absence is not a wildcard in either direction: two
+reservations naming no group are not thereby in the same group. 1.6J's `RemoteStartTransaction`
+carries no parent tag, so on that version an idToken mismatch still refuses.
+
+**Implementing it surfaced two real defects, both older than this row:**
+
+- **The FR.21/.22 identity check was unreachable.** `can_start_here` excluded `ConnectorState::
+  Reserved` by state before ever comparing identifiers, so a reservation refused a remote start from
+  the very driver it was made for — the one thing a reservation exists to enable. `Reserved` is now
+  an admissible state subject to the match, and a bay this driver reserved is preferred over a
+  merely free one so the reservation is consumed rather than stranded.
+- **Any event landing on a reserved connector wiped the reservation record.** `*slot =
+  reservation_made` ran on every event that left the connector `Reserved`, and only
+  `ConnectorEvent::Reserved` carries one — so an idle connector's next meter sample left the bay
+  reserved with nothing saying for whom. Now only an event that actually carries a reservation
+  records one.
 
 ## CV8 — Tariff pricing model and local cost calculation
 
@@ -374,9 +437,9 @@ itself.
 
 | ID | Item | Requirements | Status |
 |---|---|---|---|
-| **CV9** (done) | `SignCertificate` retry discipline: resend after `CertSigningWaitMinimum`, doubling the back-off, stopping at `CertSigningRepeatTimes` until a `TriggerMessage` restarts it. Register both variables. `MaxCertificateChainSize` (a MAY) alongside. | A02.FR.17–.19, A03.FR.17–.19 | open |
+| **CV9** | `SignCertificate` retry discipline: resend after `CertSigningWaitMinimum`, doubling the back-off, stopping at `CertSigningRepeatTimes` until a `TriggerMessage` restarts it. Register both variables. `MaxCertificateChainSize` (a MAY) alongside. | A02.FR.17–.19, A03.FR.17–.19 | **done** |
 | **CV10** | **done** — make `NetworkConfiguration.BasicAuthPassword` writable — apply a new password to the connection and reconnect (A01.FR.02) — and log the change in the security log without disclosing the value. CV1.3 registered the variable and refuses the write; this is what makes the write real. | A01.FR.02, A01.FR.04, A01.FR.11/.12 | **done** |
-| **CV11** | A lock-failure signal distinct from a generic fault. | G05 | open |
+| **CV11** | A lock-failure signal distinct from a generic fault: `ConnectorEvent::LockFailed` takes the identical fail-safe path a fault does (G05.FR.01 is precisely "SHALL NOT start charging"), and what makes it distinguishable to the CSMS is the connector's `ConnectorPlugRetentionLock`/`Problem` variable and the hard-wired `NotifyEvent` that go with it (G05.FR.02) — not a different connector state, there being no safer state than the one a fault already produces. | G05 | **done** |
 
 ## CV12 — Requirement-level sweeps for the unverified blocks
 
@@ -401,12 +464,27 @@ Status: **open**.
 CV1.1 ──┬─> CV5
         └─> (B07 SummaryInventory)
 CV1.3 ────> CV10
-CV2.1 ────> CV2.2 … CV2.10   (each flips one variable from refused to honoured)
+CV2.1 ────> CV2.2 … CV2.11   (each flips one variable from refused to honoured)
 CV2.3 ────> CV7
 CV3, CV4, CV6, CV9, CV11      independent
 CV8                            independent, largest
 CV12                           continuous, in parallel
 ```
 
+Everything above the line is done. **CV12 is the only row of this document still open**, plus the
+`*Interval` variables noted below.
+
 An OCTT run (`docs/PRODUCTION-ROADMAP.md` H3.1) is worth doing once CV1–CV7 are closed. Before that
 it would mostly restate this document.
+
+**CV1–CV7 are now closed**, so that run is the next thing this workstream is waiting on rather than
+a future one. What remains here is CV12's requirement-level sweeps — which build nothing and are
+better informed by a real test-tool run than preceding one — and, outside this document, the two
+`crate::hardware` additions `docs/CERTIFICATION.md` §3 names as outright blockers (a DER actuation
+surface, and the payment terminal work CV2.11 only half-answers). Neither blocks Core, Reservation,
+Local Authorization List Management or Smart Charging, which is what an OCTT run should take first
+(`docs/CERTIFICATION.md` §4).
+
+One caveat on the four `*Interval` variables under CV2.6: they remain refused, so a station is
+conformant in *what* it samples but not yet configurable in *how often*. That is a known, declared
+refusal rather than a silent one, which is what B05.FR.09 asks for.

@@ -66,6 +66,18 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   them; `NoKeyStore` refuses all three and `SoftKeyStore` persists them through `Storage` the same
   way it does keys. See the trait's module docs, "Credentials are not key material", for why this
   does not undermine the no-export invariant the rest of the trait exists to protect.
+- `remote_control::handle_request_start_transaction` takes the request's `groupIdToken`, and
+  `reservation::handle_reserve_now` takes the reservation's, as a new `state::Reservation::
+  group_id_token` field (CV7, F01.FR.22). Struct literals of `Reservation` must add the field;
+  persisted records written before this decode as `None`.
+- New `RequestStartTransactionOutcome::AcceptedPendingAuthorization` variant (CV7, F01.FR.01);
+  exhaustive matches over that enum must handle it. It projects onto OCPP's `Accepted` exactly as
+  its two sibling accepted outcomes do.
+- A `RequestStartTransaction` is no longer refused outright on a `Reserved` connector (CV7,
+  F01.FR.21/.22). The identity comparison those requirements are *about* was previously
+  unreachable, so a reservation refused a remote start from the very driver it was made for. A
+  reservation now admits a request whose `idToken` or `groupIdToken` matches, and a bay this
+  driver reserved is preferred over a merely free one.
 - `device_model::SetVariablesHandler::register_set_variables_handler` and
   `device_model::handle_set_variables` take a `hardware::KeyStore` (CV10) — see "Added" below for
   what it is now used for. `ChargePointBuilder::configuration`/`device_model` pass
@@ -102,6 +114,19 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   `OfflineTxForUnknownIdEnabled` are honoured rather than merely stored (CV2).
 - `RequestStartTransaction` with no cable yet is accepted and held until the driver plugs in —
   OCPP's F02, which previously did not work at all (CV7).
+- `AuthCtrlr.AuthorizeRemoteStart` is honoured (CV7, F01.FR.01/.02). Off — the default — keeps the
+  previous behaviour exactly: the CSMS's own request is the authorization decision. On, a
+  `RequestStartTransaction` takes the same path a card presented at the reader does, and the
+  contactor waits for the answer; the request is still answered `Accepted` immediately, as the
+  requirement's own note describes. `Central` and `NoAuthorization` identifiers are exempt either
+  way. The `remoteStartId` survives the round trip, so the resulting transaction still reports
+  `triggerReason = RemoteStart` and quotes the id (F01.FR.25).
+- `AuthCtrlr.DisableRemoteAuthorization` is registered and honoured (CV7). When set, the charge
+  point issues no `AuthorizeRequest` at all and decides from the local authorization list and the
+  authorization cache alone, refusing anything neither knows. Distinct from every offline switch:
+  those describe what to do when the CSMS *cannot* be reached, this one is an instruction not to
+  reach for it. A Plug & Charge presentation is refused rather than decided locally, since C07
+  puts contract validation at the CSMS.
 - `PaymentCtrlr`'s live status variables are driven by real hardware (CV2.11, C18–C24). New
   **default-implemented** `hardware::PaymentTerminal::status()` returns a `PaymentTerminalStatus`
   — `Connected`, `Problem`, `ICCID`, `IMSI` and the five `Merchant` instances — applied at
@@ -160,6 +185,20 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   transaction's true start (no meter history exists to back-price against once it wasn't), and the
   bare `OCPP2_1Client` `TransactionNotifier` impl has no `ChargePointActor` to price against and
   reports no cost at all, mirroring its existing measurand-list limitation.
+
+### Fixed
+
+- **A reservation was erased by the next event that touched its connector.** The reservation
+  record was reassigned on every event that left the connector `Reserved`, and only
+  `ConnectorEvent::Reserved` carries one — so the first meter sample an idle connector's hardware
+  pushed left the bay reserved with nothing recording who for. `GetCompositeSchedule`,
+  `CancelReservation` and the CSMS-facing state all then saw an unreserved-looking bay that no
+  driver could use. Only an event actually carrying a reservation records one now.
+- **A held remote start awaiting authorization is no longer swept as a driver who never arrived.**
+  `TxCtrlr.EVConnectionTimeOut` times how long to wait for the EV to connect; a connector whose
+  cable is already latched is waiting on the CSMS instead, and releasing its hold would deauthorize
+  a session for the one reason that demonstrably did not happen. Only reachable together with
+  CV7's new `AuthorizeRemoteStart` path.
 
 ## [0.1.0] — 2026-08-10
 

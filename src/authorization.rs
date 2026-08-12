@@ -21,6 +21,20 @@
 //! with a guessed fallback, so "what will you do offline?" is a question the CSMS can actually
 //! ask.
 //!
+//! # Not asking at all
+//!
+//! `AuthCtrlr.DisableRemoteAuthorization` (CV7) is a different question from every switch above,
+//! and the difference is worth stating because the two look alike from the outside. The offline
+//! switches describe what to do when the CSMS *cannot* be reached; this one is an operator
+//! instruction never to reach for it, on a station whose link is perfectly healthy. When it is
+//! set, [`local_only_decision`] answers from the local authorization list and the authorization
+//! cache and refuses anything neither knows - and no `Authorize` is sent, which is the point.
+//!
+//! It is deliberately not implemented by pretending to be offline: two of [`offline_decision`]'s
+//! three switches describe outage behaviour and would be wrong here, so it has its own function
+//! rather than a flag threaded through that one. See [`local_only_decision`] for which switch
+//! survives the distinction and why.
+//!
 //! # Plug & Charge (OCPP use case C07)
 //!
 //! An identifier that arrived with an ISO 15118 contract certificate takes a different path
@@ -149,6 +163,60 @@ pub fn offline_decision(
                 "authorizing an unknown identifier offline: OfflineTxForUnknownIdEnabled is set"
             );
             AuthorizationStatus::Accepted
+        }
+        None => AuthorizationStatus::Rejected,
+    }
+}
+
+/// Whether `AuthCtrlr.DisableRemoteAuthorization` forbids asking the CSMS at all (CV7).
+///
+/// Distinct from every offline switch in this module: those describe what to do when the CSMS
+/// *cannot* be reached, this one is an operator instruction not to reach for it in the first
+/// place. OCPP's own note draws the same line against `AuthCacheCtrlr.DisablePostAuthorization`,
+/// which only suppresses re-authorizing a token already known to be refused.
+fn remote_authorization_disabled(state: &ChargePointState) -> bool {
+    boolean_variable(state, "AuthCtrlr", "DisableRemoteAuthorization", false)
+}
+
+/// The decision to reach when [`remote_authorization_disabled`] holds: the local authorization
+/// list, then the authorization cache, then refusal.
+///
+/// Deliberately **not** [`offline_decision`], though the two consult the same two sources in the
+/// same order. Two of that function's three switches are about being offline and would be wrong
+/// here:
+///
+/// - `AuthCtrlr.LocalAuthorizeOffline` answers "may this station decide for itself while the link
+///   is down?". The link is not down; the operator has said what to decide from. Honouring it
+///   would let an unrelated variable silently turn this one off.
+/// - `AuthCtrlr.OfflineTxForUnknownIdEnabled` grants energy to an *unknown* identifier rather than
+///   strand a driver mid-outage. There is no outage to be stranded by, so an identifier neither
+///   source knows is simply refused.
+///
+/// `AuthCacheCtrlr.Enabled` *is* honoured, because a disabled cache is not a source at all.
+fn local_only_decision(
+    state: &ChargePointState,
+    id_token: &IdToken,
+    now: Option<DateTime<Utc>>,
+) -> AuthorizationStatus {
+    if let Some(entry) = state
+        .local_authorization_list
+        .entries
+        .iter()
+        .find(|entry| entry.id_token.value == id_token.value)
+    {
+        tracing::debug!("deciding from the local authorization list: the CSMS is not to be asked");
+        return entry.status;
+    }
+    if !boolean_variable(state, "AuthCacheCtrlr", "Enabled", true) {
+        return AuthorizationStatus::Rejected;
+    }
+    match state
+        .authorization_cache
+        .lookup(id_token, now, cache_life_time_secs(state))
+    {
+        Some(entry) => {
+            tracing::debug!("deciding from the authorization cache: the CSMS is not to be asked");
+            entry.status
         }
         None => AuthorizationStatus::Rejected,
     }
@@ -321,12 +389,20 @@ pub async fn run_authorization_requests<A: Authorizer + Sync, C: Clock>(
 
 /// The ordinary (card, app, EIM) authorization decision: ask the CSMS, remember what it said, and
 /// fall back to [`offline_decision`] if the call itself failed.
+///
+/// Unless `AuthCtrlr.DisableRemoteAuthorization` says not to ask at all, in which case the answer
+/// comes from [`local_only_decision`] and nothing is cached - there is no CSMS decision to record,
+/// and writing the station's own local answer back into the cache would let it harden into
+/// evidence it was never given.
 async fn plain_decision<A: Authorizer + Sync>(
     authorizer: &A,
     actor: &ChargePointActor,
     id_token: &IdToken,
     now: Option<DateTime<Utc>>,
 ) -> AuthorizationStatus {
+    if remote_authorization_disabled(&actor.state()) {
+        return local_only_decision(&actor.state(), id_token, now);
+    }
     match authorizer.authorize(id_token).await {
         Ok(status) => {
             cache_decision(actor, id_token, status, now).await;
@@ -361,6 +437,17 @@ async fn contract_decision<A: Authorizer + Sync>(
     contract: ContractCertificate,
     now: Option<DateTime<Utc>>,
 ) -> AuthorizationStatus {
+    // The same refusal the offline branch below reaches, by the same reasoning: C07 puts contract
+    // validation at the CSMS, and a station forbidden to ask cannot establish that the contract
+    // behind the eMAID is still valid. The local list and cache hold decisions about *tokens*, and
+    // an accepted eMAID is not evidence of an unrevoked contract.
+    if remote_authorization_disabled(&actor.state()) {
+        tracing::warn!(
+            "refusing a Plug & Charge presentation: AuthCtrlr.DisableRemoteAuthorization forbids \
+             asking the CSMS, and this charge point cannot validate a contract certificate itself"
+        );
+        return AuthorizationStatus::Rejected;
+    }
     let contract = withhold_chain_unless_allowed(&actor.state(), contract);
     match authorizer.authorize_contract(id_token, &contract).await {
         Ok(authorization) => {
@@ -2046,6 +2133,274 @@ mod offline_tests {
         assert_eq!(
             handle_clear_cache(&actor).await,
             ClearCacheOutcome::Rejected
+        );
+    }
+}
+
+/// `AuthCtrlr.DisableRemoteAuthorization` (CV7): the operator told this station to stop asking the
+/// CSMS at all and decide from what it already holds.
+#[cfg(test)]
+mod disable_remote_authorization_tests {
+    use super::{Authorizer, ContractAuthorization, run_authorization_requests};
+    use crate::actor::ChargePointActor;
+    use crate::executor::TokioExecutor;
+    use crate::state::{
+        AuthorizationRequested, AuthorizationStatus, ChargePointEvent, ConnectorEvent,
+        ConnectorState, ContractCertificate, DeviceModelEvent, EvseEvent, IdToken, IdTokenKind,
+        LocalListEntry, VariableAttributeType,
+    };
+    use crate::sync::broadcast_channel;
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    fn token(value: &str) -> IdToken {
+        IdToken {
+            value: value.into(),
+            kind: IdTokenKind::ISO14443,
+        }
+    }
+
+    /// Accepts everything, and records whether it was asked at all - which is the whole point of
+    /// the variable under test: not what the CSMS would have said, but that it was never consulted.
+    struct RecordingAuthorizer {
+        asked: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Authorizer for RecordingAuthorizer {
+        type Error = core::convert::Infallible;
+
+        async fn authorize(&self, _id_token: &IdToken) -> Result<AuthorizationStatus, Self::Error> {
+            self.asked.store(true, Ordering::SeqCst);
+            Ok(AuthorizationStatus::Accepted)
+        }
+
+        async fn authorize_contract(
+            &self,
+            _id_token: &IdToken,
+            _contract: &ContractCertificate,
+        ) -> Result<ContractAuthorization, Self::Error> {
+            self.asked.store(true, Ordering::SeqCst);
+            Ok(ContractAuthorization {
+                status: AuthorizationStatus::Accepted,
+                certificate_status: None,
+            })
+        }
+    }
+
+    async fn set_variable(actor: &ChargePointActor, component: &str, variable: &str, value: &str) {
+        let _ = actor
+            .send(ChargePointEvent::DeviceModel(
+                DeviceModelEvent::AttributeValueSet {
+                    component: crate::state::Component {
+                        name: component.into(),
+                        instance: None,
+                        evse: None,
+                    },
+                    variable: crate::state::Variable {
+                        name: variable.into(),
+                        instance: None,
+                    },
+                    attribute_type: VariableAttributeType::Actual,
+                    value: value.into(),
+                },
+            ))
+            .await;
+    }
+
+    /// A connector in `Authorizing` with `DisableRemoteAuthorization` already set, so the only
+    /// thing left to vary per test is what the station locally knows about the token.
+    async fn locally_deciding_actor() -> ChargePointActor {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        set_variable(&actor, "AuthCtrlr", "DisableRemoteAuthorization", "true").await;
+        for event in [
+            ConnectorEvent::CableConnected,
+            ConnectorEvent::LockConfirmed,
+            ConnectorEvent::IdTokenPresented(token("A")),
+        ] {
+            actor
+                .send(ChargePointEvent::Evse {
+                    evse_id: 0,
+                    event: EvseEvent::Connector {
+                        connector_id: 0,
+                        event,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        actor
+    }
+
+    /// Runs one authorization request to completion and reports whether the CSMS was asked.
+    async fn decide(actor: &ChargePointActor, contract: Option<ContractCertificate>) -> bool {
+        let asked = Arc::new(AtomicBool::new(false));
+        let authorizer = RecordingAuthorizer {
+            asked: Arc::clone(&asked),
+        };
+        let sender = broadcast_channel();
+        let receiver = sender.subscribe();
+        sender.send(AuthorizationRequested {
+            evse_id: 0,
+            connector_id: 0,
+            id_token: token("A"),
+            contract,
+        });
+        drop(sender);
+        run_authorization_requests(
+            receiver,
+            &authorizer,
+            actor.clone(),
+            &crate::clock::SystemClock,
+        )
+        .await;
+        asked.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn the_local_authorization_list_answers_without_asking_the_csms() {
+        let actor = locally_deciding_actor().await;
+        let _ = actor
+            .send(ChargePointEvent::LocalListUpdated {
+                version: 1,
+                entries: alloc::vec![LocalListEntry {
+                    id_token: token("A"),
+                    status: AuthorizationStatus::Accepted,
+                }],
+            })
+            .await;
+
+        assert!(
+            !decide(&actor, None).await,
+            "DisableRemoteAuthorization means no AuthorizeRequest is issued at all"
+        );
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn the_authorization_cache_answers_too() {
+        let actor = locally_deciding_actor().await;
+        let _ = actor
+            .send(ChargePointEvent::AuthorizationCached {
+                id_token: token("A"),
+                status: AuthorizationStatus::Accepted,
+                cached_at: None,
+            })
+            .await;
+
+        assert!(!decide(&actor, None).await);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identifier_neither_source_knows_is_refused() {
+        // "We were told not to ask, and we don't know" is not "yes" - the same rule the offline
+        // path follows, for the same reason.
+        let actor = locally_deciding_actor().await;
+
+        assert!(!decide(&actor, None).await);
+        assert_eq!(actor.state().evses[0].connectors[0], ConnectorState::Locked);
+    }
+
+    /// `LocalAuthorizeOffline` gates what this station does *when it cannot reach the CSMS*. Here
+    /// it can reach the CSMS perfectly well and has been told not to bother, so that variable has
+    /// nothing to say - reusing it would let an unrelated setting silently disable the switch.
+    #[tokio::test]
+    async fn local_authorize_offline_does_not_gate_it() {
+        let actor = locally_deciding_actor().await;
+        set_variable(&actor, "AuthCtrlr", "LocalAuthorizeOffline", "false").await;
+        let _ = actor
+            .send(ChargePointEvent::LocalListUpdated {
+                version: 1,
+                entries: alloc::vec![LocalListEntry {
+                    id_token: token("A"),
+                    status: AuthorizationStatus::Accepted,
+                }],
+            })
+            .await;
+
+        assert!(!decide(&actor, None).await);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Starting
+        );
+    }
+
+    /// Disabling the cache still disables the cache; the list keeps answering.
+    #[tokio::test]
+    async fn disabling_the_cache_stops_it_answering_here_as_well() {
+        let actor = locally_deciding_actor().await;
+        set_variable(&actor, "AuthCacheCtrlr", "Enabled", "false").await;
+        let _ = actor
+            .send(ChargePointEvent::AuthorizationCached {
+                id_token: token("A"),
+                status: AuthorizationStatus::Accepted,
+                cached_at: None,
+            })
+            .await;
+
+        assert!(!decide(&actor, None).await);
+        assert_eq!(actor.state().evses[0].connectors[0], ConnectorState::Locked);
+    }
+
+    /// A Plug & Charge presentation is refused rather than answered locally: C07 puts contract
+    /// validation at the CSMS, and this crate parses no X.509 itself - so a station forbidden to
+    /// ask has no way to establish the contract is still valid. Same reasoning as the offline
+    /// contract path.
+    #[tokio::test]
+    async fn a_contract_presentation_is_refused_rather_than_decided_locally() {
+        let actor = locally_deciding_actor().await;
+        let _ = actor
+            .send(ChargePointEvent::LocalListUpdated {
+                version: 1,
+                entries: alloc::vec![LocalListEntry {
+                    id_token: token("A"),
+                    status: AuthorizationStatus::Accepted,
+                }],
+            })
+            .await;
+
+        let contract = ContractCertificate {
+            chain_pem: None,
+            ocsp_data: alloc::vec![],
+        };
+        assert!(!decide(&actor, Some(contract)).await);
+        assert_eq!(actor.state().evses[0].connectors[0], ConnectorState::Locked);
+    }
+
+    /// The switch is off by default, so an unconfigured station still asks - without this the
+    /// tests above would pass just as well against a station that never asked anybody.
+    #[tokio::test]
+    async fn an_unconfigured_station_still_asks_the_csms() {
+        let actor = ChargePointActor::spawn([1], &TokioExecutor);
+        for event in [
+            ConnectorEvent::CableConnected,
+            ConnectorEvent::LockConfirmed,
+            ConnectorEvent::IdTokenPresented(token("A")),
+        ] {
+            actor
+                .send(ChargePointEvent::Evse {
+                    evse_id: 0,
+                    event: EvseEvent::Connector {
+                        connector_id: 0,
+                        event,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(decide(&actor, None).await);
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Starting
         );
     }
 }
