@@ -1,7 +1,6 @@
 # OCPP 2.1 compliance audit — spec vs. this crate
 
-**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13, §2.15, §2.16 and §2.17
-closed 2026-08-12 ·
+**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13–§2.17 closed 2026-08-12 ·
 **Baseline:** `main` @ `4c6abe3`, sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
 part 2 appendices v2.1 CSVs + errata 2026-06).
 
@@ -330,7 +329,28 @@ as "notify-flows that report a limit's *origin* rather than apply one", and deli
 What was never done is ask what K11 requires *behaviourally* of a station that sends them — which is
 precisely the residual risk §3 was written to name.
 
-### 2.14 High · transaction limits are entirely unimplemented (E16, 20 FRs) [MECHANICAL]
+### 2.14 ~~High~~ **Closed by CV15** · transaction limits are entirely unimplemented (E16, 20 FRs) [MECHANICAL]
+
+**Fixed, with one ceiling of the four declared unsupported rather than half-done.**
+`state::TransactionLimit` is a real internal type on `Transaction`. The CSMS sets one on a
+`TransactionEventResponse` (FR.02) and an integrator sets one on the driver's behalf; either is
+filtered to what this build enforces (FR.13), clamped so a local one never exceeds the CSMS's
+(FR.04), confirmed back exactly once with `triggerReason = LimitSet` (FR.01/.03), and enforced.
+Reaching a ceiling commands 0 A, moves the connector to `SuspendedEVSE` and reports the trigger
+reason that names *which* ceiling (FR.05); raising it past where the transaction stands resumes
+(FR.14); setting one below where it already stands binds at once (FR.10). Cost uses the station's
+own running total where a tariff prices the session and the CSMS's figure otherwise, which is
+FR.16 and FR.15 in that order.
+
+Two things worth reading in the roadmap's CV15 section rather than inferring: **E16.FR.06 is
+unreachable here** (the suspend-vs-end branch needs `TxStopPoint = EnergyTransfer`, which this
+crate's `values_list` refuses, so suspension is always the answer), and **`maxTime` is not
+supported** — it is the only ceiling that cannot be decided from a meter reading, and
+`TxCtrlr.SupportedLimits` omits it so FR.12/.13 make that honest rather than silent. **CV21** is
+the row that would close it.
+
+C17 (prepaid) is no longer stranded: its whole mechanism is a CSMS-set `maxCost`, which now
+records, confirms and binds. Original finding follows.
 
 `TransactionLimit` occurs once in `src/`, as a type alias in `src/wire.rs:1083`. It is never
 constructed, never read from a `TransactionEventResponse`, and never enforced.
@@ -508,10 +528,10 @@ where a requirement read is worth the time.
 | **E** | E11 connection loss | offline queue, transaction continues | present; requirement read outstanding |
 | | E13 message not accepted | `TransactionEventResponse` handling | present; requirement read outstanding |
 | | E14 check transaction status | `handle_get_transaction_status` (48 refs) | present; requirement read outstanding |
-| | **E16 fixed cost/energy/SoC/time** | `TransactionLimit`, `triggerReason = LimitSet` | **absent — see §2.14** |
+| | **E16 fixed cost/energy/SoC/time** | `TransactionLimit`, `triggerReason = LimitSet` | **present since CV15** — cost, energy and SoC enforced; `maxTime` declared unsupported (CV21). See §2.14. |
 | | E17 resume after forced reboot | power-cut recovery, swept by `tests/power_cut_recovery.rs` | present, and the strongest-evidenced row here |
 | **C** | **C16 master pass** | `MasterPassGroupId` | **absent** — 0 occurrences, as first recorded in §2.2's era and re-confirmed |
-| | **C17 prepaid card** | rests entirely on E16's `maxCost` | **blocked on §2.14** |
+| | **C17 prepaid card** | rests entirely on E16's `maxCost` | unblocked by CV15 — `maxCost` records, confirms and binds; C17's own requirements not yet swept |
 | | C19–C23 cancellation/settlement | `NotifySettlement`, `SettlementStatus` (57 refs) | present; requirement read outstanding |
 | | C24 stand-alone terminal | `PaymentTerminal` + CV2.11's `status()` | present since CV2.11; requirement read outstanding |
 | | **C25 ad hoc payment via QR code** | `WebPaymentsCtrlr`, `QRCode` | **absent** — 0 occurrences of `QRCode`; all five `WebPaymentsCtrlr` variables are decorative (§2.15). 27 FRs. |
@@ -555,8 +575,9 @@ the sweep, by certification impact rather than by size:
 10. ~~**§2.15 (the second variable table)**~~ — **closed by CV14.** It was the same one-word-per-row
     change CV2.1 was, on the table CV2.1 never reached, and it turned up **CV19**: three station-owned
     counters registered at 0 that nothing ever updates.
-11. **§2.14 (E16 transaction limits)** — 20 FRs, unblocks C17 outright, and gives CV8's locally
-    computed cost something to act on. The largest of the three.
+11. ~~**§2.14 (E16 transaction limits)**~~ — **closed by CV15**, which unblocked C17 and gave CV8's
+    locally computed cost a ceiling to act on. `maxTime` is declared unsupported rather than
+    half-enforced; see CV21.
 12. ~~**§2.16**~~ — **closed by CV17**, which turned out to be a behaviour fix: local generation
     adds capacity, and collapsing it onto `ExternalConstraints` had it capping instead. **§2.17**
     ~~**§2.17**~~ — **closed by CV18**, reachable only once §2.13 made an external limit change the

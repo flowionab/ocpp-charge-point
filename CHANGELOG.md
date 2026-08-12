@@ -64,6 +64,23 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   must add it (`false` preserves today's behaviour exactly). An integrator's energy-management
   binding that pushes locally generated capacity sets it `true`, which changes what the limit
   *does* — it adds rather than caps — and sets `isLocalGeneration` on the 2.1 wire (K27.FR.03).
+- **Transaction limits are enforced** (CV15, E16). New `state::TransactionLimit` and
+  `state::TransactionLimitKind`; `state::Transaction` gained `limit`, `csms_limit`,
+  `limit_reached` and `energy_start_wh`, so struct literals of it must add all four (`None`
+  preserves today's behaviour). New `ConnectorEvent::TransactionLimitSet` and
+  `TransactionUpdateReason::{LimitSet, LimitReached}` variants; exhaustive matches over either
+  must handle them. A CSMS setting `transactionLimit` on a `TransactionEventResponse`, or an
+  integrator raising `TransactionLimitSet` for a driver-entered figure, now **stops energy
+  transfer** when the ceiling is reached — the connector goes `SuspendedEVSE` and is commanded to
+  0 A. `maxCost`, `maxEnergy` and `maxSoC` are enforced; `maxTime` is declared unsupported in
+  `TxCtrlr.SupportedLimits` and is neither recorded nor confirmed.
+- `state::Transaction`, `state::TransactionEventOccurred`, `state::RecoveredTransaction` and
+  `transactions::TransactionEventOutcome` are no longer `Eq` (still `PartialEq`): a transaction
+  limit carries `f64` costs, and rounding one to keep a derive would change the limit.
+- `transactions::TransactionEventOutcome` gained `transaction_limit`, and
+  `ConnectorEvent::RunningCostAdvanced` became a struct variant `{ cost, total }` — the total is
+  what a `maxCost` is compared against, and deriving it needs the tariff and a clock the state
+  machine does not have. `EvseState` gained `running_cost_totals` alongside.
 - `ConnectorEvent::CurrentLimitComputed` is now a struct variant, `{ limit_ma, externally_caused }`
   (CV18): the projection sets the second field so the state machine can tell a rate change an
   energy manager caused from one the CSMS's own profiles caused. New

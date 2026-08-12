@@ -65,6 +65,17 @@ pub struct EvseState {
     /// this field is never written from inside [`crate::state::ChargePointState::apply`] itself
     /// on a raw hardware event; it only ever receives the value an adapter already computed.
     pub running_cost: Vec<Option<crate::pricing::TransactionCost>>,
+    /// The grand total of [`Self::running_cost`], indexed the same as `connectors` - what the
+    /// driver would be billed if the session ended now, with the tariff's own `minCost`/`maxCost`
+    /// already applied (I12.FR.17).
+    ///
+    /// Stored rather than derived because deriving it needs the tariff pricing the transaction,
+    /// and resolving that needs a clock the state machine does not have - see
+    /// [`ConnectorEvent::RunningCostAdvanced`](crate::state::ConnectorEvent::RunningCostAdvanced).
+    /// It exists so a `maxCost` transaction limit can be enforced against the station's *own*
+    /// figure where one is available, which is what **E16.FR.16** requires; [`Self::running_costs`]
+    /// is the CSMS's figure and E16.FR.15's fallback for a station that prices nothing locally.
+    pub running_cost_totals: Vec<Option<f64>>,
     /// The most recent meter reading each connector's hardware pushed in, indexed the same as
     /// `connectors` - recorded whether or not a transaction is running on it, unlike
     /// [`Transaction::last_meter_sample`](crate::state::Transaction::last_meter_sample), which is
@@ -149,6 +160,7 @@ impl EvseState {
             running_costs: vec![None; connector_count],
             transaction_tariffs: vec![None; connector_count],
             running_cost: vec![None; connector_count],
+            running_cost_totals: vec![None; connector_count],
             latest_meter_samples: vec![None; connector_count],
             charging_limits: vec![None; connector_count],
             honoured_reservations: vec![None; connector_count],

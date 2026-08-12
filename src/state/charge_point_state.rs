@@ -1502,6 +1502,12 @@ impl ChargePointState {
             ConnectorEvent::AuthorizationRevoked => EventKind::AuthorizationRevoked,
             ConnectorEvent::MeterValueSampled(_) => EventKind::MeterValueSampled,
             ConnectorEvent::LockFailed => EventKind::LockFailed,
+            ConnectorEvent::TransactionLimitSet { limit, from_csms } => {
+                EventKind::TransactionLimitSet {
+                    limit: *limit,
+                    from_csms: *from_csms,
+                }
+            }
             _ => EventKind::Other,
         };
         // CV7: `Some(Some(..))` records a pending start, `Some(None)` clears one, `None` means
@@ -1541,7 +1547,7 @@ impl ChargePointState {
             _ => None,
         };
         let running_cost_update = match &event {
-            ConnectorEvent::RunningCostAdvanced(cost) => Some((**cost).clone()),
+            ConnectorEvent::RunningCostAdvanced { cost, total } => Some(((**cost).clone(), *total)),
             _ => None,
         };
         let computed_limit = match &event {
@@ -1635,6 +1641,46 @@ impl ChargePointState {
                 allowance_wh = allowance,
                 "the identifier was revoked; granting the configured last allowance"
             );
+        }
+        // E16 (CV15): a ceiling arriving for this connector's transaction. Filtered to what this
+        // build enforces (FR.13) and clamped to whatever the CSMS allows (FR.04) before it is
+        // recorded, so both rules hold for the value that is confirmed *and* the value that is
+        // enforced - there is only ever one of it.
+        let mut limit_set = false;
+        if let EventKind::TransactionLimitSet { limit, from_csms } = event_kind
+            && let Some(Some(transaction)) = evse.transactions.get_mut(connector_id)
+        {
+            let supported = limit.supported();
+            if supported.is_empty() {
+                // Everything the setter asked for is a limit kind this build does not enforce.
+                // Recording nothing and confirming nothing is exactly FR.13; saying so at `warn`
+                // because an operator who set one deserves to know it did not take.
+                tracing::warn!(
+                    evse_id,
+                    connector_id,
+                    from_csms,
+                    "a transaction limit named no limit this build supports; ignoring it"
+                );
+            } else {
+                if from_csms {
+                    transaction.csms_limit = Some(supported);
+                }
+                // The CSMS's own limit is the ceiling, not a value to clamp against itself: it is
+                // free to raise what it previously set (which is what E16.FR.14's "increased by
+                // CSMS" case is), while a locally-set one never rises above it.
+                transaction.limit = Some(match (from_csms, transaction.csms_limit) {
+                    (false, Some(ceiling)) => supported.clamped_to(&ceiling),
+                    _ => supported,
+                });
+                transaction.seq_no += 1;
+                limit_set = true;
+                tracing::info!(
+                    evse_id,
+                    connector_id,
+                    from_csms,
+                    "a transaction limit was set"
+                );
+            }
         }
         // CV7/F02: the pending remote start's lifecycle. Recorded on request, dispatched the
         // moment the cable latches, cleared when the connector goes idle without ever being used
@@ -1936,6 +1982,20 @@ impl ChargePointState {
                 },
             ));
         }
+        // E16.FR.01/.03 (CV15): the confirmation the setter is owed, sent once, carrying the
+        // ceiling now in force. Emitted here rather than where the limit was recorded so it lands
+        // after the connector's own transition effects, in the order the CSMS will read them.
+        if limit_set && let Some(Some(transaction)) = evse.transactions.get_mut(connector_id) {
+            effects.push(ChargePointEffect::TransactionEvent(
+                TransactionEventOccurred {
+                    evse_id,
+                    connector_id,
+                    kind: TransactionEventKind::Updated(TransactionUpdateReason::LimitSet),
+                    transaction: transaction.clone(),
+                    offline: false,
+                },
+            ));
+        }
         let limit_confirmed = confirmed_limit.is_some_and(|limit_ma| {
             let Some(slot) = evse.applied_charging_limits.get_mut(connector_id) else {
                 return false;
@@ -1966,7 +2026,7 @@ impl ChargePointState {
             }
             false
         });
-        let running_cost_recorded = running_cost_update.is_some_and(|cost| {
+        let running_cost_recorded = running_cost_update.is_some_and(|(cost, total)| {
             if evse
                 .transactions
                 .get(connector_id)
@@ -1974,6 +2034,11 @@ impl ChargePointState {
                 && let Some(running_cost_slot) = evse.running_cost.get_mut(connector_id)
             {
                 *running_cost_slot = Some(cost);
+                // Recorded beside the cost itself so `enforce_transaction_limit` has a figure to
+                // compare a `maxCost` against without needing the tariff (CV15).
+                if let Some(total_slot) = evse.running_cost_totals.get_mut(connector_id) {
+                    *total_slot = Some(total);
+                }
                 return true;
             }
             false
@@ -2035,7 +2100,11 @@ impl ChargePointState {
             || limit_confirmed
             || sample_recorded
             || pending_changed
-            || lock_problem_changed;
+            || lock_problem_changed
+            // A recorded transaction limit moves nothing about the connector, but it is state a
+            // subscriber must see - the CSMS-facing snapshot, persistence, and the projection all
+            // read what the transaction is running under (CV15).
+            || limit_set;
         // E05 (CV2.5): the last allowance ran out. Checked after the sample has been recorded, so
         // the stop is decided against the reading the CSMS will also see, and dispatched through
         // the ordinary stop path so the transaction ends exactly as any other does.
@@ -2065,6 +2134,22 @@ impl ChargePointState {
                 effects,
             );
             return true;
+        }
+        // E16.FR.05/.10/.14 (CV15): the two moments a transaction limit can change its verdict -
+        // a fresh meter reading, or the limit itself moving. FR.10 is why a limit being *set* is
+        // one of them: a ceiling below where the transaction already stands binds immediately
+        // rather than at the next sample.
+        // Whatever moved a figure a ceiling is measured against: a meter reading (energy, state
+        // of charge), a cost - the station's own or the CSMS's - or the ceiling itself moving.
+        // The last is E16.FR.10's case, a limit set below where the transaction already stands,
+        // which binds at once rather than at the next sample.
+        if matches!(
+            event_kind,
+            EventKind::MeterValueSampled | EventKind::TransactionLimitSet { .. }
+        ) || running_cost_recorded
+            || cost_recorded
+        {
+            self.enforce_transaction_limit(evse_id, connector_id, effects);
         }
         if let Some(pending) = dispatch_pending {
             // Recursing through `apply_connector_event` rather than reaching into the connector
@@ -2352,6 +2437,180 @@ impl ChargePointState {
         true
     }
 
+    /// Applies **E16**'s ceilings to one connector's transaction: suspends energy transfer when
+    /// one has been reached, and resumes it when the ceiling moves back above where the
+    /// transaction stands (CV15).
+    ///
+    /// # Which cost, and why it is read rather than chosen here
+    ///
+    /// **E16.FR.15/.16** split the cost source by whether the station prices the session itself:
+    /// with a tariff in force the local running cost decides, and without one the CSMS's
+    /// `totalCost`/`CostUpdated` does. Both are already on [`EvseState`] - `running_cost` is
+    /// CV8's, `running_costs` is the CSMS's - so this reads whichever exists, preferring the local
+    /// one exactly as those requirements order them.
+    ///
+    /// # Suspend, never end
+    ///
+    /// E16.FR.06 would have the transaction *end* rather than suspend when `TxCtrlr.TxStopPoint`
+    /// contains `EnergyTransfer`. It cannot here: [`TxStopPoint`] models the three points this
+    /// crate can observe and `EnergyTransfer` is not among them, so a `SetVariables` naming it is
+    /// `Rejected` by CV3's validation against the declared `values_list`. The station can
+    /// therefore never be configured into FR.06's branch, and FR.05 - suspend, report
+    /// `SuspendedEVSE` with the limit's own trigger reason - is the only answer it can give.
+    ///
+    /// Suspending means *commanding* zero current, not merely recording a state: OCPP's
+    /// `SuspendedEVSE` is a report, and a station that reported it while energy kept flowing
+    /// would be lying in the direction that costs the driver money. The command goes out from
+    /// here rather than from `crate::smart_charging`'s projection so that a station built without
+    /// the smart-charging feature still enforces the limit it accepted.
+    fn enforce_transaction_limit(
+        &mut self,
+        evse_id: usize,
+        connector_id: usize,
+        effects: &mut Vec<ChargePointEffect>,
+    ) {
+        let Some(evse) = self.evses.get(evse_id) else {
+            return;
+        };
+        let local_cost = evse
+            .running_cost_totals
+            .get(connector_id)
+            .copied()
+            .flatten();
+        let csms_cost = evse.running_costs.get(connector_id).copied().flatten();
+        let Some(Some(transaction)) = evse.transactions.get(connector_id) else {
+            return;
+        };
+        let Some(limit) = transaction.limit else {
+            return;
+        };
+        // E16.FR.16 before E16.FR.15: a locally priced session uses its own figure, and only a
+        // station that cannot price one falls back to what the CSMS last said it had spent.
+        let cost = local_cost.or(csms_cost);
+        let delivered_wh = transaction
+            .energy_start_wh
+            .zip(transaction.last_meter_sample)
+            .map(|(start, sample)| (sample.energy_wh - start) as f64);
+        let soc = transaction
+            .last_meter_sample
+            .and_then(|sample| sample.soc_percent);
+
+        let reached = None
+            .or_else(|| {
+                (limit.max_cost.zip(cost)).and_then(|(max, cost)| {
+                    (cost >= max).then_some(crate::state::TransactionLimitKind::Cost)
+                })
+            })
+            .or_else(|| {
+                (limit.max_energy_wh.zip(delivered_wh)).and_then(|(max, delivered)| {
+                    (delivered >= max).then_some(crate::state::TransactionLimitKind::Energy)
+                })
+            })
+            .or_else(|| {
+                (limit.max_soc_percent.zip(soc)).and_then(|(max, soc)| {
+                    (soc >= max).then_some(crate::state::TransactionLimitKind::Soc)
+                })
+            });
+
+        match (reached, transaction.limit_reached) {
+            // Already suspended for this reason, and still over it - nothing to say twice.
+            (Some(_), Some(_)) | (None, None) => {}
+            (Some(kind), None) => {
+                tracing::info!(
+                    evse_id,
+                    connector_id,
+                    limit = kind.name(),
+                    "a transaction limit was reached; suspending energy transfer"
+                );
+                // Order matters: stop the energy, then report having stopped it.
+                self.request_current_limit(evse_id, connector_id, Some(0), effects);
+                self.apply_connector_event(
+                    evse_id,
+                    connector_id,
+                    ConnectorEvent::ChargingSuspendedByEvse,
+                    effects,
+                );
+                if let Some(Some(transaction)) = self
+                    .evses
+                    .get_mut(evse_id)
+                    .and_then(|evse| evse.transactions.get_mut(connector_id))
+                {
+                    transaction.limit_reached = Some(kind);
+                    transaction.seq_no += 1;
+                    effects.push(ChargePointEffect::TransactionEvent(
+                        TransactionEventOccurred {
+                            evse_id,
+                            connector_id,
+                            kind: TransactionEventKind::Updated(
+                                TransactionUpdateReason::LimitReached(kind),
+                            ),
+                            transaction: transaction.clone(),
+                            offline: false,
+                        },
+                    ));
+                }
+            }
+            // E16.FR.14: the ceiling moved back above where this transaction stands, so energy
+            // may flow again. The 0 A command is withdrawn rather than raised to a number: what
+            // the connector may draw is `crate::smart_charging`'s answer, not this function's,
+            // and `None` is "nothing here limits it" rather than a limit of this crate's
+            // invention.
+            (None, Some(kind)) => {
+                tracing::info!(
+                    evse_id,
+                    connector_id,
+                    limit = kind.name(),
+                    "the transaction limit was raised; resuming energy transfer"
+                );
+                self.request_current_limit(evse_id, connector_id, None, effects);
+                self.apply_connector_event(
+                    evse_id,
+                    connector_id,
+                    ConnectorEvent::ChargingResumed,
+                    effects,
+                );
+                if let Some(Some(transaction)) = self
+                    .evses
+                    .get_mut(evse_id)
+                    .and_then(|evse| evse.transactions.get_mut(connector_id))
+                {
+                    transaction.limit_reached = None;
+                }
+            }
+        }
+    }
+
+    /// Records a requested current limit for one connector and commands hardware, if it differs
+    /// from what that connector was last asked for - the same "only when it actually changed"
+    /// rule [`ConnectorEvent::CurrentLimitComputed`] follows, factored out so a transaction limit
+    /// (CV15) can reach hardware through it without going round the projection.
+    fn request_current_limit(
+        &mut self,
+        evse_id: usize,
+        connector_id: usize,
+        limit_ma: Option<u32>,
+        effects: &mut Vec<ChargePointEffect>,
+    ) {
+        let Some(slot) = self
+            .evses
+            .get_mut(evse_id)
+            .and_then(|evse| evse.charging_limits.get_mut(connector_id))
+        else {
+            return;
+        };
+        if *slot == limit_ma {
+            return;
+        }
+        *slot = limit_ma;
+        effects.push(ChargePointEffect::HardwareCommand(
+            HardwareCommand::SetCurrentLimit {
+                evse_id,
+                connector_id,
+                limit_ma,
+            },
+        ));
+    }
+
     /// Clears an external charging limit previously recorded by [`Self::set_external_charging_limit`]
     /// and pushes the [`ChargePointEffect::SmartChargingNotification`] that reports it - but only
     /// if `evse_id`/`source` actually match a limit currently recorded there. Reporting a
@@ -2392,14 +2651,20 @@ impl ChargePointState {
 
 /// Which of the events `apply_connector_event` special-cases this one is - captured before
 /// `ConnectorState::apply` consumes it, because two later blocks still need to know (CV2.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum EventKind {
     /// The identifier was revoked mid-session (E05).
     AuthorizationRevoked,
-    /// A meter reading arrived - the thing that can cross an E05 allowance.
+    /// A meter reading arrived - the thing that can cross an E05 allowance, or a transaction
+    /// limit (E16).
     MeterValueSampled,
     /// The connector's plug retention lock failed (G05).
     LockFailed,
+    /// A ceiling was set on the transaction (E16, CV15).
+    TransactionLimitSet {
+        limit: crate::state::TransactionLimit,
+        from_csms: bool,
+    },
     Other,
 }
 
@@ -2547,6 +2812,10 @@ fn advance_transaction(
             remote_start_id: origin.remote_start_id,
             reservation_id: origin.reservation_id,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         };
         *slot = Some(transaction.clone());
         return Some((TransactionEventKind::Started, transaction));
@@ -2642,6 +2911,10 @@ fn apply_meter_sample(
     if transaction.charging_state != TransactionChargingState::Charging {
         return None;
     }
+    // The baseline `maxEnergy` is measured against (E16, CV15): the first reading this
+    // transaction saw while charging, so the limit bounds the energy *this session* delivered
+    // rather than wherever the meter's lifetime total happened to stand.
+    transaction.energy_start_wh.get_or_insert(sample.energy_wh);
     transaction.last_meter_sample = Some(sample);
     transaction.seq_no += 1;
     Some((
@@ -2813,6 +3086,254 @@ mod tests {
         apply_connector_event(state, ConnectorEvent::IdTokenPresented(test_id_token()));
     }
 
+    // --- CV15: transaction limits (E16) ---
+
+    /// A connector charging, with `wh` on the meter as its baseline.
+    fn charging_from(wh: i64) -> ChargePointState {
+        let mut state = ChargePointState::new([1]);
+        plug_in_and_authorize(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingAuthorized(test_id_token()),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::MeterValueSampled(MeterSample {
+                energy_wh: wh,
+                ..Default::default()
+            }),
+        );
+        state
+    }
+
+    fn sample_at(wh: i64) -> ConnectorEvent {
+        ConnectorEvent::MeterValueSampled(MeterSample {
+            energy_wh: wh,
+            ..Default::default()
+        })
+    }
+
+    fn energy_limit(wh: f64) -> ConnectorEvent {
+        ConnectorEvent::TransactionLimitSet {
+            limit: crate::state::TransactionLimit {
+                max_energy_wh: Some(wh),
+                ..Default::default()
+            },
+            from_csms: true,
+        }
+    }
+
+    /// Only the reasons CV15 introduces - a meter sample reports `MeterValuePeriodic` on its own
+    /// account, and counting that here would make every assertion below about limits pass or fail
+    /// for the wrong reason.
+    fn reported_limit_events(
+        effects: &[ChargePointEffect],
+    ) -> alloc::vec::Vec<TransactionUpdateReason> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                ChargePointEffect::TransactionEvent(occurred) => match occurred.kind {
+                    TransactionEventKind::Updated(
+                        reason @ (TransactionUpdateReason::LimitSet
+                        | TransactionUpdateReason::LimitReached(_)),
+                    ) => Some(reason),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// E16.FR.01/.03: the ceiling is recorded and confirmed back once, with its own trigger
+    /// reason, which is what tells the CSMS the limit took.
+    #[test]
+    fn a_transaction_limit_is_recorded_and_confirmed_once() {
+        let mut state = charging_from(1_000);
+
+        let effects = apply_connector_event(&mut state, energy_limit(5_000.0));
+
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.limit)
+                .and_then(|limit| limit.max_energy_wh),
+            Some(5_000.0)
+        );
+        assert_eq!(
+            reported_limit_events(&effects),
+            alloc::vec![TransactionUpdateReason::LimitSet]
+        );
+    }
+
+    /// E16.FR.05: reaching it suspends energy transfer, says so with the trigger reason that
+    /// names *which* limit, and actually stops the current rather than only reporting that it
+    /// did.
+    #[test]
+    fn reaching_an_energy_limit_suspends_energy_transfer_and_says_which_limit() {
+        let mut state = charging_from(1_000);
+        apply_connector_event(&mut state, energy_limit(5_000.0));
+
+        // 4 999 Wh delivered - still under.
+        let effects = apply_connector_event(&mut state, sample_at(5_999));
+        assert!(reported_limit_events(&effects).is_empty());
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+
+        // 5 000 Wh delivered - at the limit, which counts as reached.
+        let effects = apply_connector_event(&mut state, sample_at(6_000));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::SuspendedEvse);
+        assert!(
+            reported_limit_events(&effects).contains(&TransactionUpdateReason::LimitReached(
+                crate::state::TransactionLimitKind::Energy
+            ))
+        );
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::SetCurrentLimit {
+                evse_id: 0,
+                connector_id: 0,
+                limit_ma: Some(0),
+            }
+        )));
+    }
+
+    /// The limit is measured from the transaction's own baseline, not the meter's lifetime total
+    /// - a station whose meter has 900 kWh on it must not refuse every session.
+    #[test]
+    fn the_energy_limit_measures_from_this_transactions_first_reading() {
+        let mut state = charging_from(900_000);
+        apply_connector_event(&mut state, energy_limit(5_000.0));
+
+        let effects = apply_connector_event(&mut state, sample_at(902_000));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+        assert!(reported_limit_events(&effects).is_empty());
+    }
+
+    /// E16.FR.14: raising the ceiling past where the transaction stands resumes energy transfer,
+    /// and withdraws the 0 A command rather than inventing a limit of its own.
+    #[test]
+    fn raising_the_limit_resumes_energy_transfer() {
+        let mut state = charging_from(1_000);
+        apply_connector_event(&mut state, energy_limit(5_000.0));
+        apply_connector_event(&mut state, sample_at(6_000));
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::SuspendedEvse);
+
+        let effects = apply_connector_event(&mut state, energy_limit(10_000.0));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+        assert!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .is_some_and(|transaction| transaction.limit_reached.is_none())
+        );
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::SetCurrentLimit {
+                evse_id: 0,
+                connector_id: 0,
+                limit_ma: None,
+            }
+        )));
+    }
+
+    /// E16.FR.10: a ceiling set below where the transaction already stands binds at once, rather
+    /// than waiting for a meter reading that may be a full sampling interval away.
+    #[test]
+    fn a_limit_set_below_the_energy_already_delivered_binds_immediately() {
+        let mut state = charging_from(1_000);
+        apply_connector_event(&mut state, sample_at(6_000));
+
+        let effects = apply_connector_event(&mut state, energy_limit(2_000.0));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::SuspendedEvse);
+        assert!(
+            reported_limit_events(&effects).contains(&TransactionUpdateReason::LimitReached(
+                crate::state::TransactionLimitKind::Energy
+            ))
+        );
+    }
+
+    /// E16.FR.04: the CSMS has the last word. A driver asking for more than the prepaid balance
+    /// allows gets the balance, not the request.
+    #[test]
+    fn a_locally_set_limit_cannot_exceed_the_one_the_csms_set() {
+        let mut state = charging_from(1_000);
+        apply_connector_event(&mut state, energy_limit(5_000.0));
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::TransactionLimitSet {
+                limit: crate::state::TransactionLimit {
+                    max_energy_wh: Some(50_000.0),
+                    ..Default::default()
+                },
+                from_csms: false,
+            },
+        );
+
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.limit)
+                .and_then(|limit| limit.max_energy_wh),
+            Some(5_000.0),
+        );
+    }
+
+    /// ...and the CSMS raising its *own* limit is not clamped against its previous one, which is
+    /// what E16.FR.14's "increased by CSMS" case depends on.
+    #[test]
+    fn the_csms_may_raise_the_limit_it_set_itself() {
+        let mut state = charging_from(1_000);
+        apply_connector_event(&mut state, energy_limit(5_000.0));
+
+        apply_connector_event(&mut state, energy_limit(50_000.0));
+
+        assert_eq!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.limit)
+                .and_then(|limit| limit.max_energy_wh),
+            Some(50_000.0),
+        );
+    }
+
+    /// E16.FR.13: a limit naming only kinds this build does not enforce is neither recorded nor
+    /// confirmed - the CSMS learns from the silence, having been told what is supported by
+    /// `TxCtrlr.SupportedLimits`.
+    #[test]
+    fn a_limit_this_build_cannot_enforce_is_neither_recorded_nor_confirmed() {
+        let mut state = charging_from(1_000);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::TransactionLimitSet {
+                limit: crate::state::TransactionLimit {
+                    max_time_secs: Some(3_600),
+                    ..Default::default()
+                },
+                from_csms: true,
+            },
+        );
+
+        assert!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .is_some_and(|transaction| transaction.limit.is_none())
+        );
+        assert!(reported_limit_events(&effects).is_empty());
+    }
+
+    /// A ceiling on a connector with nothing running is nothing - and must not blow up.
+    #[test]
+    fn a_limit_on_an_idle_connector_is_a_no_op() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = apply_connector_event(&mut state, energy_limit(5_000.0));
+
+        assert!(reported_limit_events(&effects).is_empty());
+    }
+
     #[test]
     fn a_remote_unlock_request_while_locked_unlocks_the_connector() {
         let mut state = ChargePointState::new([1]);
@@ -2870,6 +3391,10 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -3312,6 +3837,10 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -3350,6 +3879,10 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -3393,6 +3926,13 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            // The first reading this transaction saw is the baseline `maxEnergy` is measured
+            // against (CV15) - recorded whether or not a limit is in force, since one set later
+            // must still measure from the session's real start.
+            energy_start_wh: Some(sample.energy_wh),
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -3533,6 +4073,10 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         };
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
         assert_eq!(state.evses[0].transactions[0], None);
@@ -3570,6 +4114,10 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         };
         assert_eq!(state.evses[0].transactions[0], None);
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
@@ -5217,7 +5765,10 @@ mod tests {
 
         apply_connector_event(
             &mut state,
-            ConnectorEvent::RunningCostAdvanced(alloc::boxed::Box::new(test_running_cost())),
+            ConnectorEvent::RunningCostAdvanced {
+                cost: alloc::boxed::Box::new(test_running_cost()),
+                total: 0.0,
+            },
         );
 
         assert_eq!(state.evses[0].running_cost[0], Some(test_running_cost()));
@@ -5229,7 +5780,10 @@ mod tests {
 
         apply_connector_event(
             &mut state,
-            ConnectorEvent::RunningCostAdvanced(alloc::boxed::Box::new(test_running_cost())),
+            ConnectorEvent::RunningCostAdvanced {
+                cost: alloc::boxed::Box::new(test_running_cost()),
+                total: 0.0,
+            },
         );
 
         assert_eq!(state.evses[0].running_cost[0], None);
@@ -5246,7 +5800,10 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::ContactorClosed);
         apply_connector_event(
             &mut state,
-            ConnectorEvent::RunningCostAdvanced(alloc::boxed::Box::new(test_running_cost())),
+            ConnectorEvent::RunningCostAdvanced {
+                cost: alloc::boxed::Box::new(test_running_cost()),
+                total: 0.0,
+            },
         );
         apply_connector_event(
             &mut state,
@@ -5777,6 +6334,10 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         }
     }
 

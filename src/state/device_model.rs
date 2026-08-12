@@ -820,6 +820,28 @@ pub(crate) const VARIABLE_BOUNDS: &[VariableBounds] = &[
 /// is exactly where a charge point is supposed to say what it accepts.
 const TX_START_STOP_POINTS: &[&str] = &["EVConnected", "Authorized", "PowerPathClosed"];
 
+/// The transaction limits this build enforces - `TxCtrlr.SupportedLimits` (**E16**, CV15).
+///
+/// Narrower than OCPP's `TransactionLimitType` by exactly one field, and narrowed for the same
+/// reason `TX_START_STOP_POINTS` is: naming a limit the station cannot enforce, and then not
+/// enforcing it, is the silent lie B05.FR.09 forbids - and here it would be worse than a
+/// mis-set variable, because a CSMS relying on `maxTime` to free a bay would be relying on
+/// nothing.
+///
+/// **`maxTime` is absent.** A time limit runs from the transaction's start (E16.FR.09), and this
+/// crate's state machine is deliberately clock-free - it has no start *time* to measure against,
+/// only the meter readings the other three limits are decided from. Supporting it needs a clock-
+/// driven sweep of the kind `crate::remote_control::run_pending_remote_start_timeouts` already is;
+/// see the roadmap's CV21. Until then the honest answer is the one OCPP provides for: say so here,
+/// and E16.FR.12/.13 do the rest - a CSMS knows not to send it, and a station handed one anyway
+/// neither records it nor confirms it.
+pub(crate) const SUPPORTED_TRANSACTION_LIMITS: &[&str] = &["maxCost", "maxEnergy", "maxSoC"];
+
+/// [`SUPPORTED_TRANSACTION_LIMITS`] as the `MemberList` value the variable registers with. Written
+/// out rather than joined at runtime because `DEFAULT_VARIABLES` is a `const` table of `&'static
+/// str`; a test asserts the two stay in step.
+const SUPPORTED_TRANSACTION_LIMITS_VALUE: &str = "maxCost,maxEnergy,maxSoC";
+
 impl Default for DeviceModel {
     fn default() -> Self {
         Self::new()
@@ -1157,6 +1179,24 @@ pub(crate) const DEFAULT_VARIABLES: &[DefaultVariable] = &[
         value: "0",
         mutability: VariableMutability::ReadWrite,
         // CV2.5: read into `ConnectorPolicy` and honoured on E05.
+        honoured: true,
+        persistent: false,
+    },
+    DefaultVariable {
+        component: "TxCtrlr",
+        variable: "SupportedLimits",
+        instance: None,
+        data_type: VariableDataType::MemberList,
+        unit: None,
+        // E16.FR.12 reads this to decide what it may send, and E16.FR.13 has the station stay
+        // silent about anything not named here - so the value is load-bearing rather than
+        // descriptive, and `SUPPORTED_TRANSACTION_LIMITS` is the one place it comes from.
+        value: SUPPORTED_TRANSACTION_LIMITS_VALUE,
+        // `ReadOnly` because it is a fact about the firmware, not a setting: a CSMS cannot make
+        // this build enforce a limit kind by writing one here.
+        mutability: VariableMutability::ReadOnly,
+        // Genuinely acted on - `ChargePointState` filters every incoming limit against the same
+        // list before recording it (CV15).
         honoured: true,
         persistent: false,
     },
@@ -1741,6 +1781,23 @@ mod tests {
             constant: false,
             requires_reboot: false,
         }
+    }
+
+    /// CV15: `TxCtrlr.SupportedLimits` is what a CSMS reads to know which ceilings it may send
+    /// (E16.FR.12), and the same list decides which ones this build records (E16.FR.13). One
+    /// source, two readers - so the registered value and the list the state machine filters
+    /// against must be the same thing, and this is what says so.
+    #[test]
+    fn the_supported_transaction_limits_variable_matches_the_list_that_is_enforced() {
+        let registered = DEFAULT_VARIABLES
+            .iter()
+            .find(|default| default.component == "TxCtrlr" && default.variable == "SupportedLimits")
+            .expect("TxCtrlr.SupportedLimits should be registered");
+
+        assert_eq!(registered.value, SUPPORTED_TRANSACTION_LIMITS.join(","));
+        // And the one OCPP defines that this build does not enforce is genuinely absent, rather
+        // than named here and quietly ignored (B05.FR.09's rule, applied to a `ReadOnly` fact).
+        assert!(!SUPPORTED_TRANSACTION_LIMITS.contains(&"maxTime"));
     }
 
     #[test]

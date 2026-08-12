@@ -575,6 +575,7 @@ impl ConnectorEvent {
             Self::RemoteStartPending { .. } => "RemoteStartPending",
             Self::RemoteStartPendingCleared { .. } => "RemoteStartPendingCleared",
             Self::AuthorizationRevoked { .. } => "AuthorizationRevoked",
+            Self::TransactionLimitSet { .. } => "TransactionLimitSet",
             Self::ChargingStopped { .. } => "ChargingStopped",
             Self::ChargingSuspendedByEv { .. } => "ChargingSuspendedByEv",
             Self::ChargingSuspendedByEvse { .. } => "ChargingSuspendedByEvse",
@@ -727,6 +728,28 @@ pub enum ConnectorEvent {
     /// otherwise `TxCtrlr.MaxEnergyOnInvalidId` grants a last allowance so the driver is not
     /// stranded mid-motorway by a CSMS blocklist update. See [`crate::state::Transaction::stop_at_energy_wh`].
     AuthorizationRevoked,
+    /// A ceiling has been set on this connector's transaction - **E16** (CV15).
+    ///
+    /// Both directions arrive here. `from_csms` marks the CSMS's own limit, read off a
+    /// `TransactionEventResponse` by [`crate::transactions::deliver_transaction_event`]
+    /// (E16.FR.02); `false` is a limit the charge point set on the driver's behalf - a figure
+    /// entered at the station's UI, or a payment terminal's pre-authorized amount - which an
+    /// integrator raises directly (E16.FR.01).
+    ///
+    /// The difference is not cosmetic: a CSMS limit becomes the ceiling every later locally-set
+    /// one is clamped to (E16.FR.04), so a driver cannot ask for more energy than the prepaid
+    /// balance the CSMS allowed. Both are filtered to the limits this build supports before being
+    /// recorded (E16.FR.13), and both are confirmed to the CSMS exactly once, on the next
+    /// `TransactionEvent`, with `triggerReason = LimitSet`.
+    ///
+    /// A no-op on a connector with no transaction running: a ceiling on nothing is nothing.
+    TransactionLimitSet {
+        /// The ceiling being set. Replaces whatever was in force rather than merging with it -
+        /// OCPP has no way to unset a single limit (E16.FR.17), so the whole value is the state.
+        limit: crate::state::TransactionLimit,
+        /// Whether the CSMS set it, as opposed to the charge point setting it locally.
+        from_csms: bool,
+    },
     /// The authorization held against this connector is no longer wanted - the cable arrived and
     /// it was dispatched, or `TxCtrlr.EVConnectionTimeOut` expired without one. Covers both a held
     /// `RequestStartTransaction` (F02.FR.07/.08) and a card presented before the cable
@@ -795,7 +818,21 @@ pub enum ConnectorEvent {
     /// Boxed for the same reason [`Self::TariffAssigned`] is: [`crate::pricing::TransactionCost`]
     /// carries a growing list of charging periods, easily the largest payload any connector event
     /// not already boxed would carry.
-    RunningCostAdvanced(alloc::boxed::Box<crate::pricing::TransactionCost>),
+    RunningCostAdvanced {
+        /// The cost as recomputed, stored on [`crate::state::EvseState::running_cost`].
+        cost: alloc::boxed::Box<crate::pricing::TransactionCost>,
+        /// That cost's grand total, with the tariff's own `minCost`/`maxCost` already applied -
+        /// the single figure a `maxCost` transaction limit is compared against (**E16.FR.16**,
+        /// CV15).
+        ///
+        /// Carried on the event rather than derived from `cost` because deriving it needs the
+        /// tariff currently pricing the transaction (only its `minCost`/`maxCost`, but that is
+        /// enough), and resolving *which* tariff that is needs a clock - both of which the state
+        /// machine deliberately does not have. The adapter that computes the cost has both in
+        /// hand already, so it states the answer rather than leaving the state machine to guess
+        /// or to skip the check.
+        total: f64,
+    },
     /// A CSMS-initiated `Reset` (`ResetKind::Immediate`) covers this connector. Any state where
     /// a cable is engaged (`Connected`/`Locked`/`Authorizing`/`Starting`/`Charging`) is driven
     /// through the same fail-safe stop already used for a normal charging stop (open the
@@ -1025,11 +1062,19 @@ pub enum TransactionUpdateReason {
     /// a `MAY` under K01.FR.61 and is not reported - see
     /// [`ConnectorEvent::CurrentLimitComputed::externally_caused`].
     ChargingRateChanged,
+    /// A ceiling was set on this transaction, and this event confirms it back to the CSMS -
+    /// **E16.FR.01/.03** (CV15). Carries the limit in `transactionInfo.transactionLimit`, once.
+    LimitSet,
+    /// A ceiling was reached, so energy transfer is suspended - **E16.FR.05**. The kind says
+    /// which, because the CSMS otherwise cannot tell a transaction limit from a smart-charging
+    /// suspension, and each maps to its own `triggerReason`
+    /// (`CostLimitReached`/`EnergyLimitReached`/`SoCLimitReached`/`TimeLimitReached`).
+    LimitReached(crate::state::TransactionLimitKind),
 }
 
 /// One in-flight transaction read back from durable storage at boot, carried by
 /// [`ChargePointEvent::PersistedTransactionsRestored`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecoveredTransaction {
     /// The transaction's connector's EVSE index.
     pub evse_id: usize,
@@ -1067,7 +1112,7 @@ pub struct RecoveredDeviceModelAttribute {
 }
 
 /// A transaction lifecycle event, reported to the CSMS via TransactionEvent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TransactionEventOccurred {
     /// The transaction's connector's EVSE index.
     pub evse_id: usize,

@@ -494,17 +494,47 @@ CSMS something untrue about its own behaviour. It is now closed.
 | **CV13** | **Enforce an external charging limit, don't just report it.** `external_charging_limits` turns the recorded limits — the station-wide one and the EVSE's own — into `ExternalConstraints` capping profiles, and `composing_profiles` joins them onto `charging_profiles.applying_to()` at both composition sites: the projection that drives hardware, and `GetCompositeSchedule`, so the CSMS is shown the curve the station will apply. Audit §2.13. | K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01 | **done** |
 | **CV14** | **Sweep `CAPABILITY_GATED_VARIABLES` the way CV2.1 swept `DEFAULT_VARIABLES`.** `CapabilityGatedVariable::honoured` now records, per row, whether this build makes the value mean anything, and `false` forces the registration to `ReadOnly` — the same lever `register_defaults` pulls. 24 of the 26 writable rows refuse the write; the two `ISO15118Ctrlr` rows stay writable. Audit §2.15. | B05.FR.09 | **done** |
 | **CV19** | **Three station-owned counters registered at 0 and never updated** — `LocalAuthListCtrlr.Entries`, `SmartChargingCtrlr.Entries[ChargingProfiles]`, `DisplayMessageCtrlr.DisplayMessages`. A CSMS reads each to know how full the station is; all three answer 0 however much is installed. Found by CV14's sweep. | D01, K01, B6 | open |
-| **CV15** | **Transaction limits (E16).** `TransactionLimit` exists only as a type alias; `triggerReason = LimitSet` occurs nowhere. Unblocks C17 (prepaid) outright and gives CV8's local cost a ceiling to act on. Audit §2.14. | E16 (20 FRs), C17 | open |
+| **CV15** | **Transaction limits (E16).** `state::TransactionLimit` is a real internal type on `Transaction`, set by the CSMS off a `TransactionEventResponse` or locally on the driver's behalf, confirmed once with `triggerReason = LimitSet`, and enforced: reaching a ceiling commands 0 A, moves the connector to `SuspendedEVSE` and reports the trigger reason naming *which* ceiling. Cost, energy and state of charge are enforced; `maxTime` is declared unsupported rather than half-done (see CV21). Audit §2.14. | E16.FR.01/.02/.03/.04/.05/.10/.13/.14/.15/.16/.17, C17 | **done** |
+| **CV21** | **`maxTime` transaction limits.** The one E16 ceiling CV15 left out, and the only one that cannot be decided from a meter reading: E16.FR.09 measures it from the transaction's start, and the state machine is clock-free by design. Needs a clock-driven sweep of the kind `run_pending_remote_start_timeouts` already is, plus the transaction start times such a sweep would have to keep (as `ChargingLimitProjection` already does for `Relative` profiles). `TxCtrlr.SupportedLimits` omits `maxTime` until then, so a CSMS is told not to send one and a station handed one anyway neither records nor confirms it (E16.FR.12/.13). | E16.FR.09, `maxTime` | open |
 | **CV16** | **A renegotiation surface in `crate::hardware`.** K16.FR.02 is a `SHALL` on the station whenever the composite schedule changes, and `Iso15118Controller` has one method — a certificate hook. No integrator can satisfy K16–K20 through this crate today. Audit §2.18. | K16, K17 (33 FRs) | open |
 | **CV17** | **`LocalGeneration` has its own internal purpose, and it *adds* rather than caps.** The `_` catch-all made it an `ExternalConstraints` cap, so 2 kW of sun under a 5 kW `TxDefaultProfile` charged at 2 kW instead of K27's own 7 kW — a behaviour bug, not the reporting one this row was filed as. `ExternalChargingLimit` carries `is_local_generation`, held in its own slot per scope so a constraint and capacity can both be in force (K27.FR.05), and `isLocalGeneration` is now stated on the wire in both directions. Audit §2.16. | K27.FR.01/.02/.03/.05, §K.3.6 | **done** |
 | **CV20** | **Two K27/K10 remainders CV17 did not take.** (a) K27.FR.02 wants an EMS-pushed `LocalGeneration` schedule reported by `GetChargingProfiles`, but external limits are deliberately not stored as profiles and their synthetic ids are negative — reporting them needs a positive reserved id range first. (b) K10.FR.04/.08/.09 have `ClearChargingProfile` disregard `ExternalConstraints` **and** `LocalGeneration`; `ChargingProfileCriteria::matches` excludes neither, so a CSMS that installs one (K01.FR.06 says it shall not, but the station receives what it receives) can clear it. | K27.FR.02, K10.FR.04/.08/.09 | open |
 | **CV18** | **`triggerReason = ChargingRateChanged`.** Sent when an external limit is set or released, the composed rate actually moves, and a transaction is running — all three preconditions the two requirements state. The CSMS-caused case stays unsent: K01.FR.61 makes it a `MAY`, and the CSMS installed the schedule whose boundaries it would be told about. `ConnectorEvent::CurrentLimitComputed` carries `externally_caused`, set by the projection, which is the only place that can see the difference. Audit §2.17. | K11.FR.04, K13.FR.03 | **done** |
 
 **Sequencing:** CV13 before CV18 (nothing changes a rate externally until the limit is enforced),
-and both are now done, as are CV14 and CV17. **What is left of this group is CV15 (independent and
-largest), CV16 (a `crate::hardware` addition that should be taken together with the DER actuation
-trait `docs/CERTIFICATION.md` §3 names — one considered break rather than two), and the two rows
-the finished work opened: CV19 and CV20.**
+and both are now done, as are CV14, CV15 and CV17. **What is left of this group is CV16 (a
+`crate::hardware` addition that should be taken together with the DER actuation trait
+`docs/CERTIFICATION.md` §3 names — one considered break rather than two), and the three rows the
+finished work opened: CV19, CV20 and CV21.**
+
+### CV15 — the three decisions, and the one limit it does not support
+
+**E16.FR.06 is unreachable on this station, so FR.05 is the only branch.** The suspend-vs-end
+choice turns on `TxCtrlr.TxStopPoint` containing `EnergyTransfer`, and `TX_START_STOP_POINTS`
+deliberately narrows the variable's `values_list` to the three points this crate can observe —
+`EnergyTransfer` needs a "current is actually flowing" signal no hardware binding provides, so a
+`SetVariables` naming it is `Rejected` by CV3. A station can therefore never be configured into
+FR.06's branch, and reaching a ceiling always suspends.
+
+**Suspending means commanding zero, not recording a state.** `ChargingSuspendedByEvse` models
+*hardware told us it paused* and issues no command; a transaction limit needs the station to stop
+the energy itself. The 0 A command is issued from the state machine rather than from
+`crate::smart_charging`'s projection, so a build without the smart-charging feature still enforces
+the limit it accepted — and resuming withdraws the command (`None`) rather than naming a current,
+because what the connector may draw is composition's answer, not this path's.
+
+**The cost a `maxCost` is measured against is stated, not derived.** E16.FR.15/.16 split it: a
+locally priced session uses the station's own running cost, and one the CSMS prices uses its
+`totalCost`/`CostUpdated`. Deriving the first needs the tariff in force, and resolving *that* needs
+a clock — so `ConnectorEvent::RunningCostAdvanced` now carries the total alongside the cost, and
+`EvseState::running_cost_totals` holds it. The adapter that computes the cost already has the
+tariff and the clock in hand; making it state the figure is cheaper and more honest than having
+the state machine guess or skip the check.
+
+**`maxTime` is not supported, and says so.** It is the one ceiling that cannot be decided from a
+meter reading. Rather than half-enforce it, `TxCtrlr.SupportedLimits` names the three that are
+enforced, and E16.FR.12/.13 do the rest — the same stance CV14 took, applied to a limit instead of
+a variable. **CV21** is the row that would close it.
 
 ### CV17 — the row that was filed as reporting fidelity and turned out to be behaviour
 
@@ -579,7 +609,7 @@ and four of the six rows its first sweep opened, plus the one CV14 added on its 
 CV12.1 (K, done) ──┬─> CV13 (done) ──> CV18 (done)
                    ├─> CV17 (done) ──> CV20   the K27/K10 remainders it did not take
                    ├─> CV14 (done) ──> CV19   the stale counters the sweep turned up
-                   ├─> CV15        independent, largest
+                   ├─> CV15 (done) ──> CV21   the maxTime ceiling it declined to half-do
                    └─> CV16        a crate::hardware break — take with the DER trait
 CV12.2 … CV12.7                    the rest of the sweeps, continuous
 ```

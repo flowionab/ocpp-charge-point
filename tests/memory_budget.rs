@@ -173,6 +173,10 @@ fn full_transaction(index: usize) -> Transaction {
         remote_start_id: None,
         reservation_id: None,
         stop_at_energy_wh: None,
+        limit: None,
+        csms_limit: None,
+        limit_reached: None,
+        energy_start_wh: None,
     }
 }
 

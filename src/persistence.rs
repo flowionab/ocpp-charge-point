@@ -141,9 +141,15 @@ pub fn persistence_decision(
         // charging state. An energy manager may move the limit every few minutes - a dynamic
         // profile every `dynUpdateInterval` - so writing here would put flash wear on a path that
         // buys a recovered transaction nothing but a fresher sequence number.
-        TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged) => {
-            PersistenceDecision::Skip
-        }
+        // The same reasoning covers a limit being set or reached (CV15): both move `seq_no` and
+        // neither changes what a recovered transaction is owed - the energy delivered is the
+        // meter's business, and a limit a power cut interrupted is one the CSMS re-sends or the
+        // driver re-enters.
+        TransactionEventKind::Updated(
+            TransactionUpdateReason::ChargingRateChanged
+            | TransactionUpdateReason::LimitSet
+            | TransactionUpdateReason::LimitReached(_),
+        ) => PersistenceDecision::Skip,
         TransactionEventKind::Updated(TransactionUpdateReason::MeterValuePeriodic) => {
             let Some(sample) = occurred.transaction.last_meter_sample else {
                 return PersistenceDecision::Skip;
@@ -941,6 +947,11 @@ impl From<TransactionEventKind> for PersistedTransactionEventKind {
             TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged) => {
                 Self::UpdatedChargingRateChanged
             }
+            // Never written either - `persistence_decision` skips both - and mapped onto the same
+            // "an update that changed nothing recoverable" record for the same reason.
+            TransactionEventKind::Updated(
+                TransactionUpdateReason::LimitSet | TransactionUpdateReason::LimitReached(_),
+            ) => Self::UpdatedChargingRateChanged,
             TransactionEventKind::Ended => Self::Ended,
         }
     }
@@ -3488,6 +3499,10 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         }
     }
 

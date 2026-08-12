@@ -600,7 +600,13 @@ pub(crate) async fn advance_running_cost(
             evse_id,
             event: EvseEvent::Connector {
                 connector_id,
-                event: ConnectorEvent::RunningCostAdvanced(Box::new(cost.clone())),
+                event: ConnectorEvent::RunningCostAdvanced {
+                    // I12.FR.17's grand total, with the tariff's own floor/cap applied - what the
+                    // driver would be billed if the session ended here, and so the figure E16's
+                    // `maxCost` has to be measured against.
+                    total: cost.totals(&tariff).total.incl_tax.to_decimal(),
+                    cost: Box::new(cost.clone()),
+                },
             },
         })
         .await;

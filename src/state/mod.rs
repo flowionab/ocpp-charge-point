@@ -8,7 +8,7 @@ mod connector_state;
 mod connector_status;
 mod contract_certificate;
 mod der_control;
-mod device_model;
+pub(crate) mod device_model;
 mod display_message;
 mod event;
 mod evse_state;
@@ -98,7 +98,10 @@ pub use self::tariff::{
     TariffScope, TariffSetRejection, TariffStore, TaxPercent, TaxRate, TimeComponent, TimeOfDay,
     TimePrice, milli_from_decimal, milli_to_decimal,
 };
-pub use self::transaction::{StopReason, Transaction, TransactionChargingState, TransactionId};
+pub use self::transaction::{
+    StopReason, Transaction, TransactionChargingState, TransactionId, TransactionLimit,
+    TransactionLimitKind,
+};
 pub use self::variable_monitoring::{
     EventTrigger, MonitorType, MonitoringBase, SetMonitorRejection, TriggeredMonitor,
     VariableMonitor, VariableMonitorId, VariableMonitorStore, VariableMonitoringEvent,

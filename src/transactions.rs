@@ -24,13 +24,21 @@ pub use self::ocpp_2_1::Ocpp2_1TransactionNotifier;
 /// Non-exhaustive because a response carries more the crate may come to honour (`totalCost`,
 /// `chargingPriority`, `updatedPersonalMessage`); adding one should not break an integrator's own
 /// notifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[non_exhaustive]
 pub struct TransactionEventOutcome {
     /// The response's `idTokenInfo.status`, or `None` when it carried no `idTokenInfo` at all -
     /// which is the ordinary case for an event that quoted no identifier, and is *not* the same as
     /// a rejection.
     pub id_token_status: Option<crate::state::AuthorizationStatus>,
+    /// The response's `transactionLimit` - a ceiling the CSMS is placing on this transaction
+    /// (**E16.FR.02**, CV15), most often a prepaid balance (C17).
+    ///
+    /// `None` for a response that carried none, which is the ordinary case: OCPP has the CSMS
+    /// send a limit "only once for every change in cost limit", so silence means "unchanged", not
+    /// "no limit". 2.1 only - neither 2.0.1's nor 1.6J's response has the field, so their
+    /// notifiers always report `None`.
+    pub transaction_limit: Option<crate::state::TransactionLimit>,
 }
 
 impl TransactionEventOutcome {
@@ -44,6 +52,15 @@ impl TransactionEventOutcome {
     pub fn with_id_token_status(status: crate::state::AuthorizationStatus) -> Self {
         Self {
             id_token_status: Some(status),
+            ..Self::default()
+        }
+    }
+
+    /// This outcome with the CSMS's transaction limit attached (E16.FR.02).
+    pub fn with_transaction_limit(self, limit: crate::state::TransactionLimit) -> Self {
+        Self {
+            transaction_limit: Some(limit),
+            ..self
         }
     }
 
@@ -114,6 +131,24 @@ pub async fn deliver_transaction_event<N: TransactionNotifier>(
             occurred.offline,
         )
         .await?;
+    // E16.FR.02/.03 (CV15): a ceiling the CSMS placed on this transaction. Applied before the
+    // deauthorization check below because the two are independent - a response can carry both,
+    // and a revoked identifier does not make the limit uninteresting to record.
+    if let Some(limit) = outcome.transaction_limit {
+        tracing::debug!(evse_id, connector_id, "the CSMS set a transaction limit");
+        let _ = actor
+            .send(crate::state::ChargePointEvent::Evse {
+                evse_id,
+                event: crate::state::EvseEvent::Connector {
+                    connector_id,
+                    event: crate::state::ConnectorEvent::TransactionLimitSet {
+                        limit,
+                        from_csms: true,
+                    },
+                },
+            })
+            .await;
+    }
     if outcome.id_token_rejected() {
         tracing::info!(
             evse_id,
@@ -244,6 +279,10 @@ mod tests {
             remote_start_id: None,
             reservation_id: None,
             stop_at_energy_wh: None,
+            limit: None,
+            csms_limit: None,
+            limit_reached: None,
+            energy_start_wh: None,
         };
         sender.send(TransactionEventOccurred {
             evse_id: 0,
@@ -373,6 +412,50 @@ mod tests {
         );
     }
 
+    /// CV15 (E16.FR.02): a ceiling on the response is not an acknowledgement to be logged - it is
+    /// the CSMS setting a limit this session must run under, so it has to reach the state machine.
+    #[tokio::test]
+    async fn a_transaction_limit_on_the_response_reaches_the_transaction() {
+        let actor = charging_actor().await;
+        let notifier = FixedOutcomeNotifier(
+            TransactionEventOutcome::acknowledged().with_transaction_limit(
+                crate::state::TransactionLimit {
+                    max_energy_wh: Some(20_000.0),
+                    ..Default::default()
+                },
+            ),
+        );
+
+        super::deliver_transaction_event(
+            &notifier,
+            &actor,
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Started,
+                transaction: actor.state().evses[0].transactions[0].clone().unwrap(),
+                offline: false,
+            },
+        )
+        .await
+        .expect("the notifier cannot fail");
+
+        assert_eq!(
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.limit)
+                .and_then(|limit| limit.max_energy_wh),
+            Some(20_000.0),
+        );
+        // And it is remembered as the CSMS's ceiling, which is what later clamps a locally-set
+        // one (E16.FR.04).
+        assert!(
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .is_some_and(|transaction| transaction.csms_limit.is_some())
+        );
+    }
+
     /// The far more common case, and the one a bug here would break: an accepted (or silent)
     /// response leaves the session exactly alone.
     #[tokio::test]
@@ -420,7 +503,7 @@ pub(crate) mod ocpp_2_1 {
     use crate::meter_values::MeasurandSet;
     use crate::state::{
         MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
-        TransactionUpdateReason,
+        TransactionLimitKind, TransactionUpdateReason,
     };
     use crate::wire::v21::common::{
         ChargingStateEnum, MeasurandEnum, MeterValue, ReadingContextEnum, ReasonEnum, SampledValue,
@@ -484,6 +567,20 @@ pub(crate) mod ocpp_2_1 {
             // K11.FR.04/K13.FR.03 (CV18): an external control system moved the rate.
             TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged) => {
                 TriggerReasonEnum::ChargingRateChanged
+            }
+            // E16.FR.01/.03 (CV15): confirming the ceiling now in force.
+            TransactionEventKind::Updated(TransactionUpdateReason::LimitSet) => {
+                TriggerReasonEnum::LimitSet
+            }
+            // E16.FR.05: *which* ceiling was reached, which is the whole reason the four values
+            // exist - a bare `SuspendedEVSE` cannot be told from a smart-charging suspension.
+            TransactionEventKind::Updated(TransactionUpdateReason::LimitReached(kind)) => {
+                match kind {
+                    TransactionLimitKind::Cost => TriggerReasonEnum::CostLimitReached,
+                    TransactionLimitKind::Energy => TriggerReasonEnum::EnergyLimitReached,
+                    TransactionLimitKind::Soc => TriggerReasonEnum::SoCLimitReached,
+                    TransactionLimitKind::Time => TriggerReasonEnum::TimeLimitReached,
+                }
             }
             TransactionEventKind::Ended => match transaction.stop_reason {
                 Some(StopReason::EmergencyStop) => TriggerReasonEnum::AbnormalCondition,
@@ -597,7 +694,7 @@ pub(crate) mod ocpp_2_1 {
         use crate::clock::{Clock, is_synchronized};
         use crate::meter_values::{MeasurandSet, transaction_event_measurands};
         use crate::pricing::{DimensionCost, TotalCostKind, TransactionCost};
-        use crate::state::{Tariff, Transaction, TransactionEventKind};
+        use crate::state::{Tariff, Transaction, TransactionEventKind, TransactionUpdateReason};
         use crate::tariff::advance_running_cost;
         use crate::transactions::{TransactionEventOutcome, TransactionNotifier};
         use crate::wire::v21::TransactionEventRequest;
@@ -605,6 +702,7 @@ pub(crate) mod ocpp_2_1 {
         use crate::wire::v21::common::{
             ChargingPeriod, CostDetails, CostDimension, CostDimensionEnum, EVSE, Price,
             TariffCostEnum, TotalCost, TotalPrice, TotalUsage, Transaction as WireTransaction,
+            TransactionLimit as WireTransactionLimit,
         };
         use alloc::boxed::Box;
         use alloc::vec::Vec;
@@ -766,7 +864,25 @@ pub(crate) mod ocpp_2_1 {
                     operation_mode: None,
                     // I11/I12: which tariff is (or just priced) this transaction.
                     tariff_id,
-                    transaction_limit: None,
+                    // E16.FR.01/.03 (CV15): the confirmation, carried exactly once - on the event
+                    // whose trigger reason *is* `LimitSet`. Keying off the event kind rather than
+                    // a "still to be reported" flag means the two cannot drift: the field is the
+                    // confirmation, so it is present precisely where the trigger reason says it
+                    // will be. Already filtered to what this build enforces (E16.FR.13) - the
+                    // state machine did that before recording it.
+                    transaction_limit: matches!(
+                        kind,
+                        TransactionEventKind::Updated(TransactionUpdateReason::LimitSet)
+                    )
+                    .then(|| transaction.limit)
+                    .flatten()
+                    .map(|limit| WireTransactionLimit {
+                        custom_data: None,
+                        max_cost: limit.max_cost,
+                        max_energy: limit.max_energy_wh,
+                        max_so_c: limit.max_soc_percent.map(i64::from),
+                        max_time: limit.max_time_secs,
+                    }),
                     custom_data: None,
                 },
                 // E12 (CV6.1): only stated when it is true. OCPP defaults the field to `false`,
@@ -822,16 +938,30 @@ pub(crate) mod ocpp_2_1 {
         fn read_outcome(
             response: &crate::wire::v21::TransactionEventResponse,
         ) -> TransactionEventOutcome {
-            let Some(info) = response.id_token_info.as_ref() else {
-                return TransactionEventOutcome::acknowledged();
+            let outcome = match response.id_token_info.as_ref() {
+                Some(info) => TransactionEventOutcome::with_id_token_status(
+                    if info.status == AuthorizationStatusEnum::Accepted {
+                        crate::state::AuthorizationStatus::Accepted
+                    } else {
+                        crate::state::AuthorizationStatus::Rejected
+                    },
+                ),
+                None => TransactionEventOutcome::acknowledged(),
             };
-            TransactionEventOutcome::with_id_token_status(
-                if info.status == AuthorizationStatusEnum::Accepted {
-                    crate::state::AuthorizationStatus::Accepted
-                } else {
-                    crate::state::AuthorizationStatus::Rejected
-                },
-            )
+            // E16.FR.02 (CV15): the ceiling the CSMS is placing on this transaction. Read
+            // verbatim - filtering it to what this build enforces is the state machine's job
+            // (E16.FR.13), so the two questions stay in one place each.
+            match response.transaction_limit.as_ref() {
+                Some(limit) => outcome.with_transaction_limit(crate::state::TransactionLimit {
+                    max_cost: limit.max_cost,
+                    max_energy_wh: limit.max_energy,
+                    // OCPP types the percentage as an integer; anything outside 0-100 is not a
+                    // state of charge, and clamping would invent a limit the CSMS did not set.
+                    max_soc_percent: limit.max_so_c.and_then(|soc| u8::try_from(soc).ok()),
+                    max_time_secs: limit.max_time,
+                }),
+                None => outcome,
+            }
         }
 
         /// Wraps an `OCPP2_1Client` with a caller-supplied [`Clock`] for the TransactionEvent
@@ -995,6 +1125,10 @@ pub(crate) mod ocpp_2_1 {
                     remote_start_id: None,
                     reservation_id: None,
                     stop_at_energy_wh: None,
+                    limit: None,
+                    csms_limit: None,
+                    limit_reached: None,
+                    energy_start_wh: None,
                 }
             }
 
@@ -1120,6 +1254,93 @@ pub(crate) mod ocpp_2_1 {
                         != Some(crate::wire::v21::common::MeasurandEnum::PowerActiveImport)),
                     "power was sampled but not selected"
                 );
+            }
+
+            /// CV15 (E16.FR.01/.03): the confirmation rides on the event whose trigger reason is
+            /// `LimitSet`, and on no other. Both halves asserted together, because "once" is the
+            /// requirement and a test of only the positive case would pass on a build that sent
+            /// it every time.
+            #[test]
+            fn the_transaction_limit_is_confirmed_on_the_limit_set_event_and_no_other() {
+                let clock = FixedClock(DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap());
+                let limited = Transaction {
+                    limit: Some(crate::state::TransactionLimit {
+                        max_cost: Some(12.34),
+                        max_energy_wh: Some(20_000.0),
+                        ..Default::default()
+                    }),
+                    ..transaction_with_sample()
+                };
+                let request = |kind| {
+                    build_transaction_event_request(
+                        clock.now(),
+                        0,
+                        0,
+                        kind,
+                        limited.clone(),
+                        false,
+                        MeasurandSet::default(),
+                        None,
+                    )
+                };
+
+                let confirmation = request(TransactionEventKind::Updated(
+                    TransactionUpdateReason::LimitSet,
+                ));
+                let limit = confirmation
+                    .transaction_info
+                    .transaction_limit
+                    .expect("the LimitSet event carries the limit");
+                assert_eq!(limit.max_cost, Some(12.34));
+                assert_eq!(limit.max_energy, Some(20_000.0));
+                assert_eq!(
+                    confirmation.trigger_reason,
+                    crate::wire::v21::common::TriggerReasonEnum::LimitSet
+                );
+
+                // The same transaction, still under the same limit, reporting a meter reading:
+                // the limit is in force but has already been confirmed, so it is not repeated.
+                let periodic = request(TransactionEventKind::Updated(
+                    TransactionUpdateReason::MeterValuePeriodic,
+                ));
+                assert_eq!(periodic.transaction_info.transaction_limit, None);
+            }
+
+            /// E16.FR.05, at the wire: each ceiling reports its own trigger reason, which is the
+            /// only thing telling a CSMS why the connector went `SuspendedEVSE`.
+            #[test]
+            fn each_limit_reached_reports_its_own_trigger_reason() {
+                use crate::state::TransactionLimitKind;
+                use crate::wire::v21::common::TriggerReasonEnum;
+
+                for (kind, expected) in [
+                    (
+                        TransactionLimitKind::Cost,
+                        TriggerReasonEnum::CostLimitReached,
+                    ),
+                    (
+                        TransactionLimitKind::Energy,
+                        TriggerReasonEnum::EnergyLimitReached,
+                    ),
+                    (
+                        TransactionLimitKind::Soc,
+                        TriggerReasonEnum::SoCLimitReached,
+                    ),
+                    (
+                        TransactionLimitKind::Time,
+                        TriggerReasonEnum::TimeLimitReached,
+                    ),
+                ] {
+                    assert_eq!(
+                        trigger_reason_for(
+                            TransactionEventKind::Updated(TransactionUpdateReason::LimitReached(
+                                kind
+                            )),
+                            &transaction(),
+                        ),
+                        expected,
+                    );
+                }
             }
 
             /// CV2.6: a cleared list produces no `meterValue` member at all. The event itself is a
@@ -1350,6 +1571,10 @@ pub(crate) mod ocpp_2_1 {
                 remote_start_id: None,
                 reservation_id: None,
                 stop_at_energy_wh: None,
+                limit: None,
+                csms_limit: None,
+                limit_reached: None,
+                energy_start_wh: None,
             };
 
             assert_eq!(
@@ -1388,6 +1613,10 @@ pub(crate) mod ocpp_2_1 {
                 remote_start_id: Some(7),
                 reservation_id: None,
                 stop_at_energy_wh: None,
+                limit: None,
+                csms_limit: None,
+                limit_reached: None,
+                energy_start_wh: None,
             };
 
             assert_eq!(
@@ -1417,6 +1646,10 @@ pub(crate) mod ocpp_2_1 {
                 remote_start_id: None,
                 reservation_id: None,
                 stop_at_energy_wh: None,
+                limit: None,
+                csms_limit: None,
+                limit_reached: None,
+                energy_start_wh: None,
             };
 
             assert_eq!(
@@ -1483,7 +1716,7 @@ pub(crate) mod ocpp_2_0_1 {
 
     use crate::state::{
         MeterSample, StopReason, Transaction, TransactionChargingState, TransactionEventKind,
-        TransactionUpdateReason,
+        TransactionLimitKind, TransactionUpdateReason,
     };
     use crate::wire::v201::common::{
         ChargingStateEnum, MeasurandEnum, MeterValue, ReadingContextEnum, ReasonEnum, SampledValue,
@@ -1545,6 +1778,24 @@ pub(crate) mod ocpp_2_0_1 {
             // K11.FR.04/K13.FR.03 (CV18): an external control system moved the rate.
             TransactionEventKind::Updated(TransactionUpdateReason::ChargingRateChanged) => {
                 TriggerReasonEnum::ChargingRateChanged
+            }
+            // E16 is 2.1-only, and 2.0.1's `TriggerReasonEnum` has neither `LimitSet` nor
+            // `CostLimitReached`/`SoCLimitReached`. `EnergyLimitReached` and `TimeLimitReached`
+            // it does have, so those two are exact; the other two report the charging-state
+            // change that accompanies them, which is true (the connector really did move to
+            // `SuspendedEVSE`) even though it does not say why. A `LimitSet` confirmation has no
+            // honest 2.0.1 spelling at all and is not sent - see `notify_transaction_event`.
+            TransactionEventKind::Updated(TransactionUpdateReason::LimitSet) => {
+                TriggerReasonEnum::ChargingStateChanged
+            }
+            TransactionEventKind::Updated(TransactionUpdateReason::LimitReached(kind)) => {
+                match kind {
+                    TransactionLimitKind::Energy => TriggerReasonEnum::EnergyLimitReached,
+                    TransactionLimitKind::Time => TriggerReasonEnum::TimeLimitReached,
+                    TransactionLimitKind::Cost | TransactionLimitKind::Soc => {
+                        TriggerReasonEnum::ChargingStateChanged
+                    }
+                }
             }
             TransactionEventKind::Ended => match transaction.stop_reason {
                 Some(StopReason::EmergencyStop) => TriggerReasonEnum::AbnormalCondition,
@@ -1888,6 +2139,10 @@ pub(crate) mod ocpp_2_0_1 {
                     remote_start_id: None,
                     reservation_id: None,
                     stop_at_energy_wh: None,
+                    limit: None,
+                    csms_limit: None,
+                    limit_reached: None,
+                    energy_start_wh: None,
                 }
             }
 
@@ -2027,6 +2282,10 @@ pub(crate) mod ocpp_2_0_1 {
                 remote_start_id: None,
                 reservation_id: None,
                 stop_at_energy_wh: None,
+                limit: None,
+                csms_limit: None,
+                limit_reached: None,
+                energy_start_wh: None,
             };
 
             assert_eq!(
@@ -2062,6 +2321,10 @@ pub(crate) mod ocpp_2_0_1 {
                 remote_start_id: None,
                 reservation_id: None,
                 stop_at_energy_wh: None,
+                limit: None,
+                csms_limit: None,
+                limit_reached: None,
+                energy_start_wh: None,
             };
 
             assert_eq!(
