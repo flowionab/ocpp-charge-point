@@ -1,7 +1,8 @@
 # OCPP 2.1 compliance audit — spec vs. this crate
 
-**Date:** 2026-08-11 · **Baseline:** `main` @ `4c6abe3` · **Spec:** OCPP 2.1 edition 2
-(`docs/OCPP-2.1/`, part 2 specification + part 2 appendices v2.1 CSVs + errata 2026-06).
+**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12 · **Baseline:** `main` @ `4c6abe3`,
+sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
+part 2 appendices v2.1 CSVs + errata 2026-06).
 
 This document is the *comparison* half of certification readiness: what the spec requires of a
 Charging Station, what this crate does, and where the two differ. It does not replace
@@ -284,21 +285,166 @@ Carried forward from `docs/CERTIFICATION.md` §3 — re-confirmed as still curre
 - **ISO 15118 HLC (K15–K20, Q, R)**: the crate relays EXI opaquely and does not run a 15118 session
   state machine; Q/R conformance is a product claim resting on the integrator's stack.
 
+### 2.13 High · an external charging limit is reported to the CSMS but never enforced (K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01) [READ]
+
+Found by CV12's K sweep. An integrator's energy-management binding pushes
+`ChargePointEvent::ExternalChargingLimitSet`; `ChargePointState::set_external_charging_limit`
+(`src/state/charge_point_state.rs:2274`) records it on `EvseState::external_charging_limit` (or
+`station_external_charging_limit`) and pushes exactly one effect — the
+`NotifyChargingLimit` that tells the CSMS about it. Nothing else happens.
+
+**The limit is never applied.** `smart_charging::projection` composes from
+`state.charging_profiles.applying_to(evse_id)` alone, and `ChargingProfileStore` holds *installed
+charging profiles*; the external-limit field is a separate slot that `compose` has no way to see.
+So a station under a 6 kW EMS limit tells the CSMS it is limited to 6 kW and keeps drawing whatever
+the CSMS profile allowed. K11.FR.01 is a `SHALL`, and this is the failure direction that matters:
+reporting a limit that is not enforced is worse than not supporting external limits at all, because
+the CSMS's own load calculation now double-counts a reduction that never happened.
+
+K13.FR.01 ("SHALL NOT limit charging anymore based on the previously received limit") passes only
+vacuously — there was never a limit in force to stop applying.
+
+Not a regression and not a mis-claim: `docs/PRODUCTION-ROADMAP.md` B2.8 scoped these four messages
+as "notify-flows that report a limit's *origin* rather than apply one", and delivered exactly that.
+What was never done is ask what K11 requires *behaviourally* of a station that sends them — which is
+precisely the residual risk §3 was written to name.
+
+### 2.14 High · transaction limits are entirely unimplemented (E16, 20 FRs) [MECHANICAL]
+
+`TransactionLimit` occurs once in `src/`, as a type alias in `src/wire.rs:1083`. It is never
+constructed, never read from a `TransactionEventResponse`, and never enforced.
+`TriggerReasonEnum::LimitSet` occurs zero times, and `transactions::trigger_reason_for` has no arm
+that could produce it.
+
+So none of E16 holds: the station never reports a limit it set (E16.FR.01), never honours one the
+CSMS set in a `TransactionEventResponse` (E16.FR.02/.03), and never stops a transaction on reaching
+a cost, energy, SoC or time limit. This also strands **C17 (authorization with prepaid card)**,
+whose whole mechanism is a CSMS-set `maxCost` — and it is the one gap that directly limits CV8's
+value, since the crate now computes a running cost locally (`EvseState::running_cost`) and still has
+no way to act on a cost ceiling.
+
+### 2.15 Medium · `CAPABILITY_GATED_VARIABLES` was never swept by CV2.1 — 19 of 26 writable rows accept a write and discard it (B05.FR.09) [MECHANICAL]
+
+CV2.1 added `DefaultVariable::honoured` and swept `DEFAULT_VARIABLES` (`src/state/device_model.rs`).
+`CapabilityGatedVariable` (`src/device_model.rs:36`) has no such field, so the same question was
+never asked of the second table — and 26 of its 72 rows are registered `ReadWrite`.
+
+Re-running CV2.1's own detector against it, with the stricter rule CV2.1 adopted (a doc comment or a
+test asserting the variable is *registered* does not count as a use):
+
+| Verdict | Rows |
+|---|---|
+| **Decorative** — writable, read nowhere | **19** |
+| Station-written — the terminal drives them, so a CSMS write is accepted and then overwritten | 5 (`PaymentCtrlr.Merchant[Id\|TaxId\|Name\|Address\|City]`) |
+| Genuinely honoured | 2 (`ISO15118Ctrlr.ContractValidationOffline`, `.CentralContractValidationAllowed`) |
+
+The 19: `SmartChargingCtrlr.LimitChangeSignificance`, `DisplayMessageCtrlr.Language`,
+`TariffCostCtrlr.{Currency,TariffFallbackMessage×2,TotalCostFallbackMessage×2}`,
+`PaymentCtrlr.{Enabled,AuthorizeDirectPayment,AuthorizationAmount,PaymentDetails,SettlementByCSMS,ReceiptServerUrl,ReceiptByCSMS}`,
+`V2XChargingCtrlr.Enabled`, `WebPaymentsCtrlr.{URLTemplate,TOTPVersion,Length,ValidityTime}`.
+
+`SmartChargingCtrlr.LimitChangeSignificance` is the one the appendix marks `Required? = yes`, and
+the one with a behavioural consequence beyond the false `Accepted`: a CSMS setting it to 20% is told
+the threshold took, and the station goes on reporting every change. Three of the `TariffCostCtrlr`
+rows are the same ones CV8 recorded as unhonoured — this finding is about the *refusal*, not the
+honouring.
+
+Two rows also caught CV2.1's original blind spot exactly: `LimitChangeSignificance` and `Language`
+each appear outside their registration site only inside a test asserting they are registered.
+
+### 2.16 Medium · `LocalGeneration` is collapsed into `ExternalConstraints` and cannot round-trip (K27.FR.02/.03/.05) [READ]
+
+`smart_charging::ocpp_2_1::map_purpose` maps 2.1's `LocalGeneration` purpose onto this crate's
+`ChargingProfilePurpose::ExternalConstraints` through a `_` catch-all arm, and `wire_purpose` maps
+that back to `ChargingStationExternalConstraints`. There is no internal purpose for local generation,
+so:
+
+- **K27.FR.02** — `GetChargingProfiles` cannot report the profile with
+  `chargingProfilePurpose = LocalGeneration`; it comes back as external constraints.
+- **K27.FR.03/.05** — `NotifyChargingLimit` must carry `isLocalGeneration = true` and must group the
+  two purposes separately. `wire_charging_limit` hardcodes `is_local_generation: None`, and
+  `ExternalChargingLimit` has no field that could carry it.
+- A `ClearChargingProfile` filtered on either purpose necessarily hits both.
+
+The `_` catch-all is also the mechanism: it silently absorbs any purpose 2.1 adds later, which is the
+failure mode `CLAUDE.md`'s "exhaustive matches with no wildcard arm" rule exists to prevent.
+
+### 2.17 Medium · no `triggerReason = ChargingRateChanged` (K11.FR.04, K13.FR.03) [MECHANICAL]
+
+`ChargingRateChanged` occurs nowhere in `src/`, and `TransactionUpdateReason` has only
+`ChargingStateChanged` and `MeterValuePeriodic`.
+
+The distinction matters and was checked rather than assumed: **K01.FR.61 makes this a `MAY`** for a
+rate change the CSMS itself caused, so not sending it there is conformant. **K11.FR.04 and K13.FR.03
+make it a `SHALL`** when an external control system changed the rate. Those two are unmet — though
+only reachable once §2.13 is fixed, since today no external limit changes any rate.
+
+### 2.18 Medium · ISO 15118 renegotiation has no hardware surface at all (K16, K17 — 33 FRs) [READ]
+
+`hardware::Iso15118Controller` has exactly one method, `deliver_certificate_response`, and
+`renegotiat` matches nothing anywhere in `src/`. K16.FR.02 is a `SHALL` on the Charging Station
+whenever the composite schedule changes ("initiate schedule renegotiation with EV"), and K16.FR.03
+requires handing the composite schedule to the EV.
+
+This is the *same shape* of blocker as DER actuation in §2.12, and belongs beside it: not "the
+integrator must supply a stack" but "there is no trait for the integrator to implement". A product
+with a complete HLC stack still could not satisfy K16/K17 through this crate today. `docs/
+CERTIFICATION.md` §3 item 2 names the ISO 15118 dependency but describes it as an integrator-stack
+gap; it is also a missing surface here.
+
 ---
 
-## 3. Blocks surveyed but not requirement-verified
+## 3. Requirement-level sweeps (workstream CV12)
 
-Absence of findings below means *not checked at requirement level*, not *conformant*. These carry the
-largest residual risk:
+Absence of findings below still means *not checked at requirement level*, not *conformant*. What
+changed on 2026-08-12 is that the **K block's sweep is done** and the rest have had a mechanism-level
+pass that says which use cases are worth a requirement-level read at all.
+
+### 3.1 K — Smart charging: swept
+
+The headline is that **317 was a misleading number**, and the residual risk in K is much smaller than
+it looked — but concentrated. Classifying K11–K29 by who the requirement actually addresses:
+
+| Class | Use cases | FRs | What it means |
+|---|---|---|---|
+| **Not addressed to a Charging Station** | K14, K24, K25, K26 | 6 | Every requirement names the **Local Controller**. K24/K25/K26 carry no requirements of their own — the spec says each is "already covered in use case K14". Nothing to implement in charge-point firmware. |
+| **Deferred to another use case** | K23 | 0 | "Already covered in use cases K11 and K12" — so §2.13 is K23's finding too. |
+| **Blocked on a hardware surface that does not exist** | K16, K17, K18, K19, K20 | 78 | ISO 15118 renegotiation and 15118-20 scheduled/dynamic control modes. See §2.18: not merely "needs an integrator's HLC stack" but *no trait to implement*. |
+| **Station-side, verified this sweep** | K11, K12, K13, K21, K22, K27 | 36 | Findings §2.13, §2.16, §2.17. K21.FR.01–.04 check out against `handle_use_priority_charging`: `NoProfile` when no `PriorityCharging` profile applies to the transaction's EVSE or the charge point, `Rejected` on an unknown transaction, and `applying_to` covering "EVSE #0 or the EVSE of the transaction" exactly. Both reason codes are optional in the spec and are not sent. K21's remaining six FRs and FR.04's *application* (which rests on `PriorityCharging` outranking `Tx` in purpose precedence) were not read. K22's local trigger is reachable because `handle_use_priority_charging` is public, so a button binding can drive it — K22.FR.01's "notify user it is not capable" is a `hardware::Display` concern a product owns. |
+| **Station-side, still unverified** | K28, K29 | 23 | Dynamic charging profiles from the CSMS and from an external system. `ChargingProfileKind::Dynamic` and `dynUpdateInterval` are present and referenced ~150 times, so this is a read of behaviour rather than a search for a mechanism. **The one piece of K left.** |
+
+Two conclusions worth carrying into H3.1's OCTT planning: **Smart Charging as a certifiable profile
+rests on K01–K13 and K21–K29**, of which only K28/K29 are now unread — and the 78 FRs of 15118-20
+control modes are unreachable for any product until a renegotiation surface exists, whatever stack
+the integrator brings.
+
+### 3.2 E, C, N, Q — mechanism-level pass, requirement-level reads outstanding
+
+Each named use case was checked for whether its mechanism exists at all. That is weaker than a
+requirement read and is labelled `[MECHANICAL]` where the answer was a count, but it is what decides
+where a requirement read is worth the time.
+
+| Block | Use case | Mechanism | Verdict |
+|---|---|---|---|
+| **E** | E11 connection loss | offline queue, transaction continues | present; requirement read outstanding |
+| | E13 message not accepted | `TransactionEventResponse` handling | present; requirement read outstanding |
+| | E14 check transaction status | `handle_get_transaction_status` (48 refs) | present; requirement read outstanding |
+| | **E16 fixed cost/energy/SoC/time** | `TransactionLimit`, `triggerReason = LimitSet` | **absent — see §2.14** |
+| | E17 resume after forced reboot | power-cut recovery, swept by `tests/power_cut_recovery.rs` | present, and the strongest-evidenced row here |
+| **C** | **C16 master pass** | `MasterPassGroupId` | **absent** — 0 occurrences, as first recorded in §2.2's era and re-confirmed |
+| | **C17 prepaid card** | rests entirely on E16's `maxCost` | **blocked on §2.14** |
+| | C19–C23 cancellation/settlement | `NotifySettlement`, `SettlementStatus` (57 refs) | present; requirement read outstanding |
+| | C24 stand-alone terminal | `PaymentTerminal` + CV2.11's `status()` | present since CV2.11; requirement read outstanding |
+| | **C25 ad hoc payment via QR code** | `WebPaymentsCtrlr`, `QRCode` | **absent** — 0 occurrences of `QRCode`; all five `WebPaymentsCtrlr` variables are decorative (§2.15). 27 FRs. |
+| **N** | N09/N10 customer information | `CustomerInformation` (177 refs) | present; requirement read outstanding |
+| | N11 frequent periodic monitoring | `variable_monitoring` engine | present; requirement read outstanding |
+| | N12–N15 periodic event streams | `PeriodicEventStream` (307 refs) | present; requirement read outstanding |
+| **Q** | Q01 V2X authorization | authorization path | present; requirement read outstanding |
+| | Q02–Q08 V2X control | DER/V2X actuation | **blocked on the same missing trait as §2.12's DER row.** `V2XChargingCtrlr.Enabled` is decorative (§2.15), so a station cannot even be told to enable it. 50 FRs. |
 
 | Block | FRs | Depth |
 |---|---|---|
-| K — Smart charging | 317 | `[SURVEY]` + composition engine `[READ]`. K11–K14 (external limits), K16–K20 (renegotiation, 15118-20 control modes), K21–K29 (priority, dynamic profiles, EMS topologies) unverified. |
-| E — Transactions | 196 | `[READ]` for the specific findings above; E11, E13, E14, E16, E17 unverified at requirement level. |
-| C — Authorization | 186 | `[READ]` for C07/C13–C15; C16 (master pass — `MasterPassGroupId` absent), C17, C19–C25 unverified. |
-| N — Diagnostics/monitoring | 156 | `[SURVEY]`; the engine looks complete but N09–N15 unverified. |
-| Q — V2X | 77 | `[SURVEY]` only. |
-| I, L, M, O, P, G, H, J, S | 349 combined | `[SURVEY]` only. |
+| I, L, M, O, P, G, H, J, S | 349 combined | `[SURVEY]` only — untouched by this sweep. |
 
 ---
 
@@ -320,3 +466,18 @@ largest residual risk:
 8. **§3** — requirement-level verification sweeps for the unverified blocks, K and E first.
 
 Only after 1–7 is an OCTT run (H3.1) likely to be informative rather than a list of the above.
+
+**Items 1–7 are now closed** (CV1–CV11), and item 8's K half is done. The order that follows from
+the sweep, by certification impact rather than by size:
+
+9. **§2.13 (external limits are not enforced)** — the only finding here where the station tells the
+   CSMS something untrue about its own behaviour, and the prerequisite for §2.17. Everything it
+   needs already exists: the limit is recorded, and `compose` already has an `ExternalConstraints`
+   capping purpose to feed it into.
+10. **§2.15 (the second variable table)** — the same one-word-per-row change CV2.1 was, on a table
+    CV2.1 never reached, and the same B05.FR.09 argument.
+11. **§2.14 (E16 transaction limits)** — 20 FRs, unblocks C17 outright, and gives CV8's locally
+    computed cost something to act on. The largest of the three.
+12. **§2.16 / §2.17** — contained, and both are consequences of work above.
+13. **§2.18** — a `crate::hardware` addition, so it belongs with the DER actuation trait in a single
+    considered break rather than on its own.

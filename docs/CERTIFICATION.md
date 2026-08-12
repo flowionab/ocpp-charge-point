@@ -145,6 +145,16 @@ drift for whoever maintains that document next:
    README's hardware-class table) needs this integrator stack present, and none ships with this
    crate.
 
+   **Sharper than "needs an integrator stack", as of the 2026-08-12 K sweep.** For *renegotiation*
+   specifically — K16 and K17, 33 FRs, plus K18–K20's 15118-20 control modes — there is no trait to
+   implement: `hardware::Iso15118Controller` has exactly one method, `deliver_certificate_response`,
+   and nothing in `src/` mentions renegotiation at all. K16.FR.02 is a `SHALL` on the Charging
+   Station whenever the composite schedule changes. So this item is **two** gaps, not one: an
+   integrator-stack dependency for Plug & Charge, and a missing `crate::hardware` surface for
+   renegotiation that puts K16–K20 out of reach of any product. See
+   `docs/OCPP-2.1-COMPLIANCE-AUDIT.md` §2.18 and roadmap CV16 — which is the same shape of blocker
+   as item 1's DER actuation trait, and should be taken with it as one break.
+
 3. **`PaymentCtrlr`'s live status variables are placeholders.** Verified current in
    `src/payment.rs`'s module docs: the 22 required variables `CAPABILITY_GATED_VARIABLES` defines
    for `PaymentCtrlr` exist as device-model bookkeeping, but nothing drives them from a real
@@ -196,6 +206,15 @@ class table) the claim unlocks.
    fully message-complete, and covered by C3.5's cross-surface consistency test. Cheapest
    incremental claims after Core, and they cover the "public AC" and "DC fast charger" rows of
    the README's hardware-class table.
+
+   > **Smart Charging carries a caveat since 2026-08-12**, from the K-block requirement sweep in
+   > `docs/OCPP-2.1-COMPLIANCE-AUDIT.md` §3.1. Reservation and Local Authorization List Management
+   > are unaffected. Three findings touch this claim, and the first is the one to settle before
+   > booking OCTT time: an **external charging limit is reported to the CSMS but never enforced**
+   > (§2.13, roadmap CV13) — K11.FR.01 is a `SHALL`, and a station that says it is limited and is
+   > not is a worse failure than one that does not support external limits. `LocalGeneration`
+   > cannot round-trip (§2.16) and `triggerReason = ChargingRateChanged` is absent (§2.17). The
+   > composition engine itself (K01–K10) remains verified-good, and K28/K29 are still unread.
 3. **RemoteTrigger** (1.6J). Zero marginal cost — no feature flag, no hardware dependency,
    already wired and registered by default.
 

@@ -454,7 +454,54 @@ how much of the block is already claimed:
 5. **Q** (77), then the remaining blocks.
 
 Each sweep produces findings in the audit document's format, and any new gap gets a CV row here.
-Status: **open**.
+Status: **in progress** — K swept (2026-08-12), E/C/N/Q given a mechanism-level pass.
+
+| ID | Sweep | Status |
+|---|---|---|
+| **CV12.1** | **K — smart charging.** Swept K11–K29 requirement by requirement. Six findings, audit §2.13/§2.16/§2.17/§2.18. | **done** |
+| **CV12.2** | **K28/K29 (23 FRs), plus K21's last six.** Dynamic charging profiles from the CSMS and from an external system; the mechanism exists (`ChargingProfileKind::Dynamic`, `dynUpdateInterval`, ~150 references), so this is a behaviour read rather than a search. The K21 remainder includes FR.04's *application* — whether `PriorityCharging` actually displaces an active `Tx` profile in composition, which the sweep checked only at the response level. | open |
+| **CV12.3** | **E** (196) — E11, E13, E14, E17 at requirement level. E16 needs no sweep: audit §2.14 found it absent outright. | open |
+| **CV12.4** | **C** (186) — C19–C24 at requirement level. C16, C17 and C25 need no sweep: absent or blocked, per audit §3.2. | open |
+| **CV12.5** | **N** (156) — N09–N15. Every mechanism is present; this is a read for conformance, not for existence. | open |
+| **CV12.6** | **Q** (77) — Q01 only. Q02–Q08 (50 FRs) are blocked on the DER/V2X actuation trait and are not worth reading until it exists. | open |
+| **CV12.7** | **I, L, M, O, P, G, H, J, S** (349 combined) — untouched. | open |
+
+### CV12.1 — what the K sweep actually found, and why 317 was the wrong number
+
+The block's headline count made it the largest risk in this document. Classifying every use case by
+*who the requirement addresses* shrinks it sharply, and moves what is left into two piles:
+
+- **6 FRs are not addressed to a Charging Station at all.** K14 names the Local Controller
+  throughout, and K24/K25/K26 carry no requirements of their own — the spec says each is "already
+  covered in use case K14". K23 likewise defers to K11/K12. Four of the nine use cases in the
+  "EMS topologies" band are therefore nothing this crate can implement or fail.
+- **78 FRs (K16–K20) are unreachable by anyone**, not merely unimplemented here — see CV16.
+
+What remains is 59 station-side FRs, of which 36 were reached this sweep and 23 (K28/K29) are
+CV12.2. K21 came out clean as far as it was read — FR.01–.04 match `handle_use_priority_charging`
+response for response, including the "EVSE #0 or the EVSE of the transaction" scoping that
+`applying_to` gets right — and K22's local trigger is reachable because that function is public, so
+an integrator's button binding can drive it. K21's remaining six FRs are not read; they are folded
+into CV12.2 rather than counted as clean.
+
+**The one that matters is CV13.** It is the only finding in the sweep where the charge point tells
+the CSMS something untrue about its own behaviour.
+
+## CV13–CV18 — what the K sweep opened
+
+| ID | Item | Requirements | Status |
+|---|---|---|---|
+| **CV13** | **Enforce an external charging limit, don't just report it.** `set_external_charging_limit` records the limit and pushes the `NotifyChargingLimit` effect; `smart_charging::projection` composes from `charging_profiles.applying_to()` alone, so the limit never reaches hardware. Audit §2.13. | K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01 | open |
+| **CV14** | **Sweep `CAPABILITY_GATED_VARIABLES` the way CV2.1 swept `DEFAULT_VARIABLES`.** `CapabilityGatedVariable` has no `honoured` field, so 19 of its 26 writable rows accept a `SetVariables` and discard it. Audit §2.15. | B05.FR.09 | open |
+| **CV15** | **Transaction limits (E16).** `TransactionLimit` exists only as a type alias; `triggerReason = LimitSet` occurs nowhere. Unblocks C17 (prepaid) outright and gives CV8's local cost a ceiling to act on. Audit §2.14. | E16 (20 FRs), C17 | open |
+| **CV16** | **A renegotiation surface in `crate::hardware`.** K16.FR.02 is a `SHALL` on the station whenever the composite schedule changes, and `Iso15118Controller` has one method — a certificate hook. No integrator can satisfy K16–K20 through this crate today. Audit §2.18. | K16, K17 (33 FRs) | open |
+| **CV17** | **`LocalGeneration` needs its own internal purpose.** It is currently mapped onto `ExternalConstraints` through a `_` catch-all and cannot round-trip through `GetChargingProfiles`; `isLocalGeneration` is hardcoded `None`. Audit §2.16. | K27.FR.02/.03/.05 | open |
+| **CV18** | **`triggerReason = ChargingRateChanged`.** A `SHALL` only for externally caused rate changes (K11.FR.04, K13.FR.03) — K01.FR.61 makes the CSMS-caused case a `MAY`, so this is narrower than it looks, and only reachable once CV13 lands. Audit §2.17. | K11.FR.04, K13.FR.03 | open |
+
+**Sequencing:** CV13 before CV18 (nothing changes a rate externally until the limit is enforced),
+CV17 alongside CV13 (both touch the same purpose mapping), CV14 independent and cheap, CV15
+independent and largest, CV16 a `crate::hardware` addition that should be taken together with the
+DER actuation trait `docs/CERTIFICATION.md` §3 names — one considered break rather than two.
 
 ---
 
@@ -471,19 +518,33 @@ CV8                            independent, largest
 CV12                           continuous, in parallel
 ```
 
-Everything above the line is done. **CV12 is the only row of this document still open**, plus the
-`*Interval` variables noted below.
+Everything above the line is done. **CV1–CV11 are closed.** What is open is CV12's remaining sweeps
+and the six rows its first sweep opened:
+
+```
+CV12.1 (K, done) ──┬─> CV13 ──> CV18
+                   ├─> CV17
+                   ├─> CV14        independent, cheap
+                   ├─> CV15        independent, largest
+                   └─> CV16        a crate::hardware break — take with the DER trait
+CV12.2 … CV12.7                    the rest of the sweeps, continuous
+```
 
 An OCTT run (`docs/PRODUCTION-ROADMAP.md` H3.1) is worth doing once CV1–CV7 are closed. Before that
 it would mostly restate this document.
 
 **CV1–CV7 are now closed**, so that run is the next thing this workstream is waiting on rather than
-a future one. What remains here is CV12's requirement-level sweeps — which build nothing and are
-better informed by a real test-tool run than preceding one — and, outside this document, the two
-`crate::hardware` additions `docs/CERTIFICATION.md` §3 names as outright blockers (a DER actuation
-surface, and the payment terminal work CV2.11 only half-answers). Neither blocks Core, Reservation,
-Local Authorization List Management or Smart Charging, which is what an OCTT run should take first
-(`docs/CERTIFICATION.md` §4).
+a future one — and the K sweep sharpened what it should take first. **CV13 is the one finding that
+should not wait for it**: a station that reports an external charging limit it never applies gives
+the CSMS's load calculation a reduction that did not happen, and that is worse than not supporting
+external limits at all. The rest of the sweep's findings are either cheap (CV14), bounded and
+well-understood (CV15, CV17, CV18), or a hardware-surface decision (CV16) that belongs with the two
+`crate::hardware` additions `docs/CERTIFICATION.md` §3 already names as outright blockers — a DER
+actuation surface, and the payment terminal work CV2.11 half-answers. CV16 makes that list three.
+
+None of CV13–CV18 blocks Core, Reservation or Local Authorization List Management. **CV13, CV17 and
+CV18 do touch Smart Charging**, which `docs/CERTIFICATION.md` §4 puts in the first group of claims
+to pursue — so that claim is now worth revisiting before the OCTT run rather than after it.
 
 One caveat on the four `*Interval` variables under CV2.6: they remain refused, so a station is
 conformant in *what* it samples but not yet configurable in *how often*. That is a known, declared
