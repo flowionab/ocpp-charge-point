@@ -1,6 +1,7 @@
 //! Internal types for the outbound smart-charging notifications this crate forwards to the CSMS
 //! but never decides to send off its own state machine: an external charging limit (from
-//! something other than a CSMS charging profile - typically a local energy-management system) and
+//! something other than a CSMS charging profile - typically a local energy-management system,
+//! which [`ExternalChargingLimit`] also enforces rather than merely reporting) and
 //! whatever an EV reported via ISO 15118, which this crate does not implement (see
 //! `docs/PRODUCTION-ROADMAP.md` B4.5) but forwards on an integrator's behalf. See
 //! `crate::smart_charging::notifications` (B2.8) for the notifier traits and per-version wire
@@ -19,13 +20,27 @@ use crate::state::{ChargingLimitSource, ChargingSchedule};
 /// reported, never addressed by the CSMS at all), and conflating them would let an EMS's limit be
 /// reported back to the CSMS as though the CSMS itself had set it.
 ///
-/// **Not currently factored into [`crate::smart_charging`]'s composite-schedule projection.**
-/// Combining an externally-reported limit (in whatever unit its source chose) with a CSMS's own
-/// installed schedule - which may be in a different unit, and needs
-/// [`crate::smart_charging::SupplyCharacteristics`] to convert, plus a real decision about which
-/// of two independent, simultaneously-valid limits should bind - is a correctness-sensitive merge
-/// with its own failure modes. It deserves a task of its own rather than a guess bolted onto this
-/// one, so this crate reports the limit faithfully to the CSMS and does not yet act on it.
+/// **Enforced as well as reported** (OCPP K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01). Being kept
+/// out of the profile store does not mean being kept out of composition:
+/// [`crate::smart_charging::external_charging_limits`] turns whichever limits are in force into
+/// [`ChargingProfilePurpose::ExternalConstraints`](crate::state::ChargingProfilePurpose::ExternalConstraints)
+/// capping profiles at composition time, so the limit lowers whatever the CSMS's own profiles asked
+/// for and never raises it. A station that reported a limit it did not apply would hand the CSMS's
+/// load calculation a reduction that never happened, which is worse than not supporting external
+/// limits at all.
+///
+/// Two cases where a limit is reported but cannot bind, both by construction rather than by
+/// oversight:
+///
+/// - [`Self::schedule`] is `None`. There is no value to enforce; recording it warns.
+/// - The schedule is in [`ChargingRateUnit::Watts`](crate::state::ChargingRateUnit::Watts) and the
+///   projection was built without [`crate::smart_charging::SupplyCharacteristics`]. Converting
+///   would need the installation's voltage and phase count, which this crate refuses to guess -
+///   the same rule that applies to a watt-denominated CSMS profile, for the same reason.
+///
+/// Not persisted, unlike an installed profile: a reboot drops the limit and the enforcement of it
+/// together, so the station never goes on limiting for a reason it can no longer report - but an
+/// external system does have to re-push after a power cut.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalChargingLimit {
     /// Who imposed the limit - [`ChargingLimitSource::Ems`] or [`ChargingLimitSource::Other`] in

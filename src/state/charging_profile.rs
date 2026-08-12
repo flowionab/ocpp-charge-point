@@ -345,8 +345,11 @@ impl ChargingProfileCriteria {
 /// the answer is "none" rather than "all of them".
 ///
 /// Limits arriving from somewhere other than the CSMS - a local energy manager, a DSO signal - are
-/// not profiles and are not stored here; reporting them is `NotifyChargingLimit`
-/// (`docs/PRODUCTION-ROADMAP.md` B2), which this crate does not implement.
+/// not profiles and are not stored here. They arrive as
+/// [`ExternalChargingLimit`](crate::state::ExternalChargingLimit), are reported with
+/// `NotifyChargingLimit`/`ClearedChargingLimit`, and are enforced by
+/// [`crate::smart_charging::composing_profiles`], which joins them onto the installed profiles as
+/// capping profiles at composition time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChargingLimitSource {
     /// An energy management system on site.
@@ -357,6 +360,20 @@ pub enum ChargingLimitSource {
     So,
     /// Anything else.
     Other,
+}
+
+impl ChargingLimitSource {
+    /// A stable, low-cardinality name for logging - see `CLAUDE.md`'s "fields over prose". The
+    /// match is exhaustive with no wildcard arm on purpose: a new source must be a compile error
+    /// rather than a mislabelled log line.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Ems => "EMS",
+            Self::Cso => "CSO",
+            Self::So => "SO",
+            Self::Other => "Other",
+        }
+    }
 }
 
 impl InstalledChargingProfile {

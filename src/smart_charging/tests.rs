@@ -738,3 +738,144 @@ fn a_dynamic_profile_whose_csms_went_quiet_falls_through_to_the_next_profile() {
     let composed = compose(&profiles.iter().collect::<Vec<_>>(), &context()).unwrap();
     assert_eq!(limits(&composed), vec![(0, 8.0)]);
 }
+
+/// CV13's own cases: an external charging limit is not a stored profile, so it reaches composition
+/// through [`external_charging_limits`]/[`composing_profiles`] rather than through the store. What
+/// it does once it gets there is the [`ChargingProfilePurpose::ExternalConstraints`] capping rule,
+/// already covered above - these check the joining, and the two ways a limit can fail to reach it.
+mod external_charging_limits_compose_as_caps {
+    use super::*;
+    use crate::state::{ChargePointEvent, ChargePointState, ChargingLimitSource};
+
+    fn ems_limit(schedule: Option<ChargingSchedule>) -> crate::state::ExternalChargingLimit {
+        crate::state::ExternalChargingLimit {
+            source: ChargingLimitSource::Ems,
+            is_grid_critical: None,
+            schedule,
+        }
+    }
+
+    /// A charge point with one 32 A `TxDefault` profile installed on EVSE 0, which every case here
+    /// then constrains (or fails to).
+    fn state_with_a_32a_profile() -> ChargePointState {
+        let mut state = ChargePointState::new([1]);
+        state.apply(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::Evse(0),
+            profile: alloc::boxed::Box::new(
+                profile(
+                    1,
+                    ChargingProfilePurpose::TxDefault,
+                    0,
+                    schedule(&[(0, 32.0)]),
+                )
+                .profile,
+            ),
+        });
+        state
+    }
+
+    fn composed_limit_ma(state: &ChargePointState) -> Option<u32> {
+        let external = external_charging_limits(state, 0);
+        current_limit_ma(&composing_profiles(state, 0, &external), &context())
+    }
+
+    #[test]
+    fn an_evse_limit_caps_the_profile_the_csms_installed() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(Some(schedule(&[(0, 6.0)]))),
+        });
+
+        assert_eq!(composed_limit_ma(&state), Some(6_000));
+    }
+
+    #[test]
+    fn a_station_wide_limit_and_an_evse_limit_both_bind_and_the_lowest_wins() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: None,
+            limit: ems_limit(Some(schedule(&[(0, 10.0)]))),
+        });
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(Some(schedule(&[(0, 16.0)]))),
+        });
+
+        assert_eq!(composed_limit_ma(&state), Some(10_000));
+    }
+
+    /// An external limit never *raises* what the CSMS asked for: it is a constraint the station is
+    /// under, not a permission it was granted.
+    #[test]
+    fn a_limit_above_the_installed_profile_changes_nothing() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(Some(schedule(&[(0, 63.0)]))),
+        });
+
+        assert_eq!(composed_limit_ma(&state), Some(32_000));
+    }
+
+    /// OCPP's `chargingSchedule` is optional on `NotifyChargingLimit`, so an external system may
+    /// say "you are limited" without saying to what. There is then no number to enforce, and
+    /// inventing one - zero, or the profile's own limit - would be worse than the honest nothing
+    /// this does. Recording it warns for exactly that reason.
+    #[test]
+    fn a_limit_with_no_schedule_reports_but_does_not_cap() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(None),
+        });
+
+        assert!(state.evses[0].external_charging_limit.is_some());
+        assert_eq!(composed_limit_ma(&state), Some(32_000));
+    }
+
+    /// K13.FR.01: once withdrawn, the station must stop limiting on it.
+    #[test]
+    fn a_cleared_limit_stops_capping() {
+        let mut state = state_with_a_32a_profile();
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(Some(schedule(&[(0, 6.0)]))),
+        });
+        state.apply(ChargePointEvent::ExternalChargingLimitCleared {
+            evse_id: Some(0),
+            source: ChargingLimitSource::Ems,
+        });
+
+        assert_eq!(composed_limit_ma(&state), Some(32_000));
+    }
+
+    /// A limit on one EVSE is not a limit on another - only the station-wide slot crosses.
+    #[test]
+    fn an_evse_limit_does_not_reach_another_evse() {
+        let mut state = ChargePointState::new([1, 1]);
+        state.apply(ChargePointEvent::ChargingProfileSet {
+            scope: ChargingProfileScope::ChargePoint,
+            profile: alloc::boxed::Box::new(
+                profile(
+                    1,
+                    ChargingProfilePurpose::TxDefault,
+                    0,
+                    schedule(&[(0, 32.0)]),
+                )
+                .profile,
+            ),
+        });
+        state.apply(ChargePointEvent::ExternalChargingLimitSet {
+            evse_id: Some(0),
+            limit: ems_limit(Some(schedule(&[(0, 6.0)]))),
+        });
+
+        assert_eq!(composed_limit_ma(&state), Some(6_000));
+        let external = external_charging_limits(&state, 1);
+        assert_eq!(
+            current_limit_ma(&composing_profiles(&state, 1, &external), &context()),
+            Some(32_000)
+        );
+    }
+}

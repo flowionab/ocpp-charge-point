@@ -5,7 +5,10 @@
 //!
 //! 1. The CSMS installs a profile (`SetChargingProfile`), which lands in
 //!    [`crate::state::ChargingProfileStore`] via
-//!    [`crate::state::ChargePointEvent::ChargingProfileSet`] (B2.1).
+//!    [`crate::state::ChargePointEvent::ChargingProfileSet`] (B2.1) - or an external system (a
+//!    local energy manager, a DSO signal) imposes a limit through
+//!    [`crate::state::ChargePointEvent::ExternalChargingLimitSet`], which [`composing_profiles`]
+//!    joins onto the installed ones as a capping profile.
 //! 2. [`compose`] turns whatever profiles apply to a connector into one [`CompositeSchedule`] -
 //!    the single limit curve that results from purpose precedence, stack levels and capping
 //!    profiles (B2.2). It is a pure function of the profiles and a [`CompositionContext`], so
@@ -27,8 +30,9 @@ use alloc::vec::Vec;
 use chrono::{DateTime, Duration, Utc};
 
 use crate::state::{
-    ChargingProfileKind, ChargingProfilePurpose, ChargingRateUnit, ChargingSchedule,
-    ChargingSchedulePeriod, InstalledChargingProfile, TransactionId,
+    ChargePointState, ChargingProfile, ChargingProfileId, ChargingProfileKind,
+    ChargingProfilePurpose, ChargingProfileScope, ChargingRateUnit, ChargingSchedule,
+    ChargingSchedulePeriod, ExternalChargingLimit, InstalledChargingProfile, TransactionId,
 };
 
 mod handlers;
@@ -325,6 +329,114 @@ pub fn current_limit_ma(
     // clamp below leaves, and needs no `libm` dependency.
     let milliamps = (resolved.limit * 1_000.0).clamp(0.0, f64::from(u32::MAX));
     Some((milliamps + 0.5) as u32)
+}
+
+/// The profile id a limit from an external system composes under.
+///
+/// Negative, and therefore outside the range a CSMS uses (OCPP profile ids are non-negative), so
+/// that a synthetic profile can share a list with real installed ones inside [`compose`] without
+/// ever colliding with one. Nothing reports these ids: an external limit is not an installed
+/// charging profile, and `GetChargingProfiles` must go on saying so - see
+/// [`crate::state::ChargingLimitSource`].
+fn external_limit_profile_id(scope: ChargingProfileScope) -> ChargingProfileId {
+    match scope {
+        ChargingProfileScope::ChargePoint => ChargingProfileId(-1),
+        ChargingProfileScope::Evse(evse_id) => {
+            ChargingProfileId((-2i32).saturating_sub(i32::try_from(evse_id).unwrap_or(i32::MAX)))
+        }
+    }
+}
+
+/// The capping profile an external limit composes as, or `None` when the limit carries no schedule
+/// and so says nothing that *could* be enforced.
+///
+/// [`ChargingProfilePurpose::ExternalConstraints`] because that is exactly what this is - a
+/// constraint the station is subject to rather than one it chose - and because that purpose already
+/// [caps the composed result](ChargingProfilePurpose::caps_the_result) rather than competing for
+/// it: an external limit lowers whatever the CSMS asked for and never raises it.
+///
+/// [`ChargingProfileKind::Absolute`], so a limit whose schedule carries a `start_schedule` is
+/// honoured to the second. A schedule *without* one anchors at "now" on every evaluation, which is
+/// right for the usual case (one period, in force until withdrawn) and wrong for a multi-period
+/// external schedule, which would restart rather than advance. An external system that wants a
+/// time-bounded limit must therefore stamp `start_schedule` itself - unlike the wire adapters,
+/// which stamp it on the CSMS's behalf, the state machine here is deliberately clock-free.
+fn as_capping_profile(
+    limit: &ExternalChargingLimit,
+    scope: ChargingProfileScope,
+) -> Option<InstalledChargingProfile> {
+    let schedule = limit.schedule.clone()?;
+    Some(InstalledChargingProfile {
+        scope,
+        profile: ChargingProfile {
+            id: external_limit_profile_id(scope),
+            stack_level: 0,
+            purpose: ChargingProfilePurpose::ExternalConstraints,
+            kind: ChargingProfileKind::Absolute,
+            recurrency: None,
+            valid_from: None,
+            valid_to: None,
+            transaction_id: None,
+            schedules: alloc::vec![schedule],
+            dyn_update_interval_secs: None,
+            dyn_update_time: None,
+        },
+    })
+}
+
+/// The limits an external system currently imposes on `evse_id` - the station-wide one and the
+/// EVSE's own, whichever are in force - as the capping profiles [`compose`] reads them through.
+///
+/// Built on demand rather than stored, so that the one representation of an external limit stays
+/// [`ExternalChargingLimit`]: it is what the integrator pushes in, what `NotifyChargingLimit`
+/// reports, and what `ClearedChargingLimit` withdraws, and a second stored copy of it could drift
+/// from that. The cost is one clone of the limit's schedule per evaluation, which is the same order
+/// as the composition it feeds.
+///
+/// A limit carrying no schedule contributes nothing here - there is no number to enforce. That case
+/// is reported to the CSMS (OCPP's own `chargingSchedule` is optional) and warned about where it is
+/// recorded, rather than being silently treated as a limit of zero or as no limit at all.
+pub fn external_charging_limits(
+    state: &ChargePointState,
+    evse_id: usize,
+) -> Vec<InstalledChargingProfile> {
+    let station = state
+        .station_external_charging_limit
+        .as_ref()
+        .and_then(|limit| as_capping_profile(limit, ChargingProfileScope::ChargePoint));
+    let evse = state
+        .evses
+        .get(evse_id)
+        .and_then(|evse| evse.external_charging_limit.as_ref())
+        .and_then(|limit| as_capping_profile(limit, ChargingProfileScope::Evse(evse_id)));
+    station.into_iter().chain(evse).collect()
+}
+
+/// Everything that limits `evse_id`: the profiles the CSMS installed, plus the capping profiles
+/// standing for whatever an external system has imposed - what [`compose`] and [`current_limit_ma`]
+/// must be given if the limit they produce is to be the one the charge point will actually apply
+/// (OCPP K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01).
+///
+/// `external` is a parameter rather than something this function derives because the two halves
+/// have different lifetimes: the installed profiles are borrowed from `state`, while the external
+/// ones are built on demand and must outlive the borrow. Call it as:
+///
+/// ```ignore
+/// let external = external_charging_limits(&state, evse_id);
+/// let profiles = composing_profiles(&state, evse_id, &external);
+/// ```
+///
+/// Public for the same reason [`connector_composition_context`] is: a CSMS asking
+/// `GetCompositeSchedule` "what will you do" must be answered from the same profile set that
+/// decides what the charge point actually does, not from a second, subtly different derivation.
+pub fn composing_profiles<'a>(
+    state: &'a ChargePointState,
+    evse_id: usize,
+    external: &'a [InstalledChargingProfile],
+) -> Vec<&'a InstalledChargingProfile> {
+    let mut profiles = state.charging_profiles.applying_to(evse_id);
+    profiles.extend(external);
+    profiles
 }
 
 /// Every instant within the window at which some profile's contribution could change: the window

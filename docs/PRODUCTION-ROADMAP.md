@@ -548,9 +548,10 @@ version.
 
 Was the largest genuinely-missing block, and the one a real deployment demands
 first: without it there is no load management. **Complete as of B2.8** — the
-notify-flows that report a limit's *origin* rather than apply one had no task of
-their own for a long time, which is exactly how they came to be the last four
-messages missing from 2.0.1 outside certificates. B2.8 gave them one.
+notify-flows that report a limit's *origin* had no task of their own for a long
+time, which is exactly how they came to be the last four messages missing from
+2.0.1 outside certificates. B2.8 gave them one; CV13 later made the limit they
+report bind on hardware as well.
 
 | Message | 1.6J | 2.0.1 | 2.1 |
 |---------|:----:|:-----:|:---:|
@@ -803,10 +804,16 @@ messages missing from 2.0.1 outside certificates. B2.8 gave them one.
       slot for OCPP's absent/zero `evseId`), never inside it. The integrator pushes one in the
       same way metering is pushed in, rather than through a new hardware trait.
 
-      **Two deliberate omissions.** The external limit is reported to the CSMS but **does not yet
-      clamp what a connector may draw** — combining it with an installed CSMS schedule needs unit
-      conversion via `SupplyCharacteristics` and a real priority decision between two
-      simultaneously-valid limits, which is correctness-sensitive enough to deserve its own task.
+      **Two deliberate omissions, one of them since closed.** The external limit was reported to
+      the CSMS but did **not** clamp what a connector may draw — deferred because combining it with
+      an installed CSMS schedule needs unit conversion via `SupplyCharacteristics` and a real
+      priority decision between two simultaneously-valid limits. That task was CV13
+      (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md`), and the decision it made is that an external limit
+      *caps* rather than competes: it composes as an `ExternalConstraints` profile, so it lowers
+      what the CSMS asked for and never raises it, and a limit in a unit the projection cannot
+      convert is skipped rather than mis-scaled. Deferring it was defensible on effort and not on
+      risk: until CV13 the station reported a reduction it was not making, which is what the 2.1
+      audit eventually found as its §2.13.
       And `NotifyEVChargingNeeds`/`NotifyEVChargingSchedule` carry data that in reality comes from
       ISO 15118 ([B4.5](#b4--certificates-and-iso-15118-r1-r13)), which this crate does not
       implement; the messages are wired and the integrator supplies the data, rather than a fake

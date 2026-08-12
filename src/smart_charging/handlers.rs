@@ -13,7 +13,8 @@ use chrono::{DateTime, Utc};
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::smart_charging::{
-    ChargingLimitProjection, CompositeSchedule, compose, connector_composition_context,
+    ChargingLimitProjection, CompositeSchedule, compose, composing_profiles,
+    connector_composition_context, external_charging_limits,
 };
 use crate::state::{
     ChargePointEvent, ChargingLimitSource, ChargingProfile, ChargingProfileCriteria,
@@ -213,7 +214,8 @@ pub async fn handle_get_composite_schedule<C: Clock>(
     let mut context =
         connector_composition_context(projection, &state, evse_id, 0, clock.now(), duration_secs);
     context.rate_unit = rate_unit;
-    let profiles = state.charging_profiles.applying_to(evse_id);
+    let external = external_charging_limits(&state, evse_id);
+    let profiles = composing_profiles(&state, evse_id, &external);
     GetCompositeScheduleOutcome::Accepted(compose(&profiles, &context))
 }
 
@@ -873,6 +875,67 @@ mod tests {
             .await,
             GetCompositeScheduleOutcome::Rejected
         );
+    }
+
+    /// The composite the CSMS is shown has to be the one the charge point will apply, so an
+    /// external limit belongs in it too (CV13). Answering `GetCompositeSchedule` from the installed
+    /// profiles alone would tell the CSMS the station is about to draw 16 A while it is in fact
+    /// held to 6 A by the site's energy manager.
+    #[tokio::test]
+    async fn a_composite_schedule_includes_the_external_limit_in_force() {
+        struct FixedClock;
+        impl Clock for FixedClock {
+            fn now(&self) -> DateTime<Utc> {
+                DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+            }
+        }
+
+        let actor = actor_with_smart_charging().await;
+        let projection = ChargingLimitProjection::new();
+        let mut installation_limit = profile(1);
+        installation_limit.purpose = ChargingProfilePurpose::ChargePointMax;
+        handle_set_charging_profile(
+            &actor,
+            ChargingProfileScope::ChargePoint,
+            installation_limit,
+            now(),
+        )
+        .await;
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitSet {
+                evse_id: Some(0),
+                limit: crate::state::ExternalChargingLimit {
+                    source: ChargingLimitSource::Ems,
+                    is_grid_critical: Some(true),
+                    schedule: Some(ChargingSchedule {
+                        id: 1,
+                        start_schedule: None,
+                        duration_secs: None,
+                        rate_unit: ChargingRateUnit::Amps,
+                        min_charging_rate: None,
+                        periods: alloc::vec![ChargingSchedulePeriod {
+                            start_period_secs: 0,
+                            limit: 6.0,
+                            number_phases: None,
+                        }],
+                    }),
+                },
+            })
+            .await;
+
+        let outcome = handle_get_composite_schedule(
+            &actor,
+            &projection,
+            &FixedClock,
+            0,
+            3_600,
+            ChargingRateUnit::Amps,
+        )
+        .await;
+        let GetCompositeScheduleOutcome::Accepted(Some(composed)) = outcome else {
+            panic!("expected a composed schedule, got {outcome:?}");
+        };
+        assert_eq!(composed.periods[0].limit, 6.0);
     }
 
     #[tokio::test]

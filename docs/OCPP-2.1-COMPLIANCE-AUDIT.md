@@ -1,7 +1,7 @@
 # OCPP 2.1 compliance audit — spec vs. this crate
 
-**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12 · **Baseline:** `main` @ `4c6abe3`,
-sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
+**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13 closed 2026-08-12 ·
+**Baseline:** `main` @ `4c6abe3`, sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
 part 2 appendices v2.1 CSVs + errata 2026-06).
 
 This document is the *comparison* half of certification readiness: what the spec requires of a
@@ -285,7 +285,27 @@ Carried forward from `docs/CERTIFICATION.md` §3 — re-confirmed as still curre
 - **ISO 15118 HLC (K15–K20, Q, R)**: the crate relays EXI opaquely and does not run a 15118 session
   state machine; Q/R conformance is a product claim resting on the integrator's stack.
 
-### 2.13 High · an external charging limit is reported to the CSMS but never enforced (K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01) [READ]
+### 2.13 ~~High~~ **Closed by CV13** · an external charging limit is reported to the CSMS but never enforced (K11.FR.01, K12.FR.01, K13.FR.01, K27.FR.01) [READ]
+
+**Fixed.** `smart_charging::external_charging_limits` turns whichever limits are in force for an
+EVSE — the station-wide one and the EVSE's own — into `ExternalConstraints` capping profiles, and
+`composing_profiles` joins them onto `charging_profiles.applying_to()`. Both composition sites use
+it: the projection that drives `Connector::set_current_limit`, and `GetCompositeSchedule`, so what
+the CSMS is *shown* stays the same curve the charge point will *apply*. Withdrawing the limit
+releases the connector without the CSMS reinstalling anything (K13.FR.01, now non-vacuously).
+
+Two cases still report without binding, both by construction and both stated in
+`ExternalChargingLimit`'s docs: a limit carrying no `schedule` has no value to enforce (recording
+one now warns), and a watt-denominated limit on a projection built without `SupplyCharacteristics`
+is skipped rather than mis-scaled — the same rule a watt-denominated CSMS profile already gets.
+
+An external limit is still not persisted across a reboot — it never was — so a restart drops both
+the limit and the enforcement of it. That leaves the station's behaviour and its own reports
+consistent with each other, which is what this finding was about, but it does mean an EMS must
+re-push after a power cut. Worth a row of its own if a deployment needs it; not part of this one.
+
+K11.FR.04/K13.FR.03 (`triggerReason = ChargingRateChanged`) stay open as §2.17/CV18; enforcement was
+their prerequisite, not their implementation. Original finding follows.
 
 Found by CV12's K sweep. An integrator's energy-management binding pushes
 `ChargePointEvent::ExternalChargingLimitSet`; `ChargePointState::set_external_charging_limit`
@@ -376,8 +396,9 @@ failure mode `CLAUDE.md`'s "exhaustive matches with no wildcard arm" rule exists
 
 The distinction matters and was checked rather than assumed: **K01.FR.61 makes this a `MAY`** for a
 rate change the CSMS itself caused, so not sending it there is conformant. **K11.FR.04 and K13.FR.03
-make it a `SHALL`** when an external control system changed the rate. Those two are unmet — though
-only reachable once §2.13 is fixed, since today no external limit changes any rate.
+make it a `SHALL`** when an external control system changed the rate. Those two are unmet — and now
+*reachable*: CV13 closed §2.13, so an external limit does change the rate, which is what makes this
+the next thing in the K block worth doing (CV18).
 
 ### 2.18 Medium · ISO 15118 renegotiation has no hardware surface at all (K16, K17 — 33 FRs) [READ]
 
@@ -470,10 +491,9 @@ Only after 1–7 is an OCTT run (H3.1) likely to be informative rather than a li
 **Items 1–7 are now closed** (CV1–CV11), and item 8's K half is done. The order that follows from
 the sweep, by certification impact rather than by size:
 
-9. **§2.13 (external limits are not enforced)** — the only finding here where the station tells the
-   CSMS something untrue about its own behaviour, and the prerequisite for §2.17. Everything it
-   needs already exists: the limit is recorded, and `compose` already has an `ExternalConstraints`
-   capping purpose to feed it into.
+9. ~~**§2.13 (external limits are not enforced)**~~ — **closed by CV13.** It was the only finding
+   here where the station told the CSMS something untrue about its own behaviour, and it was the
+   prerequisite for §2.17, which is now reachable.
 10. **§2.15 (the second variable table)** — the same one-word-per-row change CV2.1 was, on a table
     CV2.1 never reached, and the same B05.FR.09 argument.
 11. **§2.14 (E16 transaction limits)** — 20 FRs, unblocks C17 outright, and gives CV8's locally

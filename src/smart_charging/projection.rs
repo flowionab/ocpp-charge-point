@@ -19,7 +19,10 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use crate::actor::ChargePointActor;
 use crate::clock::Clock;
 use crate::provisioning::Backoff;
-use crate::smart_charging::{CompositionContext, SupplyCharacteristics, compose, current_limit_ma};
+use crate::smart_charging::{
+    CompositionContext, SupplyCharacteristics, compose, composing_profiles, current_limit_ma,
+    external_charging_limits,
+};
 use crate::state::{
     ChargePointEvent, ChargePointState, ChargingRateUnit, ConnectorEvent, EvseEvent, TransactionId,
 };
@@ -179,7 +182,8 @@ async fn evaluate_all<C: Clock>(
                 now,
                 LOOKAHEAD_SECS,
             );
-            let profiles = state.charging_profiles.applying_to(evse_id);
+            let external = external_charging_limits(&state, evse_id);
+            let profiles = composing_profiles(&state, evse_id, &external);
             let limit_ma = current_limit_ma(&profiles, &context);
             if let Some(composed) = compose(&profiles, &context)
                 && let Some(change) = composed.next_change_after(now)
@@ -609,6 +613,95 @@ mod tests {
             .await;
         settle().await;
         assert_eq!(actor.state().evses[0].charging_limits[0], Some(32_000));
+    }
+
+    /// An EMS limit of `amps`, expressed the way an integrator's energy-management binding would.
+    fn ems_limit(amps: f64) -> crate::state::ExternalChargingLimit {
+        crate::state::ExternalChargingLimit {
+            source: crate::state::ChargingLimitSource::Ems,
+            is_grid_critical: Some(false),
+            schedule: Some(ChargingSchedule {
+                id: 1,
+                start_schedule: None,
+                duration_secs: None,
+                rate_unit: ChargingRateUnit::Amps,
+                min_charging_rate: None,
+                periods: alloc::vec![ChargingSchedulePeriod {
+                    start_period_secs: 0,
+                    limit: amps,
+                    number_phases: None,
+                }],
+            }),
+        }
+    }
+
+    /// CV13 (K11.FR.01, K12.FR.01, K13.FR.01): the limit an external system imposes has to reach
+    /// hardware, not just the CSMS. Reporting a reduction that never happened is worse than not
+    /// supporting external limits at all - the CSMS's own load calculation then double-counts it.
+    #[tokio::test]
+    async fn an_external_charging_limit_caps_the_connector_and_releases_it_when_cleared() {
+        let actor = Arc::new(ChargePointActor::spawn([1], &TokioExecutor));
+        let projection = Arc::new(ChargingLimitProjection::new());
+
+        let task_actor = actor.clone();
+        let task_projection = projection.clone();
+        tokio::spawn(async move {
+            run_charging_limit_projection(&task_actor, &task_projection, &fixed_clock()).await;
+        });
+
+        start_charging(&actor).await;
+        let _ = actor
+            .send(ChargePointEvent::ChargingProfileSet {
+                scope: ChargingProfileScope::Evse(0),
+                profile: alloc::boxed::Box::new(amp_profile(1, 32.0)),
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(32_000));
+
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitSet {
+                evse_id: Some(0),
+                limit: ems_limit(6.0),
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(6_000));
+
+        // K13.FR.01: once the limit is withdrawn the station stops limiting on it, without the
+        // CSMS reinstalling anything.
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitCleared {
+                evse_id: Some(0),
+                source: crate::state::ChargingLimitSource::Ems,
+            })
+            .await;
+        settle().await;
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(32_000));
+    }
+
+    /// A station-wide limit (`evseId` absent) binds every connector, including one with no profile
+    /// of its own - the same way an installation limit does.
+    #[tokio::test]
+    async fn a_station_wide_external_limit_limits_a_connector_with_no_profile_of_its_own() {
+        let actor = Arc::new(ChargePointActor::spawn([1], &TokioExecutor));
+        let projection = Arc::new(ChargingLimitProjection::new());
+
+        let task_actor = actor.clone();
+        let task_projection = projection.clone();
+        tokio::spawn(async move {
+            run_charging_limit_projection(&task_actor, &task_projection, &fixed_clock()).await;
+        });
+
+        let _ = actor
+            .send(ChargePointEvent::ExternalChargingLimitSet {
+                evse_id: None,
+                limit: ems_limit(10.0),
+            })
+            .await;
+        settle().await;
+
+        assert_eq!(actor.state().evses[0].charging_limits[0], Some(10_000));
     }
 
     #[tokio::test]

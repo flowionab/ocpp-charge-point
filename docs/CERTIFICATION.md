@@ -209,12 +209,14 @@ class table) the claim unlocks.
 
    > **Smart Charging carries a caveat since 2026-08-12**, from the K-block requirement sweep in
    > `docs/OCPP-2.1-COMPLIANCE-AUDIT.md` §3.1. Reservation and Local Authorization List Management
-   > are unaffected. Three findings touch this claim, and the first is the one to settle before
-   > booking OCTT time: an **external charging limit is reported to the CSMS but never enforced**
-   > (§2.13, roadmap CV13) — K11.FR.01 is a `SHALL`, and a station that says it is limited and is
-   > not is a worse failure than one that does not support external limits. `LocalGeneration`
-   > cannot round-trip (§2.16) and `triggerReason = ChargingRateChanged` is absent (§2.17). The
-   > composition engine itself (K01–K10) remains verified-good, and K28/K29 are still unread.
+   > are unaffected. Three findings touched this claim; **the one that had to be settled before
+   > booking OCTT time is closed as of 2026-08-12** — an external charging limit was reported to the
+   > CSMS but never enforced (§2.13, roadmap CV13), and it is now applied as a cap on the composed
+   > limit at both composition sites, so K11.FR.01's `SHALL` holds and the station no longer claims
+   > a reduction it did not make. What remains against this claim is reporting fidelity rather than
+   > behaviour the station gets wrong: `LocalGeneration` cannot round-trip (§2.16) and
+   > `triggerReason = ChargingRateChanged` is absent (§2.17, reachable now that CV13 has landed).
+   > The composition engine itself (K01–K10) remains verified-good, and K28/K29 are still unread.
 3. **RemoteTrigger** (1.6J). Zero marginal cost — no feature flag, no hardware dependency,
    already wired and registered by default.
 

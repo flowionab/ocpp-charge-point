@@ -2271,12 +2271,25 @@ impl ChargePointState {
     /// station - and pushes the [`ChargePointEffect::SmartChargingNotification`] that reports it.
     /// A limit addressing an EVSE that doesn't exist is dropped and logged rather than recorded
     /// anywhere, mirroring how an out-of-range address is handled throughout this crate.
+    ///
+    /// Recording it is also what *enforces* it: the slot written here is read by
+    /// [`crate::smart_charging::external_charging_limits`], which composition applies as an upper
+    /// bound on whatever the CSMS's own profiles asked for (K11.FR.01, K12.FR.01, K27.FR.01). A
+    /// limit that carries no schedule is the one exception - there is no number to enforce - and it
+    /// is warned about rather than silently reported as if it had taken effect.
     fn set_external_charging_limit(
         &mut self,
         evse_id: Option<usize>,
         limit: ExternalChargingLimit,
         effects: &mut Vec<ChargePointEffect>,
     ) -> bool {
+        if limit.schedule.is_none() {
+            tracing::warn!(
+                source = limit.source.name(),
+                "an external charging limit carrying no schedule will be reported to the CSMS but \
+                 cannot be enforced - there is no limit value to apply"
+            );
+        }
         match evse_id {
             None => self.station_external_charging_limit = Some(limit.clone()),
             Some(id) => {

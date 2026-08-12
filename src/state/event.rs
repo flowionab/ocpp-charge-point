@@ -376,10 +376,16 @@ pub enum ChargePointEvent {
     /// [`crate::display_message::handle_clear_display_message`].
     DisplayMessageCleared(DisplayMessageId),
     /// An external charging limit (from something other than a CSMS charging profile - typically
-    /// a local energy-management system) came into force, to be reported via `NotifyChargingLimit`
-    /// (2.0.1/2.1 only, `docs/PRODUCTION-ROADMAP.md` B2.8). Pushed in by an integrator the same
-    /// way [`ConnectorEvent::MeterValueSampled`] is - this crate has no local energy-management
-    /// stack of its own.
+    /// a local energy-management system) came into force. Pushed in by an integrator the same way
+    /// [`ConnectorEvent::MeterValueSampled`] is - this crate has no local energy-management stack
+    /// of its own.
+    ///
+    /// It is both **enforced and reported**. Enforced by composition, which applies it as an upper
+    /// bound on whatever the CSMS's profiles asked for (OCPP K11.FR.01, K12.FR.01, K27.FR.01) - see
+    /// [`crate::smart_charging::external_charging_limits`]. Reported with `NotifyChargingLimit`
+    /// (2.0.1/2.1 only, `docs/PRODUCTION-ROADMAP.md` B2.8). A limit whose
+    /// [`schedule`](ExternalChargingLimit::schedule) is `None` is reported but cannot be enforced -
+    /// there is no value to apply - and recording one warns.
     ExternalChargingLimitSet {
         /// The EVSE the limit applies to, or `None` for the whole charging station.
         evse_id: Option<usize>,
