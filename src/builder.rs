@@ -873,6 +873,46 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         self
     }
 
+    /// Spawns the sweep that enforces a `maxTime` transaction limit
+    /// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV21, **E16.FR.09**).
+    ///
+    /// Only this ceiling needs a loop: `maxCost`, `maxEnergy` and `maxSoC` are decided from
+    /// figures the state machine already holds, so they bind without one. A station whose CSMS
+    /// never sets `maxTime` loses nothing by omitting this - but a station that omits it while
+    /// `TxCtrlr.SupportedLimits` advertises `maxTime` would accept a ceiling it never enforces,
+    /// which is the one outcome E16.FR.13 exists to prevent.
+    ///
+    /// `interval_secs` wants to be a fraction of the shortest limit an operator expects to set:
+    /// a ceiling binds up to one interval after it truly elapses. See
+    /// [`crate::transactions::run_transaction_time_limits`] for what the sweep costs and what a
+    /// mid-session restart does to it.
+    pub async fn transaction_time_limits<B, M>(
+        self,
+        backoff: B,
+        monotonic: M,
+        interval_secs: u32,
+    ) -> Self
+    where
+        B: crate::provisioning::Backoff + Send + Sync + 'static,
+        M: MonotonicClock + Send + Sync + 'static,
+    {
+        // The advertised list *is* the enforced list (E16.FR.12/.13): `maxTime` joins
+        // `TxCtrlr.SupportedLimits` here, when the sweep that enforces it starts, so a station
+        // that never calls this neither claims the ceiling nor records one a CSMS sends anyway.
+        crate::transactions::advertise_time_limit_support(&self.runtime.actor()).await;
+        let actor = self.runtime.actor();
+        self.executor.spawn(Box::pin(async move {
+            crate::transactions::run_transaction_time_limits(
+                &actor,
+                &backoff,
+                &monotonic,
+                interval_secs,
+            )
+            .await;
+        }));
+        self
+    }
+
     /// Reports every connector's current status when the CSMS's picture of this charge point can
     /// no longer be trusted (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV5).
     ///
@@ -4782,6 +4822,7 @@ mod tests {
                     csms_limit: None,
                     limit_reached: None,
                     energy_start_wh: None,
+                    elapsed_secs: None,
                 },
                 started_at: None,
                 meter_start: None,

@@ -220,6 +220,177 @@ pub async fn run_transaction_events<N: TransactionNotifier>(
     }
 }
 
+/// Adds `maxTime` to `TxCtrlr.SupportedLimits`, declaring that this station enforces the one E16
+/// ceiling whose enforcement is optional at build time (**E16.FR.12**, CV21).
+///
+/// Called by
+/// [`ChargePointBuilder::transaction_time_limits`](crate::ChargePointBuilder::transaction_time_limits)
+/// as it spawns [`run_transaction_time_limits`], so the claim and the thing that makes it true
+/// arrive together. An integrator driving the sweep themselves - the same way one may drive
+/// `crate::payment::apply_payment_terminal_status` instead of the polling helper - calls this
+/// once at start-up.
+///
+/// Idempotent: a second call finds the member already there and changes nothing.
+pub async fn advertise_time_limit_support(actor: &crate::actor::ChargePointActor) {
+    let component = crate::state::Component {
+        name: "TxCtrlr".into(),
+        instance: None,
+        evse: None,
+    };
+    let variable = crate::state::Variable {
+        name: "SupportedLimits".into(),
+        instance: None,
+    };
+    let current = actor
+        .state()
+        .device_model
+        .get(&component, &variable)
+        .and_then(|definition| definition.attribute(crate::state::VariableAttributeType::Actual))
+        .map(|attribute| attribute.value.clone())
+        .unwrap_or_default();
+    if current
+        .split(',')
+        .any(|member| member.trim() == crate::state::MAX_TIME_TRANSACTION_LIMIT)
+    {
+        return;
+    }
+    let value = if current.is_empty() {
+        alloc::string::String::from(crate::state::MAX_TIME_TRANSACTION_LIMIT)
+    } else {
+        alloc::format!("{current},{}", crate::state::MAX_TIME_TRANSACTION_LIMIT)
+    };
+    let _ = actor
+        .send(crate::state::ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::AttributeValueSet {
+                component,
+                variable,
+                attribute_type: crate::state::VariableAttributeType::Actual,
+                value,
+            },
+        ))
+        .await;
+}
+
+/// Measures how long each running transaction has been running, and tells the state machine when
+/// that crosses (or stops crossing) a `maxTime` transaction limit - **E16.FR.09**
+/// (`docs/OCPP-2.1-COMPLIANCE-ROADMAP.md` CV21).
+///
+/// The other three ceilings E16 defines are decided from a meter reading, which the state machine
+/// already has. Time is the exception: it runs from the transaction *starting* rather than from
+/// energy first flowing, and the state machine is deliberately clock-free (see [`crate::clock`]).
+/// So this loop owns the clock, and states its answer as
+/// [`ConnectorEvent::TransactionElapsed`](crate::state::ConnectorEvent::TransactionElapsed) - the
+/// same split `crate::tariff` makes for the running cost, and for the same reason.
+///
+/// **It reports only when the verdict would move.** A figure that ticked up every interval for
+/// every running transaction would wake every subscriber and re-persist every record to say
+/// nothing new. So an elapsed report goes out when a ceiling has just been crossed, or has just
+/// stopped being crossed because it was raised - and the state machine, which owns the comparison,
+/// does the rest.
+///
+/// # Where the start times live, and what that costs
+///
+/// In this loop, for the reason [`crate::remote_control::run_pending_remote_start_timeouts`] gives
+/// for its own: a timestamp on [`crate::state::Transaction`] would need a clock inside every
+/// protocol version's inbound adapter to serve one field, where a small map here changes no
+/// signature. [`crate::persistence::PersistedTransaction::started_at`] makes the same split, and
+/// [`crate::smart_charging::ChargingLimitProjection`] keeps its own for `Relative` profiles.
+///
+/// The cost is the same one those pay. A transaction already running when this loop starts - a
+/// charge point restarted mid-session - is timed from when the loop first *saw* it, not from when
+/// it really began, so a restart extends the driver's allowance rather than cutting it short. That
+/// is the safer direction of the two, and it is logged where it happens.
+///
+/// A ceiling is crossed between `interval_secs` and `interval_secs` after it truly elapses, so the
+/// interval wants to be a fraction of the shortest limit an operator expects to set rather than
+/// equal to it.
+///
+/// Runs forever.
+pub async fn run_transaction_time_limits<B, M>(
+    actor: &crate::actor::ChargePointActor,
+    backoff: &B,
+    monotonic: &M,
+    interval_secs: u32,
+) where
+    B: crate::provisioning::Backoff,
+    M: crate::clock::MonotonicClock,
+{
+    let mut first_seen: alloc::collections::BTreeMap<
+        (usize, usize),
+        (crate::state::TransactionId, crate::clock::MonotonicInstant),
+    > = alloc::collections::BTreeMap::new();
+    loop {
+        backoff.wait(interval_secs.max(1)).await;
+        let now = monotonic.now();
+        let state = actor.state();
+
+        // Every connector running a transaction, with the ceiling it is running under.
+        let running: alloc::vec::Vec<_> = state
+            .evses
+            .iter()
+            .enumerate()
+            .flat_map(|(evse_id, evse)| {
+                evse.transactions.iter().enumerate().filter_map(
+                    move |(connector_id, transaction)| {
+                        transaction
+                            .as_ref()
+                            .map(|transaction| (evse_id, connector_id, transaction))
+                    },
+                )
+            })
+            .collect();
+
+        // Forget connectors whose transaction ended, so the next one on the same connector is
+        // timed from when *it* started rather than from its predecessor.
+        first_seen.retain(|address, (id, _)| {
+            running.iter().any(|(evse_id, connector_id, transaction)| {
+                (*evse_id, *connector_id) == *address && transaction.id == *id
+            })
+        });
+
+        for (evse_id, connector_id, transaction) in running {
+            let address = (evse_id, connector_id);
+            let since = match first_seen.get(&address) {
+                Some((_, since)) => *since,
+                None => {
+                    // Anchored where this loop first saw it - see this function's docs for why
+                    // that is the honest best available after a restart.
+                    if transaction.elapsed_secs.is_none() {
+                        tracing::debug!(
+                            evse_id,
+                            connector_id,
+                            "timing a transaction from when the sweep first saw it"
+                        );
+                    }
+                    first_seen.insert(address, (transaction.id, now));
+                    now
+                }
+            };
+            let Some(max) = transaction.limit.and_then(|limit| limit.max_time_secs) else {
+                continue;
+            };
+            let elapsed = now.duration_since(since).as_secs() as i64;
+            // The state machine holds the comparison; this only decides whether it is worth
+            // asking again. Both directions matter: a ceiling newly crossed suspends, and one
+            // that stopped being crossed (because it was raised) resumes (E16.FR.14).
+            let suspended_for_time =
+                transaction.limit_reached == Some(crate::state::TransactionLimitKind::Time);
+            if (elapsed >= max) == suspended_for_time {
+                continue;
+            }
+            let _ = actor
+                .send(crate::state::ChargePointEvent::Evse {
+                    evse_id,
+                    event: crate::state::EvseEvent::Connector {
+                        connector_id,
+                        event: crate::state::ConnectorEvent::TransactionElapsed(elapsed),
+                    },
+                })
+                .await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TransactionEventOutcome, TransactionNotifier, run_transaction_events};
@@ -283,6 +454,7 @@ mod tests {
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         };
         sender.send(TransactionEventOccurred {
             evse_id: 0,
@@ -371,6 +543,157 @@ mod tests {
                 .await;
         }
         actor
+    }
+
+    /// A monotonic clock the test advances by hand, so elapsed time is exact rather than raced.
+    #[derive(Default)]
+    struct FakeMonotonicClock(core::sync::atomic::AtomicU64);
+
+    impl FakeMonotonicClock {
+        fn advance_secs(&self, secs: u64) {
+            self.0
+                .fetch_add(secs * 1_000_000_000, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl crate::clock::MonotonicClock for FakeMonotonicClock {
+        fn now(&self) -> crate::clock::MonotonicInstant {
+            crate::clock::MonotonicInstant::from_ticks(
+                self.0.load(core::sync::atomic::Ordering::SeqCst),
+            )
+        }
+    }
+
+    struct ImmediateBackoff;
+
+    #[async_trait::async_trait]
+    impl crate::provisioning::Backoff for ImmediateBackoff {
+        async fn wait(&self, _seconds: u32) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// CV21 (E16.FR.09) end to end: the sweep measures elapsed time from the transaction it is
+    /// timing, and the state machine suspends when the ceiling is crossed. The interesting part
+    /// is the *contrast* - the same sweep running before the ceiling is reached must say nothing,
+    /// or "only when the verdict moves" would be an empty claim.
+    #[tokio::test]
+    async fn the_sweep_suspends_a_transaction_that_runs_past_its_time_limit() {
+        use crate::state::{
+            ChargePointEvent, ConnectorEvent, ConnectorState, EvseEvent, TransactionLimit,
+            TransactionLimitKind,
+        };
+
+        let actor = alloc::sync::Arc::new(charging_actor().await);
+        // The claim and the enforcement arrive together (E16.FR.12/.13): without this the station
+        // does not advertise `maxTime`, and a ceiling naming only it would be dropped rather than
+        // recorded - which is the behaviour `a_station_that_does_not_sweep_refuses_a_time_limit`
+        // pins.
+        super::advertise_time_limit_support(&actor).await;
+        let _ = actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::TransactionLimitSet {
+                        limit: TransactionLimit {
+                            max_time_secs: Some(600),
+                            ..Default::default()
+                        },
+                        from_csms: true,
+                    },
+                },
+            })
+            .await;
+
+        let monotonic = alloc::sync::Arc::new(FakeMonotonicClock::default());
+        let task_actor = actor.clone();
+        let task_monotonic = monotonic.clone();
+        let sweep = tokio::spawn(async move {
+            super::run_transaction_time_limits(&task_actor, &ImmediateBackoff, &*task_monotonic, 1)
+                .await;
+        });
+
+        // The limit has to be in force, or everything below would pass for the wrong reason.
+        assert_eq!(
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.limit)
+                .and_then(|limit| limit.max_time_secs),
+            Some(600)
+        );
+        // Let the sweep anchor this transaction at zero before any time passes - it times from
+        // when it first *saw* the transaction, so a test that advanced the clock first would be
+        // measuring from the wrong instant rather than testing the ceiling.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // Well short of the ceiling: the sweep runs, and reports nothing.
+        monotonic.advance_secs(300);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Charging
+        );
+        assert!(
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .is_some_and(|transaction| transaction.elapsed_secs.is_none()),
+            "nothing to say means nothing said"
+        );
+
+        // Past it.
+        monotonic.advance_secs(300);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::SuspendedEvse
+        );
+        assert_eq!(
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .and_then(|transaction| transaction.limit_reached),
+            Some(TransactionLimitKind::Time)
+        );
+
+        sweep.abort();
+    }
+
+    /// The other half of CV21's contract, and the reason the advertised list is the enforced
+    /// list: a station that never spawns the sweep does not claim `maxTime` in
+    /// `TxCtrlr.SupportedLimits`, so a CSMS-sent time ceiling is dropped rather than accepted and
+    /// never acted on (E16.FR.13).
+    #[tokio::test]
+    async fn a_station_that_does_not_sweep_refuses_a_time_limit() {
+        use crate::state::{ChargePointEvent, ConnectorEvent, EvseEvent, TransactionLimit};
+
+        let actor = charging_actor().await;
+        let _ = actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::TransactionLimitSet {
+                        limit: TransactionLimit {
+                            max_time_secs: Some(600),
+                            ..Default::default()
+                        },
+                        from_csms: true,
+                    },
+                },
+            })
+            .await;
+
+        assert!(
+            actor.state().evses[0].transactions[0]
+                .as_ref()
+                .is_some_and(|transaction| transaction.limit.is_none())
+        );
     }
 
     /// **E05 (CV2.5), the producer this crate was missing.** A CSMS blocklist update arrives as a
@@ -1129,6 +1452,7 @@ pub(crate) mod ocpp_2_1 {
                     csms_limit: None,
                     limit_reached: None,
                     energy_start_wh: None,
+                    elapsed_secs: None,
                 }
             }
 
@@ -1575,6 +1899,7 @@ pub(crate) mod ocpp_2_1 {
                 csms_limit: None,
                 limit_reached: None,
                 energy_start_wh: None,
+                elapsed_secs: None,
             };
 
             assert_eq!(
@@ -1617,6 +1942,7 @@ pub(crate) mod ocpp_2_1 {
                 csms_limit: None,
                 limit_reached: None,
                 energy_start_wh: None,
+                elapsed_secs: None,
             };
 
             assert_eq!(
@@ -1650,6 +1976,7 @@ pub(crate) mod ocpp_2_1 {
                 csms_limit: None,
                 limit_reached: None,
                 energy_start_wh: None,
+                elapsed_secs: None,
             };
 
             assert_eq!(
@@ -2143,6 +2470,7 @@ pub(crate) mod ocpp_2_0_1 {
                     csms_limit: None,
                     limit_reached: None,
                     energy_start_wh: None,
+                    elapsed_secs: None,
                 }
             }
 
@@ -2286,6 +2614,7 @@ pub(crate) mod ocpp_2_0_1 {
                 csms_limit: None,
                 limit_reached: None,
                 energy_start_wh: None,
+                elapsed_secs: None,
             };
 
             assert_eq!(
@@ -2325,6 +2654,7 @@ pub(crate) mod ocpp_2_0_1 {
                 csms_limit: None,
                 limit_reached: None,
                 energy_start_wh: None,
+                elapsed_secs: None,
             };
 
             assert_eq!(

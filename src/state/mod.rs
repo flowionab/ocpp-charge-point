@@ -52,6 +52,7 @@ pub use self::der_control::{
     EnterServiceSettings, FixedPfSettings, FixedVarSettings, FreqDroopSettings, GradientSettings,
     InstalledDERControl, LimitMaxDischargeSettings,
 };
+pub use self::device_model::MAX_TIME_TRANSACTION_LIMIT;
 pub use self::device_model::{
     Component, DeviceModel, DeviceModelEvent, Variable, VariableAttribute, VariableAttributeType,
     VariableCharacteristics, VariableDataType, VariableDefinition, VariableMutability,

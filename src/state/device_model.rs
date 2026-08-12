@@ -820,22 +820,32 @@ pub(crate) const VARIABLE_BOUNDS: &[VariableBounds] = &[
 /// is exactly where a charge point is supposed to say what it accepts.
 const TX_START_STOP_POINTS: &[&str] = &["EVConnected", "Authorized", "PowerPathClosed"];
 
-/// The transaction limits this build enforces - `TxCtrlr.SupportedLimits` (**E16**, CV15).
+/// The transaction limits *every* build enforces - the value `TxCtrlr.SupportedLimits` starts
+/// with (**E16**, CV15/CV21).
 ///
-/// Narrower than OCPP's `TransactionLimitType` by exactly one field, and narrowed for the same
-/// reason `TX_START_STOP_POINTS` is: naming a limit the station cannot enforce, and then not
-/// enforcing it, is the silent lie B05.FR.09 forbids - and here it would be worse than a
+/// Three of E16's four ceilings, and the three that need nothing of the integrator: energy and
+/// state of charge are decided from a meter reading, and cost from a figure `crate::tariff`
+/// states. **`maxTime` is not here**, because it is the one ceiling whose enforcement is optional
+/// at build time - E16.FR.09 measures it from the transaction's start, which needs the clock-
+/// bearing sweep [`crate::transactions::run_transaction_time_limits`] to be running.
+/// [`ChargePointBuilder::transaction_time_limits`](crate::ChargePointBuilder::transaction_time_limits)
+/// adds it to the variable when it spawns that sweep, so the list a CSMS reads is the list this
+/// station will act on rather than the list this crate can compile.
+///
+/// That the variable is *read* rather than a constant consulted is the point: naming a limit the
+/// station will not enforce is the silent lie B05.FR.09 forbids, and here it would be worse than a
 /// mis-set variable, because a CSMS relying on `maxTime` to free a bay would be relying on
 /// nothing.
 ///
-/// **`maxTime` is absent.** A time limit runs from the transaction's start (E16.FR.09), and this
-/// crate's state machine is deliberately clock-free - it has no start *time* to measure against,
-/// only the meter readings the other three limits are decided from. Supporting it needs a clock-
-/// driven sweep of the kind `crate::remote_control::run_pending_remote_start_timeouts` already is;
-/// see the roadmap's CV21. Until then the honest answer is the one OCPP provides for: say so here,
-/// and E16.FR.12/.13 do the rest - a CSMS knows not to send it, and a station handed one anyway
-/// neither records it nor confirms it.
+/// Test-only since CV21 moved the filtering onto the variable's own value: nothing in the crate
+/// consults this list any more, because consulting a constant instead of the variable is exactly
+/// the drift it would have permitted. It stays as what the registered value is checked against.
+#[cfg(test)]
 pub(crate) const SUPPORTED_TRANSACTION_LIMITS: &[&str] = &["maxCost", "maxEnergy", "maxSoC"];
+
+/// The `maxTime` member [`ChargePointBuilder::transaction_time_limits`](crate::ChargePointBuilder::transaction_time_limits)
+/// appends once the sweep that enforces it is running.
+pub const MAX_TIME_TRANSACTION_LIMIT: &str = "maxTime";
 
 /// [`SUPPORTED_TRANSACTION_LIMITS`] as the `MemberList` value the variable registers with. Written
 /// out rather than joined at runtime because `DEFAULT_VARIABLES` is a `const` table of `&'static
@@ -1795,9 +1805,10 @@ mod tests {
             .expect("TxCtrlr.SupportedLimits should be registered");
 
         assert_eq!(registered.value, SUPPORTED_TRANSACTION_LIMITS.join(","));
-        // And the one OCPP defines that this build does not enforce is genuinely absent, rather
-        // than named here and quietly ignored (B05.FR.09's rule, applied to a `ReadOnly` fact).
-        assert!(!SUPPORTED_TRANSACTION_LIMITS.contains(&"maxTime"));
+        // `maxTime` is the one ceiling a build can lack (CV21): it is added to the variable by
+        // the builder method that spawns the sweep enforcing it, so a station that never spawns
+        // one never claims it.
+        assert!(!SUPPORTED_TRANSACTION_LIMITS.contains(&MAX_TIME_TRANSACTION_LIMIT));
     }
 
     #[test]

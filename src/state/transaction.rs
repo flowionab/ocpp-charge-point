@@ -113,15 +113,24 @@ impl TransactionLimit {
             && self.max_time_secs.is_none()
     }
 
-    /// This limit with every field this build cannot enforce dropped - **E16.FR.13**.
+    /// This limit with every field `supported_limits` does not name dropped - **E16.FR.13**.
     ///
     /// The station must not confirm a limit it will not act on: a CSMS that saw `maxTime` echoed
     /// back would believe the bay would free itself. Dropping it here means it is neither recorded
-    /// nor confirmed, which is precisely what FR.13 asks for, and `TxCtrlr.SupportedLimits` told
-    /// the CSMS to expect that.
-    pub fn supported(&self) -> Self {
-        let supports =
-            |name: &str| crate::state::device_model::SUPPORTED_TRANSACTION_LIMITS.contains(&name);
+    /// nor confirmed, which is precisely what FR.13 asks for.
+    ///
+    /// `supported_limits` is `TxCtrlr.SupportedLimits`' own `MemberList` value - the same string
+    /// the CSMS reads (E16.FR.12), rather than a constant that happens to agree with it. That is
+    /// what makes the variable load-bearing: a station whose build cannot enforce `maxTime` does
+    /// not advertise it *and* does not record it, from one fact rather than two that could drift.
+    /// Parsed the way every other `MemberList` in this crate is, so the type stays testable
+    /// without a device model.
+    pub fn supported(&self, supported_limits: &str) -> Self {
+        let supports = |name: &str| {
+            supported_limits
+                .split(',')
+                .any(|member| member.trim() == name)
+        };
         Self {
             max_cost: self.max_cost.filter(|_| supports("maxCost")),
             max_energy_wh: self.max_energy_wh.filter(|_| supports("maxEnergy")),
@@ -287,4 +296,20 @@ pub struct Transaction {
     /// needs no clock, so the state machine can hold it without giving up being clock-free.
     #[serde(default)]
     pub energy_start_wh: Option<i64>,
+    /// How long this transaction has been running, in seconds, as last reported by the sweep that
+    /// owns the clock (**E16.FR.09**, CV21) - measured from the transaction *starting*, not from
+    /// energy first flowing, since depending on `TxStartPoint` a transaction may begin well
+    /// before any energy moves.
+    ///
+    /// `None` until something reports one. Recorded rather than computed for the reason the whole
+    /// state machine is clock-free (see [`crate::clock`]): elapsed time is the one measurement a
+    /// transaction limit needs that cannot be read off the meter, so
+    /// [`crate::transactions::run_transaction_time_limits`] measures it and states the answer,
+    /// exactly as `crate::tariff` states the running cost total.
+    ///
+    /// Written only when the answer would change a verdict, not on every sweep tick: a figure
+    /// that ticks up once a minute for every running transaction would wake every subscriber and
+    /// re-persist every record for nothing.
+    #[serde(default)]
+    pub elapsed_secs: Option<i64>,
 }

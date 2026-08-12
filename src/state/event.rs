@@ -576,6 +576,7 @@ impl ConnectorEvent {
             Self::RemoteStartPendingCleared { .. } => "RemoteStartPendingCleared",
             Self::AuthorizationRevoked { .. } => "AuthorizationRevoked",
             Self::TransactionLimitSet { .. } => "TransactionLimitSet",
+            Self::TransactionElapsed { .. } => "TransactionElapsed",
             Self::ChargingStopped { .. } => "ChargingStopped",
             Self::ChargingSuspendedByEv { .. } => "ChargingSuspendedByEv",
             Self::ChargingSuspendedByEvse { .. } => "ChargingSuspendedByEvse",
@@ -750,6 +751,18 @@ pub enum ConnectorEvent {
         /// Whether the CSMS set it, as opposed to the charge point setting it locally.
         from_csms: bool,
     },
+    /// How long this connector's transaction has been running, in seconds - the one measurement
+    /// **E16**'s ceilings need that no meter can supply (**E16.FR.09**, CV21).
+    ///
+    /// Raised by [`crate::transactions::run_transaction_time_limits`], which owns the clock the
+    /// state machine deliberately does not, and only when the answer would change a verdict -
+    /// a `maxTime` ceiling has just been crossed, or has just stopped being crossed because it
+    /// was raised. Recorded on [`crate::state::Transaction::elapsed_secs`] and compared there
+    /// alongside the energy, cost and state-of-charge ceilings, so every kind of limit takes one
+    /// path.
+    ///
+    /// A no-op on a connector with no transaction running.
+    TransactionElapsed(i64),
     /// The authorization held against this connector is no longer wanted - the cable arrived and
     /// it was dispatched, or `TxCtrlr.EVConnectionTimeOut` expired without one. Covers both a held
     /// `RequestStartTransaction` (F02.FR.07/.08) and a card presented before the cable

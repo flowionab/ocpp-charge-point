@@ -64,6 +64,17 @@ and grounded in the requirement-level audit in [`docs/OCPP-2.1-COMPLIANCE-AUDIT.
   must add it (`false` preserves today's behaviour exactly). An integrator's energy-management
   binding that pushes locally generated capacity sets it `true`, which changes what the limit
   *does* — it adds rather than caps — and sets `isLocalGeneration` on the 2.1 wire (K27.FR.03).
+- **`maxTime` transaction limits are enforced** (CV21, E16.FR.09), completing E16's four ceilings.
+  New `ConnectorEvent::TransactionElapsed` variant and `state::Transaction::elapsed_secs` field —
+  exhaustive matches over `ConnectorEvent` must handle the first, and struct literals of
+  `Transaction` must add the second. New
+  `ChargePointBuilder::transaction_time_limits(backoff, monotonic, interval_secs)` spawns the
+  sweep that measures elapsed time; **it is `async`**, unlike the other builder registrations,
+  because it also adds `maxTime` to `TxCtrlr.SupportedLimits` as it starts. A station that does
+  not call it neither advertises the ceiling nor records one a CSMS sends, so nothing silently
+  goes unenforced.
+- `state::TransactionLimit::supported` takes the `TxCtrlr.SupportedLimits` member list rather than
+  reading a crate constant (CV21), so what a station advertises and what it records are one fact.
 - `state::InstalledChargingProfile` gained a `source` field and lost its `source()` method (CV20).
   It returned `ChargingLimitSource::Cso` unconditionally, which stopped being true once the limits
   an external system imposed became reportable: those carry the external system's own source.

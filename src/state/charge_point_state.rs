@@ -1540,6 +1540,11 @@ impl ChargePointState {
                 ConnectorPolicy::default().authorize_remote_start,
             ),
         };
+        // E16.FR.12/.13 (CV15/CV21): the ceilings this station will act on, read from the same
+        // variable the CSMS reads rather than from a constant beside it - see
+        // `TransactionLimit::supported`. Read here for the reason the policy above is: before the
+        // mutable borrow.
+        let supported_transaction_limits = self.string_variable("TxCtrlr", "SupportedLimits");
         let Some(evse) = self.evses.get_mut(evse_id) else {
             return false;
         };
@@ -1601,6 +1606,7 @@ impl ChargePointState {
                     from_csms: *from_csms,
                 }
             }
+            ConnectorEvent::TransactionElapsed(secs) => EventKind::TransactionElapsed(*secs),
             _ => EventKind::Other,
         };
         // CV7: `Some(Some(..))` records a pending start, `Some(None)` clears one, `None` means
@@ -1743,7 +1749,7 @@ impl ChargePointState {
         if let EventKind::TransactionLimitSet { limit, from_csms } = event_kind
             && let Some(Some(transaction)) = evse.transactions.get_mut(connector_id)
         {
-            let supported = limit.supported();
+            let supported = limit.supported(&supported_transaction_limits);
             if supported.is_empty() {
                 // Everything the setter asked for is a limit kind this build does not enforce.
                 // Recording nothing and confirming nothing is exactly FR.13; saying so at `warn`
@@ -1774,6 +1780,16 @@ impl ChargePointState {
                     "a transaction limit was set"
                 );
             }
+        }
+        // E16.FR.09 (CV21): the elapsed figure the sweep measured, recorded so the ceiling check
+        // below can compare it the way it compares a meter reading. `changed` covers it because
+        // the sweep only reports one when the verdict is about to move.
+        let mut elapsed_reported = false;
+        if let EventKind::TransactionElapsed(secs) = event_kind
+            && let Some(Some(transaction)) = evse.transactions.get_mut(connector_id)
+        {
+            transaction.elapsed_secs = Some(secs);
+            elapsed_reported = true;
         }
         // CV7/F02: the pending remote start's lifecycle. Recorded on request, dispatched the
         // moment the cable latches, cleared when the connector goes idle without ever being used
@@ -2197,7 +2213,8 @@ impl ChargePointState {
             // A recorded transaction limit moves nothing about the connector, but it is state a
             // subscriber must see - the CSMS-facing snapshot, persistence, and the projection all
             // read what the transaction is running under (CV15).
-            || limit_set;
+            || limit_set
+            || elapsed_reported;
         // E05 (CV2.5): the last allowance ran out. Checked after the sample has been recorded, so
         // the stop is decided against the reading the CSMS will also see, and dispatched through
         // the ordinary stop path so the transaction ends exactly as any other does.
@@ -2238,7 +2255,9 @@ impl ChargePointState {
         // which binds at once rather than at the next sample.
         if matches!(
             event_kind,
-            EventKind::MeterValueSampled | EventKind::TransactionLimitSet { .. }
+            EventKind::MeterValueSampled
+                | EventKind::TransactionLimitSet { .. }
+                | EventKind::TransactionElapsed(_)
         ) || running_cost_recorded
             || cost_recorded
         {
@@ -2603,6 +2622,11 @@ impl ChargePointState {
                 (limit.max_soc_percent.zip(soc)).and_then(|(max, soc)| {
                     (soc >= max).then_some(crate::state::TransactionLimitKind::Soc)
                 })
+            })
+            .or_else(|| {
+                (limit.max_time_secs.zip(transaction.elapsed_secs)).and_then(|(max, elapsed)| {
+                    (elapsed >= max).then_some(crate::state::TransactionLimitKind::Time)
+                })
             });
 
         match (reached, transaction.limit_reached) {
@@ -2758,6 +2782,8 @@ enum EventKind {
         limit: crate::state::TransactionLimit,
         from_csms: bool,
     },
+    /// How long the transaction has been running, from the clock-bearing sweep (E16.FR.09, CV21).
+    TransactionElapsed(i64),
     Other,
 }
 
@@ -2909,6 +2935,7 @@ fn advance_transaction(
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         };
         *slot = Some(transaction.clone());
         return Some((TransactionEventKind::Started, transaction));
@@ -3391,20 +3418,23 @@ mod tests {
         );
     }
 
-    /// E16.FR.13: a limit naming only kinds this build does not enforce is neither recorded nor
+    /// E16.FR.13: a limit that names nothing this build enforces is neither recorded nor
     /// confirmed - the CSMS learns from the silence, having been told what is supported by
     /// `TxCtrlr.SupportedLimits`.
+    ///
+    /// Since CV21 there is no *unsupported kind* left to demonstrate that with - all four OCPP
+    /// defines are enforced - so what remains reachable is the boundary the filter shares with an
+    /// empty limit: a ceiling that states no ceiling. The filtering itself is asserted against
+    /// `SUPPORTED_TRANSACTION_LIMITS` in `crate::state::device_model`'s own tests, so removing a
+    /// kind from that list without removing its check would still be caught.
     #[test]
-    fn a_limit_this_build_cannot_enforce_is_neither_recorded_nor_confirmed() {
+    fn a_limit_that_states_no_ceiling_is_neither_recorded_nor_confirmed() {
         let mut state = charging_from(1_000);
 
         let effects = apply_connector_event(
             &mut state,
             ConnectorEvent::TransactionLimitSet {
-                limit: crate::state::TransactionLimit {
-                    max_time_secs: Some(3_600),
-                    ..Default::default()
-                },
+                limit: crate::state::TransactionLimit::default(),
                 from_csms: true,
             },
         );
@@ -3424,6 +3454,102 @@ mod tests {
 
         let effects = apply_connector_event(&mut state, energy_limit(5_000.0));
 
+        assert!(reported_limit_events(&effects).is_empty());
+    }
+
+    /// A station that declares it enforces `maxTime` - what
+    /// `ChargePointBuilder::transaction_time_limits` does when it spawns the sweep, applied
+    /// directly so these tests need no builder (CV21).
+    fn declaring_time_limit_support(state: &mut ChargePointState) {
+        state.apply(ChargePointEvent::DeviceModel(
+            crate::state::DeviceModelEvent::AttributeValueSet {
+                component: Component {
+                    name: "TxCtrlr".into(),
+                    instance: None,
+                    evse: None,
+                },
+                variable: crate::state::Variable {
+                    name: "SupportedLimits".into(),
+                    instance: None,
+                },
+                attribute_type: crate::state::VariableAttributeType::Actual,
+                value: "maxCost,maxEnergy,maxSoC,maxTime".into(),
+            },
+        ));
+    }
+
+    fn time_limit(secs: i64) -> ConnectorEvent {
+        ConnectorEvent::TransactionLimitSet {
+            limit: crate::state::TransactionLimit {
+                max_time_secs: Some(secs),
+                ..Default::default()
+            },
+            from_csms: true,
+        }
+    }
+
+    /// E16.FR.05/.09 (CV21): a time limit is reached like any other ceiling, and reports the
+    /// trigger reason that names it. The elapsed figure comes from the sweep that owns the clock
+    /// - the state machine compares, it does not measure.
+    #[test]
+    fn reaching_a_time_limit_suspends_energy_transfer_and_says_which_limit() {
+        let mut state = charging_from(1_000);
+        declaring_time_limit_support(&mut state);
+        apply_connector_event(&mut state, time_limit(3_600));
+
+        // Under the limit: nothing to report.
+        let effects = apply_connector_event(&mut state, ConnectorEvent::TransactionElapsed(3_599));
+        assert!(reported_limit_events(&effects).is_empty());
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::TransactionElapsed(3_600));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::SuspendedEvse);
+        assert!(
+            reported_limit_events(&effects).contains(&TransactionUpdateReason::LimitReached(
+                crate::state::TransactionLimitKind::Time
+            ))
+        );
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::SetCurrentLimit {
+                evse_id: 0,
+                connector_id: 0,
+                limit_ma: Some(0),
+            }
+        )));
+    }
+
+    /// E16.FR.14 for the time ceiling: raising it past where the transaction stands resumes,
+    /// exactly as raising an energy ceiling does - which is the point of the state machine
+    /// comparing a recorded elapsed figure rather than each limit kind having its own path.
+    #[test]
+    fn raising_a_time_limit_resumes_energy_transfer() {
+        let mut state = charging_from(1_000);
+        declaring_time_limit_support(&mut state);
+        apply_connector_event(&mut state, time_limit(3_600));
+        apply_connector_event(&mut state, ConnectorEvent::TransactionElapsed(3_600));
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::SuspendedEvse);
+
+        apply_connector_event(&mut state, time_limit(7_200));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
+        assert!(
+            state.evses[0].transactions[0]
+                .as_ref()
+                .is_some_and(|transaction| transaction.limit_reached.is_none())
+        );
+    }
+
+    /// An elapsed report against a transaction with no time ceiling records the figure and does
+    /// nothing else - the sweep only sends one when the verdict would change, but a stale one
+    /// arriving after a limit was cleared must not suspend anything.
+    #[test]
+    fn an_elapsed_report_with_no_time_limit_changes_nothing() {
+        let mut state = charging_from(1_000);
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::TransactionElapsed(99_999));
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Charging);
         assert!(reported_limit_events(&effects).is_empty());
     }
 
@@ -3488,6 +3614,7 @@ mod tests {
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -3934,6 +4061,7 @@ mod tests {
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -3976,6 +4104,7 @@ mod tests {
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -4026,6 +4155,7 @@ mod tests {
             // against (CV15) - recorded whether or not a limit is in force, since one set later
             // must still measure from the session's real start.
             energy_start_wh: Some(sample.energy_wh),
+            elapsed_secs: None,
         };
         assert_eq!(
             state.evses[0].transactions[0],
@@ -4170,6 +4300,7 @@ mod tests {
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         };
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
         assert_eq!(state.evses[0].transactions[0], None);
@@ -4211,6 +4342,7 @@ mod tests {
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         };
         assert_eq!(state.evses[0].transactions[0], None);
         assert!(effects.contains(&ChargePointEffect::TransactionEvent(
@@ -6651,6 +6783,7 @@ mod tests {
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         }
     }
 

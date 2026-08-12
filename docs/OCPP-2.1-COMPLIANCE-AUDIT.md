@@ -344,10 +344,11 @@ FR.16 and FR.15 in that order.
 
 Two things worth reading in the roadmap's CV15 section rather than inferring: **E16.FR.06 is
 unreachable here** (the suspend-vs-end branch needs `TxStopPoint = EnergyTransfer`, which this
-crate's `values_list` refuses, so suspension is always the answer), and **`maxTime` is not
-supported** — it is the only ceiling that cannot be decided from a meter reading, and
-`TxCtrlr.SupportedLimits` omits it so FR.12/.13 make that honest rather than silent. **CV21** is
-the row that would close it.
+crate's `values_list` refuses, so suspension is always the answer), and **`maxTime` needed a
+clock** — it is the only ceiling that cannot be decided from a meter reading. **CV21 has since
+closed it**: `crate::transactions::run_transaction_time_limits` measures the elapsed time, and
+`TxCtrlr.SupportedLimits` gains `maxTime` when that sweep is spawned, so a build without it
+neither advertises the ceiling nor records one (E16.FR.12/.13).
 
 C17 (prepaid) is no longer stranded: its whole mechanism is a CSMS-set `maxCost`, which now
 records, confirms and binds. Original finding follows.

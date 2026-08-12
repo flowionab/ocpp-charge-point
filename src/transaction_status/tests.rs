@@ -64,6 +64,7 @@ fn queued_event(id: TransactionId) -> TransactionEventOccurred {
             csms_limit: None,
             limit_reached: None,
             energy_start_wh: None,
+            elapsed_secs: None,
         },
         offline: false,
     }
