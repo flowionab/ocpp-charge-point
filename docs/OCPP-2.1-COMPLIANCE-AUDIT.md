@@ -1,7 +1,7 @@
 # OCPP 2.1 compliance audit — spec vs. this crate
 
 **Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13–§2.17 closed 2026-08-12,
-§2.19–§2.26 opened by the K28/K29, E, C, N and Q sweeps 2026-08-12/13 ·
+§2.19–§2.29 opened by the K28/K29, E, C, N, Q, G, H, O and P sweeps 2026-08-12/13 ·
 **Baseline:** `main` @ `4c6abe3`, sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
 part 2 appendices v2.1 CSVs + errata 2026-06).
 
@@ -365,6 +365,57 @@ a cost, energy, SoC or time limit. This also strands **C17 (authorization with p
 whose whole mechanism is a CSMS-set `maxCost` — and it is the one gap that directly limits CV8's
 value, since the crate now computes a running cost locally (`EvseState::running_cost`) and still has
 no way to act on a cost ceiling.
+
+### 2.27 High · `ChangeAvailability` takes effect mid-transaction, with no `Scheduled` and no contactor command (G03.FR.05) [READ]
+
+Found by CV12.7's G sweep. G03.FR.05: when a transaction is in progress, the station SHALL answer
+`Scheduled` and defer the change until the transaction finishes. `ChangeAvailabilityOutcome` has
+two variants, `Accepted` and `Rejected`, and its docs say `Scheduled` "isn't modeled". So the CSMS
+is told `Accepted` where the spec says `Scheduled` - and that is the smaller half.
+
+The connector transition is `(_, ConnectorEvent::SetUnavailable) => (Self::Unavailable, None)`:
+from **any** state, including `Charging`, with **no** `ConnectorCommand`. Taking a charging bay out
+of service therefore reports it `Unavailable` to the CSMS while the contactor is still closed and
+the transaction is still open - the station's report and its behaviour describe different things,
+which is the pattern §2.13 and §2.16 were each an instance of. `ends_transaction` is not consulted
+either, so the transaction is not stopped, merely orphaned behind an `Unavailable` status.
+
+Deferring is what the requirement asks for and is also the safe reading: a driver mid-session is
+not interrupted, and the bay goes out of service when it is free.
+
+### 2.28 High · availability is not persistent across a reboot (G01.FR.02, G03.FR.08) [MECHANICAL]
+
+Found by CV12.7's G sweep. Both requirements are explicit - G01.FR.02: "The EVSE's Unavailable
+status SHALL be persistent across reboots"; G03.FR.08: "The set availability state SHALL be
+persistent across reboot/power loss."
+
+`crate::persistence` restores transactions, queues, the authorization cache, charging profiles,
+network profiles, the security log, the local authorization list, reservations and the device
+model. Availability is not among them, and it could not be recovered from the device model either:
+`AvailabilityState` is `ReadOnly` and re-derived per applied event by `sync_availability_variables`
+from `LifecycleState`/`EvseStatus`/`ConnectorState`, none of which is restored.
+`PersistedConnectorState` exists, but only to serialize *queued status-change reports*.
+
+So an operator takes a bay out of service, the station reboots - a firmware update, a power cut -
+and the bay silently returns to service. The CSMS is told, since boot reports every connector's
+status (CV5), but "told the truth about the wrong state" is not the requirement.
+
+### 2.29 Medium · display messages ignore their transaction, their schedule and the reboot (O02.FR.02/.06/.07/.10) [READ]
+
+Found by CV12.7's O sweep. Four requirements, one shape - the message store holds `id`, `priority`,
+`state`, `message` and `transaction_id`, and nothing else O02 asks for:
+
+- **O02.FR.02** ("when the transaction ends, remove the message"): `DisplayMessageStore::
+  clear_for_transaction` exists and is called from nowhere but its own test - the code says so in
+  as many words, citing B6.
+- **O02.FR.06/.07** (`startTime`/`endTime`): not modelled at all, so a message scheduled for later
+  displays immediately and one past its end time is never removed.
+- **O02.FR.10** ("store the messages in persistent storage, so they survive a power cycle"): no
+  display-message record exists in `crate::persistence`.
+
+O01, O03-O06 are implemented, including the `NotSupportedPriority`/`NotSupportedState`/
+`NotSupportedMessageFormat` refusals O02.FR.03-.05 ask for, which are decided against the real
+`hardware::Display` (CV1.6/CV14 made `SupportedFormats` a hardware fact rather than a claim).
 
 ### 2.25 Low · a periodic event stream batches by interval only, never by value count (N15.FR.07/.08) [READ]
 
