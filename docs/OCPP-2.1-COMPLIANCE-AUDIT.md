@@ -1,6 +1,7 @@
 # OCPP 2.1 compliance audit — spec vs. this crate
 
-**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13–§2.17 closed 2026-08-12 ·
+**Date:** 2026-08-11, §2.13–§2.18 and §3 re-swept 2026-08-12, §2.13–§2.17 closed 2026-08-12,
+§2.19–§2.26 opened by the K28/K29, E, C, N and Q sweeps 2026-08-12/13 ·
 **Baseline:** `main` @ `4c6abe3`, sweep baseline `02dfa69` · **Spec:** OCPP 2.1 edition 2 (`docs/OCPP-2.1/`, part 2 specification +
 part 2 appendices v2.1 CSVs + errata 2026-06).
 
@@ -364,6 +365,153 @@ a cost, energy, SoC or time limit. This also strands **C17 (authorization with p
 whose whole mechanism is a CSMS-set `maxCost` — and it is the one gap that directly limits CV8's
 value, since the crate now computes a running cost locally (`EvseState::running_cost`) and still has
 no way to act on a cost ceiling.
+
+### 2.25 Low · a periodic event stream batches by interval only, never by value count (N15.FR.07/.08) [READ]
+
+Found by CV12.5's N sweep, and already self-documented in `crate::periodic_event_stream`'s module
+docs. `PeriodicEventStreamParams.values` is stored and reported faithfully by
+`GetPeriodicEventStream`, but the driver loop sends exactly one data element per sweep, so:
+
+- **N15.FR.08** ("send as soon as `params.values` values are available") never fires - the interval
+  is the only trigger.
+- **N15.FR.07** ("no more than `params.values` values at a time") holds trivially, one being no
+  more than any positive number.
+- **N15.FR.04**'s `pending` is honest at `0`: nothing is buffered, so nothing is pending.
+
+The failure mode is over-sending rather than silence: an `interval` of `0` is clamped to one
+second, so a CSMS that configured a stream purely by value count still receives data - roughly one
+message per second carrying one element, where it asked for one message per `values` elements. On a
+metered or constrained link that is the difference the batching was for.
+
+N09-N14 were read and hold: `GetCustomerInformation`/`ClearCustomerInformation` answer against this
+crate's real state rather than a fabricated store (`crate::customer_information`'s own docs walk
+each place), and the stream lifecycle messages (open, get, close, adjust) are implemented against a
+real store with a `StateLimits` bound.
+
+### 2.26 Medium · `IdToken.additionalInfo` is not modelled, so Q01.FR.02's EVCCID cannot be reported [MECHANICAL]
+
+Found by CV12.6's Q sweep. `crate::state::IdToken` is `{ value, kind }`; OCPP's `IdTokenType` also
+carries `additionalInfo`, a list of `(additionalIdToken, type)` pairs, and every wire encoder in
+this crate sets `additional_info: None`.
+
+Q01.FR.02 needs exactly that field: on an ISO 15118-20 transaction the station must put the EVCCID
+into `idToken.additionalInfo.additionalIdToken` with `type = "EVCCID"` on the
+`TransactionEvent(Started)`, because the CSMS uses it to decide whether to allow bidirectional
+transfer. `IdTokenKind::EVCCID` exists as a *kind* - an identifier that **is** an EVCCID - which is
+a different thing from an identifier *accompanied by* one.
+
+Q01's other requirements rest on an ISO 15118-20 stack this crate does not run (§3's standing
+note), so they are the product's. This one is not: the field is on a message this crate builds, so
+no integrator can supply it from outside. Q01.FR.01 is CSMS-side.
+
+### 2.24 High · `hardware::PaymentTerminal` can be read but not driven, so C19-C23's station-side requirements are unreachable [READ]
+
+Found by CV12.4's C sweep. The trait has two methods - `info()` and `status()` - and both *ask*
+the terminal something. Nothing on it *tells* the terminal anything, and the C19-C23 requirements
+are almost entirely instructions to a terminal:
+
+| Requirement | Asks the station to |
+|---|---|
+| C19.FR.01 | instruct the terminal to release the authorization amount and cancel the payment |
+| C21.FR.01 | settle the total cost of the transaction via the terminal |
+| C21.FR.06 | *not* settle via the terminal when the CSMS settles instead |
+| C23 | raise the authorized amount during a session (incremental authorization) |
+
+The *reporting* half exists and is good: `crate::payment::report_settlement` sends
+`NotifySettlement` with the status, amount, time, transaction and `pspRef` C21.FR.02 asks for, and
+`report_web_payment_started`/`validate_vat_number` cover their own messages. So an integrator can
+drive their terminal themselves and hand this crate the outcome to report. What they cannot do is
+implement a `crate::hardware` trait and have the crate carry out C19-C23 - which is the promise
+`CLAUDE.md` makes ("integrators should only ever need to supply hardware bindings").
+
+The same shape as §2.18's missing renegotiation surface and the DER actuation trait, and the third
+member of that set. `docs/CERTIFICATION.md` §3 names a payment blocker, but the one it names -
+"nothing drives the live status variables from a real payment terminal" - **was closed by CV2.11**
+and is stale; this is the gap that actually remains.
+
+C24 (ad hoc payment via a stand-alone terminal) is the one member of the group this shape does not
+block, since a stand-alone terminal authorizes on its own account and the station's part is to
+report - which it can.
+
+### 2.21 Medium · a saturated offline queue drops exactly the messages E11.FR.05 says to keep [READ]
+
+Found by CV12.3's E sweep. `OfflineQueue`'s two overflow policies are `DropOldest` ("evict the
+oldest queued message") and `DropNewest` ("reject the new message"), and E11.FR.05 names both as
+the things not to do:
+
+> When dropping TransactionEventRequest(eventType = Updated) messages, the Charging Station SHALL
+> drop intermediate messages first (2nd message, 4th message, 6th message etc.), not start dropping
+> messages from the start or stop adding messages to the queue.
+
+The rule exists to protect the two messages a billing system cannot reconstruct - the `Started` and
+the `Ended` - by thinning the interchangeable `Updated`s between them. This crate's policies do the
+opposite at whichever end they act on: `DropOldest` loses the `Started`, `DropNewest` loses the
+`Ended`, and neither distinguishes an `Updated` from either. `DropNewest` is the policy the docs
+recommend for transaction events, so the recommended configuration is the one that loses the
+message closing the session.
+
+Dropping at all is a `MAY` (E11.FR.04), so a station that never drops is conformant - but this one
+drops, and FR.05 constrains how. The fix is a policy that knows the message kind, which the queue
+deliberately does not (it is generic over `M`); the transaction queue would need to supply a
+predicate the way it already supplies `mark_offline`.
+
+### 2.22 Low · the transaction-event retry interval does not escalate (E13.FR.03) [READ]
+
+Found by CV12.3. E13.FR.03: "The Charging Station SHALL wait as many seconds as specified in its
+MessageAttemptIntervalTransactionEvent key, **multiplied by the number of preceding transmissions
+of this same message**" - the spec's own example is 60 s, then 120 s, then discard.
+
+`run_offline_queue_retries` waits `message_attempt_interval_secs` before *every* sweep, with no
+per-message attempt counter feeding a multiplier. E13.FR.02 (retry up to `MessageAttempts`) and
+E13.FR.04 (discard after the final attempt) are both implemented; only the escalation is not, so a
+CSMS that is rejecting messages is retried more often than the spec prescribes - which is load on
+exactly the CSMS the back-off exists to spare.
+
+### 2.23 Medium · E17 (resuming a transaction after interruption) is absent - 17 FRs [MECHANICAL]
+
+Found by CV12.3. `TxResumptionTimeout`, `TxAllowEnergyTransferResumption` and
+`triggerReason = TxResumed` occur zero times in `src/`. This crate closes a recovered transaction
+out instead: `crate::persistence` reports it `Ended` with `StopReason::PowerLoss` on the next boot
+(`docs/PRODUCTION-ROADMAP.md` §7.4, E4.1).
+
+That is a deliberate, documented choice and it is safe - a session that cannot be resumed is closed
+honestly rather than left half-alive - but E17 is a 2.1 use case whose requirements are `SHALL`s,
+and no audit row said so until this sweep. Closing it needs the resumption timeout, the charging
+state to be restored per E17.FR.11-13's three-way branch on
+`TxAllowEnergyTransferResumption`, and the `TxResumed` event. The persisted record already carries
+what E17.FR.01 asks to be stored.
+
+### 2.19 Medium · `ChargingSchedulePeriod.operationMode` is never read, so K29.FR.03's delegation does not happen [MECHANICAL]
+
+Found by CV12.2's K28/K29 sweep. 2.1 added `operationMode` to a schedule period, and `map_schedule`
+(`src/smart_charging/ocpp_2_1.rs`) builds a `ChargingSchedulePeriod` from `start_period`, `limit`
+and `number_phases` only - the field is neither read on the way in nor set on the way out (three
+literal `operation_mode: None` at the encode sites, zero reads).
+
+The concrete cost is **K29.FR.03**: a CSMS may install a `TxProfile`/`TxDefaultProfile` with
+`chargingProfileKind = Dynamic` and `operationMode = ExternalLimits`/`ExternalSetpoint`, which
+means *this profile's limit is whatever the on-site system says it is*. A station that ignores the
+field applies the numbers the CSMS happened to put in the single period instead, and never
+delegates - so the CSMS believes an EMS is driving the limit while the station holds a static one.
+The same class as §2.16: the station's behaviour and its report describe different charge points.
+
+Table 95 of the spec maps `operationMode` per `chargingProfilePurpose`, so the field also governs
+setpoint semantics more broadly (`CentralSetpoint`, `LocalFrequency`, `Idle`, …). This crate models
+limits only and says so - `DynamicScheduleUpdate::carried_unprojectable_values` already logs when
+an update carried setpoints it has no hardware hook for - so the wider gap is declared. K29.FR.03
+is the part that is not.
+
+### 2.20 Low · `SmartChargingCtrlr.SupportedAdditionalPurposes` is not registered, so the CSMS is not told which 2.1 purposes this station supports (K21.FR.10) [MECHANICAL]
+
+Found by CV12.2. The variable lists "the additional chargingProfilePurposes, that have been
+introduced in OCPP 2.1, that are supported by the Charging Station", and K21.FR.10's note names it
+as how a station reports support for `UsePriorityCharging`. It occurs zero times in `src/`.
+
+This station supports two of them: `PriorityCharging` (K21/K22, implemented) and - since CV17 -
+`LocalGeneration` (K27). Both work, and neither is advertised, so a CSMS following the spec's own
+discovery path concludes it may not send either. `Required? = no` in the appendix, so this is not a
+conformance violation; it is the same shape as CV14's decorative variables with the sign reversed -
+a capability the station has and does not claim, rather than one it claims and does not have.
 
 ### 2.15 ~~Medium~~ **Closed by CV14** · `CAPABILITY_GATED_VARIABLES` was never swept by CV2.1 — 19 of 26 writable rows accept a write and discard it (B05.FR.09) [MECHANICAL]
 
